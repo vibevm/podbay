@@ -15,23 +15,27 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetProcessTimes,
+    OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    ResumeThread, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::{PossibleProcess, ProcessIdentity, ResumeFence, Win32Error};
 
-struct OwnedHandle(HANDLE);
+pub(super) struct OwnedHandle(HANDLE);
+// SAFETY: OwnedHandle uniquely owns a real kernel HANDLE. Moving that sole
+// owner to a worker thread does not invalidate the handle; the worker closes
+// it exactly once on Drop. We deliberately do not implement Sync.
+unsafe impl Send for OwnedHandle {}
 impl OwnedHandle {
-    fn new(raw: HANDLE) -> Result<Self, Win32Error> {
+    pub(super) fn new(raw: HANDLE) -> Result<Self, Win32Error> {
         if raw.is_null() {
             Err(Win32Error::Os(io::Error::last_os_error()))
         } else {
             Ok(Self(raw))
         }
     }
-    fn raw(&self) -> HANDLE {
+    pub(super) fn raw(&self) -> HANDLE {
         self.0
     }
 }
@@ -200,7 +204,23 @@ impl PodJob {
         exact_command_line: &OsStr,
         cwd: &Path,
     ) -> Result<RunningProcess, Win32Error> {
-        let mut child = create_suspended(application, exact_command_line, cwd, CREATE_SUSPENDED)?;
+        self.spawn_child_with_startup(application, exact_command_line, cwd, None)
+    }
+
+    pub(super) fn spawn_child_with_startup(
+        &self,
+        application: &Path,
+        exact_command_line: &OsStr,
+        cwd: &Path,
+        startup: Option<&STARTUPINFOEXW>,
+    ) -> Result<RunningProcess, Win32Error> {
+        let mut child = create_suspended_with_startup(
+            application,
+            exact_command_line,
+            cwd,
+            CREATE_SUSPENDED,
+            startup,
+        )?;
         // SAFETY: both handles are live and owned; child is still suspended.
         let assigned = unsafe {
             AssignProcessToJobObject(self.job.raw(), child.process.as_ref().unwrap().raw())
@@ -296,6 +316,16 @@ fn create_suspended(
     cwd: &Path,
     flags: u32,
 ) -> Result<SuspendedProcess, Win32Error> {
+    create_suspended_with_startup(application, command_line, cwd, flags, None)
+}
+
+fn create_suspended_with_startup(
+    application: &Path,
+    command_line: &OsStr,
+    cwd: &Path,
+    flags: u32,
+    extended: Option<&STARTUPINFOEXW>,
+) -> Result<SuspendedProcess, Win32Error> {
     if !application.is_absolute() || !cwd.is_absolute() {
         return Err(Win32Error::Invalid("application and cwd must be absolute"));
     }
@@ -307,6 +337,14 @@ fn create_suspended(
     }
     let mut startup = STARTUPINFOW::default();
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let startup_ptr = extended.map_or(&startup as *const STARTUPINFOW, |value| {
+        &value.StartupInfo as *const STARTUPINFOW
+    });
+    let extended_flag = if extended.is_some() {
+        EXTENDED_STARTUPINFO_PRESENT
+    } else {
+        0
+    };
     let mut info = PROCESS_INFORMATION::default();
     // PB27a never inherits the manager's ambient credentials. A later PodBay
     // environment policy can supply an explicit, reviewed Unicode block.
@@ -321,10 +359,10 @@ fn create_suspended(
             null(),
             null(),
             0,
-            flags | CREATE_UNICODE_ENVIRONMENT,
+            flags | CREATE_UNICODE_ENVIRONMENT | extended_flag,
             empty_environment.as_ptr().cast(),
             cwd.as_ptr(),
-            &startup,
+            startup_ptr,
             &mut info,
         )
     };

@@ -67,7 +67,15 @@ impl ResumeFence {
 }
 
 #[cfg(windows)]
+mod conpty;
+#[cfg(any(windows, test))]
+mod conpty_model;
+#[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub use conpty::ConPtyProcess;
+#[cfg(windows)]
+pub use conpty_model::{OutputChunk, OutputPage};
 #[cfg(windows)]
 pub use windows::{
     PodJob, RunningProcess, SuspendedProcess, launch_independent_suspended, open_exact_process,
