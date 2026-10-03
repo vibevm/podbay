@@ -7,6 +7,8 @@ mod manifest;
 mod peer_checkpoint;
 mod ports;
 #[cfg(target_os = "linux")]
+mod rebind_protocol;
+#[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
 mod spool;
