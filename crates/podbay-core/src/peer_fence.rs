@@ -344,6 +344,35 @@ pub struct PodFenceCheckpoint {
 }
 
 impl PodFenceCheckpoint {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_durable_parts(
+        version: u16,
+        identity: PodFenceIdentity,
+        manager_containment: String,
+        manager_peer: AttestedPeer,
+        owner_epoch: OwnerEpoch,
+        credential_epoch: CredentialEpoch,
+        input_epochs: BTreeMap<ResourceId, InputEpoch>,
+        phase: RebindPhase,
+        pending_rebind: Option<RebindProposal>,
+        last_rebind: Option<RebindProposal>,
+    ) -> Result<Self, FenceError> {
+        let checkpoint = Self {
+            version,
+            identity,
+            manager_containment: manager_containment.into_boxed_str(),
+            manager_peer,
+            owner_epoch,
+            credential_epoch,
+            input_epochs,
+            phase,
+            pending_rebind,
+            last_rebind,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     pub fn version(&self) -> u16 {
         self.version
     }
@@ -1955,6 +1984,36 @@ mod tests {
     #[test]
     fn malformed_checkpoint_association_or_epoch_refuses_restore() {
         let original = fence().checkpoint();
+        assert_eq!(
+            PodFenceCheckpoint::from_durable_parts(
+                original.version() + 1,
+                original.identity().clone(),
+                original.manager_containment().into(),
+                original.manager_peer().clone(),
+                original.owner_epoch(),
+                original.credential_epoch(),
+                original.input_epochs().clone(),
+                original.phase(),
+                None,
+                None
+            ),
+            Err(FenceError::InvalidEvidence)
+        );
+        assert_eq!(
+            PodFenceCheckpoint::from_durable_parts(
+                original.version(),
+                original.identity().clone(),
+                original.manager_containment().into(),
+                original.manager_peer().clone(),
+                original.owner_epoch(),
+                original.credential_epoch(),
+                original.input_epochs().clone(),
+                RebindPhase::PendingStore,
+                None,
+                None
+            ),
+            Err(FenceError::InvalidEvidence)
+        );
         let mut wrong_version = original.clone();
         wrong_version.version += 1;
         assert_eq!(

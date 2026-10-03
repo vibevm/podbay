@@ -4,6 +4,7 @@
 #[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
+mod peer_checkpoint;
 mod ports;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -20,6 +21,9 @@ pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 pub use manifest::{LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path};
 #[cfg(target_os = "linux")]
 pub use manifest::{PodManifest, PodStatus};
+pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
+#[cfg(target_os = "linux")]
+pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
     DurableFiles, LocalConnection, LocalControlTransport, PodControlPort, PodObservation,
     ProcessIdentity, SupervisorBackend, SupervisorEvidence, TerminalBackend, TerminalResource,
