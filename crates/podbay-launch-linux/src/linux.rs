@@ -300,6 +300,216 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Observation returned only by a live, bidirectionally attested inspect
+/// exchange through this adapter. No public constructor, Clone or Deserialize
+/// is provided. It is a point-in-time observation, not a grant or admission;
+/// a future prepare operation must recheck its borrowed manager context.
+pub struct VerifiedRebindInspection {
+    prior: podbay_store::HostObservedPriorCheckpoint,
+    store_path: PathBuf,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    manager_peer: podbay_core::AttestedPeer,
+    input_epochs: std::collections::BTreeMap<podbay_core::ResourceId, podbay_core::InputEpoch>,
+    authority_revision: u64,
+    descriptor_digest: String,
+    nonce: String,
+    child_pid: u32,
+    child_start_ticks: u64,
+}
+
+impl VerifiedRebindInspection {
+    /// Diagnostic data only. Copying this DTO does not create another verified
+    /// observation, and no adapter API accepts a DTO in place of this value.
+    pub fn prior_checkpoint(&self) -> &podbay_store::HostObservedPriorCheckpoint {
+        &self.prior
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+    }
+    pub fn manager_peer(&self) -> &podbay_core::AttestedPeer {
+        &self.manager_peer
+    }
+    pub fn resource_input_epochs(
+        &self,
+    ) -> &std::collections::BTreeMap<podbay_core::ResourceId, podbay_core::InputEpoch> {
+        &self.input_epochs
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn descriptor_digest(&self) -> &str {
+        &self.descriptor_digest
+    }
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    pub fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+    pub fn child_start_ticks(&self) -> u64 {
+        self.child_start_ticks
+    }
+}
+
+impl LinuxLaunchPort {
+    /// Inspect an already-running pod without its old bearer. The path comes
+    /// only from trusted adapter configuration and store-derived identities.
+    /// This method performs no launch, rebind preparation or authority write.
+    pub fn inspect_existing(
+        &self,
+        context: &mut podbay_host::ManagerRebindContext<'_>,
+    ) -> Result<VerifiedRebindInspection, PodError> {
+        self.inspect_with(context, |path, identity, owner, credential| {
+            podbay_pod::PodClient::inspect_rebind(path, identity, owner, credential)
+        })
+    }
+
+    // A private seam for deterministic validation tests. Production supplies
+    // only PodClient::inspect_rebind; callers cannot inject an inspection DTO.
+    fn inspect_with(
+        &self,
+        context: &mut podbay_host::ManagerRebindContext<'_>,
+        inspect: impl FnOnce(
+            &Path,
+            &podbay_core::PodFenceIdentity,
+            u64,
+            u64,
+        ) -> Result<podbay_pod::RebindInspection, PodError>,
+    ) -> Result<VerifiedRebindInspection, PodError> {
+        self.config.recheck()?;
+        context
+            .recheck_current()
+            .map_err(|_| PodError::Refused("manager rebind context changed"))?;
+        let wire =
+            podbay_wire::ImmutableLaunchDescriptor::decode_json(&context.launch().descriptor)
+                .map_err(|_| PodError::Refused("committed rebind descriptor is malformed"))?;
+        let identity = context.identity();
+        if wire.scope_id() != identity.scope_id.as_str()
+            || wire.pod_id() != identity.pod_id.as_str()
+            || wire.attempt_id() != identity.attempt_id.as_str()
+            || wire.pod_incarnation() != identity.incarnation.get()
+            || wire.cwd() != self.config.directory.to_string_lossy()
+            || identity.store_lineage.as_str() != context.store_lineage()
+        {
+            return Err(PodError::Refused(
+                "trusted rebind directory or identity differs",
+            ));
+        }
+        let manifest = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &identity.pod_id,
+            &identity.attempt_id,
+            identity.incarnation,
+        );
+        let response = inspect(
+            &manifest,
+            identity,
+            context.owner_epoch(),
+            context.credential_epoch(),
+        )?;
+        self.config.recheck()?;
+        context
+            .recheck_current()
+            .map_err(|_| PodError::Refused("manager rebind context changed during inspect"))?;
+        let identity = context.identity();
+        let expected_unit = format!(
+            "podbay-pod-{}.service",
+            manifest
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or(PodError::Invalid("rebind manifest slot"))?
+        );
+        if response.protocol != "podbay.rebind-inspect/1"
+            || response.scope_id != identity.scope_id.as_str()
+            || response.pod_id != identity.pod_id.as_str()
+            || response.attempt_id != identity.attempt_id.as_str()
+            || response.incarnation != identity.incarnation.get()
+            || response.store_lineage != context.store_lineage()
+            || response.prior_owner_epoch == 0
+            || response.prior_owner_epoch >= context.owner_epoch()
+            || response.prior_credential_epoch == 0
+            || response.prior_credential_epoch >= context.credential_epoch()
+            || response.prior_input_epochs.len() != context.resource_input_epochs().len()
+            || response.prior_input_epochs.is_empty()
+            || response.checkpoint_digest.len() != 64
+            || !response
+                .checkpoint_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || response.nonce.len() != 64
+            || !response
+                .nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || response.supervisor_pid == 0
+            || response.supervisor_start_ticks == 0
+            || response.child_pid == 0
+            || response.child_start_ticks == 0
+            || response.unit_name != expected_unit
+            || !response.cgroup_path.starts_with('/')
+            || response.cgroup_path.rsplit('/').next() != Some(expected_unit.as_str())
+            || response.cgroup_path.chars().any(char::is_control)
+            || format!("linux.boot.{}", response.boot_id) != context.manager_peer().boot_identity()
+        {
+            return Err(PodError::Refused(
+                "inspection does not match current manager context",
+            ));
+        }
+        let mut prior_inputs = std::collections::BTreeMap::new();
+        for (id, current) in context.resource_input_epochs() {
+            let prior = response
+                .prior_input_epochs
+                .get(id.as_str())
+                .ok_or(PodError::Refused("inspection resource set differs"))?;
+            if *prior == 0 || *prior >= current.get() {
+                return Err(PodError::Refused(
+                    "inspection resource input did not advance",
+                ));
+            }
+            prior_inputs.insert(
+                id.clone(),
+                podbay_core::InputEpoch::new(*prior)
+                    .map_err(|_| PodError::Invalid("prior input epoch"))?,
+            );
+        }
+        let prior = podbay_store::HostObservedPriorCheckpoint {
+            identity: identity.clone(),
+            phase: podbay_core::RebindPhase::Active,
+            owner_epoch: podbay_core::OwnerEpoch::new(response.prior_owner_epoch)
+                .map_err(|_| PodError::Invalid("prior owner epoch"))?,
+            credential_epoch: podbay_core::CredentialEpoch::new(response.prior_credential_epoch)
+                .map_err(|_| PodError::Invalid("prior credential epoch"))?,
+            input_epochs: prior_inputs,
+            checkpoint_digest: response.checkpoint_digest,
+            supervisor_pid: response.supervisor_pid,
+            supervisor_start_ticks: response.supervisor_start_ticks,
+            boot_id: response.boot_id,
+            unit_name: response.unit_name,
+            cgroup_path: response.cgroup_path,
+        };
+        Ok(VerifiedRebindInspection {
+            prior,
+            store_path: context.store_path().to_path_buf(),
+            owner_epoch: context.owner_epoch(),
+            credential_epoch: context.credential_epoch(),
+            manager_peer: context.manager_peer().clone(),
+            input_epochs: context.resource_input_epochs().clone(),
+            authority_revision: context.authority_revision(),
+            descriptor_digest: wire.digest().into(),
+            nonce: response.nonce,
+            child_pid: response.child_pid,
+            child_start_ticks: response.child_start_ticks,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +950,198 @@ mod tests {
         assert_eq!(after_duplicate.supervisor, status.supervisor);
         assert_eq!(after_duplicate.child, status.child);
         assert!(!client.stop().unwrap().child_running);
+    }
+
+    fn inspect_adapter(fixture: &Fixture) -> LinuxLaunchPort {
+        let binary = fs::canonicalize("/bin/true").unwrap();
+        LinuxLaunchPort::new(
+            TrustedLinuxLaunchConfig::from_trusted_policy(
+                binary.clone(),
+                sha256_file(&binary).unwrap(),
+                fixture.directory.clone(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn inspect_setup() -> (Fixture, DurableAuthority<HarnessPort>, LinuxLaunchPort) {
+        let (fixture, mut first, transport, request, calls) = setup(Mode::Good, "/bin/true".into());
+        first.admit_bound_pod(&transport, request).unwrap();
+        drop(first);
+        let adapter = inspect_adapter(&fixture);
+        let host = DurableAuthority::open(
+            fixture.directory.join("store.sqlite"),
+            HarnessPort {
+                inner: inspect_adapter(&fixture),
+                mode: Mode::Good,
+                calls,
+            },
+        )
+        .unwrap();
+        (fixture, host, adapter)
+    }
+
+    fn inspect_response(path: &Path, identity: &PodFenceIdentity) -> podbay_pod::RebindInspection {
+        let peer = LinuxPeerEvidence::for_current_process().unwrap();
+        let unit = format!(
+            "podbay-pod-{}.service",
+            path.file_stem().unwrap().to_str().unwrap()
+        );
+        podbay_pod::RebindInspection {
+            protocol: "podbay.rebind-inspect/1".into(),
+            nonce: "a".repeat(64),
+            scope_id: identity.scope_id.as_str().into(),
+            pod_id: identity.pod_id.as_str().into(),
+            attempt_id: identity.attempt_id.as_str().into(),
+            incarnation: identity.incarnation.get(),
+            store_lineage: identity.store_lineage.as_str().into(),
+            prior_owner_epoch: 1,
+            prior_credential_epoch: 1,
+            prior_input_epochs: std::collections::BTreeMap::from([(
+                "resource.synthetic".into(),
+                1,
+            )]),
+            checkpoint_digest: "c".repeat(64),
+            supervisor_pid: 1234,
+            supervisor_start_ticks: 5678,
+            child_pid: 1235,
+            child_start_ticks: 5679,
+            boot_id: peer.boot_id().into(),
+            cgroup_path: format!("/user.slice/{unit}"),
+            unit_name: unit,
+        }
+    }
+
+    #[test]
+    fn inspect_existing_derives_manifest_and_returns_bound_read_only_observation() {
+        let (fixture, mut host, adapter) = inspect_setup();
+        let mut store = PodBayStore::open(fixture.directory.join("store.sqlite")).unwrap();
+        let before = store.authority_snapshot().unwrap();
+        let mut context = host
+            .rebind_context(
+                &ScopeId::try_from("scope.synthetic").unwrap(),
+                &PodId::try_from("pod.synthetic").unwrap(),
+            )
+            .unwrap();
+        let expected_path = podbay_pod::manifest_path_for_identity(
+            &fixture.directory,
+            &context.identity().pod_id,
+            &context.identity().attempt_id,
+            context.identity().incarnation,
+        );
+        let verified = adapter
+            .inspect_with(&mut context, |path, identity, owner, credential| {
+                assert_eq!(path, expected_path);
+                assert_eq!((owner, credential), (2, 2));
+                Ok(inspect_response(path, identity))
+            })
+            .unwrap();
+        assert_eq!(verified.prior_checkpoint().identity, *context.identity());
+        assert_eq!(verified.prior_checkpoint().phase, RebindPhase::Active);
+        assert_eq!(verified.prior_checkpoint().owner_epoch.get(), 1);
+        assert_eq!(
+            verified.prior_checkpoint().input_epochs
+                [&ResourceId::try_from("resource.synthetic").unwrap()]
+                .get(),
+            1
+        );
+        assert_eq!(verified.owner_epoch(), 2);
+        assert_eq!(verified.credential_epoch(), 2);
+        assert_eq!(verified.manager_peer(), context.manager_peer());
+        assert_eq!(
+            verified.resource_input_epochs(),
+            context.resource_input_epochs()
+        );
+        assert_eq!(verified.store_path(), context.store_path());
+        assert_eq!(verified.authority_revision(), context.authority_revision());
+        assert_eq!(verified.nonce(), "a".repeat(64));
+        assert_eq!(verified.child_pid(), 1235);
+        assert_eq!(verified.child_start_ticks(), 5679);
+        assert_eq!(store.authority_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn inspect_existing_refuses_foreign_or_nonadvancing_inspection_vectors() {
+        let (_fixture, mut host, adapter) = inspect_setup();
+        let mut context = host
+            .rebind_context(
+                &ScopeId::try_from("scope.synthetic").unwrap(),
+                &PodId::try_from("pod.synthetic").unwrap(),
+            )
+            .unwrap();
+        for case in 0..10 {
+            let result = adapter.inspect_with(&mut context, |path, identity, owner, credential| {
+                let mut response = inspect_response(path, identity);
+                match case {
+                    0 => response.store_lineage = "store.foreign".into(),
+                    1 => response.attempt_id = "attempt.foreign".into(),
+                    2 => response.prior_owner_epoch = owner,
+                    3 => response.prior_credential_epoch = credential,
+                    4 => {
+                        response
+                            .prior_input_epochs
+                            .insert("resource.synthetic".into(), 2);
+                    }
+                    5 => {
+                        response
+                            .prior_input_epochs
+                            .insert("resource.extra".into(), 1);
+                    }
+                    6 => response.prior_input_epochs.clear(),
+                    7 => response.boot_id = "boot.foreign".into(),
+                    8 => response.cgroup_path = "/user.slice/foreign.service".into(),
+                    _ => response.checkpoint_digest = "not-a-digest".into(),
+                }
+                Ok(response)
+            });
+            assert!(result.is_err(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn inspect_existing_rechecks_context_before_and_after_transport() {
+        for stale_before in [true, false] {
+            let (fixture, mut host, adapter) = inspect_setup();
+            let mut context = host
+                .rebind_context(
+                    &ScopeId::try_from("scope.synthetic").unwrap(),
+                    &PodId::try_from("pod.synthetic").unwrap(),
+                )
+                .unwrap();
+            let mut other = PodBayStore::open(fixture.directory.join("store.sqlite")).unwrap();
+            let mut called = false;
+            if stale_before {
+                other.begin_authority_replay(2, 3).unwrap();
+            }
+            let result = adapter.inspect_with(&mut context, |path, identity, _, _| {
+                called = true;
+                let response = inspect_response(path, identity);
+                other.begin_authority_replay(2, 3).unwrap();
+                Ok(response)
+            });
+            assert!(result.is_err());
+            assert_eq!(called, !stale_before);
+        }
+    }
+
+    #[test]
+    fn inspect_existing_rechecks_pinned_config_after_transport() {
+        let (fixture, mut host, adapter) = inspect_setup();
+        let mut context = host
+            .rebind_context(
+                &ScopeId::try_from("scope.synthetic").unwrap(),
+                &PodId::try_from("pod.synthetic").unwrap(),
+            )
+            .unwrap();
+        assert!(
+            adapter
+                .inspect_with(&mut context, |path, identity, _, _| {
+                    let response = inspect_response(path, identity);
+                    fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    Ok(response)
+                })
+                .is_err()
+        );
     }
 }

@@ -28,3 +28,14 @@ Focused tests: cargo test -p podbay-launch-linux --lib
 The ignored native_disposable_sleep_fixture test additionally requires a user
 systemd session and PODBAY_TEST_POD_BINARY naming the built podbay-pod binary.
 It runs a disposable sleep process and cleans up only its own transient unit.
+
+Read-only recovery inspection uses LinuxLaunchPort::inspect_existing with a
+borrowed ManagerRebindContext. The manifest slot is derived from trusted
+directory configuration and the context identity. The typed pod client mints
+a fresh nonce and authenticates both socket peers; the adapter rechecks its
+pinned configuration and manager context before and after the exchange.
+VerifiedRebindInspection has private fields and cannot be cloned or decoded
+from caller data. Its prior-checkpoint DTO getter is diagnostic data, not a
+replacement proof. No preparation, Pending insertion, activation or authority
+mutation is performed. A future preparation must revalidate the current
+manager context because an inspection is only a point-in-time observation.

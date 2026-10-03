@@ -3,4 +3,4 @@
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig};
+pub use linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig, VerifiedRebindInspection};
