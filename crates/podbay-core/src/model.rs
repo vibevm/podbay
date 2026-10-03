@@ -291,6 +291,9 @@ impl Run {
     pub fn current_attempt_id(&self) -> Option<&AttemptId> {
         self.current_attempt_id.as_ref()
     }
+    pub fn last_attempt_ordinal(&self) -> u64 {
+        self.last_attempt_ordinal
+    }
     pub fn revision(&self) -> Revision {
         self.revision
     }

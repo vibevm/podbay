@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod ids;
+mod launch_binding;
 mod model;
 mod peer_fence;
 mod state;
@@ -11,6 +12,7 @@ pub use ids::{
     IdError, InputEpoch, OwnerEpoch, PeerGrantId, PodId, ReportId, ResourceId, Revision, RunId,
     ScopeId, SessionId, SourceId, StoreLineageId, WorkIntervalId,
 };
+pub use launch_binding::{BoundResource, LaunchBinding, LaunchBindingError};
 pub use model::{
     Attempt, CommandAdmission, Delivery, DeliveryEvidenceLookup, ForegroundEvidence,
     ObservationEvidence, Pod, PodObservationEvidence, ProcessEvidence, Resource,
