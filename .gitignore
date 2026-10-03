@@ -3,3 +3,4 @@
 /vibedeps/
 /vibevm/vibedeps/
 **/node_modules/
+vibevm/vibespecs/boot/.vibe-boot-artifacts.lock
