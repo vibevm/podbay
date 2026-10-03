@@ -10,7 +10,7 @@ use crate::model::{
     Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -234,6 +234,66 @@ impl PodBayStore {
                 )?;
             }
         }
+        if version < 7 {
+            let nonpositive_launch: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM outbox WHERE kind='pod.offer' AND target_epoch<=0",
+                [],
+                |row| row.get(0),
+            )?;
+            if nonpositive_launch != 0 {
+                return Err(StoreError::Conflict(
+                    "legacy launch has nonpositive pod incarnation",
+                ));
+            }
+            let duplicate_launch_slot: Option<(String, String, i64)> = transaction
+                .query_row(
+                    "SELECT scope_id,target_id,target_epoch FROM outbox
+                     WHERE kind='pod.offer'
+                     GROUP BY scope_id,target_id,target_epoch HAVING COUNT(*)>1 LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if duplicate_launch_slot.is_some() {
+                return Err(StoreError::Conflict(
+                    "legacy store has multiple launches for one pod incarnation",
+                ));
+            }
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS launch_slots (
+                   scope_id TEXT NOT NULL,pod_id TEXT NOT NULL,
+                   pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+                   command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
+                   PRIMARY KEY(scope_id,pod_id,pod_incarnation)
+                 ) STRICT;
+                 INSERT OR IGNORE INTO launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)
+                 SELECT scope_id,target_id,target_epoch,command_rowid
+                 FROM outbox WHERE kind='pod.offer';",
+            )?;
+            let mismatched: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM outbox o LEFT JOIN launch_slots s
+                 ON s.scope_id=o.scope_id AND s.pod_id=o.target_id
+                   AND s.pod_incarnation=o.target_epoch
+                 WHERE o.kind='pod.offer'
+                   AND (s.command_rowid IS NULL OR s.command_rowid!=o.command_rowid)",
+                [],
+                |row| row.get(0),
+            )?;
+            let extra: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM launch_slots s LEFT JOIN outbox o
+                 ON o.command_rowid=s.command_rowid
+                 WHERE o.command_rowid IS NULL OR o.kind!='pod.offer'
+                   OR o.scope_id!=s.scope_id OR o.target_id!=s.pod_id
+                   OR o.target_epoch!=s.pod_incarnation",
+                [],
+                |row| row.get(0),
+            )?;
+            if mismatched != 0 || extra != 0 {
+                return Err(StoreError::Conflict(
+                    "legacy launch reservation does not match committed outbox",
+                ));
+            }
+        }
         verify_authority_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -407,6 +467,21 @@ impl PodBayStore {
         if actual_owner != owner_epoch || actual_target.unwrap_or(0) != target_epoch {
             return Err(StoreError::StaleEpoch);
         }
+        if request.effect_kind == "pod.offer" {
+            let occupied: Option<i64> = transaction
+                .query_row(
+                    "SELECT command_rowid FROM launch_slots
+                     WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+                    params![request.scope_id, request.target_id, target_epoch],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if occupied.is_some() {
+                return Err(StoreError::Conflict(
+                    "launch slot already admitted for pod incarnation",
+                ));
+            }
+        }
         transaction.execute(
             "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
               digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
@@ -426,6 +501,18 @@ impl PodBayStore {
             ],
         )?;
         let command_rowid = transaction.last_insert_rowid();
+        if request.effect_kind == "pod.offer" {
+            transaction.execute(
+                "INSERT INTO launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)
+                 VALUES(?1,?2,?3,?4)",
+                params![
+                    request.scope_id,
+                    request.target_id,
+                    target_epoch,
+                    command_rowid
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO events(
                event_id,schema_version,command_rowid,scope_id,target_id,
@@ -1011,6 +1098,11 @@ fn validate_request(request: &CommandRequest) -> Result<(), StoreError> {
     ] {
         valid_id(value)?;
     }
+    if request.effect_kind == "pod.offer" && request.expected_target_epoch == 0 {
+        return Err(StoreError::InvalidInput(
+            "launch pod incarnation must be positive",
+        ));
+    }
     for bytes in [
         &request.canonical_request,
         &request.event_payload,
@@ -1325,6 +1417,10 @@ fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()
                 "receipt_ref",
                 "recorded_at",
             ][..],
+        ),
+        (
+            "launch_slots",
+            &["scope_id", "pod_id", "pod_incarnation", "command_rowid"][..],
         ),
     ] {
         let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;

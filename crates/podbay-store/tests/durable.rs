@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
@@ -52,6 +54,19 @@ fn request(scope: &str, key: &str, body: &[u8]) -> CommandRequest {
         effect_kind: "pod.offer".into(),
         effect_payload: b"effect.fixture".to_vec(),
     }
+}
+
+fn request_for_target(
+    scope: &str,
+    key: &str,
+    body: &[u8],
+    target: &str,
+    target_epoch: u64,
+) -> CommandRequest {
+    let mut value = request(scope, key, body);
+    value.target_id = target.to_owned();
+    value.expected_target_epoch = target_epoch;
+    value
 }
 fn ready(store: &mut PodBayStore) {
     store.advance_owner_epoch(0, 1).unwrap();
@@ -125,6 +140,244 @@ fn duplicate_key_returns_original_opaque_id_and_changed_digest_conflicts() {
         store.scope_snapshot("scope.fixture").unwrap().receipts,
         vec![first]
     );
+}
+
+#[test]
+fn one_launch_slot_per_pod_incarnation_preserves_exact_replay() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let first_input = request("scope.fixture", "request.launch-one", b"same-pod");
+    let first = match store.admit(&first_input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    assert_eq!(
+        store.admit(&first_input).unwrap(),
+        Admission::Duplicate(first.clone())
+    );
+    let mut second_input = request("scope.fixture", "request.launch-two", b"same-pod");
+    assert!(matches!(
+        store.admit(&second_input),
+        Err(StoreError::Conflict(
+            "launch slot already admitted for pod incarnation"
+        ))
+    ));
+    assert_eq!(
+        store
+            .scope_snapshot("scope.fixture")
+            .unwrap()
+            .receipts
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .events_after(
+                "scope.fixture",
+                &store.initial_cursor("scope.fixture").unwrap(),
+                10,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .advance_target_epoch("scope.other", "target.fixture", 0, 1)
+        .unwrap();
+    assert!(matches!(
+        store.admit(&request(
+            "scope.other",
+            "request.launch-other-scope",
+            b"same-pod",
+        )),
+        Ok(Admission::Committed(_))
+    ));
+    store
+        .advance_target_epoch("scope.fixture", "target.fixture", 1, 2)
+        .unwrap();
+    second_input.expected_target_epoch = 2;
+    assert!(matches!(
+        store.admit(&second_input),
+        Ok(Admission::Committed(_))
+    ));
+    assert_eq!(
+        store.admit(&first_input).unwrap(),
+        Admission::Duplicate(first)
+    );
+    assert_eq!(
+        store
+            .scope_snapshot("scope.fixture")
+            .unwrap()
+            .receipts
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn concurrent_distinct_keys_commit_only_one_launch_slot() {
+    let fixture = Fixture::new();
+    let mut setup = fixture.open();
+    ready(&mut setup);
+    drop(setup);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let path = fixture.database.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            let mut store = PodBayStore::open(path).unwrap();
+            barrier.wait();
+            match store.admit(&request(
+                "scope.fixture",
+                &format!("request.concurrent.{index}"),
+                b"concurrent",
+            )) {
+                Ok(Admission::Committed(_)) => 1,
+                Err(StoreError::Conflict("launch slot already admitted for pod incarnation")) => 2,
+                other => panic!("unexpected admission: {other:?}"),
+            }
+        }));
+    }
+    barrier.wait();
+    let mut results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    results.sort();
+    assert_eq!(results, vec![1, 2]);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .scope_snapshot("scope.fixture")
+            .unwrap()
+            .receipts
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn launch_epoch_zero_refuses_before_any_durable_row() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let input = request_for_target(
+        "scope.fixture",
+        "request.zero-incarnation",
+        b"zero",
+        "target.zero",
+        0,
+    );
+    assert!(matches!(
+        store.admit(&input),
+        Err(StoreError::InvalidInput(
+            "launch pod incarnation must be positive"
+        ))
+    ));
+    assert!(store
+        .scope_snapshot("scope.fixture")
+        .unwrap()
+        .receipts
+        .is_empty());
+    assert!(store
+        .events_after(
+            "scope.fixture",
+            &store.initial_cursor("scope.fixture").unwrap(),
+            10,
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn schema_six_zero_incarnation_launch_refuses_migration() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request(
+            "scope.fixture",
+            "request.legacy-zero",
+            b"legacy-zero",
+        ))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE launch_slots; PRAGMA user_version=6;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE outbox SET target_epoch=0 WHERE outbox_id=?1",
+            [receipt.outbox_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE commands SET target_epoch=0 WHERE command_id=?1",
+            [&receipt.command_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict(
+            "legacy launch has nonpositive pod incarnation"
+        ))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+}
+
+#[test]
+fn schema_six_duplicate_preproduction_launches_refuse_migration() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    store
+        .admit(&request("scope.fixture", "request.legacy-one", b"one"))
+        .unwrap();
+    store
+        .advance_target_epoch("scope.fixture", "target.fixture", 1, 2)
+        .unwrap();
+    let mut second = request("scope.fixture", "request.legacy-two", b"two");
+    second.expected_target_epoch = 2;
+    let second_receipt = match store.admit(&second).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE launch_slots; PRAGMA user_version=6;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE outbox SET target_epoch=1 WHERE outbox_id=?1",
+            [second_receipt.outbox_id],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict(
+            "legacy store has multiple launches for one pod incarnation"
+        ))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -251,7 +504,16 @@ fn snapshot_cursor_and_following_event_have_no_gap_or_cross_scope_leak() {
     let snapshot = store.scope_snapshot("scope.fixture").unwrap();
     assert_eq!(snapshot.receipts.len(), 1);
     store
-        .admit(&request("scope.fixture", "request.after", b"after"))
+        .advance_target_epoch("scope.fixture", "target.after", 0, 1)
+        .unwrap();
+    store
+        .admit(&request_for_target(
+            "scope.fixture",
+            "request.after",
+            b"after",
+            "target.after",
+            1,
+        ))
         .unwrap();
     let following = store
         .events_after("scope.fixture", &snapshot.cursor, 32)
@@ -746,12 +1008,18 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
     let mut store = fixture.open();
     ready(&mut store);
     let mut receipts = Vec::new();
+    let targets = ["target.source.0", "target.source.1", "target.source.2"];
     for index in 0..3 {
+        store
+            .advance_target_epoch("scope.fixture", targets[index], 0, 1)
+            .unwrap();
         let receipt = match store
-            .admit(&request(
+            .admit(&request_for_target(
                 "scope.fixture",
                 &format!("request.source.{index}"),
                 b"source",
+                targets[index],
+                1,
             ))
             .unwrap()
         {
@@ -762,7 +1030,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
             .claim_effect(
                 receipt.outbox_id,
                 "scope.fixture",
-                "target.fixture",
+                targets[index],
                 1,
                 1,
                 &format!("claim.source.{index}"),
@@ -774,7 +1042,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
         .observe_effect(
             receipts[0].outbox_id,
             "scope.fixture",
-            "target.fixture",
+            targets[0],
             1,
             1,
             "claim.source.0",
@@ -790,7 +1058,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
         store.observe_effect(
             receipts[1].outbox_id,
             "scope.fixture",
-            "target.fixture",
+            targets[1],
             1,
             1,
             "claim.source.1",
@@ -816,7 +1084,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
         .observe_effect(
             receipts[1].outbox_id,
             "scope.fixture",
-            "target.fixture",
+            targets[1],
             1,
             1,
             "claim.source.1",
@@ -850,7 +1118,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
         .observe_effect(
             receipts[2].outbox_id,
             "scope.fixture",
-            "target.fixture",
+            targets[2],
             1,
             1,
             "claim.source.2",
@@ -1124,11 +1392,17 @@ fn pending_effects_paginates_past_one_full_page() {
     let mut store = fixture.open();
     ready(&mut store);
     for index in 0..513 {
+        let target = format!("target.page.{index}");
         store
-            .admit(&request(
+            .advance_target_epoch("scope.fixture", &target, 0, 1)
+            .unwrap();
+        store
+            .admit(&request_for_target(
                 "scope.fixture",
                 &format!("request.page.{index}"),
                 b"page",
+                &target,
+                1,
             ))
             .unwrap();
     }
@@ -1315,11 +1589,16 @@ fn schema_two_migration_preserves_lineage_cursor_and_legacy_evidence_stage() {
         ),
         Err(StoreError::Conflict(_))
     ));
+    migrated
+        .advance_target_epoch("scope.fixture", "target.after-schema-two", 0, 1)
+        .unwrap();
     let next = match migrated
-        .admit(&request(
+        .admit(&request_for_target(
             "scope.fixture",
             "request.after-schema-two",
             b"after",
+            "target.after-schema-two",
+            1,
         ))
         .unwrap()
     {

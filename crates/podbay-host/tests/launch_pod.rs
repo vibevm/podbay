@@ -397,6 +397,57 @@ fn launch_admits_once_and_retries_return_original_receipt() {
 }
 
 #[test]
+fn different_key_cannot_launch_same_pod_incarnation_before_port() {
+    let fixture = Fixture::new();
+    let who = identity();
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let first = host
+        .launch_pod(
+            &who.transport,
+            launch_request(&who, grant, 1, 1, b"canonical.first"),
+        )
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let mut second = launch_request(&who, grant, 1, 1, b"canonical.second");
+    second.host_request.command_key = "launch.other-key".into();
+    assert!(matches!(
+        host.launch_pod(&who.transport, second),
+        Err(LaunchPodError::Store(StoreError::Conflict(
+            "launch slot already admitted for pod incarnation"
+        )))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        store
+            .launch_dispatch_status(
+                first.receipt.outbox_id,
+                who.scope.as_str(),
+                who.pod.as_str()
+            )
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::HostAccepted
+    );
+    drop(store);
+    host.advance_pod_incarnation_from_trusted_policy(
+        &who.pod,
+        PodIncarnation::new(1).unwrap(),
+        PodIncarnation::new(2).unwrap(),
+    )
+    .unwrap();
+    let mut next = launch_request(&who, grant, 1, 1, b"canonical.next-incarnation");
+    next.host_request.command_key = "launch.next-incarnation".into();
+    next.host_request.guards.pod_incarnation = PodIncarnation::new(2).unwrap();
+    next.admission_pod_incarnation = PodIncarnation::new(2).unwrap();
+    let next_receipt = host.launch_pod(&who.transport, next).unwrap();
+    assert_ne!(next_receipt.receipt.command_id, first.receipt.command_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn prepared_intent_survives_restart_and_dispatches_once_after_replay() {
     let fixture = Fixture::new();
     let who = identity();

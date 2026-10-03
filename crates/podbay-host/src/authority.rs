@@ -1447,7 +1447,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     /// the port call occurs only after the claim transaction has committed.
     /// HostAccepted and PortSettled describe the launch port only: neither is
     /// provider insertion or run/task completion. A proven refusal remains
-    /// non-dispatchable under this claim; retry needs a new command and policy.
+    /// non-dispatchable under this claim; retry needs a new Pod incarnation,
+    /// command, and policy.
     pub fn launch_pod<T: AuthenticatedTransport>(
         &mut self,
         transport: &T,
