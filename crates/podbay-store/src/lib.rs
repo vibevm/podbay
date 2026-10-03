@@ -4,6 +4,7 @@
 mod authority;
 mod launch;
 mod model;
+mod peer_witness;
 mod store;
 
 pub use model::{
@@ -15,3 +16,4 @@ pub use model::{
     StoreError, StoredEffect, VerifiedPrincipal,
 };
 pub use store::PodBayStore;
+pub use peer_witness::SqliteOwnerEpochWitness;
