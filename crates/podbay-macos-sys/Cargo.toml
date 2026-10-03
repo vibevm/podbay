@@ -1,13 +1,9 @@
 [package]
 name = "podbay-macos-sys"
-version = "0.1.0"
-edition = "2024"
-license = "UPL-1.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Audited macOS process and filesystem syscall facade for PodBay"
-
-# Independent PB26a build until the parent PodBay workspace reviews this crate.
-[workspace]
-resolver = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

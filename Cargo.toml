@@ -6,6 +6,8 @@ members = [
   "crates/podbay-store",
   "crates/podbay-host",
   "crates/podbay-pod",
+  "crates/podbay-macos-sys",
+  "crates/podbay-win32",
   "crates/podbay-client",
   "crates/podbay-cli",
 ]

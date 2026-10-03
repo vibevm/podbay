@@ -281,6 +281,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "podbay-macos-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "podbay-pod"
 version = "0.1.0"
 dependencies = [
@@ -300,6 +307,14 @@ dependencies = [
  "podbay-core",
  "rusqlite",
  "sha2",
+]
+
+[[package]]
+name = "podbay-win32"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "windows-sys",
 ]
 
 [[package]]
