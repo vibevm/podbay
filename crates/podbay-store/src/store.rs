@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -118,6 +118,27 @@ const MANAGER_REBIND_RESOURCES_V9: &str = "CREATE TABLE manager_rebind_resources
   next_input_epoch INTEGER NOT NULL CHECK(next_input_epoch=expected_input_epoch+1),
   PRIMARY KEY(rebind_rowid,resource_id)
 ) STRICT";
+
+// V12 widens only the database envelope. Rebind admission still requires +1
+// until a trusted prior pod-checkpoint observation is available.
+fn manager_rebinds_v12() -> String {
+    MANAGER_REBINDS_V9
+        .replace(
+            "next_owner_epoch=expected_owner_epoch+1",
+            "next_owner_epoch>expected_owner_epoch",
+        )
+        .replace(
+            "next_credential_epoch=expected_credential_epoch+1",
+            "next_credential_epoch>expected_credential_epoch",
+        )
+}
+
+fn manager_rebind_resources_v12() -> String {
+    MANAGER_REBIND_RESOURCES_V9.replace(
+        "next_input_epoch=expected_input_epoch+1",
+        "next_input_epoch>expected_input_epoch",
+    )
+}
 
 // An empty v10 table makes no claim about an old v9 manager or its pod peer.
 // Only a successful owner replay mints the current manager credential epoch.
@@ -486,6 +507,10 @@ impl PodBayStore {
                 ));
             }
             transaction.execute_batch(&format!("{MANAGER_PEER_BINDINGS_V11};"))?;
+        }
+        if version < 12 {
+            verify_rebind_schema_v9(&transaction)?;
+            rebuild_rebind_schema_v12(&transaction)?;
         }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
@@ -1921,9 +1946,29 @@ fn verify_runtime_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
 }
 
 fn verify_rebind_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let parent = manager_rebinds_v12();
+    let child = manager_rebind_resources_v12();
+    verify_rebind_tables(transaction, &parent, &child, "v12 rebind schema differs")
+}
+
+fn verify_rebind_schema_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    verify_rebind_tables(
+        transaction,
+        MANAGER_REBINDS_V9,
+        MANAGER_REBIND_RESOURCES_V9,
+        "v9 rebind schema differs",
+    )
+}
+
+fn verify_rebind_tables(
+    transaction: &rusqlite::Transaction<'_>,
+    parent: &str,
+    child: &str,
+    error: &'static str,
+) -> Result<(), StoreError> {
     for (name, expected) in [
-        ("manager_rebinds", MANAGER_REBINDS_V9),
-        ("manager_rebind_resources", MANAGER_REBIND_RESOURCES_V9),
+        ("manager_rebinds", parent),
+        ("manager_rebind_resources", child),
     ] {
         let actual: Option<String> = transaction
             .query_row(
@@ -1933,8 +1978,89 @@ fn verify_rebind_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), S
             )
             .optional()?;
         if actual.as_deref() != Some(expected) {
-            return Err(StoreError::Conflict("v9 rebind schema differs"));
+            return Err(StoreError::Conflict(error));
         }
+    }
+    Ok(())
+}
+
+fn rebuild_rebind_schema_v12(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let old_sequence: Option<i64> = transaction
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='manager_rebinds'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    transaction.execute_batch(
+        "ALTER TABLE manager_rebind_resources RENAME TO manager_rebind_resources_v9_old;
+         ALTER TABLE manager_rebinds RENAME TO manager_rebinds_v9_old;",
+    )?;
+    transaction.execute_batch(&format!(
+        "{};{};",
+        manager_rebinds_v12(),
+        manager_rebind_resources_v12()
+    ))?;
+    transaction.execute_batch(
+        "INSERT INTO manager_rebinds(
+           rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
+           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
+           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref)
+         SELECT rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
+           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
+           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref
+         FROM manager_rebinds_v9_old ORDER BY rebind_rowid;
+         INSERT INTO manager_rebind_resources(
+           rebind_rowid,resource_id,expected_input_epoch,next_input_epoch)
+         SELECT rebind_rowid,resource_id,expected_input_epoch,next_input_epoch
+         FROM manager_rebind_resources_v9_old ORDER BY rebind_rowid,resource_id;",
+    )?;
+    for (old, new) in [
+        ("manager_rebinds_v9_old", "manager_rebinds"),
+        (
+            "manager_rebind_resources_v9_old",
+            "manager_rebind_resources",
+        ),
+    ] {
+        let old_count: i64 =
+            transaction.query_row(&format!("SELECT COUNT(*) FROM {old}"), [], |row| row.get(0))?;
+        let new_count: i64 =
+            transaction.query_row(&format!("SELECT COUNT(*) FROM {new}"), [], |row| row.get(0))?;
+        if old_count != new_count {
+            return Err(StoreError::Conflict("v12 rebind copy count differs"));
+        }
+    }
+    transaction.execute_batch(
+        "DROP TABLE manager_rebind_resources_v9_old;
+         DROP TABLE manager_rebinds_v9_old;",
+    )?;
+    if let Some(old_sequence) = old_sequence {
+        let new_sequence: Option<i64> = transaction
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='manager_rebinds'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if new_sequence.unwrap_or(0) < old_sequence {
+            if new_sequence.is_some() {
+                transaction.execute(
+                    "UPDATE sqlite_sequence SET seq=?1 WHERE name='manager_rebinds'",
+                    [old_sequence],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES('manager_rebinds',?1)",
+                    [old_sequence],
+                )?;
+            }
+        }
+    }
+    let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(StoreError::Conflict("v12 rebind foreign key check failed"));
     }
     Ok(())
 }

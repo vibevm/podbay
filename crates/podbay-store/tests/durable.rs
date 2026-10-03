@@ -410,7 +410,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_eleven_has_empty_runtime_rebind_and_manager_tables() {
+fn fresh_schema_twelve_has_empty_runtime_rebind_and_manager_tables() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -418,7 +418,7 @@ fn fresh_schema_eleven_has_empty_runtime_rebind_and_manager_tables() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     for table in [
         "runtime_sessions",
         "runtime_runs",
@@ -485,7 +485,7 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     for table in [
         "runtime_sessions",
         "runtime_runs",

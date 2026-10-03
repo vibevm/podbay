@@ -33,6 +33,31 @@ impl Drop for Fixture {
     }
 }
 
+fn restore_historical_rebind_tables(connection: &rusqlite::Connection) {
+    let source = include_str!("../src/store.rs");
+    let ddl = |name: &str| {
+        let marker = format!("const {name}: &str = \"");
+        source
+            .split_once(&marker)
+            .unwrap()
+            .1
+            .split_once("\";")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+    let parent = ddl("MANAGER_REBINDS_V9");
+    let child = ddl("MANAGER_REBIND_RESOURCES_V9");
+    assert!(parent.contains("next_owner_epoch=expected_owner_epoch+1"));
+    assert!(child.contains("next_input_epoch=expected_input_epoch+1"));
+    connection
+        .execute_batch("DROP TABLE manager_rebind_resources; DROP TABLE manager_rebinds;")
+        .unwrap();
+    connection
+        .execute_batch(&format!("{parent};{child};"))
+        .unwrap();
+}
+
 #[test]
 fn current_owner_claim_mints_separate_monotonic_manager_generation() {
     let fixture = Fixture::new();
@@ -163,6 +188,7 @@ fn v9_migration_has_no_fictitious_current_manager_claim() {
     let lineage = store.initial_cursor("scope.fixture").unwrap().store_lineage;
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_historical_rebind_tables(&connection);
     connection
         .execute_batch("DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
         .unwrap();
@@ -191,6 +217,7 @@ fn malformed_v10_name_refuses_migration_without_owner_change() {
     let fixture = Fixture::new();
     drop(PodBayStore::open(&fixture.database).unwrap());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_historical_rebind_tables(&connection);
     connection
         .execute_batch(
             "DROP TABLE manager_peer_bindings;

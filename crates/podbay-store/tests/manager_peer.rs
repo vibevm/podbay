@@ -34,6 +34,31 @@ impl Drop for Fixture {
     }
 }
 
+fn restore_historical_rebind_tables(connection: &rusqlite::Connection) {
+    let source = include_str!("../src/store.rs");
+    let ddl = |name: &str| {
+        let marker = format!("const {name}: &str = \"");
+        source
+            .split_once(&marker)
+            .unwrap()
+            .1
+            .split_once("\";")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+    let parent = ddl("MANAGER_REBINDS_V9");
+    let child = ddl("MANAGER_REBIND_RESOURCES_V9");
+    assert!(parent.contains("next_credential_epoch=expected_credential_epoch+1"));
+    assert!(child.contains("next_input_epoch=expected_input_epoch+1"));
+    connection
+        .execute_batch("DROP TABLE manager_rebind_resources; DROP TABLE manager_rebinds;")
+        .unwrap();
+    connection
+        .execute_batch(&format!("{parent};{child};"))
+        .unwrap();
+}
+
 fn peer(birth: &str) -> AttestedPeer {
     AttestedPeer::from_port(
         "linux.uid.1000",
@@ -207,6 +232,7 @@ fn migrated_v10_owner_has_no_synthetic_manager_peer() {
     store.begin_authority_replay(0, 1).unwrap();
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_historical_rebind_tables(&connection);
     connection
         .execute_batch("DROP TABLE manager_peer_bindings; PRAGMA user_version=10;")
         .unwrap();
@@ -270,6 +296,7 @@ fn malformed_v11_name_refuses_migration_atomically() {
     let fixture = Fixture::new();
     drop(PodBayStore::open(&fixture.database).unwrap());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_historical_rebind_tables(&connection);
     connection
         .execute_batch(
             "DROP TABLE manager_peer_bindings;

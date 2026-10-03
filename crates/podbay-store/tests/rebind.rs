@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
@@ -13,14 +14,18 @@ struct Fixture {
     directory: PathBuf,
     database: PathBuf,
 }
+static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 impl Fixture {
     fn new() -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("podbay-rebind-{}-{unique}", std::process::id()));
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-rebind-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         Self {
             database: directory.join("store.sqlite"),
@@ -59,6 +64,103 @@ fn input(value: u64) -> InputEpoch {
 }
 fn resource(id: &str) -> ResourceId {
     ResourceId::try_from(id).unwrap()
+}
+
+// Exact historical v9/v11 table SQL. Test fixtures rebuild the old CHECKs
+// with committed rows so the production v12 migration has real work to copy.
+const OLD_REBINDS: &str = "CREATE TABLE manager_rebinds (
+  rebind_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  expected_owner_epoch INTEGER NOT NULL CHECK(expected_owner_epoch>=1),
+  next_owner_epoch INTEGER NOT NULL CHECK(next_owner_epoch=expected_owner_epoch+1),
+  expected_credential_epoch INTEGER NOT NULL CHECK(expected_credential_epoch>=1),
+  next_credential_epoch INTEGER NOT NULL
+    CHECK(next_credential_epoch=expected_credential_epoch+1),
+  manager_os_identity TEXT NOT NULL CHECK(length(manager_os_identity)>0),
+  manager_process_id TEXT NOT NULL CHECK(length(manager_process_id)>0),
+  manager_boot_identity TEXT NOT NULL CHECK(length(manager_boot_identity)>0),
+  manager_birth_identity TEXT NOT NULL CHECK(length(manager_birth_identity)>0),
+  manager_containment TEXT NOT NULL CHECK(length(manager_containment)>0),
+  command_key TEXT NOT NULL CHECK(length(command_key)>0),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+  resource_count INTEGER NOT NULL CHECK(resource_count>=1),
+  phase TEXT NOT NULL CHECK(phase IN ('pending','pod_acknowledged','activated')),
+  pod_checkpoint_ref TEXT,
+  CHECK((phase='pending' AND pod_checkpoint_ref IS NULL)
+    OR (phase!='pending' AND pod_checkpoint_ref IS NOT NULL
+      AND length(pod_checkpoint_ref)>0)),
+  FOREIGN KEY(scope_id,pod_id,pod_incarnation)
+    REFERENCES launch_bindings(scope_id,pod_id,pod_incarnation),
+  UNIQUE(scope_id,pod_id,pod_incarnation,next_owner_epoch),
+  UNIQUE(scope_id,pod_id,pod_incarnation,command_key)
+) STRICT";
+const OLD_RESOURCES: &str = "CREATE TABLE manager_rebind_resources (
+  rebind_rowid INTEGER NOT NULL REFERENCES manager_rebinds(rebind_rowid),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  expected_input_epoch INTEGER NOT NULL CHECK(expected_input_epoch>=1),
+  next_input_epoch INTEGER NOT NULL CHECK(next_input_epoch=expected_input_epoch+1),
+  PRIMARY KEY(rebind_rowid,resource_id)
+) STRICT";
+
+fn restore_v11_rebind_checks(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         BEGIN IMMEDIATE;
+         ALTER TABLE manager_rebind_resources RENAME TO manager_rebind_resources_new;
+         ALTER TABLE manager_rebinds RENAME TO manager_rebinds_new;",
+        )
+        .unwrap();
+    connection
+        .execute_batch(&format!("{OLD_REBINDS};{OLD_RESOURCES};"))
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO manager_rebinds(
+           rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
+           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
+           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref)
+         SELECT rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
+           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
+           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref
+         FROM manager_rebinds_new ORDER BY rebind_rowid;
+         INSERT INTO manager_rebind_resources(rebind_rowid,resource_id,
+           expected_input_epoch,next_input_epoch)
+         SELECT rebind_rowid,resource_id,expected_input_epoch,next_input_epoch
+         FROM manager_rebind_resources_new ORDER BY rebind_rowid,resource_id;
+         DROP TABLE manager_rebind_resources_new;
+         DROP TABLE manager_rebinds_new;
+         COMMIT;
+         PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+}
+
+fn table_rows(connection: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let ordering = if table == "manager_rebinds" {
+        "rebind_rowid"
+    } else {
+        "rebind_rowid,resource_id"
+    };
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM {table} ORDER BY {ordering}"))
+        .unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn seed_existing_bound_pod(store: &mut PodBayStore, fixture: &Fixture) -> RebindProposal {
@@ -202,6 +304,189 @@ fn staged_rebind_reopens_at_every_phase_without_new_launch_or_child() {
         assert_eq!(fixture.count(table), 1, "{table}");
     }
     assert_eq!(fixture.count("manager_rebind_resources"), 2);
+}
+
+#[test]
+fn v9_and_v11_to_v12_preserve_pending_ack_active_rows_and_sequence() {
+    for old_version in [9, 11] {
+        for phase in [
+            DurableRebindPhase::Pending,
+            DurableRebindPhase::PodAcknowledged,
+            DurableRebindPhase::Activated,
+        ] {
+            let fixture = Fixture::new();
+            let mut store = fixture.open();
+            let proposal = seed_existing_bound_pod(&mut store, &fixture);
+            let mut receipt = store.prepare_manager_rebind(&proposal).unwrap();
+            if phase != DurableRebindPhase::Pending {
+                receipt = store
+                    .acknowledge_pod_rebind(&proposal, "checkpoint.fixture")
+                    .unwrap();
+            }
+            if phase == DurableRebindPhase::Activated {
+                receipt = store
+                    .activate_manager_rebind(&proposal, "checkpoint.fixture")
+                    .unwrap();
+            }
+            assert_eq!(receipt.phase, phase);
+            drop(store);
+            let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+            restore_v11_rebind_checks(&connection);
+            if old_version == 9 {
+                connection
+                    .execute_batch(
+                        "DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims;",
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "UPDATE sqlite_sequence SET seq=7 WHERE name='manager_rebinds'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", old_version)
+                .unwrap();
+            let before_parent = table_rows(&connection, "manager_rebinds");
+            let before_child = table_rows(&connection, "manager_rebind_resources");
+            drop(connection);
+
+            let mut migrated = fixture.open();
+            assert_eq!(migrated.prepare_manager_rebind(&proposal).unwrap(), receipt);
+            drop(migrated);
+            let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 12);
+            assert_eq!(table_rows(&connection, "manager_rebinds"), before_parent);
+            assert_eq!(
+                table_rows(&connection, "manager_rebind_resources"),
+                before_child
+            );
+            let sequence: i64 = connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='manager_rebinds'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sequence, 7);
+            let foreign_keys: i64 = connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(foreign_keys, 0);
+            let parent_sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='manager_rebinds'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let child_sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='manager_rebind_resources'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(parent_sql.contains("next_owner_epoch>expected_owner_epoch"));
+            assert!(parent_sql.contains("next_credential_epoch>expected_credential_epoch"));
+            assert!(child_sql.contains("next_input_epoch>expected_input_epoch"));
+        }
+    }
+}
+
+#[test]
+fn malformed_v11_schema_refuses_before_copy_and_preserves_rows() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let proposal = seed_existing_bound_pod(&mut store, &fixture);
+    store.prepare_manager_rebind(&proposal).unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_v11_rebind_checks(&connection);
+    connection
+        .execute_batch(
+            "ALTER TABLE manager_rebind_resources ADD COLUMN malformed INTEGER;
+         PRAGMA user_version=11;",
+        )
+        .unwrap();
+    let before = table_rows(&connection, "manager_rebinds");
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v9 rebind schema differs"))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+    assert_eq!(table_rows(&connection, "manager_rebinds"), before);
+}
+
+#[test]
+fn copy_failure_rolls_back_v12_table_swap_and_version() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let proposal = seed_existing_bound_pod(&mut store, &fixture);
+    store.prepare_manager_rebind(&proposal).unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_v11_rebind_checks(&connection);
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         INSERT INTO manager_rebind_resources(
+           rebind_rowid,resource_id,expected_input_epoch,next_input_epoch)
+           VALUES(9999,'resource.orphan',1,2);
+         PRAGMA user_version=11;",
+        )
+        .unwrap();
+    let before_parent = table_rows(&connection, "manager_rebinds");
+    let before_child = table_rows(&connection, "manager_rebind_resources");
+    drop(connection);
+    assert!(PodBayStore::open(&fixture.database).is_err());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+    assert_eq!(table_rows(&connection, "manager_rebinds"), before_parent);
+    assert_eq!(
+        table_rows(&connection, "manager_rebind_resources"),
+        before_child
+    );
+}
+
+#[test]
+fn v12_wider_checks_do_not_admit_skips_without_prior_checkpoint_proof() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let original = seed_existing_bound_pod(&mut store, &fixture);
+    let mut skipped = original.clone();
+    skipped.next_owner_epoch = owner(4);
+    skipped.next_credential_epoch = credential(4);
+    for next in skipped.next_input_epochs.values_mut() {
+        *next = input(4);
+    }
+    skipped.command_key = CommandKey::try_from("rebind.skipped").unwrap();
+    skipped.digest = RequestDigest::parse(&"b".repeat(64)).unwrap();
+    assert!(matches!(
+        store.prepare_manager_rebind(&skipped),
+        Err(StoreError::InvalidInput(
+            "rebind epochs or resource set are invalid"
+        ))
+    ));
+    assert_eq!(fixture.count("manager_rebinds"), 0);
+    assert_eq!(
+        store.prepare_manager_rebind(&original).unwrap().phase,
+        DurableRebindPhase::Pending
+    );
 }
 
 #[test]
@@ -382,6 +667,7 @@ fn first_v10_manager_claim_stays_above_v9_pod_rebind_credential_highwater() {
     // Reconstruct a v9 database with a durable pod-local rebind but no v10
     // manager claim. The old rebind remains evidence, not a manager identity.
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    restore_v11_rebind_checks(&connection);
     connection
         .execute_batch("DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
         .unwrap();
