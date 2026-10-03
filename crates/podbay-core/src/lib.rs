@@ -20,8 +20,8 @@ pub use model::{
 };
 pub use peer_fence::{
     AttestedPeer, FenceError, FenceOperation, FenceTarget, GrantKind, ManagerLiveness,
-    OwnerEpochWitness, PeerGrant, PeerRequest, PodFenceIdentity, PodPeerFence, RebindLedger,
-    RebindPhase, RebindProposal, RequestDigest,
+    OwnerEpochWitness, POD_FENCE_CHECKPOINT_VERSION, PeerGrant, PeerRequest, PodFenceCheckpoint,
+    PodFenceIdentity, PodPeerFence, RebindLedger, RebindPhase, RebindProposal, RequestDigest,
 };
 pub use state::{
     AdmissionState, DeliveryStage, DesiredMode, ExecutionState, ForegroundState, Observation,
