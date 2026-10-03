@@ -303,6 +303,7 @@ dependencies = [
  "podbay-core",
  "podbay-store",
  "podbay-wire",
+ "sha2",
 ]
 
 [[package]]

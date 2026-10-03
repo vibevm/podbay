@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -13,20 +15,19 @@ use podbay_core::{
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BoundHostLaunchProposal, BoundLaunchPodRequest,
-    CredentialGeneration, CredentialRef, DurableAuthority, DurableAuthorityError, GrantId,
-    GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
+    CredentialGeneration, CredentialRef, DurableAuthority, DurableAuthorityError, ExecutionMode,
+    GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
     LaunchPodError, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, Right, Target,
-    TrustedLaunchProfileInput, WorkspaceAccess, WorkspaceSelection,
+    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedNativeLaunch, Right,
+    Target, TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
+    WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
     EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore, StoreError,
     VerifiedPrincipal,
 };
-use podbay_wire::{
-    ImmutableLaunchDescriptor, NativeRole, ResourceDriver, ReviewedNativePolicy, ReviewedResource,
-    TargetOs,
-};
+use podbay_wire::{ImmutableLaunchDescriptor, NativeRole, ResourceDriver, TargetOs};
+use sha2::{Digest, Sha256};
 
 struct Fixture {
     directory: PathBuf,
@@ -69,6 +70,8 @@ struct FakeLaunchPort {
     possible_effects: Arc<AtomicUsize>,
     reviewed: Mutex<Vec<AuthorisedBoundLaunch>>,
     fixture_opt_in: bool,
+    resolved_opt_in: bool,
+    resolved_seen: Mutex<Vec<(PathBuf, PathBuf, String)>>,
 }
 
 impl FakeLaunchPort {
@@ -82,6 +85,8 @@ impl FakeLaunchPort {
                 possible_effects: possible_effects.clone(),
                 reviewed: Mutex::new(Vec::new()),
                 fixture_opt_in: true,
+                resolved_opt_in: false,
+                resolved_seen: Mutex::new(Vec::new()),
             },
             port_calls,
             possible_effects,
@@ -92,6 +97,12 @@ impl FakeLaunchPort {
         self.fixture_opt_in = false;
         self
     }
+
+    fn resolved_only(mut self) -> Self {
+        self.fixture_opt_in = false;
+        self.resolved_opt_in = true;
+        self
+    }
 }
 
 impl HostDispatchPort for FakeLaunchPort {
@@ -99,6 +110,25 @@ impl HostDispatchPort for FakeLaunchPort {
 
     fn allow_unverified_native_launch_for_fixture(&self) -> bool {
         self.fixture_opt_in
+    }
+
+    fn accepts_resolved_native_launch(&self) -> bool {
+        self.resolved_opt_in
+    }
+
+    fn launch_resolved(
+        &mut self,
+        launch: ResolvedNativeLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        self.resolved_seen.lock().unwrap().push((
+            launch.cwd().to_path_buf(),
+            launch.executable().to_path_buf(),
+            launch.executable_sha256().to_owned(),
+        ));
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PortDispatchOutcome::Accepted(
+            PortReceiptRef::from_port("receipt.resolved.one").unwrap(),
+        ))
     }
 
     fn dispatch(
@@ -153,9 +183,12 @@ struct Identity {
     actor: ActorId,
     process: AuthenticatedProcessSubject,
     transport: FakeTransport,
+    workspace_root: PathBuf,
+    executable: PathBuf,
+    executable_sha256: String,
 }
 
-fn identity() -> Identity {
+fn identity(fixture: &Fixture) -> Identity {
     let scope = ScopeId::try_from("scope.launch").unwrap();
     let pod = PodId::try_from("pod.launch").unwrap();
     let actor = ActorId::try_from("actor.launcher").unwrap();
@@ -170,12 +203,25 @@ fn identity() -> Identity {
         process.clone(),
         CredentialGeneration::new(1).unwrap(),
     ));
+    let workspace_root = fixture.directory.join("workspace");
+    std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+    let executable = fixture.directory.join("agent.sh");
+    let content = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(&executable, content).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable_sha256 = Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Identity {
         scope,
         pod,
         actor,
         process,
         transport,
+        workspace_root,
+        executable,
+        executable_sha256,
     }
 }
 
@@ -183,8 +229,28 @@ fn profile_input(who: &Identity) -> TrustedLaunchProfileInput {
     TrustedLaunchProfileInput {
         profile_ref: "profile.fixture".into(),
         profile_generation: 1,
-        executable: "/opt/podbay/bin/fake-agent".into(),
-        binary_generation: "sha256.fakegeneration1".into(),
+        executable: who.executable.to_string_lossy().into_owned(),
+        binary_generation: format!("sha256:{}", who.executable_sha256),
+        executable_sha256: who.executable_sha256.clone(),
+        workspace_root: who.workspace_root.clone(),
+        resource_layout: vec![
+            TrustedDriverTemplate {
+                kind: ResourceKind::Pty,
+                driver: ResourceDriver::Pty {
+                    rows: 24,
+                    columns: 80,
+                    retention_events: 100,
+                },
+            },
+            TrustedDriverTemplate {
+                kind: ResourceKind::StructuredProvider,
+                driver: ResourceDriver::Structured {
+                    driver_ref: "driver.fixture".into(),
+                    protocol_ref: "protocol.fixture".into(),
+                },
+            },
+        ],
+        execution_mode: ExecutionMode::LinuxCooperative,
         fixed_arguments: vec!["--managed".into()],
         permitted_extra_arguments: BTreeSet::from(["--safe".to_owned(), "--verbose".to_owned()]),
         default_model: "model.alpha".into(),
@@ -209,6 +275,13 @@ fn profile_input(who: &Identity) -> TrustedLaunchProfileInput {
 
 fn profile(who: &Identity) -> RegisteredLaunchProfile {
     RegisteredLaunchProfile::from_trusted_policy(profile_input(who)).unwrap()
+}
+
+fn native_host_config() -> TrustedNativeHostConfig {
+    TrustedNativeHostConfig::for_compiled_backend("host.fixture".into())
+        .unwrap()
+        .with_structured_driver("driver.fixture".into(), "protocol.fixture".into())
+        .unwrap()
 }
 
 fn initial_authority(
@@ -242,6 +315,8 @@ fn initial_authority(
         .unwrap();
     host.register_launch_profile_from_trusted_policy(profile(who))
         .unwrap();
+    host.register_native_host_from_trusted_policy(native_host_config())
+        .unwrap();
     (host, grant)
 }
 
@@ -258,6 +333,8 @@ fn replay(host: &mut DurableAuthority<FakeLaunchPort>, who: &Identity, grant: Gr
     .unwrap();
     host.activate_grant_from_trusted_replay(grant).unwrap();
     host.register_launch_profile_from_trusted_policy(profile(who))
+        .unwrap();
+    host.register_native_host_from_trusted_policy(native_host_config())
         .unwrap();
 }
 
@@ -307,7 +384,7 @@ fn launch_request(
             },
         },
         canonical_request: body.to_vec(),
-        proposal: Some(bound_proposal(who, &who.pod, Role::Worker, selection, None)),
+        proposal: Some(bound_proposal(who, &who.pod, Role::Worker, selection)),
     }
 }
 
@@ -323,7 +400,6 @@ fn bound_proposal(
     pod_id: &PodId,
     role: Role,
     selection: LaunchSelection,
-    selected_credential: Option<&CredentialRef>,
 ) -> BoundHostLaunchProposal {
     let mut session = Session::new(
         SessionId::try_from(format!("session.{}", pod_id.as_str())).unwrap(),
@@ -377,59 +453,166 @@ fn bound_proposal(
     }
     let binding =
         LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &resources).unwrap();
-    let native_policy = ReviewedNativePolicy {
-        target_os: TargetOs::Linux,
-        host_id: "host.fixture".into(),
-        profile_ref: "profile.fixture".into(),
-        profile_generation: 1,
-        model_id: "model.alpha".into(),
-        reasoning_effort: "medium".into(),
-        executable_generation: "sha256.fakegeneration1".into(),
-        effective_spec_digest: "0".repeat(64),
-        workspace_basis_ref: "basis.commit.one".into(),
-        executable: "/opt/podbay/bin/fake-agent".into(),
-        cwd: "/tmp".into(),
-        arguments: vec!["--managed".into(), "--safe".into()],
-        environment_refs: vec!["env.clean".into()],
-        credential_refs: selected_credential
-            .map(|value| vec![value.as_str().to_owned()])
-            .unwrap_or_default(),
-        wall_seconds: 60,
-        max_children: 2,
-        resources: resources
-            .iter()
-            .map(|resource| ReviewedResource {
-                resource_id: resource.id().clone(),
-                kind: resource.kind(),
-                epoch: resource.epoch(),
-                driver: match resource.kind() {
-                    ResourceKind::Pty => ResourceDriver::Pty {
-                        rows: 24,
-                        columns: 80,
-                        retention_events: 100,
-                    },
-                    ResourceKind::StructuredProvider => ResourceDriver::Structured {
-                        driver_ref: "driver.fixture".into(),
-                        protocol_ref: "protocol.fixture".into(),
-                    },
-                    ResourceKind::Auxiliary => unreachable!(),
-                },
-            })
-            .collect(),
-    };
     BoundHostLaunchProposal {
         session,
         run,
         binding,
         selection,
-        native_policy,
     }
+}
+
+fn assert_command_not_admitted(fixture: &Fixture, who: &Identity, request: &BoundLaunchPodRequest) {
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let result = store
+        .lookup_bound_launch(&LaunchLookupRequest {
+            principal: VerifiedPrincipal::from_authenticated_boundary(who.actor.as_str()).unwrap(),
+            namespace: "podbay.launch".into(),
+            command_key: request.host_request.command_key.clone(),
+            scope_id: who.scope.as_str().into(),
+            target_id: who.pod.as_str().into(),
+            canonical_intent: request.canonical_request.clone(),
+        })
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn resolved_port_receives_only_host_derived_native_paths() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port.resolved_only(), &who);
+    let result = host
+        .launch_bound_pod(
+            &who.transport,
+            launch_request(&who, grant, 1, 1, b"canonical.resolved"),
+        )
+        .unwrap();
+    assert_eq!(result.status.stage, LaunchDispatchStage::HostAccepted);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let seen = host.port().resolved_seen.lock().unwrap();
+    assert_eq!(
+        seen.as_slice(),
+        &[(
+            who.workspace_root.join("src"),
+            who.executable.clone(),
+            who.executable_sha256.clone(),
+        )]
+    );
+    assert!(host.port().reviewed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn native_symlink_and_parent_escape_refuse_before_admission() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let mut parent = launch_request(&who, grant, 1, 1, b"canonical.parent-escape");
+    parent
+        .proposal
+        .as_mut()
+        .unwrap()
+        .selection
+        .workspace
+        .relative_cwd = "src/../../outside".into();
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, parent.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert_command_not_admitted(&fixture, &who, &parent);
+
+    let mut read_only = launch_request(&who, grant, 1, 1, b"canonical.read-only");
+    read_only
+        .proposal
+        .as_mut()
+        .unwrap()
+        .selection
+        .workspace
+        .access = WorkspaceAccess::ReadOnly;
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, read_only.clone()),
+        Err(LaunchPodError::Host(HostError::Unsupported))
+    ));
+    assert_command_not_admitted(&fixture, &who, &read_only);
+
+    std::fs::remove_dir_all(who.workspace_root.join("src")).unwrap();
+    let outside = fixture.directory.join("workspace-sibling");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, who.workspace_root.join("src")).unwrap();
+    let symlinked = launch_request(&who, grant, 1, 1, b"canonical.symlink-escape");
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, symlinked.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert_command_not_admitted(&fixture, &who, &symlinked);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn changed_executable_and_wrong_ordered_layout_refuse_before_admission() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let content = b"#!/bin/sh\nexit 7\n";
+    std::fs::write(&who.executable, content).unwrap();
+    let changed = launch_request(&who, grant, 1, 1, b"canonical.changed-binary");
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, changed.clone()),
+        Err(LaunchPodError::Host(HostError::StaleGuard))
+    ));
+    assert_command_not_admitted(&fixture, &who, &changed);
+    std::fs::write(&who.executable, b"#!/bin/sh\nexit 0\n").unwrap();
+
+    let mut reordered = profile_input(&who);
+    reordered.profile_generation = 2;
+    reordered.resource_layout.reverse();
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(reordered).unwrap(),
+    )
+    .unwrap();
+    let mut layout = launch_request(&who, grant, 1, 1, b"canonical.layout-order");
+    layout
+        .proposal
+        .as_mut()
+        .unwrap()
+        .selection
+        .profile_generation = 2;
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, layout.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert_command_not_admitted(&fixture, &who, &layout);
+    let mut unavailable = profile_input(&who);
+    unavailable.profile_generation = 3;
+    unavailable.resource_layout[1].driver = ResourceDriver::Structured {
+        driver_ref: "driver.not-installed".into(),
+        protocol_ref: "protocol.fixture".into(),
+    };
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(unavailable).unwrap(),
+    )
+    .unwrap();
+    let mut unsupported = launch_request(&who, grant, 1, 1, b"canonical.driver-unavailable");
+    unsupported
+        .proposal
+        .as_mut()
+        .unwrap()
+        .selection
+        .profile_generation = 3;
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, unsupported.clone()),
+        Err(LaunchPodError::Host(HostError::Unsupported))
+    ));
+    assert_command_not_admitted(&fixture, &who, &unsupported);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn malformed_committed_readback_refuses_while_outbox_stays_prepared() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let request = launch_request(&who, grant, 1, 1, b"canonical.corrupt-readback");
@@ -483,7 +666,7 @@ fn malformed_committed_readback_refuses_while_outbox_stays_prepared() {
 #[test]
 fn unverified_native_policy_is_held_prepared_without_fixture_opt_in() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) =
         initial_authority(&fixture.database, port.without_fixture_opt_in(), &who);
@@ -503,7 +686,7 @@ fn unverified_native_policy_is_held_prepared_without_fixture_opt_in() {
 #[test]
 fn launch_admits_once_and_retries_return_original_receipt() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let request = launch_request(&who, grant, 1, 1, b"canonical.launch.one");
@@ -519,11 +702,11 @@ fn launch_admits_once_and_retries_return_original_receipt() {
     assert_eq!(reviewed.len(), 1);
     assert_eq!(
         reviewed[0].effective().executable(),
-        "/opt/podbay/bin/fake-agent"
+        who.executable.to_string_lossy()
     );
     assert_eq!(
         reviewed[0].effective().executable_generation(),
-        "sha256.fakegeneration1"
+        format!("sha256:{}", who.executable_sha256)
     );
     assert_eq!(reviewed[0].effective().model_id(), "model.alpha");
     assert_eq!(
@@ -532,6 +715,28 @@ fn launch_admits_once_and_retries_return_original_receipt() {
     );
     assert_eq!(reviewed[0].effective().relative_cwd(), "src");
     assert!(reviewed[0].effective().credential_refs().is_empty());
+    assert_eq!(reviewed[0].descriptor().target_os(), TargetOs::Linux);
+    assert_eq!(reviewed[0].descriptor().host_id(), "host.fixture");
+    assert_eq!(
+        reviewed[0].descriptor().cwd(),
+        who.workspace_root.join("src").to_string_lossy()
+    );
+    assert_eq!(reviewed[0].descriptor().resources_len(), 2);
+    assert_eq!(
+        reviewed[0].descriptor().resource(0).unwrap().driver,
+        &ResourceDriver::Pty {
+            rows: 24,
+            columns: 80,
+            retention_events: 100
+        }
+    );
+    assert_eq!(
+        reviewed[0].descriptor().resource(1).unwrap().driver,
+        &ResourceDriver::Structured {
+            driver_ref: "driver.fixture".into(),
+            protocol_ref: "protocol.fixture".into()
+        }
+    );
     let effect_bytes = reviewed[0].descriptor_bytes().to_vec();
     let expected_digest = reviewed[0].descriptor().digest().to_owned();
     drop(reviewed);
@@ -613,8 +818,6 @@ fn launch_admits_once_and_retries_return_original_receipt() {
     );
     let mut revised_profile = profile_input(&who);
     revised_profile.profile_generation = 2;
-    revised_profile.binary_generation = "sha256.fakegeneration2".into();
-    revised_profile.executable = "/opt/podbay/bin/fake-agent-v2".into();
     host.register_launch_profile_from_trusted_policy(
         RegisteredLaunchProfile::from_trusted_policy(revised_profile).unwrap(),
     )
@@ -656,7 +859,7 @@ fn launch_admits_once_and_retries_return_original_receipt() {
 #[test]
 fn different_key_cannot_launch_same_pod_incarnation_before_port() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let first = host
@@ -717,9 +920,117 @@ fn different_key_cannot_launch_same_pod_incarnation_before_port() {
 }
 
 #[test]
+fn prepared_launch_rechecks_executable_before_claim() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.preclaim-binary");
+    let prepared = host
+        .admit_bound_pod(&who.transport, request.clone())
+        .unwrap();
+    std::fs::write(&who.executable, b"#!/bin/sh\nexit 9\n").unwrap();
+    assert!(matches!(
+        host.resume_prepared_bound_pod(&who.transport, request),
+        Err(LaunchPodError::Host(HostError::StaleGuard))
+    ));
+    let store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        store
+            .launch_dispatch_status(
+                prepared.receipt.outbox_id,
+                who.scope.as_str(),
+                who.pod.as_str()
+            )
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::Prepared
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn changed_trusted_binary_hash_on_restart_blocks_prepared_recovery() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (first_port, _, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, grant) = initial_authority(&fixture.database, first_port, &who);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.restart-binary");
+    let prepared = first
+        .admit_bound_pod(&who.transport, request.clone())
+        .unwrap();
+    drop(first);
+
+    let new_bytes = b"#!/bin/sh\nexit 5\n";
+    std::fs::write(&who.executable, new_bytes).unwrap();
+    let new_hash = Sha256::digest(new_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (second_port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut second = DurableAuthority::open(&fixture.database, second_port).unwrap();
+    second
+        .reattest_actor_from_trusted_replay(
+            &who.transport,
+            ActorRegistration::owner_cli_from_trusted_policy(
+                who.actor.clone(),
+                who.scope.clone(),
+                who.process.clone(),
+                CredentialGeneration::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+    second.activate_grant_from_trusted_replay(grant).unwrap();
+    second
+        .register_native_host_from_trusted_policy(native_host_config())
+        .unwrap();
+    let mut changed_profile = profile_input(&who);
+    changed_profile.executable_sha256 = new_hash.clone();
+    assert!(matches!(
+        RegisteredLaunchProfile::from_trusted_policy(changed_profile.clone()),
+        Err(HostError::InvalidInput)
+    ));
+    // The immutable descriptor carries this digest even with the same
+    // profile reference and numeric generation.
+    changed_profile.binary_generation = format!("sha256:{new_hash}");
+    second
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(changed_profile).unwrap(),
+        )
+        .unwrap();
+    let mut retry = launch_request(&who, grant, 2, 1, b"canonical.restart-binary");
+    retry.proposal = None;
+    let inspected = second.launch_bound_pod(&who.transport, retry).unwrap();
+    assert!(inspected.duplicate);
+    assert_eq!(inspected.receipt, prepared.receipt);
+    assert_eq!(inspected.status.stage, LaunchDispatchStage::Prepared);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        second.resume_prepared_bound_pod(
+            &who.transport,
+            launch_request(&who, grant, 2, 1, b"canonical.restart-binary")
+        ),
+        Err(LaunchPodError::Host(HostError::StaleGuard))
+    ));
+    let store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        store
+            .launch_dispatch_status(
+                prepared.receipt.outbox_id,
+                who.scope.as_str(),
+                who.pod.as_str()
+            )
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::Prepared
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn prepared_intent_survives_restart_and_dispatches_once_after_replay() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (first_port, first_calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut first, grant) = initial_authority(&fixture.database, first_port, &who);
     let original = launch_request(&who, grant, 1, 1, b"canonical.prepared");
@@ -767,7 +1078,7 @@ fn prepared_intent_survives_restart_and_dispatches_once_after_replay() {
 #[test]
 fn lost_reply_remains_uncertain_across_manager_restart() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (first_port, first_calls, first_effects) = FakeLaunchPort::new(Mode::LostReply);
     let (mut first, grant) = initial_authority(&fixture.database, first_port, &who);
     let first_result = first
@@ -803,7 +1114,7 @@ fn lost_reply_remains_uncertain_across_manager_restart() {
 #[test]
 fn refusal_is_recorded_and_second_manager_cannot_overlap_launch() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, effects) = FakeLaunchPort::new(Mode::Refused);
     let (mut first, grant) = initial_authority(&fixture.database, port, &who);
     assert!(matches!(
@@ -836,7 +1147,7 @@ fn refusal_is_recorded_and_second_manager_cannot_overlap_launch() {
 #[test]
 fn port_settled_stage_does_not_claim_run_completion() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, effects) = FakeLaunchPort::new(Mode::Settled);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let result = host
@@ -857,7 +1168,7 @@ fn port_settled_stage_does_not_claim_run_completion() {
 #[test]
 fn profile_workspace_and_path_mismatch_refuse_before_admission() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let mut stale_profile = launch_request(&who, grant, 1, 1, b"canonical.profile");
@@ -907,7 +1218,7 @@ fn profile_workspace_and_path_mismatch_refuse_before_admission() {
 #[test]
 fn coordinator_and_worker_use_same_reviewed_port_path() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     host.launch_bound_pod(
@@ -942,7 +1253,6 @@ fn coordinator_and_worker_use_same_reviewed_port_path() {
         &coordinator_pod,
         Role::Coordinator,
         coordinator.proposal.as_ref().unwrap().selection.clone(),
-        None,
     ));
     host.launch_bound_pod(&who.transport, coordinator).unwrap();
     let reviewed = host.port().reviewed.lock().unwrap();
@@ -967,7 +1277,7 @@ fn coordinator_and_worker_use_same_reviewed_port_path() {
 #[test]
 fn only_selected_authorised_credential_reaches_effect_and_port() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut host, grant) = initial_authority(&fixture.database, port, &who);
     let selected =
@@ -1006,12 +1316,6 @@ fn only_selected_authorised_credential_reaches_effect_and_port() {
         role: Role::Worker,
         credential: Some(selected.clone()),
     };
-    request
-        .proposal
-        .as_mut()
-        .unwrap()
-        .native_policy
-        .credential_refs = vec![selected.as_str().to_owned()];
     let receipt = host.launch_bound_pod(&who.transport, request).unwrap();
     let reviewed = host.port().reviewed.lock().unwrap();
     assert_eq!(reviewed.len(), 1);
@@ -1045,7 +1349,7 @@ fn only_selected_authorised_credential_reaches_effect_and_port() {
 #[test]
 fn committed_claim_without_port_result_is_not_replayed() {
     let fixture = Fixture::new();
-    let who = identity();
+    let who = identity(&fixture);
     let (first_port, first_calls, _) = FakeLaunchPort::new(Mode::Accepted);
     let (mut first, grant) = initial_authority(&fixture.database, first_port, &who);
     let admitted = first

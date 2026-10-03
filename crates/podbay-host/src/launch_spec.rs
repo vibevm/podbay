@@ -1,7 +1,13 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
-use podbay_core::{PodId, Role, ScopeId};
+use podbay_core::{LaunchBinding, PodId, ResourceKind, Role, ScopeId};
+use podbay_wire::{
+    EffectiveLaunchContract, EffectiveWorkspaceAccess, ImmutableLaunchDescriptor,
+    NativeResourceKind, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
+};
+use sha2::{Digest, Sha256};
 
 use crate::authority::{CredentialRef, HostError};
 
@@ -35,6 +41,92 @@ pub struct LaunchSelection {
     pub parent_run_id: Option<String>,
 }
 
+/// Installed by the authenticated host policy boundary, never by a launch
+/// request. The first resolver supports the compiled Linux backend only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedNativeHostConfig {
+    host_id: String,
+    target_os: TargetOs,
+    structured_drivers: BTreeSet<(String, String)>,
+    auxiliary_drivers: BTreeSet<String>,
+}
+
+impl TrustedNativeHostConfig {
+    pub fn for_compiled_backend(host_id: String) -> Result<Self, HostError> {
+        if !cfg!(target_os = "linux") {
+            return Err(HostError::Unsupported);
+        }
+        if !valid_label(&host_id) {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            host_id,
+            target_os: TargetOs::Linux,
+            structured_drivers: BTreeSet::new(),
+            auxiliary_drivers: BTreeSet::new(),
+        })
+    }
+
+    pub fn with_structured_driver(
+        mut self,
+        driver_ref: String,
+        protocol_ref: String,
+    ) -> Result<Self, HostError> {
+        if !valid_label(&driver_ref) || !valid_label(&protocol_ref) {
+            return Err(HostError::InvalidInput);
+        }
+        self.structured_drivers.insert((driver_ref, protocol_ref));
+        Ok(self)
+    }
+
+    pub fn with_auxiliary_driver(mut self, driver_ref: String) -> Result<Self, HostError> {
+        if !valid_label(&driver_ref) {
+            return Err(HostError::InvalidInput);
+        }
+        self.auxiliary_drivers.insert(driver_ref);
+        Ok(self)
+    }
+
+    fn supports_driver(&self, driver: &ResourceDriver) -> bool {
+        match driver {
+            ResourceDriver::Pty { .. } => true,
+            ResourceDriver::Structured {
+                driver_ref,
+                protocol_ref,
+            } => self
+                .structured_drivers
+                .contains(&(driver_ref.clone(), protocol_ref.clone())),
+            ResourceDriver::Auxiliary { driver_ref } => self.auxiliary_drivers.contains(driver_ref),
+        }
+    }
+
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+    pub fn target_os(&self) -> TargetOs {
+        self.target_os
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedDriverTemplate {
+    pub kind: ResourceKind,
+    pub driver: ResourceDriver,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionMode {
+    /// Pathname-based Linux execution of dynamic binaries. This is cooperative
+    /// local policy, not hostile same-UID or loader/library isolation.
+    LinuxCooperative,
+}
+
+pub(crate) struct ResolvedNativePaths {
+    pub(crate) cwd: PathBuf,
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
+}
+
 /// Protected policy input. No request can set the executable or environment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedLaunchProfileInput {
@@ -42,6 +134,10 @@ pub struct TrustedLaunchProfileInput {
     pub profile_generation: u64,
     pub executable: String,
     pub binary_generation: String,
+    pub executable_sha256: String,
+    pub workspace_root: PathBuf,
+    pub resource_layout: Vec<TrustedDriverTemplate>,
+    pub execution_mode: ExecutionMode,
     pub fixed_arguments: Vec<String>,
     pub permitted_extra_arguments: BTreeSet<String>,
     pub default_model: String,
@@ -74,6 +170,12 @@ impl RegisteredLaunchProfile {
             || !Path::new(&input.executable).is_absolute()
             || input.executable.chars().any(char::is_control)
             || !valid_label(&input.binary_generation)
+            || !valid_sha256(&input.executable_sha256)
+            || input.binary_generation != format!("sha256:{}", input.executable_sha256)
+            || !input.workspace_root.is_absolute()
+            || input.workspace_root.as_os_str().len() > 4096
+            || input.resource_layout.is_empty()
+            || input.resource_layout.len() > 64
             || !valid_label(&input.default_model)
             || !valid_label(&input.default_effort)
             || !valid_label(&input.workspace_basis_ref)
@@ -90,6 +192,13 @@ impl RegisteredLaunchProfile {
             || input.allowed_tool_bundle_refs.len() > 64
             || input.environment_refs.len() > 64
             || input.credential_refs.len() > 32
+        {
+            return Err(HostError::InvalidInput);
+        }
+        if input
+            .resource_layout
+            .iter()
+            .any(|template| !driver_matches_kind(template))
         {
             return Err(HostError::InvalidInput);
         }
@@ -133,6 +242,117 @@ impl RegisteredLaunchProfile {
 
     pub fn workspace_scope(&self) -> &ScopeId {
         &self.input.workspace_scope
+    }
+
+    pub(crate) fn resolve_native_policy(
+        &self,
+        host: &TrustedNativeHostConfig,
+        spec: &EffectiveLaunchSpec,
+        binding: &LaunchBinding,
+        effective_digest: &str,
+    ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
+        if host.target_os != TargetOs::Linux
+            || self.input.execution_mode != ExecutionMode::LinuxCooperative
+            || spec.profile_ref != self.input.profile_ref
+            || spec.profile_generation != self.input.profile_generation
+            || spec.workspace.scope_id != self.input.workspace_scope
+            || spec.workspace.basis_ref != self.input.workspace_basis_ref
+            || spec.workspace.access != WorkspaceAccess::ReadWrite
+            || binding.resources().len() != self.input.resource_layout.len()
+        {
+            return Err(HostError::Unsupported);
+        }
+        let paths = self.resolve_native_paths(&spec.workspace.relative_cwd)?;
+        let mut resources = Vec::with_capacity(binding.resources().len());
+        for (bound, template) in binding.resources().iter().zip(&self.input.resource_layout) {
+            if bound.kind() != template.kind {
+                return Err(HostError::Unauthorised);
+            }
+            if !host.supports_driver(&template.driver) {
+                return Err(HostError::Unsupported);
+            }
+            resources.push(ReviewedResource {
+                resource_id: bound.id().clone(),
+                kind: bound.kind(),
+                epoch: bound.epoch(),
+                driver: template.driver.clone(),
+            });
+        }
+        let policy = ReviewedNativePolicy {
+            target_os: host.target_os,
+            host_id: host.host_id.clone(),
+            profile_ref: spec.profile_ref.clone(),
+            profile_generation: spec.profile_generation,
+            model_id: spec.model_id.clone(),
+            reasoning_effort: spec.reasoning_effort.clone(),
+            executable_generation: spec.binary_generation.clone(),
+            effective_spec_digest: effective_digest.to_owned(),
+            workspace_basis_ref: spec.workspace.basis_ref.clone(),
+            executable: paths.executable.to_string_lossy().into_owned(),
+            cwd: paths.cwd.to_string_lossy().into_owned(),
+            arguments: spec.arguments.clone(),
+            environment_refs: spec.environment_refs.clone(),
+            credential_refs: spec
+                .credential_refs
+                .iter()
+                .map(|reference| reference.as_str().to_owned())
+                .collect(),
+            wall_seconds: spec.wall_seconds,
+            max_children: spec.max_children,
+            resources,
+        };
+        Ok((policy, paths))
+    }
+
+    pub(crate) fn revalidate_committed_native(
+        &self,
+        host: &TrustedNativeHostConfig,
+        effective: &EffectiveLaunchContract,
+        descriptor: &ImmutableLaunchDescriptor,
+    ) -> Result<ResolvedNativePaths, HostError> {
+        if host.target_os != TargetOs::Linux
+            || descriptor.target_os() != host.target_os
+            || descriptor.host_id() != host.host_id
+            || effective.profile_ref() != self.input.profile_ref
+            || effective.profile_generation() != self.input.profile_generation
+            || effective.workspace_scope() != &self.input.workspace_scope
+            || effective.workspace_basis_ref() != self.input.workspace_basis_ref
+            || effective.workspace_access() != EffectiveWorkspaceAccess::ReadWrite
+            || !self.input.allow_write
+            || descriptor.resources_len() != self.input.resource_layout.len()
+            || descriptor.executable_generation() != self.input.binary_generation
+            || effective.executable() != self.input.executable
+        {
+            return Err(HostError::StaleGuard);
+        }
+        for (index, template) in self.input.resource_layout.iter().enumerate() {
+            let native = descriptor.resource(index).ok_or(HostError::StaleGuard)?;
+            if native.kind != NativeResourceKind::from(template.kind)
+                || native.driver != &template.driver
+                || !host.supports_driver(&template.driver)
+            {
+                return Err(HostError::StaleGuard);
+            }
+        }
+        let paths = self.resolve_native_paths(effective.relative_cwd())?;
+        if descriptor.cwd() != paths.cwd.to_string_lossy()
+            || descriptor.executable() != paths.executable.to_string_lossy()
+        {
+            return Err(HostError::StaleGuard);
+        }
+        Ok(paths)
+    }
+
+    fn resolve_native_paths(&self, relative_cwd: &str) -> Result<ResolvedNativePaths, HostError> {
+        if !valid_relative_cwd(relative_cwd) {
+            return Err(HostError::Unauthorised);
+        }
+        resolve_linux_paths(
+            &self.input.workspace_root,
+            relative_cwd,
+            Path::new(&self.input.executable),
+            &self.input.executable_sha256,
+        )
     }
 
     pub(crate) fn resolve(
@@ -385,6 +605,121 @@ fn valid_relative_cwd(value: &str) -> bool {
 
 fn cwd_within_prefix(cwd: &str, prefix: &str) -> bool {
     prefix == "." || cwd == prefix || cwd.starts_with(&format!("{prefix}/"))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn driver_matches_kind(template: &TrustedDriverTemplate) -> bool {
+    match (template.kind, &template.driver) {
+        (
+            ResourceKind::Pty,
+            ResourceDriver::Pty {
+                rows,
+                columns,
+                retention_events,
+            },
+        ) => *rows > 0 && *columns > 0 && *retention_events > 0,
+        (
+            ResourceKind::StructuredProvider,
+            ResourceDriver::Structured {
+                driver_ref,
+                protocol_ref,
+            },
+        ) => valid_label(driver_ref) && valid_label(protocol_ref),
+        (ResourceKind::Auxiliary, ResourceDriver::Auxiliary { driver_ref }) => {
+            valid_label(driver_ref)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reject_symlink_components(path: &Path) -> Result<(), HostError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            _ => return Err(HostError::InvalidInput),
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| HostError::StaleGuard)?;
+        if metadata.file_type().is_symlink() {
+            return Err(HostError::Unauthorised);
+        }
+    }
+    Ok(())
+}
+
+/// Cooperative pathname checks. A later rename/write or dynamic loader change
+/// can still race a pathname-based spawn; this is not hostile same-UID isolation.
+#[cfg(target_os = "linux")]
+fn resolve_linux_paths(
+    workspace_root: &Path,
+    relative_cwd: &str,
+    executable: &Path,
+    expected_sha256: &str,
+) -> Result<ResolvedNativePaths, HostError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    reject_symlink_components(workspace_root)?;
+    let root = std::fs::canonicalize(workspace_root).map_err(|_| HostError::StaleGuard)?;
+    if !root.is_dir() {
+        return Err(HostError::InvalidInput);
+    }
+    let requested_cwd = if relative_cwd == "." {
+        root.clone()
+    } else {
+        root.join(relative_cwd)
+    };
+    reject_symlink_components(&requested_cwd)?;
+    let cwd = std::fs::canonicalize(&requested_cwd).map_err(|_| HostError::StaleGuard)?;
+    if !cwd.starts_with(&root) || !cwd.is_dir() {
+        return Err(HostError::Unauthorised);
+    }
+
+    reject_symlink_components(executable)?;
+    let executable = std::fs::canonicalize(executable).map_err(|_| HostError::StaleGuard)?;
+    let metadata = std::fs::metadata(&executable).map_err(|_| HostError::StaleGuard)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(HostError::InvalidInput);
+    }
+    let mut file = std::fs::File::open(&executable).map_err(|_| HostError::StaleGuard)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer).map_err(|_| HostError::StaleGuard)?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+    let actual_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_sha256 != expected_sha256 {
+        return Err(HostError::StaleGuard);
+    }
+    Ok(ResolvedNativePaths {
+        cwd,
+        executable,
+        executable_sha256: actual_sha256,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_linux_paths(
+    _workspace_root: &Path,
+    _relative_cwd: &str,
+    _executable: &Path,
+    _expected_sha256: &str,
+) -> Result<ResolvedNativePaths, HostError> {
+    Err(HostError::Unsupported)
 }
 
 #[cfg(test)]

@@ -15,9 +15,12 @@ use podbay_store::{
     BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, EffectClaim, LaunchDispatchStatus,
     LaunchLookupRequest, LaunchPortResult, PodBayStore, Receipt, StoreError, VerifiedPrincipal,
 };
-use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, ReviewedNativePolicy};
+use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor};
 
-use crate::launch_spec::{EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile};
+use crate::launch_spec::{
+    EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile, ResolvedNativePaths,
+    TrustedNativeHostConfig,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostError {
@@ -488,7 +491,6 @@ pub struct AuthorisedDispatch {
 /// current profile cannot rewrite the logical launch after a lost reply.
 /// Native cwd, host and driver locality are still unverified in PB09j; only
 /// a preproduction fixture port may opt in to receiving this value.
-#[derive(Clone, Debug)]
 pub struct AuthorisedBoundLaunch {
     actor_id: ActorId,
     scope_id: ScopeId,
@@ -498,6 +500,31 @@ pub struct AuthorisedBoundLaunch {
     effective: EffectiveLaunchContract,
     descriptor: ImmutableLaunchDescriptor,
     native_resolution: NativeResolutionState,
+}
+
+/// Host-created capability for a committed descriptor whose native fields
+/// were rechecked against trusted Linux configuration immediately preclaim.
+/// Its private constructor keeps decoded/request data from creating one.
+/// This cooperative pathname proof does not pin the dynamic loader/libraries
+/// or prevent a later same-UID rename/write before an OS port uses the path.
+pub struct ResolvedNativeLaunch {
+    committed: AuthorisedBoundLaunch,
+    paths: ResolvedNativePaths,
+}
+
+impl ResolvedNativeLaunch {
+    pub fn committed(&self) -> &AuthorisedBoundLaunch {
+        &self.committed
+    }
+    pub fn cwd(&self) -> &Path {
+        &self.paths.cwd
+    }
+    pub fn executable(&self) -> &Path {
+        &self.paths.executable
+    }
+    pub fn executable_sha256(&self) -> &str {
+        &self.paths.executable_sha256
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +644,18 @@ pub trait HostDispatchPort {
         launch: AuthorisedBoundLaunch,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError>;
 
+    /// Production ports consume only the private host-created resolved value.
+    fn launch_resolved(
+        &mut self,
+        _launch: ResolvedNativeLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn accepts_resolved_native_launch(&self) -> bool {
+        false
+    }
+
     /// Default-deny until a trusted host-owned native resolver supplies a
     /// private verified capability. Only fake test ports may opt in here.
     fn allow_unverified_native_launch_for_fixture(&self) -> bool {
@@ -624,17 +663,15 @@ pub trait HostDispatchPort {
     }
 }
 
-/// Aggregate snapshots and native fields proposed for a *new* initial root
-/// launch. The native cwd, host and driver fields are not host resolved yet;
-/// the default-deny port gate keeps this preproduction path from OS launch.
-/// A duplicate may omit this entire proposal.
+/// Aggregate snapshots and logical selection for a new initial root launch.
+/// Native cwd, host, executable identity and drivers come only from registered
+/// host/profile configuration. A duplicate may omit this entire proposal.
 #[derive(Clone, Debug)]
 pub struct BoundHostLaunchProposal {
     pub session: Session,
     pub run: Run,
     pub binding: LaunchBinding,
     pub selection: LaunchSelection,
-    pub native_policy: ReviewedNativePolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -1474,6 +1511,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     store: PodBayStore,
     recorded: AuthoritySnapshot,
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
+    native_host: Option<TrustedNativeHostConfig>,
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
@@ -1543,6 +1581,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             store,
             recorded,
             launch_profiles: HashMap::new(),
+            native_host: None,
         })
     }
 
@@ -1573,6 +1612,17 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
         }
         self.launch_profiles.insert(key, profile);
+        Ok(())
+    }
+
+    pub fn register_native_host_from_trusted_policy(
+        &mut self,
+        config: TrustedNativeHostConfig,
+    ) -> Result<(), HostError> {
+        if config.target_os() != podbay_wire::TargetOs::Linux {
+            return Err(HostError::Unsupported);
+        }
+        self.native_host = Some(config);
         Ok(())
     }
 
@@ -1730,6 +1780,14 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchAdmission::Duplicate(record) => (record, true),
         };
         if !duplicate {
+            if record.effective_spec != effective_bytes
+                || record.descriptor
+                    != descriptor
+                        .encode_json()
+                        .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
             self.hydrate_new_bound(&record)?;
         }
         Ok((Some(authorised), record, duplicate))
@@ -1793,9 +1851,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         // Validate exactly the committed bytes before moving the outbox into
         // an uncertain claim state. No current proposal reaches this port.
         let committed = AuthorisedBoundLaunch::from_committed(&authorised, record.clone())?;
-        if committed.native_resolution() == NativeResolutionState::Unverified
-            && !self.host.port.allow_unverified_native_launch_for_fixture()
-        {
+        let paths = self.revalidate_committed_native(&committed)?;
+        let fixture_port = self.host.port.allow_unverified_native_launch_for_fixture();
+        if !fixture_port && !self.host.port.accepts_resolved_native_launch() {
             return Err(HostError::NativeResolutionUnverified.into());
         }
         let claim_key = format!("claim.{}", record.receipt.command_id);
@@ -1812,7 +1870,14 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return self.bound_receipt(record, duplicate);
         }
         self.ensure_current_owner_epoch()?;
-        let port_result = match self.host.port.launch_bound(committed) {
+        let port_call = if fixture_port {
+            self.host.port.launch_bound(committed)
+        } else {
+            self.host
+                .port
+                .launch_resolved(ResolvedNativeLaunch { committed, paths })
+        };
+        let port_result = match port_call {
             Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
                 receipt_ref: Some(receipt.stable_reference().to_owned()),
             },
@@ -1916,16 +1981,31 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let bytes = spec.canonical_bytes()?;
         let decoded =
             EffectiveLaunchContract::decode(&bytes).map_err(|_| HostError::Unauthorised)?;
-        let mut native = proposal.native_policy.clone();
-        // The host computes this link from the reviewed profile; a caller's
-        // placeholder digest never becomes authority.
-        native.effective_spec_digest = decoded.digest().to_owned();
+        let profile = self
+            .launch_profiles
+            .get(&proposal.selection.profile_ref)
+            .ok_or(HostError::Unsupported)?;
+        let host = self.native_host.as_ref().ok_or(HostError::Unsupported)?;
+        let (native, _) =
+            profile.resolve_native_policy(host, &spec, &proposal.binding, decoded.digest())?;
         let descriptor = ImmutableLaunchDescriptor::from_binding(&proposal.binding, native)
             .map_err(|_| HostError::Unauthorised)?;
         decoded
             .compare_with_descriptor(&descriptor)
             .map_err(|_| HostError::Unauthorised)?;
         Ok((bytes, descriptor))
+    }
+
+    fn revalidate_committed_native(
+        &self,
+        committed: &AuthorisedBoundLaunch,
+    ) -> Result<ResolvedNativePaths, HostError> {
+        let host = self.native_host.as_ref().ok_or(HostError::Unsupported)?;
+        let profile = self
+            .launch_profiles
+            .get(committed.effective().profile_ref())
+            .ok_or(HostError::Unsupported)?;
+        profile.revalidate_committed_native(host, committed.effective(), committed.descriptor())
     }
 
     fn ensure_current_owner_epoch(&self) -> Result<(), HostError> {
