@@ -67,3 +67,24 @@ This is a codec and fake-transport slice. It does not launch Codex, make
 approval decisions, or grant native permissions on its own. A native adapter
 must reconcile a lost reply against the pod-owned process and hold a durable
 native-session writer fence before submitting another turn or answer.
+
+## Isolated 0.159.3 handshake probe
+
+One disposable `codex app-server --listen stdio://` child ran with a fresh
+temporary `HOME`, `CODEX_HOME` and empty config. No credentials were copied.
+The only messages sent were `initialize` with `clientInfo`, `initialized` with
+empty params, and read-only `model/list` with `limit: 5` and
+`includeHidden: false`.
+
+`initialize` returned `codexHome`, `platformFamily`, `platformOs` and
+`userAgent`, all strings, matching the pinned handshake assumption.
+`model/list` returned `data` (five entries) and `nextCursor`. Notifications
+observed were `configWarning` and `remoteControl/status/changed`. Stderr
+reported a Linux bubblewrap user-namespace requirement and a temporary
+helper-binary warning. The child did not exit within three seconds of
+SIGTERM, so it was SIGKILLed and reaped (exit code `-9`); the temporary home
+was removed.
+
+This probe establishes only the handshake and catalog response shapes. It
+did not start, resume or read a thread; send a turn; exercise permissions;
+verify account/model entitlement; or prove native lifecycle behavior.
