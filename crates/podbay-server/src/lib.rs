@@ -1,0 +1,341 @@
+//! One-exchange PodBay/1 router for an already authenticated local stream.
+//! No socket listener, host effect, provider, or automatic retry lives here.
+#![forbid(unsafe_code)]
+
+use std::fmt;
+use std::io::{self, Read, Write};
+
+use podbay_host::{AuthenticatedPeer, AuthenticatedTransport, HostError};
+use podbay_wire::{
+    CommandEnvelope, ErrorEnvelope, MAX_FRAME_BYTES, ProtocolVersion, ReadEnvelope, ReadOperation,
+    Receipt, RuntimeError, RuntimeErrorCode, SuccessEnvelope, WireError, decode_command_json,
+    decode_read_json, encode_frame,
+};
+use serde_json::Value;
+
+#[derive(Debug)]
+pub enum ServerFault {
+    Unauthenticated,
+    Transport(io::Error),
+    /// The handler may have admitted a command, but its correlated reply was
+    /// not delivered. The caller must query the original key/CommandId.
+    ResponseLost {
+        key: Option<String>,
+        command_id: Option<String>,
+        cause: io::Error,
+    },
+    Internal(WireError),
+}
+impl fmt::Display for ServerFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthenticated => f.write_str("PodBay transport peer was not verified"),
+            Self::Transport(error) => write!(f, "PodBay request transport failed: {error}"),
+            Self::ResponseLost {
+                key,
+                command_id,
+                cause,
+            } => write!(
+                f,
+                "PodBay response lost for key {key:?}, command {command_id:?}: {cause}"
+            ),
+            Self::Internal(error) => write!(f, "PodBay server wire construction failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for ServerFault {}
+
+/// A handler supplies domain reads and durable mutation admission. It must
+/// use the supplied authenticated transport for its own live authority check
+/// immediately before admission/effect. If an effect may have occurred, it
+/// returns `Uncertain` (or an admitted deadline) and the known CommandId.
+/// This router never invokes it twice.
+pub trait Handler {
+    fn command<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: CommandEnvelope,
+    ) -> Result<Receipt<Value>, RuntimeError>;
+    fn read<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: ReadEnvelope,
+    ) -> Result<Value, RuntimeError>;
+}
+
+/// A handler-side authority check can reattest the *same* initially bound
+/// process/generation at its own durable admission boundary. No cloned peer
+/// value is supplied as a substitute for a live transport witness.
+struct BoundTransport<'a, T> {
+    inner: &'a T,
+    initial: AuthenticatedPeer,
+}
+impl<T: AuthenticatedTransport> AuthenticatedTransport for BoundTransport<'_, T> {
+    fn verified_peer(&self) -> Result<AuthenticatedPeer, HostError> {
+        let current = self.inner.verified_peer()?;
+        if current == self.initial {
+            Ok(current)
+        } else {
+            Err(HostError::Unauthenticated)
+        }
+    }
+}
+
+/// Process exactly one exchange. The transport adapter must enforce finite
+/// read/write deadlines and live reattestation on each `verified_peer` call;
+/// generic `Read + Write` alone cannot bound a partial frame wait. Authentication
+/// runs before the prefix and again before dispatch. An invalid request receives
+/// an error when framing permits; none reaches `Handler`.
+pub fn serve_one<S: Read + Write + AuthenticatedTransport, H: Handler>(
+    stream: &mut S,
+    handler: &mut H,
+) -> Result<(), ServerFault> {
+    let peer = stream
+        .verified_peer()
+        .map_err(|_| ServerFault::Unauthenticated)?;
+    let payload = match read_frame(stream) {
+        Ok(payload) => payload,
+        Err(ReadFrameFault::Io(error)) => return Err(ServerFault::Transport(error)),
+        Err(ReadFrameFault::Bound) => {
+            return send_error(
+                stream,
+                "request.invalid",
+                RuntimeErrorCode::InvalidInput,
+                "request frame exceeded bound",
+                None,
+                None,
+            );
+        }
+    };
+    let request_id = request_id_hint(&payload).unwrap_or_else(|| "request.invalid".to_owned());
+    let value: Value = match serde_json::from_slice(&payload) {
+        Ok(value) => value,
+        Err(_) => {
+            return send_error(
+                stream,
+                &request_id,
+                RuntimeErrorCode::InvalidInput,
+                "request JSON is malformed",
+                None,
+                None,
+            );
+        }
+    };
+    let operation = value.get("operation").and_then(Value::as_str).unwrap_or("");
+    let is_read = ReadOperation::SUPPORTED
+        .iter()
+        .any(|item| item.as_str() == operation);
+    if is_read {
+        let request = match decode_read_json(&payload) {
+            Ok(request) => request,
+            Err(error) => return wire_refusal(stream, &request_id, error),
+        };
+        let bound = BoundTransport {
+            inner: stream,
+            initial: peer.clone(),
+        };
+        bound
+            .verified_peer()
+            .map_err(|_| ServerFault::Unauthenticated)?;
+        let request_id = request.request_id.clone();
+        match handler.read(&bound, request) {
+            Ok(value) => {
+                let response = SuccessEnvelope {
+                    protocol: ProtocolVersion::V1,
+                    request_id: request_id.clone(),
+                    ok: value,
+                };
+                match encode_frame(&response) {
+                    Ok(frame) => write_response(stream, &frame, None, None),
+                    Err(_) => send_error(
+                        stream,
+                        &request_id,
+                        RuntimeErrorCode::Unavailable,
+                        "read response exceeded frame bound",
+                        None,
+                        None,
+                    ),
+                }
+            }
+            Err(error) => send_runtime_error(stream, &request_id, error, None),
+        }
+    } else {
+        let request = match decode_command_json(&payload) {
+            Ok(request) => request,
+            Err(error) => return wire_refusal(stream, &request_id, error),
+        };
+        let bound = BoundTransport {
+            inner: stream,
+            initial: peer.clone(),
+        };
+        bound
+            .verified_peer()
+            .map_err(|_| ServerFault::Unauthenticated)?;
+        let request_id = request.request_id.clone();
+        let key = request.key.clone();
+        match handler.command(&bound, request) {
+            Ok(receipt) => {
+                let command_id = receipt.command_id.clone();
+                if receipt.validate().is_err() {
+                    return send_error(
+                        stream,
+                        &request_id,
+                        RuntimeErrorCode::Uncertain,
+                        "admitted command receipt is invalid",
+                        Some(command_id),
+                        Some(key),
+                    );
+                }
+                let response = SuccessEnvelope {
+                    protocol: ProtocolVersion::V1,
+                    request_id: request_id.clone(),
+                    ok: receipt,
+                };
+                match encode_frame(&response) {
+                    Ok(frame) => write_response(stream, &frame, Some(key), Some(command_id)),
+                    Err(_) => send_error(
+                        stream,
+                        &request_id,
+                        RuntimeErrorCode::Uncertain,
+                        "admitted command response exceeded frame bound",
+                        Some(command_id),
+                        Some(key),
+                    ),
+                }
+            }
+            Err(error) => send_runtime_error(stream, &request_id, error, Some(key)),
+        }
+    }
+}
+
+enum ReadFrameFault {
+    Io(io::Error),
+    Bound,
+}
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, ReadFrameFault> {
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).map_err(ReadFrameFault::Io)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(ReadFrameFault::Bound);
+    }
+    let mut payload = vec![0_u8; length];
+    stream
+        .read_exact(&mut payload)
+        .map_err(ReadFrameFault::Io)?;
+    Ok(payload)
+}
+fn request_id_hint(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let id = value.get("requestId")?.as_str()?;
+    valid_identity(id).then(|| id.to_owned())
+}
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+fn wire_refusal(
+    stream: &mut impl Write,
+    request_id: &str,
+    error: WireError,
+) -> Result<(), ServerFault> {
+    let code = match error {
+        WireError::UnsupportedVersion | WireError::UnsupportedOperation(_) => {
+            RuntimeErrorCode::Unsupported
+        }
+        _ => RuntimeErrorCode::InvalidInput,
+    };
+    send_error(
+        stream,
+        request_id,
+        code,
+        "request envelope refused by podbay-wire",
+        None,
+        None,
+    )
+}
+fn send_runtime_error(
+    stream: &mut impl Write,
+    request_id: &str,
+    mut error: RuntimeError,
+    key: Option<String>,
+) -> Result<(), ServerFault> {
+    if key.is_none() {
+        error.command_id = None;
+    }
+    if error
+        .command_id
+        .as_deref()
+        .is_some_and(|id| !valid_identity(id))
+    {
+        error.command_id = None;
+        error.code = RuntimeErrorCode::Uncertain;
+    }
+    if error.command_id.is_some()
+        && error.code != RuntimeErrorCode::Uncertain
+        && error.code != RuntimeErrorCode::DeadlineExceeded
+    {
+        error.code = RuntimeErrorCode::Uncertain;
+    }
+    if error.message.is_empty() || error.message.len() > 1024 {
+        error.message = "handler error message invalid".into();
+    }
+    if error.retry.is_empty()
+        || error.retry.len() > 64
+        || !error.retry.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        error.retry = if error.command_id.is_some() {
+            "query_command"
+        } else {
+            "never"
+        }
+        .into();
+    }
+    let command_id = error.command_id.clone();
+    let envelope = ErrorEnvelope {
+        protocol: ProtocolVersion::V1,
+        request_id: request_id.to_owned(),
+        error,
+    };
+    envelope.validate().map_err(ServerFault::Internal)?;
+    let frame = encode_frame(&envelope).map_err(ServerFault::Internal)?;
+    write_response(stream, &frame, key, command_id)
+}
+fn send_error(
+    stream: &mut impl Write,
+    request_id: &str,
+    code: RuntimeErrorCode,
+    message: &str,
+    command_id: Option<String>,
+    key: Option<String>,
+) -> Result<(), ServerFault> {
+    let error = RuntimeError {
+        code,
+        message: message.to_owned(),
+        retry: if command_id.is_some() {
+            "query_command"
+        } else {
+            "never"
+        }
+        .into(),
+        command_id,
+    };
+    send_runtime_error(stream, request_id, error, key)
+}
+fn write_response(
+    stream: &mut impl Write,
+    frame: &[u8],
+    key: Option<String>,
+    command_id: Option<String>,
+) -> Result<(), ServerFault> {
+    stream
+        .write_all(frame)
+        .and_then(|()| stream.flush())
+        .map_err(|cause| ServerFault::ResponseLost {
+            key,
+            command_id,
+            cause,
+        })
+}

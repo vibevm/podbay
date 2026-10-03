@@ -318,6 +318,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "podbay-server"
+version = "0.1.0"
+dependencies = [
+ "podbay-client",
+ "podbay-host",
+ "podbay-wire",
+ "serde_json",
+]
+
+[[package]]
 name = "podbay-store"
 version = "0.1.0"
 dependencies = [
