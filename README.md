@@ -1,7 +1,9 @@
 # PodBay
 
-PodBay is an independent Rust runtime for supervised local agent processes. Zap is a consumer of PodBay; PodBay does not depend on Zap.
+PodBay is an independent Rust runtime for supervised agent processes. Zap consumes its public contract; PodBay does not depend on Zap. Coordinator, worker, and advisor are roles in one session/run/attempt/pod model.
 
-Coordinator and worker are roles of the same pod model. Each pod owns its process resources outside the client application's lifetime and exposes an exact, authenticated reattachment boundary. A future host adapter will provide PTY attachment, while an optional ACP gateway may expose compatible capabilities after conformance is proven.
+The preproduction `0.1.0` branch currently has a versioned Rust wire contract and generated TypeScript binding, a durable command/event/outbox store, and a Linux user-systemd pod with a real PTY, scoped viewers, and fenced input. These are implementation slices, not a production-ready coordinator or provider adapter. Durable PTY spool, host authority, manager reattachment, Zap migration, and provider conformance are still in progress.
 
-This `0.1.0` line is a preproduction bootstrap. The crates establish dependency direction and build boundaries; they do not yet launch, control, or recover agents. See [PROP-001](vibevm/vibespecs/PROP-001-foundation.xml).
+PodBay must support Linux, macOS, and Windows through one public API and separate OS backends. The current runtime tests are Linux-only. macOS and Windows do not yet have native acceptance receipts and must not be advertised as operational. See [platform backends](vibevm/vibespecs/PROP-008-platform-backends.xml) and the [native protocol](vibevm/vibespecs/PROP-002-protocol.xml).
+
+`vibe install --offline --registry <local-registry>` materializes the pinned package closure. `vibe validate` and focused Cargo tests verify the current package and code slices. The optional outward ACP gateway has not been implemented or certified.
