@@ -3,12 +3,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use podbay_pod::{
-    LaunchDescriptor, PodClient, PodError, PodRole, SupervisorEvidence, launch, manifest_path,
-};
+use podbay_pod::{LaunchDescriptor, PodClient, PodError, PodRole, launch, manifest_path};
 
 struct Fixture {
     directory: PathBuf,
@@ -66,21 +63,6 @@ impl Drop for Fixture {
     }
 }
 
-struct UnitGuard {
-    units: Vec<String>,
-}
-impl Drop for UnitGuard {
-    fn drop(&mut self) {
-        for unit in &self.units {
-            let _ = Command::new("systemctl")
-                .args(["--user", "stop", unit])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-}
-
 #[test]
 fn versioned_manifest_digest_and_private_paths_reject_drift() {
     let fixture = Fixture::new();
@@ -109,87 +91,20 @@ fn pb05_manifest_without_pty_keeps_its_canonical_digest() {
 }
 
 #[test]
-#[ignore = "requires isolated user systemd"]
-fn pod_and_child_survive_restart_of_a_separate_user_manager_unit() {
-    assert_eq!(std::env::var("PODBAY_TEST_SYSTEMD").as_deref(), Ok("1"));
+fn retired_pb05_launch_refuses_before_manifest_or_child() {
     let fixture = Fixture::new();
     let descriptor = fixture.descriptor();
     let manifest = manifest_path(&fixture.directory, &descriptor).unwrap();
-    let pod_binary = PathBuf::from(env!("CARGO_BIN_EXE_podbay-pod"));
-    let suffix = manifest.file_stem().unwrap().to_string_lossy();
-    let parent_unit = format!("podbay-parent-{}.service", &suffix[..16]);
-    let _units = UnitGuard {
-        units: vec![
-            parent_unit.clone(),
-            format!("podbay-pod-{}.service", suffix),
-        ],
-    };
-    let parent = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--no-ask-password",
-            "--collect",
-            "--service-type=exec",
-        ])
-        .arg(format!("--unit={parent_unit}"))
-        .args(["/bin/sleep", "60"])
-        .status()
-        .unwrap();
-    assert!(parent.success());
-    let mut client: Option<PodClient> = None;
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let launched = launch(descriptor.clone(), &fixture.directory, &pod_binary)?;
-        let first = launched.status()?;
-        assert!(first.child_running && first.child.start_identity.is_some());
-        let SupervisorEvidence::LinuxSystemd {
-            unit_name,
-            cgroup_path,
-            ..
-        } = &first.evidence
-        else {
-            panic!("Linux fixture must produce Linux systemd evidence");
-        };
-        assert!(cgroup_path.contains(unit_name));
-        let marker = fixture.directory.join("child-saw-socket");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            marker.exists(),
-            "child must observe the bound authenticated socket"
-        );
-        let wrong = LaunchDescriptor {
-            args: vec!["changed".into()],
-            ..descriptor.clone()
-        };
-        assert!(matches!(
-            launch(wrong, &fixture.directory, &pod_binary),
-            Err(PodError::Conflict(_))
-        ));
-        client = Some(launched);
-        assert!(
-            Command::new("systemctl")
-                .args(["--user", "restart", &parent_unit])
-                .status()?
-                .success()
-        );
-        let attached = PodClient::connect(&manifest)?;
-        let after = attached.status()?;
-        assert_eq!(
-            (&after.supervisor, &after.child),
-            (&first.supervisor, &first.child)
-        );
-        assert_eq!(after.manifest_digest, first.manifest_digest);
-        assert_eq!(after.evidence, first.evidence);
-        let stopped = attached.stop()?;
-        assert!(!stopped.child_running);
-        Ok(())
-    })();
-    if let Some(client) = client {
-        let _ = client.stop();
-    }
-    result.unwrap();
+    assert!(matches!(
+        launch(
+            descriptor,
+            &fixture.directory,
+            PathBuf::from(env!("CARGO_BIN_EXE_podbay-pod"))
+        ),
+        Err(PodError::Unsupported("unbound pod launch is retired"))
+    ));
+    assert!(!manifest.exists());
+    assert!(!fixture.directory.join("child-saw-socket").exists());
 }
 
 #[test]

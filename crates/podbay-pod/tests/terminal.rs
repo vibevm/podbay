@@ -88,7 +88,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-#[ignore = "requires isolated user systemd and a private PTY fixture"]
+#[ignore = "retired PB05 bearer-only PTY fixture; bound terminal awaits a peer-bound lease protocol"]
 fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     assert_eq!(std::env::var("PODBAY_TEST_SYSTEMD").as_deref(), Ok("1"));
     let mut fixture = Fixture::new();
@@ -327,7 +327,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
 }
 
 #[test]
-#[ignore = "requires isolated user systemd and a private PTY fixture"]
+#[ignore = "retired PB05 bearer-only PTY fixture; bound terminal awaits a peer-bound lease protocol"]
 fn a_viewer_token_cannot_authorize_a_raw_input_command() {
     assert_eq!(std::env::var("PODBAY_TEST_SYSTEMD").as_deref(), Ok("1"));
     let mut fixture = Fixture::new();

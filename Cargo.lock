@@ -320,6 +320,8 @@ dependencies = [
  "libc",
  "nix",
  "podbay-core",
+ "podbay-store",
+ "podbay-wire",
  "portable-pty",
  "serde",
  "serde_json",

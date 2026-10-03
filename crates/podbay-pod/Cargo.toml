@@ -11,6 +11,8 @@ serde_json = "1.0"
 sha2 = "0.11.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+podbay-store = { path = "../podbay-store" }
+podbay-wire = { path = "../podbay-wire" }
 libc = "0.2"
 nix = { version = "=0.28.0", features = ["socket"] }
 portable-pty = "0.9.0"

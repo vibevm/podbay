@@ -50,6 +50,13 @@ pub struct LinuxPeerEvidence {
 }
 
 impl LinuxPeerEvidence {
+    /// The launcher observes its own kernel credentials through a socketpair;
+    /// no request body supplies the pinned manager process identity.
+    pub fn for_current_process() -> Result<Self, LinuxPeerError> {
+        let (first, _second) = UnixStream::pair()?;
+        Self::from_accepted(&first)
+    }
+
     /// `socket` must be the accepted connection, not an outgoing client socket.
     /// Failure to read any component refuses before a control effect.
     pub fn from_accepted(socket: &UnixStream) -> Result<Self, LinuxPeerError> {
@@ -199,6 +206,18 @@ fn read_cgroup(pid: i32) -> Result<String, LinuxPeerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socketpair_pins_current_process_birth_and_containment() {
+        let observed = LinuxPeerEvidence::for_current_process().unwrap();
+        assert_eq!(observed.pid(), std::process::id() as i32);
+        assert!(observed.start_ticks() > 0);
+        assert!(observed.cgroup().starts_with('/'));
+        assert_eq!(
+            observed.attested_peer().containment_identity(),
+            format!("linux.cgroup.{}", observed.cgroup())
+        );
+    }
 
     #[test]
     fn stat_parser_uses_field_22_after_parenthesized_process_name() {

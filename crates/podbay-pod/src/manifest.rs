@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(target_os = "linux")]
 use std::fs::{self, File, OpenOptions};
@@ -7,7 +9,14 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use podbay_core::AttestedPeer;
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId};
+#[cfg(target_os = "linux")]
+use podbay_wire::{
+    EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeResourceKind, NativeRole,
+    NativeWorkKind, ResourceDriver, TargetOs,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -107,6 +116,177 @@ pub struct PodManifest {
     pub viewer_token: Option<String>,
     pub socket_path: PathBuf,
     pub unit_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_binding: Option<BoundPeerManifest>,
+}
+
+#[cfg(target_os = "linux")]
+pub const PEER_BINDING_PROTOCOL: &str = "podbay.peer-binding/1";
+#[cfg(target_os = "linux")]
+pub const SYNTHETIC_CAPABILITY: &str = "synthetic_fixture_only";
+
+/// Host-reviewed inputs that cannot be inferred from a PB05 descriptor.
+/// The manager peer itself is observed from the launcher process, never passed
+/// through this structure by a request body.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct PodPeerBootstrap {
+    pub store_path: PathBuf,
+    pub store_lineage: String,
+    pub owner_epoch: u64,
+    pub credential_epoch: u64,
+    pub resource_input_epochs: BTreeMap<String, u64>,
+    pub canonical_executable: PathBuf,
+    pub executable_sha256: String,
+    pub expected_manager_peer: AttestedPeer,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundPeerManifest {
+    pub protocol: String,
+    pub capability: String,
+    pub wire_descriptor: Vec<u8>,
+    pub effective_spec: Vec<u8>,
+    pub descriptor_digest: String,
+    pub effective_digest: String,
+    pub resource_epoch: u64,
+    pub store_path: PathBuf,
+    pub store_lineage: String,
+    pub owner_epoch: u64,
+    pub credential_epoch: u64,
+    pub resource_input_epochs: BTreeMap<String, u64>,
+    pub manager_os_identity: String,
+    pub manager_process_id: String,
+    pub manager_boot_identity: String,
+    pub manager_birth_identity: String,
+    pub manager_containment: String,
+    pub canonical_executable: PathBuf,
+    pub executable_sha256: String,
+    pub binding_digest: String,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundPeerManifest {
+    pub fn manager_peer(&self) -> Result<AttestedPeer, PodError> {
+        AttestedPeer::from_port(
+            &self.manager_os_identity,
+            &self.manager_process_id,
+            &self.manager_boot_identity,
+            &self.manager_birth_identity,
+            &self.manager_containment,
+        )
+        .map_err(|_| PodError::Invalid("manager peer binding is malformed"))
+    }
+
+    pub fn digest(&self) -> Result<String, PodError> {
+        let mut copy = self.clone();
+        copy.binding_digest.clear();
+        let mut hash = Sha256::new();
+        hash.update(b"podbay.peer-binding/1\0");
+        hash.update(serde_json::to_vec(&copy)?);
+        Ok(hex(&hash.finalize()))
+    }
+
+    pub fn validate(&self, legacy: &LaunchDescriptor, directory: &Path) -> Result<(), PodError> {
+        if self.protocol != PEER_BINDING_PROTOCOL
+            || self.capability != SYNTHETIC_CAPABILITY
+            || self.binding_digest != self.digest()?
+            || !self.store_path.is_absolute()
+            || self.owner_epoch == 0
+            || self.credential_epoch == 0
+            || self.resource_input_epochs.len() != 1
+        {
+            return Err(PodError::Invalid(
+                "peer binding version or identity changed",
+            ));
+        }
+        self.manager_peer()?;
+        let wire = ImmutableLaunchDescriptor::decode_json(&self.wire_descriptor)
+            .map_err(|_| PodError::Invalid("committed launch descriptor is malformed"))?;
+        let effective = EffectiveLaunchContract::decode(&self.effective_spec)
+            .map_err(|_| PodError::Invalid("committed effective launch is malformed"))?;
+        effective
+            .compare_with_descriptor(&wire)
+            .map_err(|_| PodError::Invalid("effective launch differs from descriptor"))?;
+        let resource = wire
+            .resource(0)
+            .ok_or(PodError::Unsupported("single Auxiliary resource required"))?;
+        if wire.resources_len() != 1
+            || resource.kind != NativeResourceKind::Auxiliary
+            || !matches!(resource.driver,ResourceDriver::Auxiliary{driver_ref}
+                if driver_ref=="process.exec")
+            || wire.target_os() != TargetOs::Linux
+            || wire.role() != NativeRole::Worker
+            || wire.work_kind() != NativeWorkKind::Task
+            || wire.model_id() != "none"
+            || wire.reasoning_effort() != "none"
+            || wire.profile_ref() != "podbay.fixture.process.exec"
+            || !wire.environment_refs().is_empty()
+            || !wire.credential_refs().is_empty()
+            || !effective.tool_bundle_refs().is_empty()
+            || wire.max_children() != 0
+            || wire.wall_seconds() != 60
+            || wire.arguments() != ["60"]
+            || self
+                .resource_input_epochs
+                .get(resource.resource_id)
+                .copied()
+                != Some(1)
+            || resource.epoch != self.resource_epoch
+            || resource.epoch != 1
+            || self.descriptor_digest != wire.digest()
+            || self.effective_digest != effective.digest()
+            || wire.scope_id() != legacy.scope_id
+            || wire.pod_id() != legacy.pod_id
+            || wire.attempt_id() != legacy.attempt_id
+            || wire.pod_incarnation() != legacy.incarnation
+            || wire.session_id() != legacy.session_id
+            || wire.run_id() != legacy.run_id
+            || wire.resource_id(0) != Some(legacy.resource_id.as_str())
+            || wire.executable() != legacy.executable.to_string_lossy()
+            || wire.cwd() != legacy.cwd.to_string_lossy()
+            || wire.arguments() != legacy.args
+            || legacy.pty.is_some()
+            || legacy.role != PodRole::Worker
+            || legacy.cwd != directory
+            || !directory.is_absolute()
+        {
+            return Err(PodError::Unsupported(
+                "descriptor is outside synthetic process.exec subset",
+            ));
+        }
+        let resolved = fs::canonicalize(&legacy.executable)?;
+        if resolved != legacy.executable
+            || resolved != self.canonical_executable
+            || self.executable_sha256.len() != 64
+            || !self
+                .executable_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || wire.executable_generation() != format!("sha256:{}", self.executable_sha256)
+        {
+            return Err(PodError::Unsupported("sleep executable generation differs"));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&resolved)?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; 8192];
+        loop {
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&bytes[..count]);
+        }
+        if hex(&hash.finalize()) != self.executable_sha256 {
+            return Err(PodError::Unsupported("sleep executable SHA differs"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -128,6 +308,50 @@ pub struct PodStatus {
     pub cgroup_path: String,
     pub child_running: bool,
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<BoundPodStatus>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundPodStatus {
+    pub capability: String,
+    pub descriptor_digest: String,
+    pub effective_digest: String,
+    pub resource_id: String,
+    pub resource_epoch: u64,
+    pub scope_id: String,
+    pub store_lineage: String,
+    pub owner_epoch: u64,
+    pub credential_epoch: u64,
+    pub manager_os_identity: String,
+    pub manager_process_id: String,
+    pub manager_boot_identity: String,
+    pub manager_birth_identity: String,
+    pub manager_containment: String,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundPeerManifest {
+    pub fn status(&self, resource_id: &str, scope_id: &str) -> BoundPodStatus {
+        BoundPodStatus {
+            capability: self.capability.clone(),
+            descriptor_digest: self.descriptor_digest.clone(),
+            effective_digest: self.effective_digest.clone(),
+            resource_id: resource_id.into(),
+            resource_epoch: self.resource_epoch,
+            scope_id: scope_id.into(),
+            store_lineage: self.store_lineage.clone(),
+            owner_epoch: self.owner_epoch,
+            credential_epoch: self.credential_epoch,
+            manager_os_identity: self.manager_os_identity.clone(),
+            manager_process_id: self.manager_process_id.clone(),
+            manager_boot_identity: self.manager_boot_identity.clone(),
+            manager_birth_identity: self.manager_birth_identity.clone(),
+            manager_containment: self.manager_containment.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -240,6 +464,9 @@ pub fn read_manifest(path: &Path) -> Result<PodManifest, PodError> {
         || manifest_path(path.parent().unwrap(), &manifest.descriptor)? != path
     {
         return Err(PodError::Invalid("manifest identity or digest changed"));
+    }
+    if let Some(binding) = &manifest.peer_binding {
+        binding.validate(&manifest.descriptor, path.parent().unwrap())?;
     }
     Ok(manifest)
 }
