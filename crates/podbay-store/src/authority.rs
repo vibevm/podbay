@@ -3,11 +3,48 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::model::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, StoreError,
+    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, ManagerCredentialClaim,
+    StoreError,
 };
 use crate::store::PodBayStore;
 
 impl PodBayStore {
+    /// Reads only a current v10 manager claim. A migrated v9 owner has no row
+    /// until a new owner replay mints one; an actor generation is never used.
+    pub fn current_manager_credential_claim(
+        &mut self,
+        expected_owner_epoch: u64,
+    ) -> Result<ManagerCredentialClaim, StoreError> {
+        let expected = sqlite_integer(expected_owner_epoch)?;
+        let transaction = self.connection.transaction()?;
+        let current: i64 = transaction.query_row(
+            "SELECT value FROM metadata WHERE key='owner_epoch'",
+            [],
+            |row| row.get(0),
+        )?;
+        if current != expected {
+            return Err(StoreError::StaleEpoch);
+        }
+        let claim: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT store_lineage,owner_epoch,credential_epoch
+             FROM manager_credential_claims WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (lineage, owner, credential) = claim.ok_or(StoreError::NotFound)?;
+        if lineage != self.store_lineage || owner != current || credential < owner {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(ManagerCredentialClaim {
+            store_lineage: lineage,
+            owner_epoch: owner as u64,
+            credential_epoch: credential as u64,
+        })
+    }
+
     pub fn authority_snapshot(&mut self) -> Result<AuthoritySnapshot, StoreError> {
         let transaction = self.connection.transaction()?;
         let owner_epoch: i64 = transaction.query_row(
@@ -156,6 +193,67 @@ impl PodBayStore {
         )?;
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
+        }
+        let prior: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT store_lineage,owner_epoch,credential_epoch
+             FROM manager_credential_claims WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if prior.as_ref().is_some_and(|(lineage, owner, credential)| {
+            lineage != &self.store_lineage || *owner != expected || *credential < *owner
+        }) {
+            return Err(StoreError::StaleEpoch);
+        }
+        // V9 rebind epochs are pod-local evidence, not a manager credential.
+        // Their maximum is only a conservative numeric allocation floor.
+        let legacy_highwater: Option<i64> = transaction.query_row(
+            "SELECT MAX(next_credential_epoch) FROM manager_rebinds",
+            [],
+            |row| row.get(0),
+        )?;
+        let legacy_floor = legacy_highwater
+            .map(|value| {
+                value.checked_add(1).ok_or(StoreError::InvalidInput(
+                    "manager credential epoch exhausted",
+                ))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        let next_credential = prior
+            .as_ref()
+            .map(|(_, _, credential)| {
+                credential.checked_add(1).ok_or(StoreError::InvalidInput(
+                    "manager credential epoch exhausted",
+                ))
+            })
+            .transpose()?
+            .unwrap_or(next)
+            .max(next)
+            .max(legacy_floor);
+        if let Some((_, _, credential)) = prior {
+            let changed = transaction.execute(
+                "UPDATE manager_credential_claims SET owner_epoch=?1,credential_epoch=?2
+                 WHERE singleton=1 AND store_lineage=?3 AND owner_epoch=?4 AND credential_epoch=?5",
+                params![
+                    next,
+                    next_credential,
+                    self.store_lineage,
+                    expected,
+                    credential
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::StaleEpoch);
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO manager_credential_claims(singleton,store_lineage,owner_epoch,credential_epoch)
+                 VALUES(1,?1,?2,?3)",
+                params![self.store_lineage, next, next_credential],
+            )?;
         }
         let exhausted: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM authority_resources WHERE input_epoch>=?1",

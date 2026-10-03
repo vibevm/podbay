@@ -427,6 +427,28 @@ pub struct AuthoritySnapshot {
     pub grants: Vec<AuthorityGrantRecord>,
 }
 
+/// Version-ten manager claim minted by the one-writer owner transition.
+/// This epoch belongs to the manager generation, never to a launch actor or
+/// an older per-pod rebind. OS peer identity needs separate host attestation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ManagerCredentialClaim {
+    pub(crate) store_lineage: String,
+    pub(crate) owner_epoch: u64,
+    pub(crate) credential_epoch: u64,
+}
+
+impl ManagerCredentialClaim {
+    pub fn store_lineage(&self) -> &str {
+        &self.store_lineage
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityMutation {
     PutPod(AuthorityPodRecord),

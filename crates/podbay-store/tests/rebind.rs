@@ -348,7 +348,8 @@ fn v8_to_v9_migration_preserves_existing_launch_without_inventing_rebind() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE manager_rebind_resources;
+            "DROP TABLE manager_credential_claims;
+      DROP TABLE manager_rebind_resources;
       DROP TABLE manager_rebinds; PRAGMA user_version=8;",
         )
         .unwrap();
@@ -368,13 +369,42 @@ fn v8_to_v9_migration_preserves_existing_launch_without_inventing_rebind() {
 }
 
 #[test]
+fn first_v10_manager_claim_stays_above_v9_pod_rebind_credential_highwater() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mut proposal = seed_existing_bound_pod(&mut store, &fixture);
+    proposal.expected_credential_epoch = credential(20);
+    proposal.next_credential_epoch = credential(21);
+    store.prepare_manager_rebind(&proposal).unwrap();
+    drop(store);
+
+    // Reconstruct a v9 database with a durable pod-local rebind but no v10
+    // manager claim. The old rebind remains evidence, not a manager identity.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
+        .unwrap();
+    drop(connection);
+    let mut migrated = fixture.open();
+    assert!(matches!(
+        migrated.current_manager_credential_claim(2),
+        Err(StoreError::NotFound)
+    ));
+    migrated.begin_authority_replay(2, 3).unwrap();
+    let claim = migrated.current_manager_credential_claim(3).unwrap();
+    assert_eq!(claim.credential_epoch(), 22);
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+}
+
+#[test]
 fn malformed_preexisting_v9_schema_refuses_migration_atomically() {
     let fixture = Fixture::new();
     drop(fixture.open());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE manager_rebind_resources;
+            "DROP TABLE manager_credential_claims;
+      DROP TABLE manager_rebind_resources;
       DROP TABLE manager_rebinds;
       CREATE TABLE manager_rebinds(rebind_rowid INTEGER PRIMARY KEY) STRICT;
       PRAGMA user_version=8;",

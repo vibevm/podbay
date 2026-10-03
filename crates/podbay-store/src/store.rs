@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -117,6 +117,15 @@ const MANAGER_REBIND_RESOURCES_V9: &str = "CREATE TABLE manager_rebind_resources
   expected_input_epoch INTEGER NOT NULL CHECK(expected_input_epoch>=1),
   next_input_epoch INTEGER NOT NULL CHECK(next_input_epoch=expected_input_epoch+1),
   PRIMARY KEY(rebind_rowid,resource_id)
+) STRICT";
+
+// An empty v10 table makes no claim about an old v9 manager or its pod peer.
+// Only a successful owner replay mints the current manager credential epoch.
+const MANAGER_CREDENTIAL_CLAIMS_V10: &str = "CREATE TABLE manager_credential_claims (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  credential_epoch INTEGER NOT NULL CHECK(credential_epoch>=1)
 ) STRICT";
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -437,9 +446,23 @@ impl PodBayStore {
                 transaction.execute_batch(&format!("{sql};"))?;
             }
         }
+        if version < 10 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_credential_claims'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v10 manager credential schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{MANAGER_CREDENTIAL_CLAIMS_V10};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
+        verify_manager_credential_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -1883,6 +1906,24 @@ fn verify_rebind_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), S
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v9 rebind schema differs"));
         }
+    }
+    Ok(())
+}
+
+fn verify_manager_credential_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='manager_credential_claims'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(MANAGER_CREDENTIAL_CLAIMS_V10) {
+        return Err(StoreError::Conflict(
+            "v10 manager credential schema differs",
+        ));
     }
     Ok(())
 }
