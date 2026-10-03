@@ -108,6 +108,9 @@ opaque_id!(
     ScopeId,
     ReportId,
     WorkIntervalId,
+    StoreLineageId,
+    PeerGrantId,
+    CommandKey,
 );
 
 macro_rules! positive_counter {
@@ -146,6 +149,9 @@ macro_rules! positive_counter {
 
 positive_counter!(Revision);
 positive_counter!(Epoch);
+positive_counter!(OwnerEpoch);
+positive_counter!(CredentialEpoch);
+positive_counter!(InputEpoch);
 
 impl Revision {
     pub const INITIAL: Self = Self(1);

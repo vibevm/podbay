@@ -3,16 +3,23 @@
 
 mod ids;
 mod model;
+mod peer_fence;
 mod state;
 
 pub use ids::{
-    ActorId, AttemptId, CommandId, DeliveryId, Epoch, EventId, IdError, PodId, ReportId,
-    ResourceId, Revision, RunId, ScopeId, SessionId, SourceId, WorkIntervalId,
+    ActorId, AttemptId, CommandId, CommandKey, CredentialEpoch, DeliveryId, Epoch, EventId,
+    IdError, InputEpoch, OwnerEpoch, PeerGrantId, PodId, ReportId, ResourceId, Revision, RunId,
+    ScopeId, SessionId, SourceId, StoreLineageId, WorkIntervalId,
 };
 pub use model::{
     Attempt, CommandAdmission, Delivery, DeliveryEvidenceLookup, ForegroundEvidence,
     ObservationEvidence, Pod, PodObservationEvidence, ProcessEvidence, Resource,
     ResourceObservationEvidence, Run, RunCommandKind, Session, TransitionError,
+};
+pub use peer_fence::{
+    AttestedPeer, FenceError, FenceOperation, FenceTarget, GrantKind, ManagerLiveness,
+    OwnerEpochWitness, PeerGrant, PeerRequest, PodFenceIdentity, PodPeerFence, RebindLedger,
+    RebindPhase, RebindProposal, RequestDigest,
 };
 pub use state::{
     AdmissionState, DeliveryStage, DesiredMode, ExecutionState, ForegroundState, Observation,
