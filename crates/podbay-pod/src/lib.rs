@@ -3,6 +3,13 @@
 
 mod manifest;
 mod runtime;
+mod terminal;
 
-pub use manifest::{LaunchDescriptor, PodError, PodManifest, PodRole, PodStatus, manifest_path};
-pub use runtime::{PodClient, launch, serve};
+pub use manifest::{
+    LaunchDescriptor, PodError, PodManifest, PodRole, PodStatus, PtySpec, manifest_path,
+};
+pub use runtime::{PodClient, TerminalViewer, launch, serve};
+pub use terminal::{
+    InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
+    TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,
+};

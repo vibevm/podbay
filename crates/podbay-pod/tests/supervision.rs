@@ -52,6 +52,7 @@ impl Fixture {
             executable: "/bin/sh".into(),
             args: vec!["-c".into(), "exec /bin/sleep 60".into()],
             cwd: self.directory.clone(),
+            pty: None,
         }
     }
 }
@@ -88,6 +89,18 @@ fn versioned_manifest_digest_and_private_paths_reject_drift() {
         manifest_path(&fixture.directory, &descriptor).unwrap(),
         manifest_path(&fixture.directory, &changed).unwrap(),
         "same pod/attempt slot must detect changed content rather than mint a replacement"
+    );
+}
+
+#[test]
+fn pb05_manifest_without_pty_keeps_its_canonical_digest() {
+    const OLD: &str = "{\"protocol\":\"podbay-pod/1\",\"pod_id\":\"pod.old.fixture\",\"attempt_id\":\"attempt.old.fixture\",\"session_id\":\"session.old.fixture\",\"run_id\":\"run.old.fixture\",\"scope_id\":\"scope.old.fixture\",\"role\":\"worker\",\"incarnation\":1,\"resource_id\":\"resource.old.fixture\",\"executable\":\"/bin/sh\",\"args\":[],\"cwd\":\"/tmp\"}";
+    let descriptor: LaunchDescriptor = serde_json::from_str(OLD).unwrap();
+    assert!(descriptor.pty.is_none());
+    assert_eq!(serde_json::to_string(&descriptor).unwrap(), OLD);
+    assert_eq!(
+        descriptor.digest().unwrap(),
+        "38173a488ee108bb5336535a11f90271004babd72e3da7bdf3e397dff5cd4160"
     );
 }
 

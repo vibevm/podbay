@@ -33,6 +33,16 @@ pub struct LaunchDescriptor {
     pub executable: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty: Option<PtySpec>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PtySpec {
+    pub rows: u16,
+    pub cols: u16,
+    pub retention_events: usize,
 }
 
 impl LaunchDescriptor {
@@ -62,6 +72,15 @@ impl LaunchDescriptor {
         {
             return Err(PodError::Invalid("resource launch bounds"));
         }
+        if let Some(pty) = self.pty
+            && (pty.rows == 0
+                || pty.rows > 200
+                || pty.cols == 0
+                || pty.cols > 400
+                || !(1..=4096).contains(&pty.retention_events))
+        {
+            return Err(PodError::Invalid("PTY geometry or retention bounds"));
+        }
         Ok(())
     }
 
@@ -80,6 +99,8 @@ pub struct PodManifest {
     pub descriptor: LaunchDescriptor,
     pub digest: String,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_token: Option<String>,
     pub socket_path: PathBuf,
     pub unit_name: String,
 }
@@ -198,6 +219,10 @@ pub fn read_manifest(path: &Path) -> Result<PodManifest, PodError> {
     if manifest.digest != manifest.descriptor.digest()?
         || manifest.token.len() != 64
         || !manifest.token.bytes().all(|c| c.is_ascii_hexdigit())
+        || (manifest.descriptor.pty.is_some()
+            && !manifest.viewer_token.as_ref().is_some_and(|token| {
+                token.len() == 64 && token.bytes().all(|c| c.is_ascii_hexdigit())
+            }))
         || manifest.socket_path != path.with_extension("sock")
         || manifest.unit_name != unit_name(path)?
         || manifest_path(path.parent().unwrap(), &manifest.descriptor)? != path
