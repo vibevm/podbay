@@ -6,6 +6,7 @@ mod cursor;
 mod decimal;
 mod error;
 mod frame;
+mod launch_descriptor;
 mod observation;
 mod read;
 mod schema;
@@ -28,6 +29,11 @@ pub use cursor::EventCursor;
 pub use decimal::DecimalString;
 pub use error::WireError;
 pub use frame::{MAX_FRAME_BYTES, decode_frame_bytes, encode_frame};
+pub use launch_descriptor::{
+    ImmutableLaunchDescriptor, LAUNCH_DESCRIPTOR_SCHEMA, LaunchDescriptorError, NativeResourceKind,
+    NativeResourceView, NativeRole, NativeWorkKind, ResourceDriver, ReviewedNativePolicy,
+    ReviewedResource, TargetOs,
+};
 pub use observation::{
     Capability, CapabilityEnvelope, CapabilitySupport, CommandStage, ErrorEnvelope, EventEnvelope,
     ObservationKind, ProtocolVersion, Receipt, RuntimeError, RuntimeErrorCode, SnapshotEnvelope,
