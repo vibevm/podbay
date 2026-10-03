@@ -71,11 +71,17 @@ mod conpty;
 #[cfg(any(windows, test))]
 mod conpty_model;
 #[cfg(windows)]
+mod pipe;
+mod pipe_model;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use conpty::ConPtyProcess;
 #[cfg(windows)]
 pub use conpty_model::{OutputChunk, OutputPage};
+#[cfg(windows)]
+pub use pipe::{AcceptedPipe, PipeClient, PipeServer};
+pub use pipe_model::{MAX_FRAME as MAX_PIPE_FRAME, PeerGrant, PipeAction, PipeRequest, PipeRole};
 #[cfg(windows)]
 pub use windows::{
     PodJob, RunningProcess, SuspendedProcess, launch_independent_suspended, open_exact_process,

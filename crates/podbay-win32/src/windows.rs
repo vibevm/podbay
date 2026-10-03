@@ -6,7 +6,8 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -29,7 +30,7 @@ pub(super) struct OwnedHandle(HANDLE);
 unsafe impl Send for OwnedHandle {}
 impl OwnedHandle {
     pub(super) fn new(raw: HANDLE) -> Result<Self, Win32Error> {
-        if raw.is_null() {
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
             Err(Win32Error::Os(io::Error::last_os_error()))
         } else {
             Ok(Self(raw))
