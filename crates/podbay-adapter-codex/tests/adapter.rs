@@ -3,9 +3,10 @@ use std::io;
 use std::path::PathBuf;
 
 use podbay_adapter_codex::{
-    ApprovalPolicy, BootstrapState, CodecError, CodexError, CodexResource, JsonlTransport,
-    MAX_FRAME_BYTES, PinnedCodexConfig, ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION,
-    TESTED_V2_SCHEMA_SHA256, decode, encode,
+    ApprovalPolicy, BlockReason, BootstrapState, CodecError, CodexError, CodexResource,
+    InterruptState, JsonlTransport, MAX_FRAME_BYTES, PinnedCodexConfig, ResourceIdentity, Sandbox,
+    TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit,
+    decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -129,12 +130,51 @@ fn status(kind: &str, active_flags: &[&str]) -> Value {
     }})
 }
 
+fn read_response(id: u64, kind: &str, active_turn_id: Option<&str>) -> Value {
+    let mut thread = native_thread("thread.one", kind);
+    if let Some(turn_id) = active_turn_id {
+        thread["turns"] = json!([{"id":turn_id,"status":"inProgress","items":[]}]);
+    }
+    json!({"id":id,"result":{"thread":thread}})
+}
+
+fn work_turn_response(id: u64, turn_id: &str) -> Value {
+    json!({"id":id,"result":{"turn":{"id":turn_id,"status":"inProgress","items":[]}}})
+}
+
+fn writer_permit(epoch: u64) -> WriterPermit {
+    WriterPermit::from_trusted_boundary(identity("resource.structured"), Epoch::new(epoch).unwrap())
+}
+
 fn resource(reads: impl IntoIterator<Item = Value>) -> CodexResource<FakeTransport> {
     CodexResource::new(
         FakeTransport::with_reads(reads),
         identity("resource.structured"),
         config(),
     )
+}
+
+fn bootstrapped(extra: impl IntoIterator<Item = Value>) -> CodexResource<FakeTransport> {
+    let mut reads = vec![
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        completed("turn.bootstrap", "completed"),
+        status("idle", &[]),
+    ];
+    reads.extend(extra);
+    let mut adapter = resource(reads);
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert!(adapter.bootstrap_ready());
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    adapter
 }
 
 #[test]
@@ -473,4 +513,308 @@ fn lost_bootstrap_reply_is_uncertain_and_cannot_submit_a_second_turn() {
         adapter.transport().methods(),
         ["initialize", "initialized", "thread/start", "turn/start"]
     );
+}
+
+#[test]
+fn idle_native_thread_starts_one_pinned_turn_after_reconciliation() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "idle", None),
+    ]);
+    let sent = adapter
+        .send_turn(&writer_permit(1), "Do the task", "message.one", None)
+        .unwrap();
+    assert_eq!(sent.client_message_id, "message.one");
+    assert_eq!(sent.mode, TurnMode::Start);
+    assert_eq!(
+        sent.stage,
+        TurnSubmissionStage::Accepted {
+            turn_id: "turn.work".into()
+        }
+    );
+    assert_eq!(
+        adapter.transport().methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "turn/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
+    let params = &adapter.transport().writes[5]["params"];
+    assert_eq!(params["threadId"], "thread.one");
+    assert_eq!(params["clientUserMessageId"], "message.one");
+    assert_eq!(params["model"], "gpt-6-sol");
+    assert_eq!(params["effort"], "medium");
+    assert_eq!(
+        adapter.turn_control_state().owned_active_turn_id.as_deref(),
+        Some("turn.work")
+    );
+    adapter.read_thread().unwrap();
+    assert!(!adapter.bootstrap_ready());
+}
+
+#[test]
+fn exact_owned_active_turn_steers_with_expected_turn_id() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "active", Some("turn.work")),
+        json!({"id":7,"result":{"turnId":"turn.work"}}),
+    ]);
+    adapter
+        .send_turn(&writer_permit(1), "First", "message.one", None)
+        .unwrap();
+    let steered = adapter
+        .send_turn(
+            &writer_permit(1),
+            "Change direction",
+            "message.two",
+            Some("turn.work"),
+        )
+        .unwrap();
+    assert_eq!(steered.mode, TurnMode::Steer);
+    assert_eq!(steered.client_message_id, "message.two");
+    assert_eq!(
+        steered.stage,
+        TurnSubmissionStage::Accepted {
+            turn_id: "turn.work".into()
+        }
+    );
+    assert_eq!(adapter.transport().methods().last(), Some(&"turn/steer"));
+    let params = &adapter.transport().writes[7]["params"];
+    assert_eq!(params["expectedTurnId"], "turn.work");
+    assert_eq!(params["clientUserMessageId"], "message.two");
+}
+
+#[test]
+fn stale_caller_turn_id_refuses_without_poisoning_the_owned_turn() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "active", Some("turn.work")),
+        read_response(7, "active", Some("turn.work")),
+        json!({"id":8,"result":{"turnId":"turn.work"}}),
+    ]);
+    adapter
+        .send_turn(&writer_permit(1), "First", "message.one", None)
+        .unwrap();
+    assert_eq!(
+        adapter.send_turn(
+            &writer_permit(1),
+            "Wrong target",
+            "message.two",
+            Some("turn.other"),
+        ),
+        Err(CodexError::Blocked(BlockReason::StaleExpectedTurn))
+    );
+    assert_eq!(adapter.transport().methods().last(), Some(&"thread/read"));
+    assert!(!adapter.turn_control_state().external_conflict);
+    let accepted = adapter
+        .send_turn(
+            &writer_permit(1),
+            "Correct target",
+            "message.two",
+            Some("turn.work"),
+        )
+        .unwrap();
+    assert_eq!(accepted.mode, TurnMode::Steer);
+    assert_eq!(adapter.transport().methods().last(), Some(&"turn/steer"));
+}
+
+#[test]
+fn competing_native_turn_refuses_without_start_or_steer() {
+    let mut adapter = bootstrapped([read_response(4, "active", Some("turn.external"))]);
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Do the task", "message.one", None),
+        Err(CodexError::Blocked(BlockReason::ExternalWriter))
+    );
+    assert!(adapter.turn_control_state().external_conflict);
+    assert_eq!(adapter.transport().methods().last(), Some(&"thread/read"));
+}
+
+#[test]
+fn pending_native_approval_blocks_send_and_exposes_exact_request_id() {
+    let approval = json!({"id":44,"method":"item/commandExecution/requestApproval","params":{
+        "threadId":"thread.one","turnId":"turn.work","itemId":"item.one"
+    }});
+    let mut adapter = bootstrapped([approval]);
+    adapter.poll_once().unwrap();
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Do the task", "message.one", None),
+        Err(CodexError::Blocked(BlockReason::PendingHostRequest))
+    );
+    assert_eq!(adapter.turn_control_state().pending_request_ids, ["n:44"]);
+    assert_eq!(adapter.transport().methods().last(), Some(&"turn/start"));
+}
+
+#[test]
+fn interrupt_rpc_receipt_waits_for_matching_interrupted_completion() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "active", Some("turn.work")),
+        json!({"id":7,"result":{}}),
+        completed("turn.other", "interrupted"),
+        completed("turn.work", "interrupted"),
+    ]);
+    adapter
+        .send_turn(&writer_permit(1), "First", "message.one", None)
+        .unwrap();
+    let before = adapter.transport().writes.len();
+    assert_eq!(
+        adapter.interrupt_turn(&writer_permit(1), "turn.other"),
+        Err(CodexError::Blocked(BlockReason::StaleExpectedTurn))
+    );
+    assert_eq!(adapter.transport().writes.len(), before);
+    assert_eq!(
+        adapter
+            .interrupt_turn(&writer_permit(1), "turn.work")
+            .unwrap(),
+        InterruptState::Requested {
+            turn_id: "turn.work".into()
+        }
+    );
+    assert_eq!(
+        adapter.transport().methods().last(),
+        Some(&"turn/interrupt")
+    );
+    let before = adapter.transport().writes.len();
+    assert_eq!(
+        adapter.send_turn(
+            &writer_permit(1),
+            "Steer after cancel",
+            "message.two",
+            Some("turn.work"),
+        ),
+        Err(CodexError::Blocked(BlockReason::InterruptAlreadyRequested))
+    );
+    assert_eq!(adapter.transport().writes.len(), before);
+    adapter.poll_once().unwrap();
+    assert_eq!(
+        adapter.turn_control_state().interrupt,
+        InterruptState::Requested {
+            turn_id: "turn.work".into()
+        }
+    );
+    adapter.poll_once().unwrap();
+    assert_eq!(
+        adapter.turn_control_state().interrupt,
+        InterruptState::Settled {
+            turn_id: "turn.work".into()
+        }
+    );
+}
+
+#[test]
+fn lost_turn_reply_retains_message_key_and_never_resends() {
+    let mut adapter = bootstrapped([read_response(4, "idle", None)]);
+    let uncertain = adapter
+        .send_turn(&writer_permit(1), "First", "message.exact", None)
+        .unwrap();
+    assert_eq!(uncertain.client_message_id, "message.exact");
+    assert_eq!(uncertain.stage, TurnSubmissionStage::Uncertain);
+    assert_eq!(
+        adapter.turn_control_state().last_submission,
+        Some(uncertain)
+    );
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "First", "message.exact", None),
+        Err(CodexError::Blocked(BlockReason::DuplicateMessageKey))
+    );
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Different", "message.other", None),
+        Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .into_iter()
+            .filter(|method| *method == "turn/start")
+            .count(),
+        2 // bootstrap plus one uncertain submission
+    );
+}
+
+#[test]
+fn native_rpc_conflict_retains_uncertain_key_and_never_resends() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        json!({"id":5,"error":{"code":-32000,"message":"active turn changed"}}),
+    ]);
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "First", "message.exact", None),
+        Err(CodexError::RemoteError(-32000))
+    );
+    assert_eq!(
+        adapter
+            .turn_control_state()
+            .last_submission
+            .unwrap()
+            .client_message_id,
+        "message.exact"
+    );
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Second", "message.other", None),
+        Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+    );
+    assert_eq!(adapter.transport().methods().last(), Some(&"turn/start"));
+}
+
+#[test]
+fn stale_resource_or_writer_permit_refuses_before_any_native_rpc() {
+    let mut adapter = bootstrapped([]);
+    let before = adapter.transport().writes.len();
+    let mut wrong = identity("resource.structured");
+    let distinct = [
+        {
+            let mut value = wrong.clone();
+            value.session_id = SessionId::try_from("session.other").unwrap();
+            value
+        },
+        {
+            let mut value = wrong.clone();
+            value.run_id = RunId::try_from("run.other").unwrap();
+            value
+        },
+        {
+            let mut value = wrong.clone();
+            value.attempt_id = AttemptId::try_from("attempt.other").unwrap();
+            value
+        },
+        {
+            let mut value = wrong.clone();
+            value.pod_id = PodId::try_from("pod.other").unwrap();
+            value
+        },
+        {
+            let mut value = wrong.clone();
+            value.resource_id = ResourceId::try_from("resource.other").unwrap();
+            value
+        },
+        {
+            wrong.resource_epoch = Epoch::new(2).unwrap();
+            wrong
+        },
+    ];
+    for identity in distinct {
+        let stale = WriterPermit::from_trusted_boundary(identity, Epoch::new(1).unwrap());
+        assert_eq!(
+            adapter.send_turn(&stale, "First", "message.one", None),
+            Err(CodexError::Blocked(BlockReason::StaleResourcePermit))
+        );
+        assert_eq!(adapter.transport().writes.len(), before);
+    }
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "First", "message.one", None),
+        Err(CodexError::Blocked(BlockReason::StaleWriterPermit))
+    );
+    assert_eq!(adapter.transport().writes.len(), before);
 }

@@ -8,8 +8,9 @@ mod adapter;
 mod codec;
 
 pub use adapter::{
-    ApprovalPolicy, BootstrapState, CodexError, CodexResource, JsonlTransport, NativeThread,
-    PinnedCodexConfig, ResourceIdentity, Sandbox, StartReceipt, ThreadStatus,
+    ApprovalPolicy, BlockReason, BootstrapState, CodexError, CodexResource, InterruptState,
+    JsonlTransport, NativeThread, PinnedCodexConfig, ResourceIdentity, Sandbox, StartReceipt,
+    ThreadStatus, TurnControlState, TurnMode, TurnSubmission, TurnSubmissionStage, WriterPermit,
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, decode, encode};
 

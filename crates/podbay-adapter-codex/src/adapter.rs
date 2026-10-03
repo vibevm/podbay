@@ -28,6 +28,24 @@ pub struct ResourceIdentity {
     pub resource_epoch: Epoch,
 }
 
+/// An input from the trusted PodBay control boundary, not an authority token.
+/// The higher layer must prove that this writer epoch is currently durable and
+/// that the native process still belongs to the named pod resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriterPermit {
+    identity: ResourceIdentity,
+    writer_epoch: Epoch,
+}
+
+impl WriterPermit {
+    pub fn from_trusted_boundary(identity: ResourceIdentity, writer_epoch: Epoch) -> Self {
+        Self {
+            identity,
+            writer_epoch,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalPolicy {
     Untrusted,
@@ -152,6 +170,63 @@ pub struct StartReceipt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnMode {
+    Start,
+    Steer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnSubmissionStage {
+    Accepted { turn_id: String },
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnSubmission {
+    pub client_message_id: String,
+    pub mode: TurnMode,
+    pub stage: TurnSubmissionStage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InterruptState {
+    None,
+    Requested { turn_id: String },
+    Settled { turn_id: String },
+    EndedWithoutInterrupt { turn_id: String },
+    Uncertain { turn_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockReason {
+    MissingWriterPermit,
+    StaleResourcePermit,
+    StaleWriterPermit,
+    BootstrapUnsettled,
+    PendingHostRequest,
+    NativeWaiting,
+    NativeBusy,
+    StaleExpectedTurn,
+    ExternalWriter,
+    ObservationUnknown,
+    DuplicateMessageKey,
+    InterruptAlreadyRequested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnControlState {
+    pub native_status: ThreadStatus,
+    pub observed_active_turn_id: Option<String>,
+    pub owned_active_turn_id: Option<String>,
+    pub pending_request_ids: Vec<String>,
+    pub status_waiting: bool,
+    pub external_conflict: bool,
+    pub writer_epoch: Option<Epoch>,
+    pub last_submission: Option<TurnSubmission>,
+    pub interrupt: InterruptState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexError {
     InvalidInput(&'static str),
     InvalidState(&'static str),
@@ -160,6 +235,7 @@ pub enum CodexError {
     TransportUncertain,
     RemoteError(i64),
     Mismatch(&'static str),
+    Blocked(BlockReason),
 }
 
 /// Only one RPC is outstanding at a time. Notifications arriving before its
@@ -175,6 +251,11 @@ pub struct CodexResource<T: JsonlTransport> {
     bootstrap: BootstrapState,
     pending_requests: HashSet<String>,
     native_status: ThreadStatus,
+    observed_active_turn_id: Option<String>,
+    owned_active_turn_id: Option<String>,
+    current_writer_epoch: Option<Epoch>,
+    last_submission: Option<TurnSubmission>,
+    interrupt: InterruptState,
     status_waiting: bool,
     idle_after_completion: bool,
     external_conflict: bool,
@@ -194,6 +275,11 @@ impl<T: JsonlTransport> CodexResource<T> {
             bootstrap: BootstrapState::NotStarted,
             pending_requests: HashSet::new(),
             native_status: ThreadStatus::NotLoaded,
+            observed_active_turn_id: None,
+            owned_active_turn_id: None,
+            current_writer_epoch: None,
+            last_submission: None,
+            interrupt: InterruptState::None,
             status_waiting: false,
             idle_after_completion: false,
             external_conflict: false,
@@ -223,6 +309,8 @@ impl<T: JsonlTransport> CodexResource<T> {
         matches!(self.bootstrap, BootstrapState::Completed { .. })
             && self.pending_requests.is_empty()
             && self.native_status == ThreadStatus::Idle
+            && self.owned_active_turn_id.is_none()
+            && self.observed_active_turn_id.is_none()
             && self.idle_after_completion
             && !self.status_waiting
             && !self.external_conflict
@@ -231,6 +319,39 @@ impl<T: JsonlTransport> CodexResource<T> {
 
     pub fn pending_request_count(&self) -> usize {
         self.pending_requests.len()
+    }
+
+    pub fn turn_control_state(&self) -> TurnControlState {
+        let mut pending_request_ids: Vec<_> = self.pending_requests.iter().cloned().collect();
+        pending_request_ids.sort();
+        TurnControlState {
+            native_status: self.native_status,
+            observed_active_turn_id: self.observed_active_turn_id.clone(),
+            owned_active_turn_id: self.owned_active_turn_id.clone(),
+            pending_request_ids,
+            status_waiting: self.status_waiting,
+            external_conflict: self.external_conflict,
+            writer_epoch: self.current_writer_epoch,
+            last_submission: self.last_submission.clone(),
+            interrupt: self.interrupt.clone(),
+        }
+    }
+
+    /// Records a monotonically advancing fence asserted by the authenticated
+    /// pod control boundary. This local snapshot does not replace the durable
+    /// writer grant or its fresh validation before the native side effect.
+    pub fn install_writer_epoch_from_trusted_boundary(
+        &mut self,
+        writer_epoch: Epoch,
+    ) -> Result<(), CodexError> {
+        if self
+            .current_writer_epoch
+            .is_some_and(|current| writer_epoch < current)
+        {
+            return Err(CodexError::Blocked(BlockReason::StaleWriterPermit));
+        }
+        self.current_writer_epoch = Some(writer_epoch);
+        Ok(())
     }
 
     pub fn initialize(&mut self) -> Result<(), CodexError> {
@@ -392,8 +513,12 @@ impl<T: JsonlTransport> CodexResource<T> {
             .inspect_err(|_| {
                 self.poisoned = true;
             })?;
+        let observed_active_turn_id = active_turn_from_thread(&result).inspect_err(|_| {
+            self.poisoned = true;
+        })?;
         self.thread = Some(thread.clone());
         self.native_status = thread.status;
+        self.observed_active_turn_id = observed_active_turn_id;
         self.status_waiting = waiting_flag(result.pointer("/thread/status"));
         if thread.status == ThreadStatus::Idle
             && matches!(self.bootstrap, BootstrapState::Completed { .. })
@@ -402,6 +527,241 @@ impl<T: JsonlTransport> CodexResource<T> {
         }
         self.apply_queued()?;
         Ok(thread)
+    }
+
+    /// Reconciles the native thread immediately before a submitted turn. The
+    /// permit must come from a fresh higher-layer writer check; this local
+    /// comparison cannot close a race with an uncontrolled external writer.
+    pub fn send_turn(
+        &mut self,
+        permit: &WriterPermit,
+        text: &str,
+        client_message_id: &str,
+        expected_active_turn_id: Option<&str>,
+    ) -> Result<TurnSubmission, CodexError> {
+        self.check_permit(permit)?;
+        if text.is_empty() || text.len() > 1_000_000 || !valid_token(client_message_id) {
+            return Err(CodexError::InvalidInput(
+                "turn text or client message key is invalid",
+            ));
+        }
+        if !matches!(self.bootstrap, BootstrapState::Completed { .. }) {
+            return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
+        }
+        if self
+            .last_submission
+            .as_ref()
+            .is_some_and(|submission| submission.client_message_id == client_message_id)
+        {
+            return Err(CodexError::Blocked(BlockReason::DuplicateMessageKey));
+        }
+        self.check_native_blockers()?;
+        self.read_thread()?;
+        self.check_native_blockers()?;
+
+        let (mode, active_turn_id) = match (
+            self.native_status,
+            self.observed_active_turn_id.as_deref(),
+            self.owned_active_turn_id.as_deref(),
+            expected_active_turn_id,
+        ) {
+            (ThreadStatus::Idle, None, None, None) if self.bootstrap_ready() => {
+                (TurnMode::Start, None)
+            }
+            (ThreadStatus::Active, Some(native), Some(owned), Some(expected))
+                if native == owned && owned == expected =>
+            {
+                (TurnMode::Steer, Some(expected.to_owned()))
+            }
+            (ThreadStatus::Active, Some(_), None, _) => {
+                self.external_conflict = true;
+                return Err(CodexError::Blocked(BlockReason::ExternalWriter));
+            }
+            (ThreadStatus::Active, Some(native), Some(owned), Some(_)) => {
+                if native != owned {
+                    self.external_conflict = true;
+                    return Err(CodexError::Blocked(BlockReason::ExternalWriter));
+                }
+                return Err(CodexError::Blocked(BlockReason::StaleExpectedTurn));
+            }
+            (ThreadStatus::Active, Some(_), Some(_), None) => {
+                return Err(CodexError::Blocked(BlockReason::NativeBusy));
+            }
+            (ThreadStatus::Idle, None, None, Some(_)) => {
+                return Err(CodexError::Blocked(BlockReason::NativeBusy));
+            }
+            _ => return Err(CodexError::Blocked(BlockReason::ObservationUnknown)),
+        };
+        let thread_id = self
+            .thread
+            .as_ref()
+            .ok_or(CodexError::Blocked(BlockReason::ObservationUnknown))?
+            .thread_id
+            .clone();
+        let (method, params) = match mode {
+            TurnMode::Start => (
+                "turn/start",
+                json!({
+                    "threadId":thread_id,
+                    "input":[{"type":"text","text":text}],
+                    "clientUserMessageId":client_message_id,
+                    "model":self.config.model,
+                    "effort":self.config.effort,
+                }),
+            ),
+            TurnMode::Steer => (
+                "turn/steer",
+                json!({
+                    "threadId":thread_id,
+                    "expectedTurnId":active_turn_id,
+                    "input":[{"type":"text","text":text}],
+                    "clientUserMessageId":client_message_id,
+                }),
+            ),
+        };
+        let uncertain = TurnSubmission {
+            client_message_id: client_message_id.to_owned(),
+            mode,
+            stage: TurnSubmissionStage::Uncertain,
+        };
+        self.last_submission = Some(uncertain.clone());
+        let response = match self.request(method, params) {
+            Ok(value) => value,
+            Err(CodexError::TransportUncertain) => return Ok(uncertain),
+            Err(error) => return Err(error),
+        };
+        let turn_id = match mode {
+            TurnMode::Start => {
+                let id = nonempty_string(response.pointer("/turn/id"));
+                let status = response.pointer("/turn/status").and_then(Value::as_str);
+                match (id, status) {
+                    (Some(id), Some("inProgress")) => id.to_owned(),
+                    _ => {
+                        self.poisoned = true;
+                        return Ok(uncertain);
+                    }
+                }
+            }
+            TurnMode::Steer => {
+                let observed = nonempty_string(response.get("turnId"));
+                match (observed, active_turn_id.as_deref()) {
+                    (Some(observed), Some(expected)) if observed == expected => observed.to_owned(),
+                    _ => {
+                        self.external_conflict = true;
+                        self.poisoned = true;
+                        return Ok(uncertain);
+                    }
+                }
+            }
+        };
+        if mode == TurnMode::Start {
+            self.owned_active_turn_id = Some(turn_id.clone());
+            self.observed_active_turn_id = Some(turn_id.clone());
+            self.native_status = ThreadStatus::Active;
+            self.idle_after_completion = false;
+        }
+        let accepted = TurnSubmission {
+            client_message_id: client_message_id.to_owned(),
+            mode,
+            stage: TurnSubmissionStage::Accepted { turn_id },
+        };
+        self.last_submission = Some(accepted.clone());
+        self.apply_queued()?;
+        Ok(accepted)
+    }
+
+    /// RPC success is only an interrupt request receipt. A matching native
+    /// `turn/completed` with `status: interrupted` settles it.
+    pub fn interrupt_turn(
+        &mut self,
+        permit: &WriterPermit,
+        expected_turn_id: &str,
+    ) -> Result<InterruptState, CodexError> {
+        self.check_permit(permit)?;
+        if !valid_token(expected_turn_id) {
+            return Err(CodexError::InvalidInput("expected turn id is invalid"));
+        }
+        match self.owned_active_turn_id.as_deref() {
+            None => return Err(CodexError::Blocked(BlockReason::NativeBusy)),
+            Some(owned) if owned != expected_turn_id => {
+                return Err(CodexError::Blocked(BlockReason::StaleExpectedTurn));
+            }
+            Some(_) => {}
+        }
+        if matches!(
+            self.interrupt,
+            InterruptState::Requested { .. } | InterruptState::Uncertain { .. }
+        ) {
+            return Err(CodexError::Blocked(BlockReason::InterruptAlreadyRequested));
+        }
+        self.read_thread()?;
+        if self.native_status != ThreadStatus::Active
+            || self.observed_active_turn_id.as_deref() != Some(expected_turn_id)
+            || self.external_conflict
+        {
+            return Err(CodexError::Blocked(BlockReason::ExternalWriter));
+        }
+        let thread_id = self
+            .thread
+            .as_ref()
+            .ok_or(CodexError::Blocked(BlockReason::ObservationUnknown))?
+            .thread_id
+            .clone();
+        self.interrupt = InterruptState::Uncertain {
+            turn_id: expected_turn_id.to_owned(),
+        };
+        let response = match self.request(
+            "turn/interrupt",
+            json!({"threadId":thread_id,"turnId":expected_turn_id}),
+        ) {
+            Ok(value) => value,
+            Err(CodexError::TransportUncertain) => return Ok(self.interrupt.clone()),
+            Err(error) => return Err(error),
+        };
+        if !response.is_object() {
+            self.poisoned = true;
+            return Ok(self.interrupt.clone());
+        }
+        self.interrupt = InterruptState::Requested {
+            turn_id: expected_turn_id.to_owned(),
+        };
+        self.apply_queued()?;
+        Ok(self.interrupt.clone())
+    }
+
+    fn check_permit(&self, permit: &WriterPermit) -> Result<(), CodexError> {
+        if permit.identity != self.identity {
+            return Err(CodexError::Blocked(BlockReason::StaleResourcePermit));
+        }
+        match self.current_writer_epoch {
+            None => Err(CodexError::Blocked(BlockReason::MissingWriterPermit)),
+            Some(current) if current != permit.writer_epoch => {
+                Err(CodexError::Blocked(BlockReason::StaleWriterPermit))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    fn check_native_blockers(&self) -> Result<(), CodexError> {
+        if self.poisoned {
+            return Err(CodexError::Blocked(BlockReason::ObservationUnknown));
+        }
+        if self.external_conflict {
+            return Err(CodexError::Blocked(BlockReason::ExternalWriter));
+        }
+        if matches!(
+            self.interrupt,
+            InterruptState::Requested { .. } | InterruptState::Uncertain { .. }
+        ) {
+            return Err(CodexError::Blocked(BlockReason::InterruptAlreadyRequested));
+        }
+        if !self.pending_requests.is_empty() {
+            return Err(CodexError::Blocked(BlockReason::PendingHostRequest));
+        }
+        if self.status_waiting {
+            return Err(CodexError::Blocked(BlockReason::NativeWaiting));
+        }
+        Ok(())
     }
 
     /// Handles one native event frame. Server requests are observed and block
@@ -659,6 +1019,9 @@ impl<T: JsonlTransport> CodexResource<T> {
                 if let Some(thread) = self.thread.as_mut() {
                     thread.status = self.native_status;
                 }
+                if self.native_status == ThreadStatus::Idle {
+                    self.observed_active_turn_id = None;
+                }
                 self.status_waiting = waiting_flag(status);
                 if self.native_status == ThreadStatus::Idle
                     && matches!(self.bootstrap, BootstrapState::Completed { .. })
@@ -671,18 +1034,15 @@ impl<T: JsonlTransport> CodexResource<T> {
             "turn/started" | "turn/completed" => {
                 let turn_id = nonempty_string(params.get("turn").and_then(|turn| turn.get("id")))
                     .ok_or(CodexError::Protocol("turn notification omitted id"))?;
-                let expected = match &self.bootstrap {
-                    BootstrapState::Submitted { turn_id } => turn_id.as_str(),
-                    _ => {
+                if let BootstrapState::Submitted { turn_id: bootstrap } = &self.bootstrap {
+                    if turn_id != bootstrap {
                         self.external_conflict = true;
                         return Ok(());
                     }
-                };
-                if turn_id != expected {
-                    self.external_conflict = true;
-                    return Ok(());
-                }
-                if method == "turn/completed" {
+                    if method == "turn/started" {
+                        self.observed_active_turn_id = Some(turn_id.to_owned());
+                        return Ok(());
+                    }
                     let status = params
                         .get("turn")
                         .and_then(|turn| turn.get("status"))
@@ -696,8 +1056,41 @@ impl<T: JsonlTransport> CodexResource<T> {
                             turn_id: turn_id.to_owned(),
                         }
                     };
+                    self.observed_active_turn_id = None;
                     self.idle_after_completion = false;
+                    return Ok(());
                 }
+                if self.owned_active_turn_id.as_deref() != Some(turn_id) {
+                    self.external_conflict = true;
+                    return Ok(());
+                }
+                if method == "turn/started" {
+                    self.observed_active_turn_id = Some(turn_id.to_owned());
+                    return Ok(());
+                }
+                let status = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str);
+                if !matches!(status, Some("completed" | "failed" | "interrupted")) {
+                    return Err(CodexError::Protocol("turn completion status is invalid"));
+                }
+                if matches!(
+                    self.interrupt,
+                    InterruptState::Requested { .. } | InterruptState::Uncertain { .. }
+                ) {
+                    self.interrupt = if status == Some("interrupted") {
+                        InterruptState::Settled {
+                            turn_id: turn_id.to_owned(),
+                        }
+                    } else {
+                        InterruptState::EndedWithoutInterrupt {
+                            turn_id: turn_id.to_owned(),
+                        }
+                    };
+                }
+                self.owned_active_turn_id = None;
+                self.observed_active_turn_id = None;
             }
             "model/rerouted" => self.external_conflict = true,
             _ => {}
@@ -726,6 +1119,31 @@ fn waiting_flag(status: Option<&Value>) -> bool {
                 )
             })
         })
+}
+
+fn active_turn_from_thread(response: &Value) -> Result<Option<String>, CodexError> {
+    let turns = response
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .ok_or(CodexError::Protocol("thread/read omitted turns"))?;
+    let mut active = None;
+    for turn in turns {
+        let id = nonempty_string(turn.get("id"))
+            .ok_or(CodexError::Protocol("thread turn omitted id"))?;
+        let status = turn.get("status").and_then(Value::as_str);
+        if !matches!(
+            status,
+            Some("inProgress" | "completed" | "interrupted" | "failed")
+        ) {
+            return Err(CodexError::Protocol("thread turn has unknown status"));
+        }
+        if status == Some("inProgress") {
+            if active.replace(id.to_owned()).is_some() {
+                return Err(CodexError::Protocol("thread has multiple active turns"));
+            }
+        }
+    }
+    Ok(active)
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {

@@ -17,6 +17,8 @@ Selected non-experimental v2 shapes from that bundle:
 | `thread/read` | `threadId` | `thread` with `id`, `sessionId`, `cwd`, `status`, `turns` |
 | `thread/resume` | `threadId` | same effective fields as `thread/start` |
 | `turn/start` | `threadId`, `input` | `turn` with `id`, `status` |
+| `turn/steer` | `threadId`, `expectedTurnId`, `input` | `turnId` |
+| `turn/interrupt` | `threadId`, `turnId` | empty object receipt |
 
 `turn/start` also accepts `model`, `effort`, and `clientUserMessageId`.
 `Turn.status` is `inProgress`, `completed`, `interrupted`, or `failed`.
@@ -24,6 +26,22 @@ Selected non-experimental v2 shapes from that bundle:
 flags include `waitingOnApproval` and `waitingOnUserInput`.
 `turn/completed` carries `threadId` and `turn`; `serverRequest/resolved`
 carries `threadId` and `requestId`.
+
+PB10b turn control uses a local `WriterPermit` comparison over the complete
+PodBay resource identity and a monotonically installed writer epoch. The
+permit is supplied by an authenticated higher layer and is **not** durable
+authority by itself. Every send or interrupt reads native thread state before
+its turn RPC. Idle chooses `turn/start`; an active turn permits `turn/steer`
+only when its ID matches both the locally owned turn and the caller's exact
+expected ID. Native permission requests remain pending and block new sends.
+`turn/interrupt` success is a request receipt; only a matching
+`turn/completed` with `status: interrupted` settles it.
+
+The adapter retains the exact most recent `clientUserMessageId` and refuses
+its immediate reuse, including after an uncertain reply. It does **not**
+deduplicate an older key after later submissions or across process restart.
+PodBay's durable command ledger must provide caller-scoped idempotency before
+turn control is exposed to a live provider.
 
 This is a codec and fake-transport slice. It neither launches Codex nor
 answers native permission requests. A native adapter must reconcile a lost
