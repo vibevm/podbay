@@ -1613,3 +1613,145 @@ fn resolved_manager_handoff_refuses_replaced_database_path_before_claim() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(host.port().manager_seen.lock().unwrap().is_empty());
 }
+
+#[test]
+fn rebind_context_derives_exact_snapshot_without_actor_reactivation_or_mutation() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, _, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, grant) = initial_authority(&fixture.database, port, &who);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.rebind-context");
+    let prepared = first.admit_bound_pod(&who.transport, request).unwrap();
+    drop(first);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut second = DurableAuthority::open(&fixture.database, port).unwrap();
+    // Actor credential remains generation 1 and is inert; context is manager
+    // recovery state, not an actor grant or credential.
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let before = store.authority_snapshot().unwrap();
+    assert_eq!(before.actors[0].credential_generation, 1);
+    let snapshot = store
+        .current_bound_pod_snapshot(who.scope.as_str(), who.pod.as_str())
+        .unwrap();
+    let claim = store.current_manager_credential_claim(2).unwrap();
+    let mut context = second.rebind_context(&who.scope, &who.pod).unwrap();
+    assert_eq!(
+        context.store_path(),
+        std::fs::canonicalize(&fixture.database).unwrap()
+    );
+    assert_eq!(context.store_lineage(), claim.store_lineage());
+    assert_eq!(context.owner_epoch(), 2);
+    assert_eq!(context.credential_epoch(), claim.credential_epoch());
+    assert_eq!(context.credential_epoch(), 2);
+    assert!(
+        store
+            .current_manager_peer_matches(&claim, context.manager_peer())
+            .unwrap()
+    );
+    assert_eq!(context.identity().attempt_id, *snapshot.attempt_id());
+    assert_eq!(context.identity().incarnation, snapshot.pod_incarnation());
+    assert_eq!(context.identity().scope_id, who.scope);
+    assert_eq!(context.identity().pod_id, who.pod);
+    assert_eq!(context.launch(), snapshot.launch());
+    assert_eq!(context.launch().receipt, prepared.receipt);
+    assert_eq!(context.authority_revision(), snapshot.authority_revision());
+    let expected = snapshot
+        .resources()
+        .iter()
+        .map(|resource| (resource.id().clone(), resource.input_epoch()))
+        .collect();
+    assert_eq!(context.resource_input_epochs(), &expected);
+    assert!(
+        context
+            .resource_input_epochs()
+            .values()
+            .all(|epoch| epoch.get() == 2)
+    );
+    context.recheck_current().unwrap();
+    context.recheck_current().unwrap();
+    assert_eq!(store.authority_snapshot().unwrap(), before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn rebind_context_recheck_refuses_fresh_owner_or_resource_drift() {
+    for change_owner in [true, false] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+        host.admit_bound_pod(
+            &who.transport,
+            launch_request(&who, grant, 1, 1, b"canonical.rebind-drift"),
+        )
+        .unwrap();
+        let mut context = host.rebind_context(&who.scope, &who.pod).unwrap();
+        let mut store = PodBayStore::open(&fixture.database).unwrap();
+        let snapshot = store.authority_snapshot().unwrap();
+        if change_owner {
+            store.begin_authority_replay(1, 2).unwrap();
+        } else {
+            let mut resource = snapshot.resources[0].clone();
+            resource.input_epoch += 1;
+            store
+                .apply_authority_mutation(
+                    1,
+                    snapshot.revision,
+                    podbay_store::AuthorityMutation::PutResource(resource),
+                )
+                .unwrap();
+        }
+        assert!(context.recheck_current().is_err());
+        drop(context);
+        assert!(host.rebind_context(&who.scope, &who.pod).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn rebind_context_refuses_foreign_selector_and_new_unbound_target_incarnation() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    host.admit_bound_pod(
+        &who.transport,
+        launch_request(&who, grant, 1, 1, b"canonical.rebind-target"),
+    )
+    .unwrap();
+    assert!(
+        host.rebind_context(&ScopeId::try_from("scope.foreign").unwrap(), &who.pod)
+            .is_err()
+    );
+    assert!(
+        host.rebind_context(&who.scope, &PodId::try_from("pod.foreign").unwrap())
+            .is_err()
+    );
+    host.advance_pod_incarnation_from_trusted_policy(
+        &who.pod,
+        PodIncarnation::new(1).unwrap(),
+        PodIncarnation::new(2).unwrap(),
+    )
+    .unwrap();
+    assert!(host.rebind_context(&who.scope, &who.pod).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn rebind_context_recheck_refuses_replaced_database_file() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    host.admit_bound_pod(
+        &who.transport,
+        launch_request(&who, grant, 1, 1, b"canonical.rebind-file"),
+    )
+    .unwrap();
+    let mut context = host.rebind_context(&who.scope, &who.pod).unwrap();
+    let original = fixture.database.with_extension("original");
+    std::fs::rename(&fixture.database, &original).unwrap();
+    std::fs::copy(original, &fixture.database).unwrap();
+    assert!(context.recheck_current().is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

@@ -1542,6 +1542,147 @@ impl<P: HostDispatchPort> HostAuthority<P> {
     }
 }
 
+/// A read-only current-pod context borrowed from the manager that still
+/// holds its lifetime lock. It is not pod inspection evidence or a rebind
+/// admission. Recheck immediately before external inspection or preparation.
+///
+/// A context cannot escape the authority that owns its manager lock:
+/// ```compile_fail
+/// use podbay_core::{ScopeId, PodId};
+/// use podbay_host::{DurableAuthority, HostDispatchPort, ManagerRebindContext};
+/// fn escape<P: HostDispatchPort>(mut host: DurableAuthority<P>, scope: ScopeId,
+///     pod: PodId) -> ManagerRebindContext<'static> {
+///     host.rebind_context(&scope, &pod).unwrap()
+/// }
+/// ```
+pub struct ManagerRebindContext<'a> {
+    _manager_lock: &'a File,
+    database: &'a Path,
+    #[cfg(target_os = "linux")]
+    database_identity: (u64, u64),
+    #[cfg(target_os = "linux")]
+    manager_peer: &'a LinuxManagerPeer,
+    manager_claim: &'a ManagerCredentialClaim,
+    store: &'a mut PodBayStore,
+    snapshot: podbay_store::CurrentBoundPodSnapshot,
+    identity: podbay_core::PodFenceIdentity,
+    input_epochs: BTreeMap<ResourceId, podbay_core::InputEpoch>,
+    peer: AttestedPeer,
+}
+
+#[derive(Debug)]
+pub enum RebindContextError {
+    Host(HostError),
+    Store(StoreError),
+}
+impl From<HostError> for RebindContextError {
+    fn from(value: HostError) -> Self {
+        Self::Host(value)
+    }
+}
+impl From<StoreError> for RebindContextError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl ManagerRebindContext<'_> {
+    pub fn store_path(&self) -> &Path {
+        self.database
+    }
+    pub fn store_lineage(&self) -> &str {
+        self.manager_claim.store_lineage()
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.manager_claim.owner_epoch()
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.manager_claim.credential_epoch()
+    }
+    pub fn manager_peer(&self) -> &AttestedPeer {
+        // The snapshot is only minted after the Linux-only manager check.
+        &self.peer
+    }
+    pub fn identity(&self) -> &podbay_core::PodFenceIdentity {
+        &self.identity
+    }
+    pub fn launch(&self) -> &BoundLaunchRecord {
+        self.snapshot.launch()
+    }
+    pub fn resource_input_epochs(&self) -> &BTreeMap<ResourceId, podbay_core::InputEpoch> {
+        &self.input_epochs
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.snapshot.authority_revision()
+    }
+
+    pub fn recheck_current(&mut self) -> Result<(), RebindContextError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            recheck_current_manager(
+                self.store,
+                self.database,
+                self.database_identity,
+                self.manager_peer,
+                self.manager_claim,
+            )?;
+            let fresh = self.store.current_bound_pod_snapshot(
+                self.identity.scope_id.as_str(),
+                self.identity.pod_id.as_str(),
+            )?;
+            let inputs = fresh
+                .resources()
+                .iter()
+                .map(|resource| (resource.id().clone(), resource.input_epoch()))
+                .collect::<BTreeMap<_, _>>();
+            if fresh.store_lineage() != self.snapshot.store_lineage()
+                || fresh.owner_epoch() != self.snapshot.owner_epoch()
+                || fresh.authority_revision() != self.snapshot.authority_revision()
+                || fresh.attempt_id() != self.snapshot.attempt_id()
+                || fresh.pod_incarnation() != self.snapshot.pod_incarnation()
+                || fresh.launch() != self.snapshot.launch()
+                || inputs != self.input_epochs
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            recheck_current_manager(
+                self.store,
+                self.database,
+                self.database_identity,
+                self.manager_peer,
+                self.manager_claim,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recheck_current_manager(
+    store: &mut PodBayStore,
+    database: &Path,
+    database_identity: (u64, u64),
+    peer: &LinuxManagerPeer,
+    claim: &ManagerCredentialClaim,
+) -> Result<AttestedPeer, RebindContextError> {
+    peer.recheck().map_err(|_| HostError::StaleGuard)?;
+    let metadata =
+        std::fs::symlink_metadata(database).map_err(|_| HostError::AuthorityStoreUnavailable)?;
+    if !metadata.is_file() || (metadata.dev(), metadata.ino()) != database_identity {
+        return Err(HostError::StaleGuard.into());
+    }
+    if std::fs::canonicalize(database).map_err(|_| HostError::AuthorityStoreUnavailable)?
+        != database
+        || store.current_manager_credential_claim(claim.owner_epoch())? != *claim
+        || !store.current_manager_peer_matches(claim, peer.peer())?
+    {
+        return Err(HostError::StaleGuard.into());
+    }
+    Ok(peer.peer().clone())
+}
+
 /// SQLite-backed authority. Recorded actors and grants are inert after reopen
 /// until trusted replay. Dispatch here is an authority gate, not durable command
 /// admission; PB09 must issue the durable receipt before production effects.
@@ -1666,6 +1807,67 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             launch_profiles: HashMap::new(),
             native_host: None,
         })
+    }
+
+    /// Scope and PodId are selectors only. Attempt, incarnation, launch bytes
+    /// and complete resource inputs are derived from one current store view.
+    pub fn rebind_context(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<ManagerRebindContext<'_>, RebindContextError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            let peer = recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )?;
+            let snapshot = self
+                .store
+                .current_bound_pod_snapshot(scope.as_str(), pod.as_str())?;
+            if snapshot.store_lineage().as_str() != self.manager_claim.store_lineage()
+                || snapshot.owner_epoch().get() != self.manager_claim.owner_epoch()
+                || snapshot.authority_revision() != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let identity = podbay_core::PodFenceIdentity {
+                scope_id: snapshot.scope_id().clone(),
+                pod_id: snapshot.pod_id().clone(),
+                attempt_id: snapshot.attempt_id().clone(),
+                incarnation: snapshot.pod_incarnation(),
+                store_lineage: snapshot.store_lineage().clone(),
+            };
+            let input_epochs = snapshot
+                .resources()
+                .iter()
+                .map(|resource| (resource.id().clone(), resource.input_epoch()))
+                .collect();
+            recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )?;
+            Ok(ManagerRebindContext {
+                _manager_lock: &self._manager_lock,
+                database: &self.canonical_database,
+                database_identity: self.database_identity,
+                manager_peer: &self.manager_peer,
+                manager_claim: &self.manager_claim,
+                store: &mut self.store,
+                snapshot,
+                identity,
+                input_epochs,
+                peer,
+            })
+        }
     }
 
     pub fn port(&self) -> &P {
@@ -1929,28 +2131,17 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         return Err(HostError::Unsupported.into());
         #[cfg(target_os = "linux")]
         {
-            self.manager_peer
-                .recheck()
-                .map_err(|_| HostError::StaleGuard)?;
-            let metadata = std::fs::symlink_metadata(&self.canonical_database)
-                .map_err(|_| HostError::AuthorityStoreUnavailable)?;
-            if !metadata.is_file() || (metadata.dev(), metadata.ino()) != self.database_identity {
-                return Err(HostError::StaleGuard.into());
-            }
-            if std::fs::canonicalize(&self.canonical_database)
-                .map_err(|_| HostError::AuthorityStoreUnavailable)?
-                != self.canonical_database
-                || self
-                    .store
-                    .current_manager_credential_claim(self.host.manager_epoch.get())?
-                    != self.manager_claim
-                || !self
-                    .store
-                    .current_manager_peer_matches(&self.manager_claim, self.manager_peer.peer())?
-            {
-                return Err(HostError::StaleGuard.into());
-            }
-            Ok(self.manager_peer.peer().clone())
+            recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )
+            .map_err(|error| match error {
+                RebindContextError::Host(error) => LaunchPodError::Host(error),
+                RebindContextError::Store(error) => LaunchPodError::Store(error),
+            })
         }
     }
 
