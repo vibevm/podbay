@@ -1,0 +1,9 @@
+[package]
+name = "podbay-adapter-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+podbay-core = { path = "../podbay-core" }
+serde_json = "1"

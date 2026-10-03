@@ -10,6 +10,7 @@ members = [
   "crates/podbay-win32",
   "crates/podbay-client",
   "crates/podbay-server",
+  "crates/podbay-adapter-codex",
   "crates/podbay-cli",
 ]
 
