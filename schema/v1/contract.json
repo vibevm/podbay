@@ -1,15 +1,33 @@
 {
-  "protocol": "podbay/1",
-  "frame": { "prefix": "u32_be", "maxBytes": 1048576 },
+  "cursorFields": [
+    "storeLineage",
+    "scopeId",
+    "sequence"
+  ],
   "decimalCounter": {
     "encoding": "json_string",
     "grammar": "0|[1-9][0-9]*",
     "maximum": "18446744073709551615"
   },
-  "cursorFields": ["storeLineage", "scopeId", "sequence"],
-  "supportedMutationSchemas": ["session.send", "run.pause", "run.resume", "run.stop", "resource.command"],
-  "resourceCommandKinds": ["write", "resize", "interrupt", "stop"],
+  "eventSchemaCompatibility": "unknown_schema_is_opaque_under_podbay/1",
+  "frame": {
+    "maxBytes": 1048576,
+    "prefix": "u32_be"
+  },
+  "protocol": "podbay/1",
+  "resourceCommandKinds": [
+    "write",
+    "resize",
+    "interrupt",
+    "stop"
+  ],
+  "supportedMutationSchemas": [
+    "session.send",
+    "run.pause",
+    "run.resume",
+    "run.stop",
+    "resource.command"
+  ],
   "unknownMutation": "reject_before_effect",
-  "unknownObservation": "retain_opaque_json",
-  "eventSchemaCompatibility": "unknown_schema_is_opaque_under_podbay/1"
+  "unknownObservation": "retain_opaque_json"
 }

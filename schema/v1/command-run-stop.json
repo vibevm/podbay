@@ -1,0 +1,18 @@
+{
+  "body": {
+    "scope": "self_only"
+  },
+  "guard": {
+    "managerEpoch": "42",
+    "targetRevision": "5"
+  },
+  "key": "key.pb03.stop.1",
+  "operation": "run.stop",
+  "payloadDigest": "4203cf2489da535af06273548239ecf8899edd9666a50a8a094d8b0514cfeb99",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.stop.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

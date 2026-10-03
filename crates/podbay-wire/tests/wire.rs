@@ -49,10 +49,51 @@ fn golden_v1_command_has_stable_cross_language_digest() {
 }
 
 #[test]
+fn all_five_generated_mutation_fixtures_decode_with_exact_operations() {
+    for (fixture, operation) in [
+        (
+            include_str!("../../../schema/v1/command-session-send.json"),
+            "session.send",
+        ),
+        (
+            include_str!("../../../schema/v1/command-run-pause.json"),
+            "run.pause",
+        ),
+        (
+            include_str!("../../../schema/v1/command-run-resume.json"),
+            "run.resume",
+        ),
+        (
+            include_str!("../../../schema/v1/command-run-stop.json"),
+            "run.stop",
+        ),
+        (
+            include_str!("../../../schema/v1/command-resource-write.json"),
+            "resource.command",
+        ),
+    ] {
+        let decoded = decode_command_json(fixture.as_bytes()).unwrap();
+        assert_eq!(decoded.operation().as_str(), operation);
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&decoded.encode_json().unwrap()).unwrap();
+        let checked_in: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(encoded, checked_in);
+    }
+}
+
+#[test]
 fn checked_in_contract_manifest_matches_rust_vocabulary() {
     let checked_in: Value =
         serde_json::from_str(include_str!("../../../schema/v1/contract.json")).unwrap();
     assert_eq!(checked_in, contract_manifest());
+}
+
+#[test]
+fn generated_typescript_binding_matches_rust_template() {
+    assert_eq!(
+        podbay_wire::typescript_source(),
+        include_str!("../../../bindings/typescript/src/generated.ts"),
+    );
 }
 
 #[test]

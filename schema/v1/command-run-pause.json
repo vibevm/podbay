@@ -1,0 +1,18 @@
+{
+  "body": {
+    "policy": "drain"
+  },
+  "guard": {
+    "managerEpoch": "42",
+    "targetRevision": "5"
+  },
+  "key": "key.pb03.pause.1",
+  "operation": "run.pause",
+  "payloadDigest": "483932507af8d9248be4f4c43a3e14dc4680340b812b424fdb7a113db2476573",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.pause.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

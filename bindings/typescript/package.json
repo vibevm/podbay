@@ -1,0 +1,8 @@
+{
+  "name": "@podbay/wire-generated",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/golden.test.ts"
+  }
+}

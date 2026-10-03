@@ -1,0 +1,25 @@
+{
+  "body": {
+    "content": [
+      {
+        "kind": "text",
+        "text": "Hello PodBay"
+      }
+    ],
+    "policy": {
+      "kind": "when_idle"
+    }
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03.send.1",
+  "operation": "session.send",
+  "payloadDigest": "4eb768058667e0b180127c869099cf116273e3919a96627d69a0e4d568d52a4e",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.send.1",
+  "target": {
+    "kind": "session",
+    "sessionId": "session.fixture"
+  }
+}

@@ -9,6 +9,7 @@ mod frame;
 mod observation;
 mod schema;
 mod timestamp;
+mod typescript;
 
 pub use command::{
     CommandBody, CommandEnvelope, ContentBlock, Guard, MutationOperation, PausePolicy,
@@ -25,3 +26,4 @@ pub use observation::{
     decode_event_json,
 };
 pub use schema::contract_manifest;
+pub use typescript::typescript_source;

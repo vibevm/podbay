@@ -1,11 +1,25 @@
 {
-  "protocol": "podbay/1",
-  "operation": "resource.command",
-  "requestId": "request.pb03.1",
-  "key": "key.pb03.write.1",
-  "target": { "kind": "resource", "podId": "pod.fixture", "resourceId": "resource.pty" },
-  "guard": { "managerEpoch": "42", "podEpoch": "7", "resourceEpoch": "3", "leaseEpoch": "19" },
+  "body": {
+    "command": {
+      "contentRef": "artifact.input.1",
+      "kind": "write"
+    }
+  },
   "deadlineAt": "2026-10-03T12:00:00Z",
+  "guard": {
+    "leaseEpoch": "19",
+    "managerEpoch": "42",
+    "podEpoch": "7",
+    "resourceEpoch": "3"
+  },
+  "key": "key.pb03.write.1",
+  "operation": "resource.command",
   "payloadDigest": "df8abdefd49491a11b6312b252922528ed9d558093770df2ee86f07750113b11",
-  "body": { "command": { "kind": "write", "contentRef": "artifact.input.1" } }
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
 }

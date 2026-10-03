@@ -1,0 +1,18 @@
+{
+  "body": {
+    "policy": "live_only"
+  },
+  "guard": {
+    "managerEpoch": "42",
+    "targetRevision": "5"
+  },
+  "key": "key.pb03.resume.1",
+  "operation": "run.resume",
+  "payloadDigest": "5a568b2f1f10920d0aa36b770322146026af1d8de1591658ee47bca49a7929ec",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.resume.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}
