@@ -2,23 +2,21 @@
 //! every request before it can reach a PodBay effect dispatcher.
 use std::io;
 use std::ptr::{null, null_mut};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_DATA,
-    FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SYNCHRONIZE, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
+use crate::overlapped::{IoKind, operate};
 use crate::pipe_model::{MAX_FRAME, PeerGrant, PipeRequest};
 use crate::security::pipe_descriptor;
 use crate::windows::{OwnedHandle, RunningProcess, open_exact_process};
@@ -60,7 +58,7 @@ impl PipeServer {
         let raw = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 MAX_FRAME as u32,
@@ -84,8 +82,8 @@ impl PipeServer {
         })
     }
 
-    /// One-shot accept. Timeout consumes this pipe instance; a late worker may
-    /// finish authentication, but cannot dispatch because its receiver is gone.
+    /// One-shot accept. Timeout consumes this pipe instance; a pending
+    /// cancellation retains its exact OS allocations in a bounded quarantine.
     pub fn accept_once(
         mut self,
         grant: PeerGrant,
@@ -97,19 +95,8 @@ impl PipeServer {
             .pipe
             .take()
             .ok_or(Win32Error::Uncertain("pipe instance consumed"))?;
-        let pod = self.pod; // pins the recorded server process through accept
-        let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("podbay-pipe-accept".into())
-            .spawn(move || {
-                let result = accept_and_authenticate(pipe, grant);
-                let _ = sender.send(result);
-                drop(pod);
-            })
-            .map_err(Win32Error::Os)?;
-        receiver.recv_timeout(timeout).map_err(|_| {
-            Win32Error::Uncertain("pipe accept/read timed out; no effect dispatched")
-        })?
+        let _pod = self.pod; // pins the recorded server process through accept
+        accept_and_authenticate(pipe, grant, Instant::now() + timeout)
     }
 }
 
@@ -130,7 +117,7 @@ impl PipeClient {
                 0,
                 null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
@@ -166,19 +153,11 @@ impl PipeClient {
             .pipe
             .take()
             .ok_or(Win32Error::Uncertain("pipe client consumed"))?;
-        let server = self.server;
-        let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("podbay-pipe-exchange".into())
-            .spawn(move || {
-                let result = write_frame(&pipe, &body).and_then(|()| read_frame(&pipe));
-                let _ = sender.send(result);
-                drop(server);
-            })
-            .map_err(Win32Error::Os)?;
-        receiver
-            .recv_timeout(timeout)
-            .map_err(|_| Win32Error::Uncertain("pipe response after possible request is unknown"))?
+        let _server = self.server;
+        let deadline = Instant::now() + timeout;
+        let pipe = write_frame(pipe, &body, deadline)?;
+        let (_, response) = read_frame(pipe, deadline)?;
+        Ok(response)
     }
 }
 
@@ -198,37 +177,17 @@ impl AcceptedPipe {
             .pipe
             .take()
             .ok_or(Win32Error::Uncertain("pipe response consumed"))?;
-        let bytes = payload.to_vec();
-        let peer = self.peer;
-        let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("podbay-pipe-response".into())
-            .spawn(move || {
-                let result = write_frame(&pipe, &bytes);
-                let _ = sender.send(result);
-                drop(peer);
-            })
-            .map_err(Win32Error::Os)?;
-        receiver
-            .recv_timeout(timeout)
-            .map_err(|_| Win32Error::Uncertain("pipe response write outcome unknown"))?
+        let _peer = self.peer;
+        write_frame(pipe, payload, Instant::now() + timeout).map(|_| ())
     }
 }
 
 fn accept_and_authenticate(
     pipe: OwnedHandle,
     grant: PeerGrant,
+    deadline: Instant,
 ) -> Result<AcceptedPipe, Win32Error> {
-    // SAFETY: the worker exclusively owns this pipe instance during connect.
-    let connected = unsafe { ConnectNamedPipe(pipe.raw(), null_mut()) };
-    if connected == 0 {
-        // SAFETY: capture the failure immediately; an already-connected client
-        // is a documented successful race for a one-instance server.
-        let code = unsafe { GetLastError() };
-        if code != ERROR_PIPE_CONNECTED {
-            return Err(Win32Error::Os(io::Error::from_raw_os_error(code as i32)));
-        }
-    }
+    let (pipe, _, _) = operate(pipe, IoKind::Connect, deadline)?;
     let mut pid = 0_u32;
     // SAFETY: connected server pipe and writable PID output are valid.
     if unsafe { GetNamedPipeClientProcessId(pipe.raw(), &mut pid) } == 0 {
@@ -238,7 +197,7 @@ fn accept_and_authenticate(
         return Err(Win32Error::Unsupported("unregistered pipe client PID"));
     }
     let peer = open_exact_process(grant.expected_process)?;
-    let body = read_frame(&pipe)?;
+    let (pipe, body) = read_frame(pipe, deadline)?;
     let request = PipeRequest::decode(&body)?;
     grant.authorize(peer.identity(), &request)?;
     Ok(AcceptedPipe {
@@ -271,62 +230,51 @@ fn bounded_timeout(value: Duration) -> Result<(), Win32Error> {
     }
 }
 
-fn read_frame(pipe: &OwnedHandle) -> Result<Vec<u8>, Win32Error> {
-    let mut size = [0_u8; 4];
-    read_exact(pipe, &mut size)?;
-    let length = u32::from_be_bytes(size) as usize;
+fn read_frame(pipe: OwnedHandle, deadline: Instant) -> Result<(OwnedHandle, Vec<u8>), Win32Error> {
+    let (pipe, size) = read_exact(pipe, 4, deadline)?;
+    let length = u32::from_be_bytes(size.try_into().unwrap()) as usize;
     if length > MAX_FRAME {
         return Err(Win32Error::Invalid("pipe frame exceeded bound"));
     }
-    let mut bytes = vec![0_u8; length];
-    read_exact(pipe, &mut bytes)?;
-    Ok(bytes)
+    read_exact(pipe, length, deadline)
 }
-fn read_exact(pipe: &OwnedHandle, mut bytes: &mut [u8]) -> Result<(), Win32Error> {
-    while !bytes.is_empty() {
-        let mut read = 0_u32;
-        // SAFETY: owned pipe and writable slice are live; synchronous I/O only.
-        let okay = unsafe {
-            ReadFile(
-                pipe.raw(),
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
-                &mut read,
-                null_mut(),
-            )
-        };
-        if okay == 0 || read == 0 {
+fn read_exact(
+    mut pipe: OwnedHandle,
+    length: usize,
+    deadline: Instant,
+) -> Result<(OwnedHandle, Vec<u8>), Win32Error> {
+    let mut collected = Vec::with_capacity(length);
+    while collected.len() < length {
+        let (next, bytes, read) = operate(pipe, IoKind::Read(length - collected.len()), deadline)?;
+        if read == 0 || read > bytes.len() {
             return Err(Win32Error::Uncertain("pipe frame read incomplete"));
         }
-        bytes = &mut bytes[read as usize..];
+        collected.extend_from_slice(&bytes[..read]);
+        pipe = next;
     }
-    Ok(())
+    Ok((pipe, collected))
 }
-fn write_frame(pipe: &OwnedHandle, bytes: &[u8]) -> Result<(), Win32Error> {
+fn write_frame(
+    mut pipe: OwnedHandle,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<OwnedHandle, Win32Error> {
     if bytes.len() > MAX_FRAME {
         return Err(Win32Error::Invalid("pipe frame exceeded bound"));
     }
     let mut frame = Vec::with_capacity(bytes.len() + 4);
     frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(bytes);
-    while !frame.is_empty() {
-        let mut written = 0_u32;
-        // SAFETY: owned pipe and immutable slice are live; synchronous I/O only.
-        let okay = unsafe {
-            WriteFile(
-                pipe.raw(),
-                frame.as_ptr(),
-                frame.len() as u32,
-                &mut written,
-                null_mut(),
-            )
-        };
-        if okay == 0 || written == 0 {
+    let mut offset = 0_usize;
+    while offset < frame.len() {
+        let (next, _, written) = operate(pipe, IoKind::Write(frame[offset..].to_vec()), deadline)?;
+        if written == 0 || written > frame.len() - offset {
             return Err(Win32Error::Uncertain("pipe frame may be partially written"));
         }
-        frame.drain(..written as usize);
+        offset += written;
+        pipe = next;
     }
-    Ok(())
+    Ok(pipe)
 }
 
 #[cfg(test)]

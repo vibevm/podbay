@@ -74,6 +74,10 @@ mod conpty_model;
 mod durable;
 mod durable_model;
 #[cfg(windows)]
+mod overlapped;
+#[cfg(any(windows, test))]
+mod overlapped_model;
+#[cfg(windows)]
 mod pipe;
 mod pipe_model;
 #[cfg(windows)]
