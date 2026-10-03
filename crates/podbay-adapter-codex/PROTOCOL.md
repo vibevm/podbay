@@ -88,3 +88,22 @@ was removed.
 This probe establishes only the handshake and catalog response shapes. It
 did not start, resume or read a thread; send a turn; exercise permissions;
 verify account/model entitlement; or prove native lifecycle behavior.
+
+## Pod-side stdio transport boundary
+
+The explicit child launcher takes a reviewed absolute executable, exact argv
+and cwd, a private isolated HOME/CODEX_HOME, and a small allowlist of supplied
+non-secret environment variables. It uses `Command` without a shell and
+`env_clear`; no ambient account or HOME fallback is used. Linux and macOS use
+nonblocking child pipes with bounded JSONL frames and finite per-frame I/O
+deadlines. Other platforms refuse before spawn until a native bounded-pipe
+backend exists. Timeout or disposal requests direct-child termination. After
+a successful kill it waits up to three seconds for reap and reports an error
+if reap is unobserved. Only a successful exit observation proves direct-child
+reap; escaped-descendant containment is not established.
+
+The current transport discards child stderr, limiting diagnostics. Its child
+birth timestamp is the parent's observation after spawn, not an OS process
+start identity or ownership attestation. Only a disposable fake child has
+exercised this launcher; real Codex, provider accounts and session lifecycle
+remain uncertified.

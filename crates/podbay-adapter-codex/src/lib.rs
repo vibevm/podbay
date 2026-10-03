@@ -1,12 +1,14 @@
 //! Role-neutral, fake-transport Codex app-server resource adapter.
 //!
-//! This crate does not spawn Codex, open a provider account, grant permissions,
-//! or claim that a native session has an exclusive writer. A pod-side transport
-//! and durable writer fence must supply those boundaries before live use.
+//! An explicit pod-side child stdio transport exists, but only fake-child
+//! fixtures have exercised it. This crate does not certify a real Codex
+//! account/session launch or an exclusive native writer. A durable writer
+//! fence and native provider conformance remain required before live use.
 
 mod adapter;
 mod codec;
 mod host_requests;
+mod process_transport;
 
 pub use adapter::{
     AnswerWriteOutcome, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason, BootstrapState,
@@ -19,6 +21,9 @@ pub use host_requests::{
     ApprovalDecision, CommandApprovalKind, NativeAnswer, NativeQuestion, NativeQuestionOption,
     NativeRequestKind, NativeRequestStage, NativeRpcId, PendingNativeRequest,
     RedactedNativeObservation,
+};
+pub use process_transport::{
+    ChildBirthObservation, ChildExitObservation, ChildLaunchSpec, ProcessJsonlTransport,
 };
 
 pub const TESTED_CODEX_CLI_VERSION: &str = "0.159.3";
