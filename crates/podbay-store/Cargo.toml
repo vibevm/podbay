@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 podbay-core = { path = "../podbay-core" }
+podbay-wire = { path = "../podbay-wire" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11.0"
 

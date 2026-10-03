@@ -2,11 +2,16 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod bound_launch;
 mod launch;
 mod model;
 mod peer_witness;
 mod store;
 
+pub use bound_launch::{
+    BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
+    BoundLaunchResource,
+};
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,

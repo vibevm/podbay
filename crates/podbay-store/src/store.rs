@@ -4,6 +4,8 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::bound_launch::{ensure_current_dispatch_eligible, read_bound_record};
+
 use crate::model::{
     Admission, AdmittedLaunchInspection, CommandRequest, CommittedEvent, DIGEST_VERSION,
     EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
@@ -866,6 +868,19 @@ impl PodBayStore {
             },
             _ => return Err(StoreError::Conflict("launch dispatch state is malformed")),
         };
+        let has_binding: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM launch_bindings WHERE command_rowid=?1",
+                [command_rowid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let binding = if has_binding.is_some() {
+            read_bound_record(&transaction, command_rowid)?;
+            LaunchIntentBinding::BoundV8
+        } else {
+            LaunchIntentBinding::HistoricalUnbound
+        };
         transaction.commit()?;
         Ok(AdmittedLaunchInspection {
             receipt: Receipt {
@@ -877,11 +892,13 @@ impl PodBayStore {
             },
             effect,
             status,
-            binding: LaunchIntentBinding::HistoricalUnboundV7,
+            binding,
         })
     }
 
     /// A claimed effect may already have happened. Reopen must not dispatch it again.
+    /// A new Prepared claim additionally CAS-checks the authority revision so
+    /// grant/policy changes between review and claim cannot authorize effect.
     pub fn claim_effect(
         &mut self,
         outbox_id: i64,
@@ -889,6 +906,7 @@ impl PodBayStore {
         target_id: &str,
         expected_owner_epoch: u64,
         expected_target_epoch: u64,
+        expected_authority_revision: u64,
         claim_key: &str,
     ) -> Result<EffectClaim, StoreError> {
         valid_id(scope_id)?;
@@ -896,13 +914,14 @@ impl PodBayStore {
         valid_id(claim_key)?;
         let owner_epoch = integer(expected_owner_epoch)?;
         let target_epoch = integer(expected_target_epoch)?;
+        let authority_revision = integer(expected_authority_revision)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
                 "SELECT scope_id,target_id,target_epoch,state,claim_key,kind,
-                        payload,effect_digest
+                        payload,effect_digest,command_rowid
                  FROM outbox WHERE outbox_id=?1",
                 [outbox_id],
                 |row| {
@@ -915,6 +934,7 @@ impl PodBayStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, Vec<u8>>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -934,8 +954,24 @@ impl PodBayStore {
         if sha256_hex(&row.6) != row.7 {
             return Err(StoreError::Conflict("outbox effect digest changed"));
         }
+        if row.5 == "pod.offer" {
+            // Generic legacy admissions remain inspectable, but no unbound
+            // offer may cross the effect-claim boundary in schema eight.
+            let bound = read_bound_record(&transaction, row.8)?;
+            if row.3 == "prepared" {
+                ensure_current_dispatch_eligible(&transaction, &bound)?;
+            }
+        }
         let result = match row.3.as_str() {
             "prepared" => {
+                let current_authority_revision: i64 = transaction.query_row(
+                    "SELECT value FROM metadata WHERE key='authority_revision'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if current_authority_revision != authority_revision {
+                    return Err(StoreError::StaleEpoch);
+                }
                 if row.2 != target_epoch {
                     return Err(StoreError::TargetReconciliationRequired);
                 }
@@ -1402,7 +1438,7 @@ impl PodBayStore {
     }
 }
 
-fn validate_request(request: &CommandRequest) -> Result<(), StoreError> {
+pub(crate) fn validate_request(request: &CommandRequest) -> Result<(), StoreError> {
     for value in [
         &request.namespace,
         &request.command_key,
@@ -1438,7 +1474,7 @@ fn supported_effect_kind(kind: &str) -> bool {
     matches!(kind, "pod.offer")
 }
 
-fn valid_id(value: &str) -> Result<(), StoreError> {
+pub(crate) fn valid_id(value: &str) -> Result<(), StoreError> {
     if value.len() < 3 || value.len() > 160 || value.chars().any(char::is_control) {
         return Err(StoreError::InvalidInput(
             "identity length or content is invalid",
@@ -1447,7 +1483,7 @@ fn valid_id(value: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn integer(value: u64) -> Result<i64, StoreError> {
+pub(crate) fn integer(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidInput("epoch exceeds SQLite range"))
 }
 
@@ -1621,7 +1657,7 @@ fn host_event_payload(proof: &HostAcceptanceProof) -> Vec<u8> {
     .into_bytes()
 }
 
-fn digest_request(request: &CommandRequest) -> String {
+pub(crate) fn digest_request(request: &CommandRequest) -> String {
     let mut digest = Sha256::new();
     for field in [
         DIGEST_VERSION.as_bytes(),
@@ -1648,7 +1684,7 @@ fn digest_request(request: &CommandRequest) -> String {
         .collect()
 }
 
-fn stable_command_id(request: &CommandRequest) -> String {
+pub(crate) fn stable_command_id(request: &CommandRequest) -> String {
     let mut digest = Sha256::new();
     for field in [
         b"podbay-command-id/1".as_slice(),
@@ -1669,7 +1705,7 @@ fn stable_command_id(request: &CommandRequest) -> String {
     )
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))

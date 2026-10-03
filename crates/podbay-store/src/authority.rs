@@ -1,5 +1,5 @@
 //! Durable authority facts. Transport attestations are deliberately not restored as live grants.
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::model::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
@@ -469,8 +469,13 @@ impl PodBayStore {
                                 |row| row.get(0),
                             )
                             .optional()?;
-                        if scope.as_deref() != Some(&record.scope_id) {
-                            return Err(StoreError::WrongScope);
+                        match scope.as_deref() {
+                            Some(existing_scope) if existing_scope == record.scope_id => {}
+                            // A launch grant can name the exact proposed Pod
+                            // before atomic bound admission creates its row.
+                            // Absence never authorizes another Pod operation.
+                            None if right.operation == "launch_pod" => {}
+                            _ => return Err(StoreError::WrongScope),
                         }
                     } else if right.target_kind == "resource" {
                         let scope: Option<String> = transaction

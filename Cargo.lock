@@ -302,6 +302,7 @@ dependencies = [
  "libc",
  "podbay-core",
  "podbay-store",
+ "podbay-wire",
 ]
 
 [[package]]
@@ -340,6 +341,7 @@ name = "podbay-store"
 version = "0.1.0"
 dependencies = [
  "podbay-core",
+ "podbay-wire",
  "rusqlite",
  "sha2",
 ]

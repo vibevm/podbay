@@ -52,6 +52,184 @@ fn actor() -> AuthorityActorRecord {
     }
 }
 
+fn unattached_actor(scope_id: &str) -> AuthorityActorRecord {
+    let mut record = actor();
+    record.scope_id = scope_id.into();
+    record.pod_id = None;
+    record.pod_incarnation = None;
+    record.origin = "user".into();
+    record
+}
+
+fn grant(
+    scope_id: &str,
+    actor_id: &str,
+    operation: &str,
+    target_kind: &str,
+    target_id: &str,
+) -> AuthorityGrantRecord {
+    AuthorityGrantRecord {
+        grant_id: 1,
+        scope_id: scope_id.into(),
+        actor_id: actor_id.into(),
+        credential_generation: 1,
+        mode: "controller".into(),
+        remaining_delegation_depth: 0,
+        rights: vec![AuthorityRightRecord {
+            operation: operation.into(),
+            target_kind: target_kind.into(),
+            target_id: target_id.into(),
+        }],
+    }
+}
+
+#[test]
+fn preissued_exact_launch_pod_grant_creates_no_pod_or_target_epoch() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(unattached_actor("scope.main")),
+        )
+        .unwrap();
+    let record = grant(
+        "scope.main",
+        "actor.worker",
+        "launch_pod",
+        "pod",
+        "pod.proposed",
+    );
+    assert_eq!(
+        store
+            .apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(record.clone()))
+            .unwrap(),
+        revision + 1
+    );
+    let snapshot = store.authority_snapshot().unwrap();
+    assert_eq!(snapshot.grants, vec![record]);
+    assert!(snapshot.pods.is_empty());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let target_epochs: i64 = connection
+        .query_row("SELECT COUNT(*) FROM target_epochs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(target_epochs, 0);
+}
+
+#[test]
+fn proposed_launch_grant_refuses_foreign_existing_pod() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(unattached_actor("scope.main")),
+        )
+        .unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            revision,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.foreign".into(),
+                pod_id: "pod.proposed".into(),
+                incarnation: 1,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.apply_authority_mutation(
+            1,
+            revision,
+            AuthorityMutation::PutGrant(grant(
+                "scope.main",
+                "actor.worker",
+                "launch_pod",
+                "pod",
+                "pod.proposed"
+            ))
+        ),
+        Err(StoreError::WrongScope)
+    ));
+    let snapshot = store.authority_snapshot().unwrap();
+    assert_eq!(snapshot.revision, revision);
+    assert!(snapshot.grants.is_empty());
+}
+
+#[test]
+fn absent_stop_pod_and_resource_rights_still_refuse() {
+    for (operation, kind, target) in [
+        ("stop_pod", "pod", "pod.proposed"),
+        ("observe_resource", "resource", "resource.proposed"),
+    ] {
+        let fixture = Fixture::new();
+        let mut store = PodBayStore::open(&fixture.database).unwrap();
+        store.begin_authority_replay(0, 1).unwrap();
+        let revision = store
+            .apply_authority_mutation(
+                1,
+                1,
+                AuthorityMutation::PutActor(unattached_actor("scope.main")),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.apply_authority_mutation(
+                1,
+                revision,
+                AuthorityMutation::PutGrant(grant(
+                    "scope.main",
+                    "actor.worker",
+                    operation,
+                    kind,
+                    target
+                ))
+            ),
+            Err(StoreError::WrongScope)
+        ));
+        assert!(store.authority_snapshot().unwrap().grants.is_empty());
+    }
+}
+
+#[test]
+fn proposed_launch_grant_requires_exact_actor_and_grant_scope() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(unattached_actor("scope.main")),
+        )
+        .unwrap();
+    for record in [
+        grant(
+            "scope.main",
+            "actor.unknown",
+            "launch_pod",
+            "pod",
+            "pod.proposed",
+        ),
+        grant(
+            "scope.other",
+            "actor.worker",
+            "launch_pod",
+            "pod",
+            "pod.proposed",
+        ),
+    ] {
+        assert!(matches!(
+            store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(record)),
+            Err(StoreError::StaleEpoch)
+        ));
+    }
+    assert!(store.authority_snapshot().unwrap().grants.is_empty());
+}
+
 #[test]
 fn actor_identity_cannot_change_within_credential_generation() {
     let fixture = Fixture::new();
@@ -155,6 +333,11 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE launch_resources;
+             DROP TABLE launch_bindings;
+             DROP TABLE runtime_runs;
+             DROP TABLE runtime_sessions;
+             DROP INDEX launch_slots_binding_identity;
              DROP TABLE authority_grant_rights;
              DROP TABLE authority_grants;
              DROP TABLE authority_actors;

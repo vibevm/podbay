@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use podbay_core::{ActorId, PodId, ResourceId, Role, ScopeId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
-    AuthorisedDispatch, AuthorisedLaunch, CredentialGeneration, DurableAuthority,
+    AuthorisedBoundLaunch, AuthorisedDispatch, CredentialGeneration, DurableAuthority,
     DurableAuthorityError, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError,
     HostRequest, InputEpoch, ManagerEpoch, Operation, PodIncarnation, PodRegistration,
     PortDispatchError, PortDispatchOutcome, ResourceEpoch, ResourceRegistration, Right, Target,
@@ -57,9 +57,9 @@ impl HostDispatchPort for FakePort {
         Ok(PortDispatchOutcome::Accepted(self.calls.len()))
     }
 
-    fn launch(
+    fn launch_bound(
         &mut self,
-        _launch: AuthorisedLaunch,
+        _launch: AuthorisedBoundLaunch,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
         Err(PortDispatchError::RefusedBeforeEffect)
     }
@@ -215,12 +215,14 @@ fn restart_requires_reattest_and_fences_old_input_lease() {
     ));
     assert_eq!(reopened.port().calls.len(), 0);
     let wrong_process = subject(200, 301, "/user.slice/pod-main.scope");
-    assert!(reopened
-        .reattest_actor_from_trusted_replay(
-            &peer(&actor_id, &pod, &wrong_process),
-            registration.clone()
-        )
-        .is_err());
+    assert!(
+        reopened
+            .reattest_actor_from_trusted_replay(
+                &peer(&actor_id, &pod, &wrong_process),
+                registration.clone()
+            )
+            .is_err()
+    );
     reopened
         .reattest_actor_from_trusted_replay(&transport, registration)
         .unwrap();

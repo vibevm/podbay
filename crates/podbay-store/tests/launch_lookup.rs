@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
-    Admission, CommandRequest, EffectClaim, EffectState, LaunchDispatchStage, LaunchIntentBinding,
-    LaunchLookupRequest, LaunchPortResult, PodBayStore, StoreError, VerifiedPrincipal,
+    Admission, CommandRequest, EffectState, LaunchDispatchStage, LaunchIntentBinding,
+    LaunchLookupRequest, PodBayStore, StoreError, VerifiedPrincipal,
 };
 
 struct Fixture {
@@ -88,7 +88,7 @@ fn original_receipt_effect_and_status_survive_reopen_without_current_profile() {
     assert_eq!(value.receipt, receipt);
     assert_eq!(value.effect.payload, b"effective.profile.old");
     assert_eq!(value.status.stage, LaunchDispatchStage::Prepared);
-    assert_eq!(value.binding, LaunchIntentBinding::HistoricalUnboundV7);
+    assert_eq!(value.binding, LaunchIntentBinding::HistoricalUnbound);
     assert_eq!(
         reopened.effect_state(receipt.outbox_id).unwrap(),
         EffectState::Prepared
@@ -172,37 +172,30 @@ fn tampered_effect_fails_before_returning_inspection() {
 #[test]
 fn historical_v7_status_is_observed_but_never_a_fresh_dispatch_binding() {
     let fixture = Fixture::new();
-    let (mut store, input, receipt) = admitted(&fixture);
-    assert_eq!(
-        store
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "pod.fixture",
-                1,
-                1,
-                "claim.fixture"
-            )
-            .unwrap(),
-        EffectClaim::NewClaim
-    );
-    store
-        .record_launch_port_result(
-            receipt.outbox_id,
-            "scope.fixture",
-            "pod.fixture",
-            1,
-            "claim.fixture",
-            LaunchPortResult::HostAccepted {
-                receipt_ref: Some("port.fixture".into()),
-            },
+    let (store, input, receipt) = admitted(&fixture);
+    drop(store);
+    // Represent a receipt settled before the v8 bound-only claim gate. A new
+    // unbound offer is now refused before any claim or host call.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE outbox SET state='claimed_uncertain',claim_key='claim.fixture',
+         claim_owner_epoch=1 WHERE outbox_id=?1",
+            [receipt.outbox_id],
         )
         .unwrap();
+    connection.execute(
+        "INSERT INTO launch_dispatch_outcomes(outbox_id,claim_key,stage,receipt_ref,recorded_at)
+         VALUES(?1,'claim.fixture','host_accepted','port.fixture','2026-10-03T12:00:00Z')",
+        [receipt.outbox_id],
+    ).unwrap();
+    drop(connection);
+    let mut store = fixture.open();
     let inspected = store.lookup_admitted_launch(&lookup(&input)).unwrap();
     assert_eq!(inspected.status.stage, LaunchDispatchStage::HostAccepted);
     assert_eq!(
         inspected.status.receipt_ref.as_deref(),
         Some("port.fixture")
     );
-    assert_eq!(inspected.binding, LaunchIntentBinding::HistoricalUnboundV7);
+    assert_eq!(inspected.binding, LaunchIntentBinding::HistoricalUnbound);
 }

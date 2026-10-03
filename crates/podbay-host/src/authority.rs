@@ -8,12 +8,14 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use podbay_core::{ActorId, PodId, ResourceId, Role, ScopeId};
+use podbay_core::{ActorId, LaunchBinding, PodId, ResourceId, Role, Run, ScopeId, Session};
 use podbay_store::{
-    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, CommandRequest, EffectClaim,
-    LaunchDispatchStatus, LaunchPortResult, PodBayStore, Receipt, StoreError, VerifiedPrincipal,
+    AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
+    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
+    BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, EffectClaim, LaunchDispatchStatus,
+    LaunchLookupRequest, LaunchPortResult, PodBayStore, Receipt, StoreError, VerifiedPrincipal,
 };
+use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, ReviewedNativePolicy};
 
 use crate::launch_spec::{EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile};
 
@@ -27,6 +29,7 @@ pub enum HostError {
     LeaseExpired,
     DeadlineExpired,
     Unsupported,
+    NativeResolutionUnverified,
     AuthorityStoreUnavailable,
     RefusedBeforeEffect,
     UncertainAfterPossibleEffect {
@@ -481,40 +484,92 @@ pub struct AuthorisedDispatch {
     pub action: HostAction,
 }
 
-/// The launch port receives only the profile-resolved immutable descriptor.
+/// The port sees only bytes read back from a committed bound admission. The
+/// current profile cannot rewrite the logical launch after a lost reply.
+/// Native cwd, host and driver locality are still unverified in PB09j; only
+/// a preproduction fixture port may opt in to receiving this value.
 #[derive(Clone, Debug)]
-pub struct AuthorisedLaunch {
+pub struct AuthorisedBoundLaunch {
     actor_id: ActorId,
     scope_id: ScopeId,
     command_key: String,
     correlation_id: String,
-    spec: EffectiveLaunchSpec,
-    spec_digest: String,
+    record: BoundLaunchRecord,
+    effective: EffectiveLaunchContract,
+    descriptor: ImmutableLaunchDescriptor,
+    native_resolution: NativeResolutionState,
 }
 
-impl AuthorisedLaunch {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NativeResolutionState {
+    Unverified,
+}
+
+impl AuthorisedBoundLaunch {
+    /// Validates a readback record against the already authenticated host
+    /// action. This check alone does not authorize any native effect.
+    pub fn from_committed(
+        authorised: &AuthorisedDispatch,
+        record: BoundLaunchRecord,
+    ) -> Result<Self, HostError> {
+        let effective = EffectiveLaunchContract::decode(&record.effective_spec)
+            .map_err(|_| HostError::StaleGuard)?;
+        let descriptor = ImmutableLaunchDescriptor::decode_json(&record.descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        effective
+            .compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        let HostAction::LaunchPod { pod_id, role, .. } = &authorised.action else {
+            return Err(HostError::InvalidInput);
+        };
+        if record.scope_id != authorised.scope_id.as_str()
+            || record.pod_id != pod_id.as_str()
+            || effective.role() != (*role).into()
+            || descriptor.session_id() != record.session_id
+            || descriptor.run_id() != record.run_id
+            || descriptor.attempt_id() != record.attempt_id
+            || descriptor.pod_incarnation() != record.pod_incarnation
+        {
+            return Err(HostError::StaleGuard);
+        }
+        Ok(Self {
+            actor_id: authorised.actor_id.clone(),
+            scope_id: authorised.scope_id.clone(),
+            command_key: authorised.command_key.clone(),
+            correlation_id: authorised.correlation_id.clone(),
+            record,
+            effective,
+            descriptor,
+            native_resolution: NativeResolutionState::Unverified,
+        })
+    }
     pub fn actor_id(&self) -> &ActorId {
         &self.actor_id
     }
-
     pub fn scope_id(&self) -> &ScopeId {
         &self.scope_id
     }
-
     pub fn command_key(&self) -> &str {
         &self.command_key
     }
-
     pub fn correlation_id(&self) -> &str {
         &self.correlation_id
     }
-
-    pub fn spec(&self) -> &EffectiveLaunchSpec {
-        &self.spec
+    pub fn record(&self) -> &BoundLaunchRecord {
+        &self.record
     }
-
-    pub fn spec_digest(&self) -> &str {
-        &self.spec_digest
+    pub fn effective(&self) -> &EffectiveLaunchContract {
+        &self.effective
+    }
+    pub fn descriptor(&self) -> &ImmutableLaunchDescriptor {
+        &self.descriptor
+    }
+    pub fn descriptor_bytes(&self) -> &[u8] {
+        &self.record.descriptor
+    }
+    pub fn native_resolution(&self) -> NativeResolutionState {
+        self.native_resolution
     }
 }
 
@@ -557,10 +612,36 @@ pub trait HostDispatchPort {
         action: AuthorisedDispatch,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError>;
 
-    fn launch(
+    fn launch_bound(
         &mut self,
-        launch: AuthorisedLaunch,
+        launch: AuthorisedBoundLaunch,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError>;
+
+    /// Default-deny until a trusted host-owned native resolver supplies a
+    /// private verified capability. Only fake test ports may opt in here.
+    fn allow_unverified_native_launch_for_fixture(&self) -> bool {
+        false
+    }
+}
+
+/// Aggregate snapshots and native fields proposed for a *new* initial root
+/// launch. The native cwd, host and driver fields are not host resolved yet;
+/// the default-deny port gate keeps this preproduction path from OS launch.
+/// A duplicate may omit this entire proposal.
+#[derive(Clone, Debug)]
+pub struct BoundHostLaunchProposal {
+    pub session: Session,
+    pub run: Run,
+    pub binding: LaunchBinding,
+    pub selection: LaunchSelection,
+    pub native_policy: ReviewedNativePolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct BoundLaunchPodRequest {
+    pub host_request: HostRequest,
+    pub canonical_request: Vec<u8>,
+    pub proposal: Option<BoundHostLaunchProposal>,
 }
 
 pub trait StablePortReceipt {
@@ -573,22 +654,13 @@ impl StablePortReceipt for PortReceiptRef {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LaunchPodRequest {
-    pub host_request: HostRequest,
-    /// Exact normalised request bytes from the typed protocol boundary.
-    pub canonical_request: Vec<u8>,
-    pub selection: LaunchSelection,
-    /// Admission epochs stay fixed across retries; host_request.guards are current.
-    pub admission_owner_epoch: ManagerEpoch,
-    pub admission_pod_incarnation: PodIncarnation,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPodReceipt {
     pub receipt: Receipt,
     pub status: LaunchDispatchStatus,
     pub duplicate: bool,
+    /// False also covers a committed Prepared admission held by the native
+    /// resolution gate; it is not evidence of an OS launch.
     pub port_called: bool,
 }
 
@@ -924,10 +996,20 @@ impl<P: HostDispatchPort> HostAuthority<P> {
         spec.rights.iter().all(|right| match &right.target {
             Target::Pod(id) => {
                 matches!(right.operation, Operation::LaunchPod | Operation::StopPod)
-                    && self
-                        .pods
-                        .get(id)
-                        .is_some_and(|pod| pod.scope_id == spec.scope_id)
+                    && match right.operation {
+                        // A precise LaunchPod right may be issued before the
+                        // initial Pod row is atomically admitted. Existing
+                        // identities may never cross scope.
+                        Operation::LaunchPod => self
+                            .pods
+                            .get(id)
+                            .is_none_or(|pod| pod.scope_id == spec.scope_id),
+                        Operation::StopPod => self
+                            .pods
+                            .get(id)
+                            .is_some_and(|pod| pod.scope_id == spec.scope_id),
+                        _ => false,
+                    }
             }
             Target::Resource(id) => {
                 matches!(
@@ -1120,6 +1202,69 @@ impl<P: HostDispatchPort> HostAuthority<P> {
             (request.action.resource_id(), request.action.lease())
         {
             self.check_lease(&actor.actor_id, &request.scope_id, resource_id, lease)?;
+        }
+        Ok(AuthorisedDispatch {
+            actor_id: actor.actor_id.clone(),
+            role: actor.role,
+            scope_id: request.scope_id.clone(),
+            command_key: request.command_key.clone(),
+            correlation_id: request.correlation_id.clone(),
+            action: request.action.clone(),
+        })
+    }
+
+    /// Initial launch authorisation for an exact proposed PodId. It checks
+    /// actor/grant/credential and initial fences without installing a Pod in
+    /// memory. The store transaction is the first authority registration.
+    fn authorise_proposed_launch<T: AuthenticatedTransport>(
+        &self,
+        transport: &T,
+        request: &HostRequest,
+    ) -> Result<AuthorisedDispatch, HostError> {
+        let HostAction::LaunchPod {
+            pod_id, credential, ..
+        } = &request.action
+        else {
+            return Err(HostError::InvalidInput);
+        };
+        request.action.validate()?;
+        if !valid_token(&request.command_key) || !valid_token(&request.correlation_id) {
+            return Err(HostError::InvalidInput);
+        }
+        if request.deadline <= Instant::now() {
+            return Err(HostError::DeadlineExpired);
+        }
+        let actor = self.authenticate(transport)?;
+        self.check_grant(
+            actor,
+            request.grant_id,
+            &request.scope_id,
+            &Right::new(Operation::LaunchPod, Target::Pod(pod_id.clone())),
+        )?;
+        if request.guards.manager_epoch != self.manager_epoch
+            || request.guards.pod_incarnation.get() != 1
+            || request.guards.resource_epoch.is_some()
+            || request.guards.credential_generation != actor.credential_generation
+        {
+            return Err(HostError::StaleGuard);
+        }
+        if self
+            .pods
+            .get(pod_id)
+            .is_some_and(|pod| pod.scope_id != request.scope_id || pod.incarnation.get() != 1)
+        {
+            return Err(HostError::StaleGuard);
+        }
+        if let Some(reference) = credential {
+            self.check_grant(
+                actor,
+                request.grant_id,
+                &request.scope_id,
+                &Right::new(
+                    Operation::UseCredential,
+                    Target::Credential(reference.clone()),
+                ),
+            )?;
         }
         Ok(AuthorisedDispatch {
             actor_id: actor.actor_id.clone(),
@@ -1443,161 +1588,265 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         self.host.dispatch(transport, request)
     }
 
-    /// One durable LaunchPod path. A persisted intent precedes the claim, and
-    /// the port call occurs only after the claim transaction has committed.
-    /// HostAccepted and PortSettled describe the launch port only: neither is
-    /// provider insertion or run/task completion. A proven refusal remains
-    /// non-dispatchable under this claim; retry needs a new Pod incarnation,
-    /// command, and policy.
-    pub fn launch_pod<T: AuthenticatedTransport>(
+    /// New bound initial launch. A duplicate is inspection-only here: it
+    /// returns original bytes/receipt before today's profile is resolved and
+    /// never replays an external port call. Prepared recovery is explicit.
+    pub fn launch_bound_pod<T: AuthenticatedTransport>(
         &mut self,
         transport: &T,
-        request: LaunchPodRequest,
+        request: BoundLaunchPodRequest,
     ) -> Result<LaunchPodReceipt, LaunchPodError>
     where
         P::Receipt: StablePortReceipt,
     {
-        let (authorised, receipt, duplicate) = self.admit_launch_intent(transport, &request)?;
-        let pod_id = authorised.spec.pod_id();
-        let claim_key = format!("claim.{}", receipt.command_id);
-        let claim = self.store.claim_effect(
-            receipt.outbox_id,
-            authorised.scope_id.as_str(),
-            pod_id.as_str(),
-            self.host.manager_epoch.get(),
-            request.host_request.guards.pod_incarnation.get(),
-            &claim_key,
-        )?;
-        if claim != EffectClaim::NewClaim {
-            return Ok(LaunchPodReceipt {
-                status: self.store.launch_dispatch_status(
-                    receipt.outbox_id,
-                    authorised.scope_id.as_str(),
-                    pod_id.as_str(),
-                )?,
-                receipt,
-                duplicate,
-                port_called: false,
-            });
+        let (authorised, record, duplicate) = self.lookup_or_admit_bound(transport, &request)?;
+        if duplicate {
+            return self.bound_receipt(record, true);
         }
-        // A noncooperative owner-epoch write between claim and port call still
-        // fences this instance. The claim remains uncertain and is not replayed.
-        self.ensure_current_owner_epoch()?;
-        let port_result = match self.host.port.launch(authorised.clone()) {
-            Ok(PortDispatchOutcome::Accepted(port_receipt)) => LaunchPortResult::HostAccepted {
-                receipt_ref: Some(port_receipt.stable_reference().to_owned()),
-            },
-            Ok(PortDispatchOutcome::Settled(port_receipt)) => LaunchPortResult::PortSettled {
-                receipt_ref: Some(port_receipt.stable_reference().to_owned()),
-            },
-            Err(PortDispatchError::RefusedBeforeEffect) => LaunchPortResult::RefusedBeforeEffect,
-            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
-                LaunchPortResult::UncertainAfterPossibleEffect {
-                    receipt_ref: receipt_ref.map(|reference| reference.as_str().to_owned()),
-                }
-            }
-        };
-        let status = self
-            .store
-            .record_launch_port_result(
-                receipt.outbox_id,
-                authorised.scope_id.as_str(),
-                pod_id.as_str(),
-                self.host.manager_epoch.get(),
-                &claim_key,
-                port_result.clone(),
-            )
-            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
-                receipt: receipt.clone(),
-                observed: port_result,
-                source,
-            })?;
-        Ok(LaunchPodReceipt {
-            receipt,
-            status,
-            duplicate,
-            port_called: true,
-        })
+        self.dispatch_committed_bound(authorised.ok_or(HostError::InvalidInput)?, record, false)
     }
 
-    /// Commits intent only. Its receipt proves persistence, not a port call.
-    pub fn admit_launch_pod<T: AuthenticatedTransport>(
+    /// Commits the complete bound launch transaction without an OS port call.
+    pub fn admit_bound_pod<T: AuthenticatedTransport>(
         &mut self,
         transport: &T,
-        request: LaunchPodRequest,
+        request: BoundLaunchPodRequest,
     ) -> Result<LaunchPodReceipt, LaunchPodError> {
-        let (authorised, receipt, duplicate) = self.admit_launch_intent(transport, &request)?;
-        let pod_id = authorised.spec.pod_id();
+        let (_, record, duplicate) = self.lookup_or_admit_bound(transport, &request)?;
+        self.bound_receipt(record, duplicate)
+    }
+
+    /// Only a still-prepared original may be dispatched after restart. The
+    /// committed descriptor is used at the port, and today's profile/grant
+    /// must independently reauthorize its exact reviewed semantics.
+    pub fn resume_prepared_bound_pod<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.ensure_current_owner_epoch()?;
+        if !matches!(request.host_request.action, HostAction::LaunchPod { .. }) {
+            return Err(LaunchPodError::WrongOperation);
+        }
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal);
+        let record = self
+            .store
+            .lookup_bound_launch(&lookup)?
+            .ok_or(StoreError::NotFound)?;
         let status = self.store.launch_dispatch_status(
-            receipt.outbox_id,
-            authorised.scope_id.as_str(),
-            pod_id.as_str(),
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+        )?;
+        if status.stage != podbay_store::LaunchDispatchStage::Prepared {
+            return self.bound_receipt(record, true);
+        }
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        let (effective_bytes, descriptor) =
+            self.review_bound_proposal(&authorised, request.host_request.grant_id, proposal)?;
+        if effective_bytes != record.effective_spec
+            || descriptor
+                .encode_json()
+                .map_err(|_| HostError::InvalidInput)?
+                != record.descriptor
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        self.dispatch_committed_bound(authorised, record, true)
+    }
+
+    fn bound_lookup(
+        &self,
+        request: &BoundLaunchPodRequest,
+        principal: VerifiedPrincipal,
+    ) -> LaunchLookupRequest {
+        let pod_id = match &request.host_request.action {
+            HostAction::LaunchPod { pod_id, .. } => pod_id.as_str(),
+            _ => "invalid.target",
+        };
+        LaunchLookupRequest {
+            principal,
+            namespace: "podbay.launch".into(),
+            command_key: request.host_request.command_key.clone(),
+            scope_id: request.host_request.scope_id.as_str().into(),
+            target_id: pod_id.into(),
+            canonical_intent: request.canonical_request.clone(),
+        }
+    }
+
+    fn lookup_or_admit_bound<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &BoundLaunchPodRequest,
+    ) -> Result<(Option<AuthorisedDispatch>, BoundLaunchRecord, bool), LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(request, principal.clone());
+        if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
+            return Ok((None, record, true));
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let (effective_bytes, descriptor) =
+            self.review_bound_proposal(&authorised, request.host_request.grant_id, proposal)?;
+        let store_request = BoundLaunchRequest {
+            principal,
+            command_key: &request.host_request.command_key,
+            canonical_intent: &request.canonical_request,
+            scope_id: authorised.scope_id.as_str(),
+            pod_id: pod_id.as_str(),
+            proposal: Some(BoundLaunchProposal {
+                session: &proposal.session,
+                run: &proposal.run,
+                binding: &proposal.binding,
+                effective_spec: &effective_bytes,
+                descriptor: &descriptor,
+                expected_owner_epoch: self.host.manager_epoch.get(),
+                expected_authority_revision: self.recorded.revision,
+            }),
+        };
+        let (record, duplicate) = match self.store.admit_bound_launch(store_request)? {
+            BoundLaunchAdmission::Committed(record) => (record, false),
+            BoundLaunchAdmission::Duplicate(record) => (record, true),
+        };
+        if !duplicate {
+            self.hydrate_new_bound(&record)?;
+        }
+        Ok((Some(authorised), record, duplicate))
+    }
+
+    fn hydrate_new_bound(&mut self, record: &BoundLaunchRecord) -> Result<(), LaunchPodError> {
+        let scope_id =
+            ScopeId::try_from(record.scope_id.as_str()).map_err(|_| HostError::InvalidInput)?;
+        let pod_id =
+            PodId::try_from(record.pod_id.as_str()).map_err(|_| HostError::InvalidInput)?;
+        let pod_incarnation = PodIncarnation::new(record.pod_incarnation)?;
+        self.host
+            .register_pod_from_trusted_policy(PodRegistration {
+                scope_id: scope_id.clone(),
+                pod_id: pod_id.clone(),
+                incarnation: pod_incarnation,
+            })?;
+        for resource in &record.resources {
+            self.host
+                .register_resource_from_trusted_policy(ResourceRegistration {
+                    scope_id: scope_id.clone(),
+                    resource_id: ResourceId::try_from(resource.id.as_str())
+                        .map_err(|_| HostError::InvalidInput)?,
+                    pod_id: pod_id.clone(),
+                    pod_incarnation,
+                    resource_epoch: ResourceEpoch::new(resource.epoch)?,
+                    input_epoch: InputEpoch::new(1)?,
+                })?;
+        }
+        self.recorded = self.store.authority_snapshot()?;
+        Ok(())
+    }
+
+    fn bound_receipt(
+        &self,
+        record: BoundLaunchRecord,
+        duplicate: bool,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        let status = self.store.launch_dispatch_status(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
         )?;
         Ok(LaunchPodReceipt {
-            receipt,
+            receipt: record.receipt,
             status,
             duplicate,
             port_called: false,
         })
     }
 
-    fn admit_launch_intent<T: AuthenticatedTransport>(
+    fn dispatch_committed_bound(
         &mut self,
-        transport: &T,
-        request: &LaunchPodRequest,
-    ) -> Result<(AuthorisedLaunch, Receipt, bool), LaunchPodError> {
-        self.ensure_current_owner_epoch()?;
-        let authorised = self
-            .host
-            .authorise_request(transport, &request.host_request)?;
-        let HostAction::LaunchPod { pod_id, .. } = &authorised.action else {
-            return Err(LaunchPodError::WrongOperation);
-        };
-        let spec = self.resolve_effective_launch(
-            &authorised,
-            request.host_request.grant_id,
-            &request.selection,
-        )?;
-        let effect_payload = spec.canonical_bytes()?;
-        let command = CommandRequest {
-            principal: VerifiedPrincipal::from_authenticated_boundary(
-                authorised.actor_id.as_str(),
-            )?,
-            namespace: "podbay.launch".to_owned(),
-            command_key: authorised.command_key.clone(),
-            scope_id: authorised.scope_id.as_str().to_owned(),
-            target_id: pod_id.as_str().to_owned(),
-            expected_owner_epoch: request.admission_owner_epoch.get(),
-            expected_target_epoch: request.admission_pod_incarnation.get(),
-            canonical_request: request.canonical_request.clone(),
-            event_kind: "command.admitted".to_owned(),
-            event_payload: br#"{"kind":"command_admitted"}"#.to_vec(),
-            effect_kind: "pod.offer".to_owned(),
-            effect_payload: effect_payload.clone(),
-        };
-        let (receipt, duplicate) = match self.store.admit(&command)? {
-            Admission::Committed(receipt) => (receipt, false),
-            Admission::Duplicate(receipt) => (receipt, true),
-        };
-        let effect = self.store.load_effect(
-            receipt.outbox_id,
-            authorised.scope_id.as_str(),
-            pod_id.as_str(),
-        )?;
-        if effect.kind != "pod.offer" || effect.payload != effect_payload {
-            return Err(LaunchPodError::Store(StoreError::Conflict(
-                "durable launch spec differs from reviewed effective spec",
-            )));
+        authorised: AuthorisedDispatch,
+        record: BoundLaunchRecord,
+        duplicate: bool,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        // Validate exactly the committed bytes before moving the outbox into
+        // an uncertain claim state. No current proposal reaches this port.
+        let committed = AuthorisedBoundLaunch::from_committed(&authorised, record.clone())?;
+        if committed.native_resolution() == NativeResolutionState::Unverified
+            && !self.host.port.allow_unverified_native_launch_for_fixture()
+        {
+            return Err(HostError::NativeResolutionUnverified.into());
         }
-        let launch = AuthorisedLaunch {
-            actor_id: authorised.actor_id,
-            scope_id: authorised.scope_id,
-            command_key: authorised.command_key,
-            correlation_id: authorised.correlation_id,
-            spec,
-            spec_digest: effect.effect_digest,
+        let claim_key = format!("claim.{}", record.receipt.command_id);
+        let claim = self.store.claim_effect(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+            self.host.manager_epoch.get(),
+            record.pod_incarnation,
+            self.recorded.revision,
+            &claim_key,
+        )?;
+        if claim != EffectClaim::NewClaim {
+            return self.bound_receipt(record, duplicate);
+        }
+        self.ensure_current_owner_epoch()?;
+        let port_result = match self.host.port.launch_bound(committed) {
+            Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Ok(PortDispatchOutcome::Settled(receipt)) => LaunchPortResult::PortSettled {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Err(PortDispatchError::RefusedBeforeEffect) => LaunchPortResult::RefusedBeforeEffect,
+            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
+                LaunchPortResult::UncertainAfterPossibleEffect {
+                    receipt_ref: receipt_ref.map(|value| value.as_str().to_owned()),
+                }
+            }
         };
-        Ok((launch, receipt, duplicate))
+        let status = self
+            .store
+            .record_launch_port_result(
+                record.receipt.outbox_id,
+                &record.scope_id,
+                &record.pod_id,
+                self.host.manager_epoch.get(),
+                &claim_key,
+                port_result.clone(),
+            )
+            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
+                receipt: record.receipt.clone(),
+                observed: port_result,
+                source,
+            })?;
+        Ok(LaunchPodReceipt {
+            receipt: record.receipt,
+            status,
+            duplicate,
+            port_called: true,
+        })
     }
 
     fn resolve_effective_launch(
@@ -1645,6 +1894,38 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             )?;
         }
         Ok(spec)
+    }
+
+    fn review_bound_proposal(
+        &self,
+        authorised: &AuthorisedDispatch,
+        grant_id: GrantId,
+        proposal: &BoundHostLaunchProposal,
+    ) -> Result<(Vec<u8>, ImmutableLaunchDescriptor), HostError> {
+        let HostAction::LaunchPod { pod_id, role, .. } = &authorised.action else {
+            return Err(HostError::InvalidInput);
+        };
+        if proposal.binding.scope_id() != &authorised.scope_id
+            || proposal.binding.actor_id() != &authorised.actor_id
+            || proposal.binding.pod_id() != pod_id
+            || proposal.binding.role() != *role
+        {
+            return Err(HostError::Unauthorised);
+        }
+        let spec = self.resolve_effective_launch(authorised, grant_id, &proposal.selection)?;
+        let bytes = spec.canonical_bytes()?;
+        let decoded =
+            EffectiveLaunchContract::decode(&bytes).map_err(|_| HostError::Unauthorised)?;
+        let mut native = proposal.native_policy.clone();
+        // The host computes this link from the reviewed profile; a caller's
+        // placeholder digest never becomes authority.
+        native.effective_spec_digest = decoded.digest().to_owned();
+        let descriptor = ImmutableLaunchDescriptor::from_binding(&proposal.binding, native)
+            .map_err(|_| HostError::Unauthorised)?;
+        decoded
+            .compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::Unauthorised)?;
+        Ok((bytes, descriptor))
     }
 
     fn ensure_current_owner_epoch(&self) -> Result<(), HostError> {
@@ -1902,7 +2183,7 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
             _ => {
                 return Err(DurableAuthorityError::Corrupt(
                     "unknown durable grant operation",
-                ))
+                ));
             }
         };
         let target = match right.target_kind.as_str() {
@@ -1922,7 +2203,7 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
             _ => {
                 return Err(DurableAuthorityError::Corrupt(
                     "unknown durable grant target",
-                ))
+                ));
             }
         };
         rights.insert(Right::new(operation, target));

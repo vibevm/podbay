@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
-    Admission, CommandRequest, EffectClaim, EffectObservation, EffectState, HostAcceptanceProof,
+    Admission, CommandRequest, EffectObservation, EffectState, HostAcceptanceProof,
     LaunchDispatchStage, LaunchPortResult, ObservedStage, PodBayStore, SourceOrder, StoreError,
     VerifiedPrincipal,
 };
@@ -73,6 +73,17 @@ fn ready(store: &mut PodBayStore) {
     store
         .advance_target_epoch("scope.fixture", "target.fixture", 0, 1)
         .unwrap();
+}
+
+fn seed_pre_v8_claim(fixture: &Fixture, outbox_id: i64, claim_key: &str, owner_epoch: i64) {
+    // These legacy fixtures represent an effect claimed before v8 introduced
+    // the bound-only dispatch gate. New unbound effects cannot reach this state.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    assert_eq!(connection.execute(
+        "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
+         WHERE outbox_id=?3 AND state='prepared'",
+        rusqlite::params![claim_key,owner_epoch,outbox_id],
+    ).unwrap(),1);
 }
 
 fn remove_v8_schema(connection: &rusqlite::Connection) {
@@ -533,7 +544,7 @@ fn schema_eight_refuses_preexisting_or_malformed_runtime_tables() {
 }
 
 #[test]
-fn claim_survives_reopen_as_uncertain_and_never_replays_as_new() {
+fn historical_unbound_claim_refuses_after_reopen() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     ready(&mut store);
@@ -546,56 +557,50 @@ fn claim_survives_reopen_as_uncertain_and_never_replays_as_new() {
         store.effect_state(receipt.outbox_id).unwrap(),
         EffectState::Prepared
     );
-    assert_eq!(
-        store
-            .claim_effect(
+    assert!(matches!(
+        store.claim_effect(
                 receipt.outbox_id,
                 "scope.fixture",
                 "target.fixture",
                 1,
-                1,
+                1, 0,
                 "claim.fixture"
-            )
-            .unwrap(),
-        EffectClaim::NewClaim
-    );
+            ), Err(StoreError::Conflict("historical launch has no bound v8 descriptor"))
+    ));
     drop(store);
     let mut reopened = fixture.open();
     assert_eq!(
         reopened.effect_state(receipt.outbox_id).unwrap(),
-        EffectState::ClaimedUncertain
+        EffectState::Prepared
     );
     assert_eq!(
         reopened.admit(&input).unwrap(),
         Admission::Duplicate(receipt.clone())
     );
-    assert_eq!(
-        reopened
-            .claim_effect(
+    assert!(matches!(
+        reopened.claim_effect(
                 receipt.outbox_id,
                 "scope.fixture",
                 "target.fixture",
                 1,
-                1,
+                1, 0,
                 "claim.fixture"
-            )
-            .unwrap(),
-        EffectClaim::ExistingUncertain
-    );
+            ), Err(StoreError::Conflict("historical launch has no bound v8 descriptor"))
+    ));
     assert!(matches!(
         reopened.claim_effect(
             receipt.outbox_id,
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.other"
         ),
         Err(StoreError::Conflict(_))
     ));
     assert_eq!(
         reopened.effect_state(receipt.outbox_id).unwrap(),
-        EffectState::ClaimedUncertain
+        EffectState::Prepared
     );
 }
 
@@ -621,7 +626,7 @@ fn stale_epochs_and_wrong_scope_refuse_without_extra_rows() {
             "scope.other",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.scope"
         ),
         Err(StoreError::WrongScope)
@@ -733,16 +738,7 @@ fn host_acceptance_adds_event_without_changing_admission_receipt() {
     };
     let before = store.scope_snapshot("scope.fixture").unwrap();
     assert_eq!(before.cursor.sequence, receipt.event_sequence);
-    store
-        .claim_effect(
-            receipt.outbox_id,
-            "scope.fixture",
-            "target.fixture",
-            1,
-            1,
-            "claim.two-events",
-        )
-        .unwrap();
+    seed_pre_v8_claim(&fixture, receipt.outbox_id, "claim.two-events", 1);
     let observation = store
         .observe_effect(
             receipt.outbox_id,
@@ -792,16 +788,7 @@ fn observation_event_insert_failure_keeps_claim_uncertain() {
         Admission::Committed(receipt) => receipt,
         other => panic!("expected commit: {other:?}"),
     };
-    store
-        .claim_effect(
-            receipt.outbox_id,
-            "scope.fixture",
-            "target.fixture",
-            1,
-            1,
-            "claim.obs-atomic",
-        )
-        .unwrap();
+    seed_pre_v8_claim(&fixture, receipt.outbox_id, "claim.obs-atomic", 1);
     let before = store.scope_snapshot("scope.fixture").unwrap().cursor;
     let injector = rusqlite::Connection::open(&fixture.database).unwrap();
     injector
@@ -854,7 +841,7 @@ fn observation_event_insert_failure_keeps_claim_uncertain() {
 }
 
 #[test]
-fn owner_takeover_claims_prepared_work_and_fences_old_owner() {
+fn owner_takeover_keeps_historical_unbound_offer_unclaimable() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     ready(&mut store);
@@ -872,69 +859,39 @@ fn owner_takeover_claims_prepared_work_and_fences_old_owner() {
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.takeover"
         ),
         Err(StoreError::StaleEpoch)
     ));
-    assert_eq!(
-        store
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                2,
-                1,
-                "claim.takeover"
-            )
-            .unwrap(),
-        EffectClaim::NewClaim
-    );
+    assert!(matches!(store.claim_effect(receipt.outbox_id,"scope.fixture","target.fixture",
+        2,1, 0,"claim.takeover"),Err(StoreError::Conflict(
+            "historical launch has no bound v8 descriptor"))));
     let effect = store
         .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
         .unwrap();
     assert_eq!(effect.admission_owner_epoch, 1);
-    assert_eq!(effect.claim_owner_epoch, Some(2));
-    assert_eq!(effect.state, EffectState::ClaimedUncertain);
+    assert_eq!(effect.claim_owner_epoch, None);
+    assert_eq!(effect.state, EffectState::Prepared);
     drop(store);
 
     let mut reopened = fixture.open();
-    assert_eq!(
-        reopened
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                2,
-                1,
-                "claim.takeover"
-            )
-            .unwrap(),
-        EffectClaim::ExistingUncertain
-    );
+    assert!(matches!(reopened.claim_effect(receipt.outbox_id,"scope.fixture","target.fixture",
+        2,1, 0,"claim.takeover"),Err(StoreError::Conflict(
+            "historical launch has no bound v8 descriptor"))));
     reopened
         .advance_target_epoch("scope.fixture", "target.fixture", 1, 2)
         .unwrap();
-    assert_eq!(
-        reopened
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                2,
-                2,
-                "claim.takeover"
-            )
-            .unwrap(),
-        EffectClaim::ExistingUncertain
-    );
+    assert!(matches!(reopened.claim_effect(receipt.outbox_id,"scope.fixture","target.fixture",
+        2,2, 0,"claim.takeover"),Err(StoreError::Conflict(
+            "historical launch has no bound v8 descriptor"))));
     assert!(matches!(
         reopened.claim_effect(
             receipt.outbox_id,
             "scope.fixture",
             "target.fixture",
             2,
-            2,
+            2, 0,
             "claim.other"
         ),
         Err(StoreError::Conflict(_))
@@ -942,7 +899,7 @@ fn owner_takeover_claims_prepared_work_and_fences_old_owner() {
 }
 
 #[test]
-fn target_takeover_blocks_prepared_old_incarnation_payload() {
+fn target_takeover_does_not_make_unbound_historical_payload_dispatchable() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     ready(&mut store);
@@ -966,10 +923,10 @@ fn target_takeover_blocks_prepared_old_incarnation_payload() {
             "scope.fixture",
             "target.fixture",
             1,
-            2,
+            2, 0,
             "claim.new-target"
         ),
-        Err(StoreError::TargetReconciliationRequired)
+        Err(StoreError::Conflict("historical launch has no bound v8 descriptor"))
     ));
     assert_eq!(
         store.effect_state(receipt.outbox_id).unwrap(),
@@ -1018,19 +975,7 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
         ),
         Err(StoreError::Conflict(_))
     ));
-    assert_eq!(
-        reopened
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                1,
-                1,
-                "claim.observe"
-            )
-            .unwrap(),
-        EffectClaim::NewClaim
-    );
+    seed_pre_v8_claim(&fixture, receipt.outbox_id, "claim.observe", 1);
     drop(reopened);
 
     let mut recovered = fixture.open();
@@ -1178,16 +1123,7 @@ fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
             Admission::Committed(receipt) => receipt,
             other => panic!("expected commit: {other:?}"),
         };
-        store
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                targets[index],
-                1,
-                1,
-                &format!("claim.source.{index}"),
-            )
-            .unwrap();
+        seed_pre_v8_claim(&fixture, receipt.outbox_id, &format!("claim.source.{index}"), 1);
         receipts.push(receipt);
     }
     let first = store
@@ -1476,7 +1412,7 @@ fn unknown_effect_refuses_admission_and_cannot_be_claimed_after_downgrade() {
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.unknown"
         ),
         Err(StoreError::UnsupportedEffectKind)
@@ -1531,7 +1467,7 @@ fn downgrade_returns_prior_receipt_for_exact_unknown_effect_retry() {
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.future"
         ),
         Err(StoreError::UnsupportedEffectKind)
@@ -1654,16 +1590,7 @@ fn schema_two_migration_preserves_lineage_cursor_and_legacy_evidence_stage() {
         other => panic!("expected commit: {other:?}"),
     };
     let original_cursor = store.scope_snapshot("scope.fixture").unwrap().cursor;
-    store
-        .claim_effect(
-            receipt.outbox_id,
-            "scope.fixture",
-            "target.fixture",
-            1,
-            1,
-            "claim.schema-two",
-        )
-        .unwrap();
+    seed_pre_v8_claim(&fixture, receipt.outbox_id, "claim.schema-two", 1);
     drop(store);
 
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
@@ -1779,19 +1706,7 @@ fn proven_launch_refusal_is_durable_and_cannot_be_relabelled() {
         Admission::Committed(receipt) => receipt,
         other => panic!("expected commit: {other:?}"),
     };
-    assert_eq!(
-        store
-            .claim_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                1,
-                1,
-                "claim.refused",
-            )
-            .unwrap(),
-        EffectClaim::NewClaim
-    );
+    seed_pre_v8_claim(&fixture, receipt.outbox_id, "claim.refused", 1);
     let first = store
         .record_launch_port_result(
             receipt.outbox_id,
@@ -1869,30 +1784,19 @@ fn schema_four_open_adds_launch_dispatch_outcome_table() {
         Admission::Committed(receipt) => receipt,
         other => panic!("expected commit: {other:?}"),
     };
-    migrated
-        .claim_effect(
+    assert!(matches!(migrated.claim_effect(
             receipt.outbox_id,
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.schema-five",
-        )
-        .unwrap();
-    assert_eq!(
-        migrated
-            .record_launch_port_result(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                1,
-                "claim.schema-five",
-                LaunchPortResult::RefusedBeforeEffect,
-            )
-            .unwrap()
-            .stage,
-        LaunchDispatchStage::RefusedBeforeEffect
-    );
+        ),Err(StoreError::Conflict("historical launch has no bound v8 descriptor"))));
+    assert_eq!(migrated.effect_state(receipt.outbox_id).unwrap(),EffectState::Prepared);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let table_count:i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master
+        WHERE name='launch_dispatch_outcomes' AND type='table'",[],|row| row.get(0)).unwrap();
+    assert_eq!(table_count,1);
 }
 
 #[test]
@@ -1938,7 +1842,7 @@ fn schema_five_backfills_effect_digest_and_tampering_refuses_claim() {
             "scope.fixture",
             "target.fixture",
             1,
-            1,
+            1, 0,
             "claim.tampered",
         ),
         Err(StoreError::Conflict("outbox effect digest changed"))

@@ -71,9 +71,12 @@ pub struct LaunchLookupRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchIntentBinding {
-    /// Schema v7 has no field binding the stored effect to a reviewed current
-    /// profile. It is inspection evidence, never a new dispatch admission.
-    HistoricalUnboundV7,
+    /// An old row or a generic schema-v8 admission has no reviewed binding.
+    /// Inspection does not authorize a new dispatch claim.
+    HistoricalUnbound,
+    /// Full immutable v8 binding and descriptor passed one-snapshot read-back.
+    /// Current dispatch eligibility still requires separate live fences.
+    BoundV8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
