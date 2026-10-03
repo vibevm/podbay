@@ -1,0 +1,11 @@
+# podbay-win32 (PB27a)
+
+This standalone preproduction crate is the narrow Win32 FFI facade for PodBay's future Windows backend. It is deliberately outside the root Cargo workspace until review. It does not implement ConPTY, named-pipe authority, durable files, manifest reconciliation, or a complete `SupervisorBackend`.
+
+`launch_independent_suspended` creates an exact executable with an empty Unicode environment and no inherited handles. It requires the new pod process to be outside **all** Job Objects before exposing a resume method. A restrictive parent Job Object therefore produces a typed refusal while user code remains suspended. The caller must durably admit the PodBay command/manifest first and must not retry an uncertain creation outcome. Closing a `RunningProcess` observation handle does not kill an independent pod.
+
+Inside the attested pod, `PodJob::new_in_pod` creates an unnamed Job Object with `KILL_ON_JOB_CLOSE`; no job handle is exported to the manager or worker. `spawn_child` creates a child suspended, assigns it to that job, verifies membership, then resumes its primary thread. On refusal, the suspended-process guard terminates and waits up to five seconds before returning a clean `Unsupported`. If termination or the wait fails, it returns `UncertainAfterCreate` with the available process identity; a suspended orphan may remain. Native fault-injection tests are required before claiming complete cleanup.
+
+Process identity is PID **plus** `GetProcessTimes` creation time. `open_exact_process` only pins that OS identity; it does not authorize PodBay reattachment by itself. The future backend must also verify the manifest digest, PodId/AttemptId/incarnation, scoped pipe principal, and credential generation.
+
+The public Rust entry points are safe; the only unsafe calls are documented in `src/windows.rs`. `windows-sys` owns the raw Win32 bindings. A Windows runner must prove manager-job breakaway, survival across manager restart, Job Object descendant cleanup, error/fault paths and process birth identity. Cross-target compilation is not that proof. The overall backend design and references are in `/fast/git/v/research/2026-10-03-podbay-windows-backend.md`.

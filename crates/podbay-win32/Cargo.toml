@@ -1,0 +1,18 @@
+[package]
+name = "podbay-win32"
+version = "0.1.0"
+edition = "2024"
+license = "UPL-1.0"
+description = "Audited Windows process and Job Object facade for PodBay"
+
+# Independent PB27a build until the parent PodBay workspace reviews this crate.
+[workspace]
+resolver = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
