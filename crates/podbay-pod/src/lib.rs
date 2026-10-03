@@ -20,7 +20,9 @@ mod unsupported;
 
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
-pub use manifest::{LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path};
+pub use manifest::{
+    LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
+};
 #[cfg(target_os = "linux")]
 pub use manifest::{BoundPodStatus, PodManifest, PodPeerBootstrap, PodStatus};
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};

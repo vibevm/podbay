@@ -392,14 +392,39 @@ impl From<serde_json::Error> for PodError {
 
 pub fn manifest_path(directory: &Path, descriptor: &LaunchDescriptor) -> Result<PathBuf, PodError> {
     descriptor.validate()?;
+    Ok(slot_path(
+        directory,
+        &descriptor.pod_id,
+        &descriptor.attempt_id,
+        descriptor.incarnation,
+    ))
+}
+
+/// Locate an admitted pod's immutable launch manifest without reconstructing
+/// a caller request or a legacy launch descriptor during manager recovery.
+pub fn manifest_path_for_identity(
+    directory: &Path,
+    pod_id: &PodId,
+    attempt_id: &AttemptId,
+    incarnation: Epoch,
+) -> PathBuf {
+    slot_path(
+        directory,
+        pod_id.as_str(),
+        attempt_id.as_str(),
+        incarnation.get(),
+    )
+}
+
+fn slot_path(directory: &Path, pod_id: &str, attempt_id: &str, incarnation: u64) -> PathBuf {
     let mut hash = Sha256::new();
     hash.update(b"podbay-pb05-slot/1\0");
-    for field in [&descriptor.pod_id, &descriptor.attempt_id] {
+    for field in [pod_id, attempt_id] {
         hash.update((field.len() as u64).to_be_bytes());
         hash.update(field.as_bytes());
     }
-    hash.update(descriptor.incarnation.to_be_bytes());
-    Ok(directory.join(format!("{}.json", &hex(&hash.finalize())[..32])))
+    hash.update(incarnation.to_be_bytes());
+    directory.join(format!("{}.json", &hex(&hash.finalize())[..32]))
 }
 
 #[cfg(target_os = "linux")]

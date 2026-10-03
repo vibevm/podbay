@@ -5,7 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use podbay_pod::{LaunchDescriptor, PodClient, PodError, PodRole, launch, manifest_path};
+use podbay_core::{AttemptId, Epoch, PodId};
+use podbay_pod::{
+    LaunchDescriptor, PodClient, PodError, PodRole, launch, manifest_path,
+    manifest_path_for_identity,
+};
 
 struct Fixture {
     directory: PathBuf,
@@ -75,6 +79,16 @@ fn versioned_manifest_digest_and_private_paths_reject_drift() {
         manifest_path(&fixture.directory, &descriptor).unwrap(),
         manifest_path(&fixture.directory, &changed).unwrap(),
         "same pod/attempt slot must detect changed content rather than mint a replacement"
+    );
+    assert_eq!(
+        manifest_path(&fixture.directory, &descriptor).unwrap(),
+        manifest_path_for_identity(
+            &fixture.directory,
+            &PodId::try_from(descriptor.pod_id.as_str()).unwrap(),
+            &AttemptId::try_from(descriptor.attempt_id.as_str()).unwrap(),
+            Epoch::new(descriptor.incarnation).unwrap(),
+        ),
+        "recovery must address the same immutable slot without caller bytes"
     );
 }
 
