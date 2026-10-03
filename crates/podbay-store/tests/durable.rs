@@ -91,7 +91,9 @@ fn remove_v8_schema(connection: &rusqlite::Connection) {
     // user_version attached to the new tables.
     connection
         .execute_batch(
-            "DROP TABLE launch_resources;
+            "DROP TABLE manager_rebind_resources;
+             DROP TABLE manager_rebinds;
+             DROP TABLE launch_resources;
              DROP TABLE launch_bindings;
              DROP TABLE runtime_runs;
              DROP TABLE runtime_sessions;
@@ -406,7 +408,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_eight_has_empty_runtime_identity_tables_and_reopens() {
+fn fresh_schema_nine_has_empty_runtime_and_rebind_tables_and_reopens() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -414,12 +416,14 @@ fn fresh_schema_eight_has_empty_runtime_identity_tables_and_reopens() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     for table in [
         "runtime_sessions",
         "runtime_runs",
         "launch_bindings",
         "launch_resources",
+        "manager_rebinds",
+        "manager_rebind_resources",
     ] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -449,7 +453,9 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE launch_resources;
+            "DROP TABLE manager_rebind_resources;
+             DROP TABLE manager_rebinds;
+             DROP TABLE launch_resources;
              DROP TABLE launch_bindings;
              DROP TABLE runtime_runs;
              DROP TABLE runtime_sessions;
@@ -473,12 +479,14 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     for table in [
         "runtime_sessions",
         "runtime_runs",
         "launch_bindings",
         "launch_resources",
+        "manager_rebinds",
+        "manager_rebind_resources",
     ] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))

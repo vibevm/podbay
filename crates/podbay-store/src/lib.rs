@@ -6,6 +6,7 @@ mod bound_launch;
 mod launch;
 mod model;
 mod peer_witness;
+mod rebind;
 mod store;
 
 pub use bound_launch::{
@@ -22,4 +23,5 @@ pub use model::{
     StoredEffect, VerifiedPrincipal,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
+pub use rebind::{DurableRebindPhase, DurableRebindReceipt, SqliteRebindLedger};
 pub use store::PodBayStore;

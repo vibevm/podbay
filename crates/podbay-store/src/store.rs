@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -79,10 +79,50 @@ const LAUNCH_RESOURCES_V8: &str = "CREATE TABLE launch_resources (
 const LAUNCH_SLOT_BINDING_INDEX_V8: &str = "CREATE UNIQUE INDEX launch_slots_binding_identity
   ON launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)";
 
+// A rebind is durable evidence, never an OS peer/liveness attestation. Version
+// nine adds no rows for older launches or an invented initial manager peer.
+const MANAGER_REBINDS_V9: &str = "CREATE TABLE manager_rebinds (
+  rebind_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  expected_owner_epoch INTEGER NOT NULL CHECK(expected_owner_epoch>=1),
+  next_owner_epoch INTEGER NOT NULL CHECK(next_owner_epoch=expected_owner_epoch+1),
+  expected_credential_epoch INTEGER NOT NULL CHECK(expected_credential_epoch>=1),
+  next_credential_epoch INTEGER NOT NULL
+    CHECK(next_credential_epoch=expected_credential_epoch+1),
+  manager_os_identity TEXT NOT NULL CHECK(length(manager_os_identity)>0),
+  manager_process_id TEXT NOT NULL CHECK(length(manager_process_id)>0),
+  manager_boot_identity TEXT NOT NULL CHECK(length(manager_boot_identity)>0),
+  manager_birth_identity TEXT NOT NULL CHECK(length(manager_birth_identity)>0),
+  manager_containment TEXT NOT NULL CHECK(length(manager_containment)>0),
+  command_key TEXT NOT NULL CHECK(length(command_key)>0),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64),
+  resource_count INTEGER NOT NULL CHECK(resource_count>=1),
+  phase TEXT NOT NULL CHECK(phase IN ('pending','pod_acknowledged','activated')),
+  pod_checkpoint_ref TEXT,
+  CHECK((phase='pending' AND pod_checkpoint_ref IS NULL)
+    OR (phase!='pending' AND pod_checkpoint_ref IS NOT NULL
+      AND length(pod_checkpoint_ref)>0)),
+  FOREIGN KEY(scope_id,pod_id,pod_incarnation)
+    REFERENCES launch_bindings(scope_id,pod_id,pod_incarnation),
+  UNIQUE(scope_id,pod_id,pod_incarnation,next_owner_epoch),
+  UNIQUE(scope_id,pod_id,pod_incarnation,command_key)
+) STRICT";
+const MANAGER_REBIND_RESOURCES_V9: &str = "CREATE TABLE manager_rebind_resources (
+  rebind_rowid INTEGER NOT NULL REFERENCES manager_rebinds(rebind_rowid),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  expected_input_epoch INTEGER NOT NULL CHECK(expected_input_epoch>=1),
+  next_input_epoch INTEGER NOT NULL CHECK(next_input_epoch=expected_input_epoch+1),
+  PRIMARY KEY(rebind_rowid,resource_id)
+) STRICT";
+
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
     pub(crate) connection: Connection,
-    store_lineage: String,
+    pub(crate) store_lineage: String,
 }
 
 impl PodBayStore {
@@ -383,8 +423,23 @@ impl PodBayStore {
                 transaction.execute_batch(&format!("{sql};"))?;
             }
         }
+        if version < 9 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('manager_rebinds','manager_rebind_resources')",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict("v9 rebind schema name already exists"));
+            }
+            for sql in [MANAGER_REBINDS_V9, MANAGER_REBIND_RESOURCES_V9] {
+                transaction.execute_batch(&format!("{sql};"))?;
+            }
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
+        verify_rebind_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -1808,6 +1863,25 @@ fn verify_runtime_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
             .optional()?;
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v8 runtime schema differs"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_rebind_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (name, expected) in [
+        ("manager_rebinds", MANAGER_REBINDS_V9),
+        ("manager_rebind_resources", MANAGER_REBIND_RESOURCES_V9),
+    ] {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v9 rebind schema differs"));
         }
     }
     Ok(())

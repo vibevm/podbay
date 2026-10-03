@@ -113,6 +113,18 @@ impl AttestedPeer {
         })
     }
 
+    pub fn os_identity(&self) -> &str {
+        &self.os_identity
+    }
+    pub fn native_process_id(&self) -> &str {
+        &self.native_process_id
+    }
+    pub fn boot_identity(&self) -> &str {
+        &self.boot_identity
+    }
+    pub fn birth_identity(&self) -> &str {
+        &self.birth_identity
+    }
     pub fn containment_identity(&self) -> &str {
         &self.containment_identity
     }
