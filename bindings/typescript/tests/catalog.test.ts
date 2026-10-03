@@ -59,12 +59,12 @@ test("question answers cannot become permission decisions or domain acceptance",
 
 test("thin client sends scoped read without a mutation key", async () => {
   const request = decodeRead(fixture("read-snapshot-get.json"));
-  const response = fixture("snapshot-current.json");
+  const response = fixture("success-snapshot.json");
   const client = new PodBayWireClient({
     async exchange(frame) {
       assert.deepEqual(decodeRead(decodeFrame(frame)), request);
       return encodeFrame(response);
     },
   });
-  assert.deepEqual(await client.read(request), response);
+  assert.deepEqual(await client.read(request), (response as { ok: unknown }).ok);
 });

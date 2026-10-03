@@ -19,6 +19,7 @@ pub fn contract_manifest() -> Value {
         "interactionKinds": ["question", "permission"],
         "unknownMutation": "reject_before_effect",
         "unknownObservation": "retain_opaque_json",
+        "responseEnvelope": { "success": "ok", "error": "error", "correlation": "requestId" },
         "eventSchemaCompatibility": "unknown_schema_is_opaque_under_podbay/1"
     })
 }

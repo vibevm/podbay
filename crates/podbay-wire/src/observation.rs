@@ -267,6 +267,22 @@ pub struct ErrorEnvelope {
     pub error: RuntimeError,
 }
 
+/// Successful exchange wrapper. RequestId belongs to this transport exchange;
+/// a contained receipt's CommandId belongs to the durable logical mutation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SuccessEnvelope<T> {
+    pub protocol: ProtocolVersion,
+    pub request_id: String,
+    pub ok: T,
+}
+
+impl<T> SuccessEnvelope<T> {
+    pub fn validate(&self) -> Result<(), WireError> {
+        valid_identity(&self.request_id).map_err(|_| WireError::InvalidField("requestId"))
+    }
+}
+
 impl ErrorEnvelope {
     pub fn validate(&self) -> Result<(), WireError> {
         valid_identity(&self.request_id).map_err(|_| WireError::InvalidField("requestId"))?;

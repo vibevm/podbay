@@ -1,0 +1,12 @@
+{
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.1",
+  "ok": {
+    "protocol": "podbay/1",
+    "commandId": "command.fixture.1",
+    "state": "persisted",
+    "value": { "deliveryId": "delivery.fixture.1", "acceptedByProvider": false },
+    "revision": "1",
+    "cursor": { "storeLineage": "store.fixture", "scopeId": "project.fixture", "sequence": "9007199254740993" }
+  }
+}

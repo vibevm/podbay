@@ -131,6 +131,31 @@ fn golden_receipt_snapshot_capability_and_error_envelopes_decode() {
 }
 
 #[test]
+fn correlated_success_fixtures_round_trip_through_rust_envelope() {
+    let receipt: Receipt<Value> =
+        serde_json::from_str(include_str!("../../../schema/v1/receipt-persisted.json")).unwrap();
+    let success: podbay_wire::SuccessEnvelope<Receipt<Value>> =
+        serde_json::from_str(include_str!("../../../schema/v1/success-receipt.json")).unwrap();
+    success.validate().unwrap();
+    success.ok.validate().unwrap();
+    assert_eq!(success.request_id, "request.pb03.1");
+    assert_eq!(success.ok, receipt);
+    let serialized = serde_json::to_value(&success).unwrap();
+    let golden: Value =
+        serde_json::from_str(include_str!("../../../schema/v1/success-receipt.json")).unwrap();
+    assert_eq!(serialized, golden);
+
+    let snapshot: podbay_wire::SuccessEnvelope<SnapshotEnvelope<Value>> =
+        serde_json::from_str(include_str!("../../../schema/v1/success-snapshot.json")).unwrap();
+    snapshot.validate().unwrap();
+    snapshot.ok.validate().unwrap();
+    assert_eq!(snapshot.request_id, "request.pb03c.read.snapshot-get.1");
+    let mut unknown_field = golden;
+    unknown_field["extra"] = Value::Bool(true);
+    assert!(serde_json::from_value::<podbay_wire::SuccessEnvelope<Value>>(unknown_field).is_err());
+}
+
+#[test]
 fn golden_unknown_event_retains_payload_and_additive_fields() {
     let fixture = include_bytes!("../../../schema/v1/event-unknown-observation.json");
     let event = decode_event_json(fixture).unwrap();

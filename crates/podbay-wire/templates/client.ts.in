@@ -191,6 +191,11 @@ export interface ErrorEnvelope {
   requestId: string;
   error: { code: RuntimeErrorCode; message: string; retry: string; commandId?: string };
 }
+export interface SuccessEnvelope<T> {
+  protocol: typeof PROTOCOL;
+  requestId: string;
+  ok: T;
+}
 
 export class PodBayWireError extends Error {
   readonly envelope: ErrorEnvelope;
@@ -665,6 +670,11 @@ export function decodeError(input: string | Uint8Array | unknown): ErrorEnvelope
   if (error.commandId !== undefined) identity(error.commandId, "error.commandId");
   return item as unknown as ErrorEnvelope;
 }
+export function decodeSuccess<T = unknown>(input: string | Uint8Array | unknown): SuccessEnvelope<T> {
+  const item = record(parse(input), "success envelope"); exact(item, ["protocol", "requestId", "ok"]);
+  protocol(item.protocol); identity(item.requestId, "requestId");
+  return item as unknown as SuccessEnvelope<T>;
+}
 export function encodeFrame(value: unknown): Uint8Array {
   const payload = encoder.encode(JSON.stringify(value));
   if (!payload.length || payload.length > MAX_FRAME_BYTES) throw new RangeError("frame exceeds bound");
@@ -690,14 +700,26 @@ export class PodBayWireClient {
     await decodeCommand(command);
     const response = parse(decodeFrame(await this.transport.exchange(encodeFrame(command))));
     const item = record(response, "response");
-    if (Object.hasOwn(item, "error")) throw new PodBayWireError(decodeError(item));
-    return decodeReceipt(item);
+    if (Object.hasOwn(item, "error")) {
+      const error = decodeError(item);
+      if (error.requestId !== command.requestId) throw new TypeError("response requestId mismatch");
+      throw new PodBayWireError(error);
+    }
+    const success = decodeSuccess(item);
+    if (success.requestId !== command.requestId) throw new TypeError("response requestId mismatch");
+    return decodeReceipt(success.ok);
   }
   async read(request: ReadEnvelope): Promise<unknown> {
     validateRead(request);
     const response = parse(decodeFrame(await this.transport.exchange(encodeFrame(request))));
     const item = record(response, "response");
-    if (Object.hasOwn(item, "error")) throw new PodBayWireError(decodeError(item));
-    return response;
+    if (Object.hasOwn(item, "error")) {
+      const error = decodeError(item);
+      if (error.requestId !== request.requestId) throw new TypeError("response requestId mismatch");
+      throw new PodBayWireError(error);
+    }
+    const success = decodeSuccess(item);
+    if (success.requestId !== request.requestId) throw new TypeError("response requestId mismatch");
+    return success.ok;
   }
 }

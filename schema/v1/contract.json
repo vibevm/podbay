@@ -25,6 +25,11 @@
     "interrupt",
     "stop"
   ],
+  "responseEnvelope": {
+    "correlation": "requestId",
+    "error": "error",
+    "success": "ok"
+  },
   "supportedMutationSchemas": [
     "launch",
     "session.close",

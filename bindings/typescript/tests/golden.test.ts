@@ -15,12 +15,14 @@ import {
   decodeFrame,
   decodeReceipt,
   decodeSnapshot,
+  decodeSuccess,
   decimal,
   effectiveSupport,
   encodeFrame,
   eventKind,
   makeCommand,
   validateCursorFor,
+  type ReadEnvelope,
 } from "../src/generated.ts";
 
 function fixture(name: string): unknown {
@@ -130,6 +132,11 @@ test("future observations and additive fields remain opaque while capabilities f
 
 test("receipt, snapshot, error, frame and thin command client use golden fixtures", async () => {
   const receipt = decodeReceipt(fixture("receipt-persisted.json"));
+  const success = decodeSuccess(fixture("success-receipt.json"));
+  assert.equal(success.requestId, "request.pb03.1");
+  assert.deepEqual(decodeReceipt(success.ok), receipt);
+  const readSuccess = decodeSuccess(fixture("success-snapshot.json"));
+  assert.deepEqual(decodeSnapshot(readSuccess.ok), decodeSnapshot(fixture("snapshot-current.json")));
   const snapshot = decodeSnapshot(fixture("snapshot-current.json"));
   const error = decodeError(fixture("error-stale-guard.json"));
   assert.equal(receipt.state, "persisted");
@@ -144,7 +151,7 @@ test("receipt, snapshot, error, frame and thin command client use golden fixture
     async exchange(request) {
       exchanges++;
       assert.deepEqual(await decodeCommand(decodeFrame(request)), command);
-      return encodeFrame(fixture("receipt-persisted.json"));
+      return encodeFrame(fixture("success-receipt.json"));
     },
   });
   assert.equal((await client.command(command)).state, "persisted");
@@ -155,4 +162,9 @@ test("receipt, snapshot, error, frame and thin command client use golden fixture
     },
   });
   await assert.rejects(() => refusing.command(command), PodBayWireError);
+  const reading = new PodBayWireClient({ async exchange() { return encodeFrame(fixture("success-snapshot.json")); } });
+  const readRequest = fixture("read-snapshot-get.json") as ReadEnvelope;
+  assert.equal(decodeSnapshot<{ foreground: string }>(await reading.read(readRequest)).state.foreground, "unknown");
+  const uncorrelated = new PodBayWireClient({ async exchange() { return encodeFrame(fixture("success-receipt.json")); } });
+  await assert.rejects(() => uncorrelated.read(readRequest), /requestId mismatch/u);
 });

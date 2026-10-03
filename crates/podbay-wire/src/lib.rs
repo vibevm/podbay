@@ -31,7 +31,7 @@ pub use frame::{MAX_FRAME_BYTES, decode_frame_bytes, encode_frame};
 pub use observation::{
     Capability, CapabilityEnvelope, CapabilitySupport, CommandStage, ErrorEnvelope, EventEnvelope,
     ObservationKind, ProtocolVersion, Receipt, RuntimeError, RuntimeErrorCode, SnapshotEnvelope,
-    decode_event_json,
+    SuccessEnvelope, decode_event_json,
 };
 pub use read::{
     CommandSelector, CommandsGetBody, EmptyReadBody, EventsSubscribeBody, HistoryReadBody,

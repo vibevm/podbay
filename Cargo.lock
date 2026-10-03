@@ -262,7 +262,9 @@ dependencies = [
 name = "podbay-client"
 version = "0.1.0"
 dependencies = [
- "podbay-core",
+ "podbay-wire",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
