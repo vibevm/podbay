@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{self, Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use podbay_core::AttestedPeer;
+use podbay_core::{AttestedPeer, ManagerLiveness};
 use podbay_pod::{LinuxPeerError, LinuxPeerEvidence};
 
 #[test]
@@ -147,5 +147,72 @@ fn accepted_same_uid_child_cannot_spoof_pid_or_birth_with_request_fields() {
             .recheck_before_effect(&fixture.stream, evidence.attested_peer())
             .is_err(),
         "a disappeared peer process must not retain control evidence"
+    );
+}
+
+#[test]
+fn pinned_manager_liveness_requires_exact_birth_uid_and_containment() {
+    let current = LinuxPeerEvidence::for_current_process().unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(current.attested_peer()),
+        ManagerLiveness::Alive
+    );
+    let changed_birth = AttestedPeer::from_port(
+        current.attested_peer().os_identity(),
+        current.attested_peer().native_process_id(),
+        current.attested_peer().boot_identity(),
+        &format!("linux.start.{}", current.start_ticks() + 1),
+        current.attested_peer().containment_identity(),
+    )
+    .unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(&changed_birth),
+        ManagerLiveness::DeadAttested
+    );
+    let changed_uid = AttestedPeer::from_port(
+        "linux.uid.4294967295",
+        current.attested_peer().native_process_id(),
+        current.attested_peer().boot_identity(),
+        current.attested_peer().birth_identity(),
+        current.attested_peer().containment_identity(),
+    )
+    .unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(&changed_uid),
+        ManagerLiveness::Unknown
+    );
+    let changed_containment = AttestedPeer::from_port(
+        current.attested_peer().os_identity(),
+        current.attested_peer().native_process_id(),
+        current.attested_peer().boot_identity(),
+        current.attested_peer().birth_identity(),
+        "linux.cgroup./unrelated.slice",
+    )
+    .unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(&changed_containment),
+        ManagerLiveness::Unknown
+    );
+    let malformed =
+        AttestedPeer::from_port("uid.1", "pid.1", "boot.1", "birth.1", "cgroup.1").unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(&malformed),
+        ManagerLiveness::Unknown
+    );
+}
+
+#[test]
+fn pinned_child_exit_is_dead_only_after_kernel_pid_disappears() {
+    let mut fixture = Fixture::start();
+    let observed = LinuxPeerEvidence::from_accepted(&fixture.stream).unwrap();
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(observed.attested_peer()),
+        ManagerLiveness::Alive
+    );
+    fixture.stream.write_all(b"x").unwrap();
+    assert!(fixture.child.wait().unwrap().success());
+    assert_eq!(
+        LinuxPeerEvidence::probe_pinned_manager(observed.attested_peer()),
+        ManagerLiveness::DeadAttested
     );
 }

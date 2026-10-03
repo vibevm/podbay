@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use podbay_core::AttestedPeer;
+use podbay_core::{AttestedPeer, ManagerLiveness};
 
 #[derive(Debug)]
 pub enum LinuxPeerError {
@@ -50,6 +50,68 @@ pub struct LinuxPeerEvidence {
 }
 
 impl LinuxPeerEvidence {
+    /// Classify a checkpoint-pinned manager using fresh kernel/procfs facts.
+    /// A changed UID or cgroup with the same birth is ambiguous, never proof
+    /// that the original process died. This grants no control by itself.
+    pub fn probe_pinned_manager(pinned: &AttestedPeer) -> ManagerLiveness {
+        let Some(expected) = PinnedLinuxPeer::parse(pinned) else {
+            return ManagerLiveness::Unknown;
+        };
+        let Ok(boot) = read_boot_id() else {
+            return ManagerLiveness::Unknown;
+        };
+        if boot != expected.boot_id {
+            return ManagerLiveness::DeadAttested;
+        }
+        let first = match read_process_stat(expected.pid) {
+            Ok(stat) => stat,
+            Err(error) => return classify_process_read_error(&error),
+        };
+        if first.start_ticks != expected.start_ticks {
+            return ManagerLiveness::DeadAttested;
+        }
+        if matches!(first.state, 'Z' | 'X' | 'x') {
+            return ManagerLiveness::Unknown;
+        }
+        let first_uid = read_effective_uid(expected.pid);
+        let first_cgroup = read_cgroup(expected.pid);
+        let second = match read_process_stat(expected.pid) {
+            Ok(stat) => stat,
+            Err(error) => return classify_process_read_error(&error),
+        };
+        if second.start_ticks != expected.start_ticks {
+            return ManagerLiveness::DeadAttested;
+        }
+        if matches!(second.state, 'Z' | 'X' | 'x') {
+            return ManagerLiveness::Unknown;
+        }
+        let second_uid = read_effective_uid(expected.pid);
+        let second_cgroup = read_cgroup(expected.pid);
+        let final_stat = match read_process_stat(expected.pid) {
+            Ok(stat) => stat,
+            Err(error) => return classify_process_read_error(&error),
+        };
+        if final_stat.start_ticks != expected.start_ticks {
+            return ManagerLiveness::DeadAttested;
+        }
+        if matches!(final_stat.state, 'Z' | 'X' | 'x')
+            || read_boot_id().ok().as_deref() != Some(expected.boot_id.as_str())
+        {
+            return ManagerLiveness::Unknown;
+        }
+        match (first_uid, first_cgroup, second_uid, second_cgroup) {
+            (Ok(uid_a), Ok(cgroup_a), Ok(uid_b), Ok(cgroup_b))
+                if uid_a == expected.uid
+                    && uid_b == expected.uid
+                    && cgroup_a == expected.cgroup
+                    && cgroup_b == expected.cgroup =>
+            {
+                ManagerLiveness::Alive
+            }
+            _ => ManagerLiveness::Unknown,
+        }
+    }
+
     /// The launcher observes its own kernel credentials through a socketpair;
     /// no request body supplies the pinned manager process identity.
     pub fn for_current_process() -> Result<Self, LinuxPeerError> {
@@ -163,18 +225,21 @@ impl LinuxPeerEvidence {
 fn read_boot_id() -> Result<String, LinuxPeerError> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();
-    if value.len() != 36
-        || !value.bytes().enumerate().all(|(index, byte)| {
+    if !valid_boot_id(value) {
+        return Err(LinuxPeerError::InvalidEvidence("boot ID"));
+    }
+    Ok(value.to_owned())
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
                 byte == b'-'
             } else {
                 byte.is_ascii_hexdigit()
             }
         })
-    {
-        return Err(LinuxPeerError::InvalidEvidence("boot ID"));
-    }
-    Ok(value.to_owned())
 }
 
 fn read_start_ticks(pid: i32) -> Result<u64, LinuxPeerError> {
@@ -182,7 +247,30 @@ fn read_start_ticks(pid: i32) -> Result<u64, LinuxPeerError> {
     parse_start_ticks(&text, pid)
 }
 
+fn classify_process_read_error(error: &LinuxPeerError) -> ManagerLiveness {
+    match error {
+        LinuxPeerError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            ManagerLiveness::DeadAttested
+        }
+        _ => ManagerLiveness::Unknown,
+    }
+}
+
 fn parse_start_ticks(text: &str, expected_pid: i32) -> Result<u64, LinuxPeerError> {
+    Ok(parse_process_stat(text, expected_pid)?.start_ticks)
+}
+
+struct ProcessStat {
+    state: char,
+    start_ticks: u64,
+}
+
+fn read_process_stat(pid: i32) -> Result<ProcessStat, LinuxPeerError> {
+    let text = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat"))?;
+    parse_process_stat(&text, pid)
+}
+
+fn parse_process_stat(text: &str, expected_pid: i32) -> Result<ProcessStat, LinuxPeerError> {
     let (prefix, tail) = text
         .rsplit_once(") ")
         .ok_or(LinuxPeerError::InvalidEvidence("process stat delimiters"))?;
@@ -193,6 +281,20 @@ fn parse_start_ticks(text: &str, expected_pid: i32) -> Result<u64, LinuxPeerErro
         return Err(LinuxPeerError::InvalidEvidence("process stat PID differs"));
     }
     // After `) ` the first token is field 3 (state); starttime is field 22.
+    let mut fields = tail.split_whitespace();
+    let state = fields
+        .next()
+        .and_then(|value| {
+            let mut chars = value.chars();
+            let state = chars.next()?;
+            (chars.next().is_none()
+                && matches!(
+                    state,
+                    'R' | 'S' | 'D' | 'Z' | 'T' | 't' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+                ))
+            .then_some(state)
+        })
+        .ok_or(LinuxPeerError::InvalidEvidence("process state"))?;
     let ticks = tail
         .split_whitespace()
         .nth(19)
@@ -203,7 +305,73 @@ fn parse_start_ticks(text: &str, expected_pid: i32) -> Result<u64, LinuxPeerErro
             "process birth ticks are zero",
         ));
     }
-    Ok(ticks)
+    Ok(ProcessStat {
+        state,
+        start_ticks: ticks,
+    })
+}
+
+fn read_effective_uid(pid: i32) -> Result<u32, LinuxPeerError> {
+    let text = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("status"))?;
+    let mut rows = text.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let values = rows
+        .next()
+        .ok_or(LinuxPeerError::InvalidEvidence("process Uid missing"))?;
+    if rows.next().is_some() {
+        return Err(LinuxPeerError::InvalidEvidence("duplicate process Uid"));
+    }
+    let fields = values.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err(LinuxPeerError::InvalidEvidence("process Uid fields"));
+    }
+    fields[1]
+        .parse()
+        .map_err(|_| LinuxPeerError::InvalidEvidence("effective process Uid"))
+}
+
+struct PinnedLinuxPeer {
+    uid: u32,
+    pid: i32,
+    boot_id: String,
+    start_ticks: u64,
+    cgroup: String,
+}
+impl PinnedLinuxPeer {
+    fn parse(peer: &AttestedPeer) -> Option<Self> {
+        let uid = peer
+            .os_identity()
+            .strip_prefix("linux.uid.")?
+            .parse()
+            .ok()?;
+        let pid: i32 = peer
+            .native_process_id()
+            .strip_prefix("linux.pid.")?
+            .parse()
+            .ok()?;
+        let boot_id = peer.boot_identity().strip_prefix("linux.boot.")?;
+        let start_ticks: u64 = peer
+            .birth_identity()
+            .strip_prefix("linux.start.")?
+            .parse()
+            .ok()?;
+        let cgroup = peer.containment_identity().strip_prefix("linux.cgroup.")?;
+        if pid <= 0
+            || start_ticks == 0
+            || !valid_boot_id(boot_id)
+            || !cgroup.starts_with('/')
+            || cgroup.len() > 4080
+            || cgroup.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(Self {
+            uid,
+            pid,
+            boot_id: boot_id.into(),
+            start_ticks,
+            cgroup: cgroup.into(),
+        })
+    }
 }
 
 fn read_cgroup(pid: i32) -> Result<String, LinuxPeerError> {
@@ -257,5 +425,25 @@ mod tests {
         assert_eq!(parse_start_ticks(&stat, 42).unwrap(), 777);
         assert!(parse_start_ticks(&stat, 43).is_err());
         assert!(parse_start_ticks("42 no delimiters", 42).is_err());
+    }
+
+    #[test]
+    fn missing_pid_is_distinct_from_permission_or_malformed_proc_evidence() {
+        assert_eq!(
+            classify_process_read_error(&LinuxPeerError::Io(io::Error::from(
+                io::ErrorKind::NotFound
+            ))),
+            ManagerLiveness::DeadAttested
+        );
+        assert_eq!(
+            classify_process_read_error(&LinuxPeerError::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            ))),
+            ManagerLiveness::Unknown
+        );
+        assert_eq!(
+            classify_process_read_error(&LinuxPeerError::InvalidEvidence("malformed stat")),
+            ManagerLiveness::Unknown
+        );
     }
 }
