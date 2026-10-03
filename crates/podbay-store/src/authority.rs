@@ -1,5 +1,6 @@
 //! Durable authority facts. Transport attestations are deliberately not restored as live grants.
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use crate::model::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
@@ -7,6 +8,8 @@ use crate::model::{
     StoreError,
 };
 use crate::store::PodBayStore;
+
+const ACTOR_VERIFIER_VERSION: &str = "podbay.ed25519/1";
 
 impl PodBayStore {
     /// Reads only a current v10 manager claim. A migrated v9 owner has no row
@@ -171,6 +174,145 @@ impl PodBayStore {
             actors,
             grants,
         })
+    }
+
+    /// Persist a public verifier supplied by trusted host policy for one
+    /// already registered actor and OS process birth. This does not attest a
+    /// transport peer or accept a credential from a request body. A repeated
+    /// exact registration at the current revision leaves state unchanged.
+    pub fn register_actor_verifier_from_trusted_host(
+        &mut self,
+        expected_owner_epoch: u64,
+        expected_revision: u64,
+        actor: &AuthorityActorRecord,
+        public_key: [u8; 32],
+    ) -> Result<u64, StoreError> {
+        if public_key == [0; 32] {
+            return Err(StoreError::InvalidInput("actor verifier key is empty"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_actor(&transaction, expected_owner_epoch, expected_revision, actor)?;
+        let binding_digest = actor_binding_digest(actor);
+        if let Some(prior) = read_actor_verifier(&transaction, &actor.actor_id)? {
+            if prior.scope_id != actor.scope_id {
+                return Err(StoreError::WrongScope);
+            }
+            if prior.credential_generation > actor.credential_generation {
+                return Err(StoreError::StaleEpoch);
+            }
+            if prior.credential_generation == actor.credential_generation {
+                if prior.revoked {
+                    return Err(StoreError::Conflict("actor verifier was revoked"));
+                }
+                if prior.version != ACTOR_VERIFIER_VERSION
+                    || prior.binding_digest != binding_digest
+                    || prior.public_key != public_key
+                {
+                    return Err(StoreError::Conflict(
+                        "actor verifier changed within credential generation",
+                    ));
+                }
+                transaction.commit()?;
+                return Ok(expected_revision);
+            }
+            if prior.public_key == public_key {
+                return Err(StoreError::Conflict(
+                    "actor verifier key reused across generations",
+                ));
+            }
+            let changed = transaction.execute(
+                "UPDATE actor_verifiers SET scope_id=?1,credential_generation=?2,
+                   verifier_version=?3,public_key=?4,binding_digest=?5,revoked=0
+                 WHERE actor_id=?6 AND credential_generation=?7",
+                params![
+                    actor.scope_id,
+                    sqlite_integer(actor.credential_generation)?,
+                    ACTOR_VERIFIER_VERSION,
+                    public_key.as_slice(),
+                    binding_digest.as_slice(),
+                    actor.actor_id,
+                    sqlite_integer(prior.credential_generation)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::StaleEpoch);
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO actor_verifiers(actor_id,scope_id,credential_generation,
+                   verifier_version,public_key,binding_digest,revoked)
+                 VALUES(?1,?2,?3,?4,?5,?6,0)",
+                params![
+                    actor.actor_id,
+                    actor.scope_id,
+                    sqlite_integer(actor.credential_generation)?,
+                    ACTOR_VERIFIER_VERSION,
+                    public_key.as_slice(),
+                    binding_digest.as_slice(),
+                ],
+            )?;
+        }
+        let next = advance_authority_revision(&transaction, expected_revision)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Revoke the exact current actor verifier. Re-registering the same
+    /// generation cannot revive it; trusted policy must advance generation.
+    pub fn revoke_actor_verifier_from_trusted_host(
+        &mut self,
+        expected_owner_epoch: u64,
+        expected_revision: u64,
+        actor: &AuthorityActorRecord,
+    ) -> Result<u64, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_actor(&transaction, expected_owner_epoch, expected_revision, actor)?;
+        let verifier = require_matching_verifier(&transaction, actor)?;
+        if verifier.revoked {
+            transaction.commit()?;
+            return Ok(expected_revision);
+        }
+        let changed = transaction.execute(
+            "UPDATE actor_verifiers SET revoked=1 WHERE actor_id=?1
+               AND credential_generation=?2 AND revoked=0",
+            params![actor.actor_id, sqlite_integer(actor.credential_generation)?],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let next = advance_authority_revision(&transaction, expected_revision)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Fresh, read-only public-key lookup for a separately OS-attested peer.
+    /// The caller must still verify a signature; this row alone authenticates
+    /// nobody. Owner, revision, actor birth, scope and generation must match.
+    pub fn current_actor_verifier(
+        &mut self,
+        expected_owner_epoch: u64,
+        expected_revision: u64,
+        actor: &AuthorityActorRecord,
+    ) -> Result<[u8; 32], StoreError> {
+        let transaction = self.connection.transaction()?;
+        require_current_actor(&transaction, expected_owner_epoch, expected_revision, actor)?;
+        let verifier = require_matching_verifier(&transaction, actor)?;
+        if verifier.revoked {
+            return Err(StoreError::NotFound);
+        }
+        let public_key: [u8; 32] = verifier
+            .public_key
+            .try_into()
+            .map_err(|_| StoreError::Conflict("actor verifier key size changed"))?;
+        if public_key == [0; 32] {
+            return Err(StoreError::Conflict("actor verifier key is empty"));
+        }
+        transaction.commit()?;
+        Ok(public_key)
     }
 
     /// A new manager fences old command writers and every old input lease atomically.
@@ -643,4 +785,182 @@ fn valid_identity(value: &str) -> Result<(), StoreError> {
         return Err(StoreError::InvalidInput("invalid authority identity"));
     }
     Ok(())
+}
+
+struct StoredActorVerifier {
+    scope_id: String,
+    credential_generation: u64,
+    version: String,
+    public_key: Vec<u8>,
+    binding_digest: Vec<u8>,
+    revoked: bool,
+}
+
+fn read_actor_verifier(
+    transaction: &rusqlite::Transaction<'_>,
+    actor_id: &str,
+) -> Result<Option<StoredActorVerifier>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT scope_id,credential_generation,verifier_version,public_key,
+                    binding_digest,revoked FROM actor_verifiers WHERE actor_id=?1",
+            [actor_id],
+            |row| {
+                Ok(StoredActorVerifier {
+                    scope_id: row.get(0)?,
+                    credential_generation: row.get::<_, i64>(1)? as u64,
+                    version: row.get(2)?,
+                    public_key: row.get(3)?,
+                    binding_digest: row.get(4)?,
+                    revoked: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn require_matching_verifier(
+    transaction: &rusqlite::Transaction<'_>,
+    actor: &AuthorityActorRecord,
+) -> Result<StoredActorVerifier, StoreError> {
+    let verifier =
+        read_actor_verifier(transaction, &actor.actor_id)?.ok_or(StoreError::NotFound)?;
+    if verifier.scope_id != actor.scope_id {
+        return Err(StoreError::WrongScope);
+    }
+    if verifier.credential_generation != actor.credential_generation {
+        return Err(StoreError::StaleEpoch);
+    }
+    if verifier.version != ACTOR_VERIFIER_VERSION
+        || verifier.binding_digest != actor_binding_digest(actor)
+        || verifier.public_key.len() != 32
+    {
+        return Err(StoreError::Conflict("actor verifier binding changed"));
+    }
+    Ok(verifier)
+}
+
+fn require_current_actor(
+    transaction: &rusqlite::Transaction<'_>,
+    expected_owner_epoch: u64,
+    expected_revision: u64,
+    actor: &AuthorityActorRecord,
+) -> Result<(), StoreError> {
+    valid_identity(&actor.actor_id)?;
+    valid_identity(&actor.scope_id)?;
+    let owner: i64 = transaction.query_row(
+        "SELECT value FROM metadata WHERE key='owner_epoch'",
+        [],
+        |row| row.get(0),
+    )?;
+    let revision: i64 = transaction.query_row(
+        "SELECT value FROM metadata WHERE key='authority_revision'",
+        [],
+        |row| row.get(0),
+    )?;
+    if owner != sqlite_integer(expected_owner_epoch)?
+        || revision != sqlite_integer(expected_revision)?
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    let current: Option<AuthorityActorRecord> = transaction
+        .query_row(
+            "SELECT scope_id,role,origin,parent_actor_id,pod_id,pod_incarnation,
+                    credential_generation,platform,os_identity,process_identity,
+                    start_identity,containment_identity
+             FROM authority_actors WHERE actor_id=?1",
+            [&actor.actor_id],
+            |row| {
+                Ok(AuthorityActorRecord {
+                    actor_id: actor.actor_id.clone(),
+                    scope_id: row.get(0)?,
+                    role: row.get(1)?,
+                    origin: row.get(2)?,
+                    parent_actor_id: row.get(3)?,
+                    pod_id: row.get(4)?,
+                    pod_incarnation: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                    credential_generation: row.get::<_, i64>(6)? as u64,
+                    platform: row.get(7)?,
+                    os_identity: row.get(8)?,
+                    process_identity: row.get(9)?,
+                    start_identity: row.get::<_, i64>(10)? as u64,
+                    containment_identity: row.get(11)?,
+                })
+            },
+        )
+        .optional()?;
+    let current = current.ok_or(StoreError::NotFound)?;
+    if current.scope_id != actor.scope_id {
+        return Err(StoreError::WrongScope);
+    }
+    if current != *actor {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(())
+}
+
+fn advance_authority_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    expected_revision: u64,
+) -> Result<u64, StoreError> {
+    let next = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidInput("authority revision exhausted"))?;
+    let changed = transaction.execute(
+        "UPDATE metadata SET value=?1 WHERE key='authority_revision' AND value=?2",
+        params![sqlite_integer(next)?, sqlite_integer(expected_revision)?],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(next)
+}
+
+fn actor_binding_digest(actor: &AuthorityActorRecord) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"podbay.actor-binding/1\0");
+    for value in [
+        &actor.actor_id,
+        &actor.scope_id,
+        &actor.role,
+        &actor.origin,
+        &actor.platform,
+        &actor.os_identity,
+        &actor.process_identity,
+        &actor.containment_identity,
+    ] {
+        digest_text(&mut hash, value);
+    }
+    digest_optional_text(&mut hash, actor.parent_actor_id.as_deref());
+    digest_optional_text(&mut hash, actor.pod_id.as_deref());
+    digest_optional_u64(&mut hash, actor.pod_incarnation);
+    hash.update(actor.credential_generation.to_be_bytes());
+    hash.update(actor.start_identity.to_be_bytes());
+    hash.finalize().into()
+}
+
+fn digest_text(hash: &mut Sha256, value: &str) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
+fn digest_optional_text(hash: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            digest_text(hash, value);
+        }
+        None => hash.update([0]),
+    }
+}
+
+fn digest_optional_u64(hash: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
 }

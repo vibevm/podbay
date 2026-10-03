@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -178,6 +178,18 @@ const MANAGER_REBIND_PRIOR_OBSERVATIONS_V13: &str =
   boot_id TEXT NOT NULL CHECK(length(boot_id) BETWEEN 1 AND 256),
   unit_name TEXT NOT NULL CHECK(length(unit_name) BETWEEN 1 AND 256),
   cgroup_path TEXT NOT NULL CHECK(length(cgroup_path) BETWEEN 1 AND 4096)
+) STRICT";
+
+// Migration never invents an actor credential. A trusted host registers one
+// public verifier only after the exact actor generation and birth are known.
+const ACTOR_VERIFIERS_V14: &str = "CREATE TABLE actor_verifiers (
+  actor_id TEXT PRIMARY KEY REFERENCES authority_actors(actor_id),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  credential_generation INTEGER NOT NULL CHECK(credential_generation>=1),
+  verifier_version TEXT NOT NULL CHECK(verifier_version='podbay.ed25519/1'),
+  public_key BLOB NOT NULL CHECK(length(public_key)=32),
+  binding_digest BLOB NOT NULL CHECK(length(binding_digest)=32),
+  revoked INTEGER NOT NULL CHECK(revoked IN (0,1))
 ) STRICT";
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -541,12 +553,26 @@ impl PodBayStore {
             }
             transaction.execute_batch(&format!("{MANAGER_REBIND_PRIOR_OBSERVATIONS_V13};"))?;
         }
+        if version < 14 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='actor_verifiers'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v14 actor verifier schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{ACTOR_VERIFIERS_V14};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
         verify_prior_observation_schema(&transaction)?;
+        verify_actor_verifier_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -2136,6 +2162,20 @@ fn verify_prior_observation_schema(
     ).optional()?;
     if actual.as_deref() != Some(MANAGER_REBIND_PRIOR_OBSERVATIONS_V13) {
         return Err(StoreError::Conflict("v13 prior observation schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_actor_verifier_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='actor_verifiers'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(ACTOR_VERIFIERS_V14) {
+        return Err(StoreError::Conflict("v14 actor verifier schema differs"));
     }
     Ok(())
 }

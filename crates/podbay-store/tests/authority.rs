@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
@@ -81,6 +83,26 @@ fn grant(
             target_id: target_id.into(),
         }],
     }
+}
+
+fn seed_actor(store: &mut PodBayStore) -> (AuthorityActorRecord, u64) {
+    let snapshot = store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            snapshot.revision,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.main".into(),
+                pod_id: "pod.worker".into(),
+                incarnation: 1,
+            }),
+        )
+        .unwrap();
+    let record = actor();
+    let revision = store
+        .apply_authority_mutation(1, revision, AuthorityMutation::PutActor(record.clone()))
+        .unwrap();
+    (record, revision)
 }
 
 #[test]
@@ -333,6 +355,8 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE actor_verifiers;
+             DROP TABLE manager_rebind_prior_observations;
              DROP TABLE manager_peer_bindings;
              DROP TABLE manager_credential_claims;
              DROP TABLE manager_rebind_resources;
@@ -395,4 +419,222 @@ fn pod_registration_and_replay_share_command_target_epoch() {
         )
         .unwrap();
     assert_eq!(store.target_epoch("scope.main", "pod.worker").unwrap(), 2);
+}
+
+#[test]
+fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut store);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE actor_verifiers; PRAGMA user_version=13;")
+        .unwrap();
+    drop(connection);
+    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        migrated.authority_snapshot().unwrap().actors,
+        vec![record.clone()]
+    );
+    assert!(matches!(
+        migrated.current_actor_verifier(1, revision, &record),
+        Err(StoreError::NotFound)
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM actor_verifiers", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn actor_verifier_survives_reopen_but_rotation_and_revoke_fence_old_key() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut store);
+    let revision = store
+        .register_actor_verifier_from_trusted_host(1, revision, &record, [7; 32])
+        .unwrap();
+    assert_eq!(
+        store
+            .register_actor_verifier_from_trusted_host(1, revision, &record, [7; 32])
+            .unwrap(),
+        revision
+    );
+    assert!(matches!(
+        store.register_actor_verifier_from_trusted_host(1, revision, &record, [8; 32]),
+        Err(StoreError::Conflict(_))
+    ));
+    drop(store);
+
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        reopened
+            .current_actor_verifier(1, revision, &record)
+            .unwrap(),
+        [7; 32]
+    );
+    let restart = reopened.begin_authority_replay(1, 2).unwrap();
+    assert_eq!(
+        reopened
+            .current_actor_verifier(2, restart.revision, &record)
+            .unwrap(),
+        [7; 32]
+    );
+    assert!(matches!(
+        reopened.current_actor_verifier(1, revision, &record),
+        Err(StoreError::StaleEpoch)
+    ));
+
+    let mut rotated = record.clone();
+    rotated.credential_generation = 2;
+    rotated.process_identity = "linux.pid.124".into();
+    rotated.start_identity = 457;
+    let revision = reopened
+        .apply_authority_mutation(
+            2,
+            restart.revision,
+            AuthorityMutation::PutActor(rotated.clone()),
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.current_actor_verifier(2, revision, &rotated),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert!(matches!(
+        reopened.register_actor_verifier_from_trusted_host(2, revision, &rotated, [7; 32]),
+        Err(StoreError::Conflict(
+            "actor verifier key reused across generations"
+        ))
+    ));
+    let revision = reopened
+        .register_actor_verifier_from_trusted_host(2, revision, &rotated, [9; 32])
+        .unwrap();
+    assert_eq!(
+        reopened
+            .current_actor_verifier(2, revision, &rotated)
+            .unwrap(),
+        [9; 32]
+    );
+    let revision = reopened
+        .revoke_actor_verifier_from_trusted_host(2, revision, &rotated)
+        .unwrap();
+    assert!(matches!(
+        reopened.current_actor_verifier(2, revision, &rotated),
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        reopened.register_actor_verifier_from_trusted_host(2, revision, &rotated, [9; 32]),
+        Err(StoreError::Conflict("actor verifier was revoked"))
+    ));
+    drop(reopened);
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    assert!(matches!(
+        reopened.current_actor_verifier(2, revision, &rotated),
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[test]
+fn actor_verifier_requires_exact_scope_birth_and_current_revision() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut store);
+    let mut foreign = record.clone();
+    foreign.scope_id = "scope.foreign".into();
+    assert!(matches!(
+        store.register_actor_verifier_from_trusted_host(1, revision, &foreign, [3; 32]),
+        Err(StoreError::WrongScope)
+    ));
+    let mut reused_pid = record.clone();
+    reused_pid.start_identity += 1;
+    assert!(matches!(
+        store.register_actor_verifier_from_trusted_host(1, revision, &reused_pid, [3; 32]),
+        Err(StoreError::StaleEpoch)
+    ));
+    let next = store
+        .register_actor_verifier_from_trusted_host(1, revision, &record, [3; 32])
+        .unwrap();
+    assert!(matches!(
+        store.current_actor_verifier(1, next, &foreign),
+        Err(StoreError::WrongScope)
+    ));
+    assert!(matches!(
+        store.current_actor_verifier(1, next, &reused_pid),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert!(matches!(
+        store.current_actor_verifier(1, revision, &record),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert!(matches!(
+        store.current_actor_verifier(2, next, &record),
+        Err(StoreError::StaleEpoch)
+    ));
+
+    // A bypassed actor-row edit cannot repoint the public verifier to a new
+    // process birth inside the same generation and authority revision.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE authority_actors SET process_identity='linux.pid.999',
+               start_identity=999 WHERE actor_id='actor.worker'",
+            [],
+        )
+        .unwrap();
+    let mut substituted = record.clone();
+    substituted.process_identity = "linux.pid.999".into();
+    substituted.start_identity = 999;
+    assert!(matches!(
+        store.current_actor_verifier(1, next, &substituted),
+        Err(StoreError::Conflict("actor verifier binding changed"))
+    ));
+}
+
+#[test]
+fn concurrent_actor_verifier_registration_never_substitutes_a_key() {
+    let fixture = Fixture::new();
+    let mut setup = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut setup);
+    drop(setup);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for key in [[11; 32], [12; 32]] {
+        let path = fixture.database.clone();
+        let actor = record.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            let mut store = PodBayStore::open(path).unwrap();
+            barrier.wait();
+            store.register_actor_verifier_from_trusted_host(1, revision, &actor, key)
+        }));
+    }
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::StaleEpoch)))
+            .count(),
+        1
+    );
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    let public_key = reopened
+        .current_actor_verifier(1, revision + 1, &record)
+        .unwrap();
+    assert!(public_key == [11; 32] || public_key == [12; 32]);
+    let other = if public_key == [11; 32] {
+        [12; 32]
+    } else {
+        [11; 32]
+    };
+    assert!(matches!(
+        reopened.register_actor_verifier_from_trusted_host(1, revision + 1, &record, other),
+        Err(StoreError::Conflict(_))
+    ));
 }
