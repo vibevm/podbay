@@ -27,6 +27,26 @@ flags include `waitingOnApproval` and `waitingOnUserInput`.
 `turn/completed` carries `threadId` and `turn`; `serverRequest/resolved`
 carries `threadId` and `requestId`.
 
+The generated 0.159.3 server-request shapes require `threadId`, `turnId` and
+`itemId` for all four handled methods. Command, file and permission requests
+also require `startedAtMs`; user-input requests require `isBlocking` and
+`questions`. A response uses the server's exact string or int64 RPC `id` with
+`result`: simple command/file `decision`, a `permissions` object, or a
+question-ID keyed `answers` object. PodBay supports explicit simple decisions,
+permissions deny-all (`{"permissions":{},"scope":"turn"}`), and exact
+question-ID answer maps. Positive permission grants and command exec-policy or
+network-policy amendments are explicitly unsupported in this slice.
+
+The higher layer supplies an authorised answer permit bound to the complete
+resource identity, current writer epoch, resource epoch, native thread/turn/item
+and exact RPC request ID. The permit carries the answer bytes to be written;
+the adapter validates their typed shape and writes at most one JSON-RPC result
+frame. A write receipt is **not** native resolution. The request remains
+pending until `serverRequest/resolved` and a later no-waiting native status
+observation. Ambiguous writes remain uncertain and are never retried here.
+Unsupported requests retain field names and encoded length as redacted
+metadata; Debug formatting omits command, path, question and answer values.
+
 PB10b turn control uses a local `WriterPermit` comparison over the complete
 PodBay resource identity and a monotonically installed writer epoch. The
 permit is supplied by an authenticated higher layer and is **not** durable
@@ -43,7 +63,7 @@ deduplicate an older key after later submissions or across process restart.
 PodBay's durable command ledger must provide caller-scoped idempotency before
 turn control is exposed to a live provider.
 
-This is a codec and fake-transport slice. It neither launches Codex nor
-answers native permission requests. A native adapter must reconcile a lost
-reply against the pod-owned process and hold a durable native-session writer
-fence before submitting another turn.
+This is a codec and fake-transport slice. It does not launch Codex, make
+approval decisions, or grant native permissions on its own. A native adapter
+must reconcile a lost reply against the pod-owned process and hold a durable
+native-session writer fence before submitting another turn or answer.

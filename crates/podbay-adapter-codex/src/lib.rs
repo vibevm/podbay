@@ -6,13 +6,20 @@
 
 mod adapter;
 mod codec;
+mod host_requests;
 
 pub use adapter::{
-    ApprovalPolicy, BlockReason, BootstrapState, CodexError, CodexResource, InterruptState,
-    JsonlTransport, NativeThread, PinnedCodexConfig, ResourceIdentity, Sandbox, StartReceipt,
-    ThreadStatus, TurnControlState, TurnMode, TurnSubmission, TurnSubmissionStage, WriterPermit,
+    AnswerWriteOutcome, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason, BootstrapState,
+    CodexError, CodexResource, InterruptState, JsonlTransport, NativeThread, PinnedCodexConfig,
+    ResourceIdentity, Sandbox, StartReceipt, ThreadStatus, TurnControlState, TurnMode,
+    TurnSubmission, TurnSubmissionStage, WriterPermit,
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, decode, encode};
+pub use host_requests::{
+    ApprovalDecision, CommandApprovalKind, NativeAnswer, NativeQuestion, NativeQuestionOption,
+    NativeRequestKind, NativeRequestStage, NativeRpcId, PendingNativeRequest,
+    RedactedNativeObservation,
+};
 
 pub const TESTED_CODEX_CLI_VERSION: &str = "0.159.3";
 pub const TESTED_V2_SCHEMA_SHA256: &str =

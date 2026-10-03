@@ -1,12 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 
 use podbay_adapter_codex::{
-    ApprovalPolicy, BlockReason, BootstrapState, CodecError, CodexError, CodexResource,
-    InterruptState, JsonlTransport, MAX_FRAME_BYTES, PinnedCodexConfig, ResourceIdentity, Sandbox,
-    TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit,
-    decode, encode,
+    AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason,
+    BootstrapState, CodecError, CodexError, CodexResource, InterruptState, JsonlTransport,
+    MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind, NativeRequestStage, NativeRpcId,
+    PinnedCodexConfig, ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION,
+    TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit, decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -15,6 +16,8 @@ use serde_json::{Value, json};
 struct FakeTransport {
     reads: VecDeque<Vec<u8>>,
     writes: Vec<Value>,
+    fail_answer_write: bool,
+    answer_write_attempts: usize,
 }
 
 impl FakeTransport {
@@ -25,6 +28,8 @@ impl FakeTransport {
                 .map(|value| encode(&value).unwrap())
                 .collect(),
             writes: Vec::new(),
+            fail_answer_write: false,
+            answer_write_attempts: 0,
         }
     }
 
@@ -32,20 +37,37 @@ impl FakeTransport {
         Self {
             reads: VecDeque::from([raw]),
             writes: Vec::new(),
+            fail_answer_write: false,
+            answer_write_attempts: 0,
         }
+    }
+
+    fn fail_answer_write(mut self) -> Self {
+        self.fail_answer_write = true;
+        self
     }
 
     fn methods(&self) -> Vec<&str> {
         self.writes
             .iter()
-            .map(|value| value["method"].as_str().unwrap())
+            .filter_map(|value| value.get("method").and_then(Value::as_str))
             .collect()
     }
 }
 
 impl JsonlTransport for FakeTransport {
     fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
-        self.writes.push(decode(line).unwrap());
+        let value = decode(line).unwrap();
+        if value.get("method").is_none() {
+            self.answer_write_attempts += 1;
+            self.writes.push(value);
+            if self.fail_answer_write {
+                self.fail_answer_write = false;
+                return Err(io::Error::other("ambiguous response write"));
+            }
+            return Ok(());
+        }
+        self.writes.push(value);
         Ok(())
     }
 
@@ -86,13 +108,18 @@ fn initialized() -> Value {
 }
 
 fn native_thread(id: &str, status: &str) -> Value {
+    let native_status = if status == "active" {
+        json!({"type":"active","activeFlags":[]})
+    } else {
+        json!({"type":status})
+    };
     json!({
         "id":id,
         "sessionId":id,
         "cwd":"/tmp/podbay-codex-work",
         "model":"gpt-6-sol",
         "reasoningEffort":"medium",
-        "status":{"type":status},
+        "status":native_status,
         "turns":[]
     })
 }
@@ -175,6 +202,77 @@ fn bootstrapped(extra: impl IntoIterator<Item = Value>) -> CodexResource<FakeTra
         .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
         .unwrap();
     adapter
+}
+
+fn command_request(id: i64) -> Value {
+    json!({"id":id,"method":"item/commandExecution/requestApproval","params":{
+        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.command",
+        "startedAtMs":1,"kind":"command","command":"echo reviewed"
+    }})
+}
+
+fn file_request(id: i64) -> Value {
+    json!({"id":id,"method":"item/fileChange/requestApproval","params":{
+        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.file",
+        "startedAtMs":1,"grantRoot":"/tmp/podbay-codex-work"
+    }})
+}
+
+fn permissions_request(id: i64) -> Value {
+    json!({"id":id,"method":"item/permissions/requestApproval","params":{
+        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.permissions",
+        "startedAtMs":1,"cwd":"/tmp/podbay-codex-work",
+        "permissions":{"network":{"enabled":true}}
+    }})
+}
+
+fn user_input_request(id: i64) -> Value {
+    json!({"id":id,"method":"item/tool/requestUserInput","params":{
+        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.question",
+        "isBlocking":true,"questions":[{"id":"question.one","header":"Choice",
+        "question":"Which action?","options":[{"label":"A","description":"Option A"}]}]
+    }})
+}
+
+fn pending_bootstrap_reads(request: Value, extra: impl IntoIterator<Item = Value>) -> Vec<Value> {
+    let mut reads = vec![
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        request,
+    ];
+    reads.extend(extra);
+    reads
+}
+
+fn pending_bootstrap_with_fake(fake: FakeTransport) -> CodexResource<FakeTransport> {
+    let mut adapter = CodexResource::new(fake, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 1);
+    adapter
+}
+
+fn pending_bootstrap(
+    request: Value,
+    extra: impl IntoIterator<Item = Value>,
+) -> CodexResource<FakeTransport> {
+    pending_bootstrap_with_fake(FakeTransport::with_reads(pending_bootstrap_reads(
+        request, extra,
+    )))
+}
+
+fn answer_permit(
+    request: &podbay_adapter_codex::PendingNativeRequest,
+    answer: NativeAnswer,
+) -> AuthorizedAnswerPermit {
+    AuthorizedAnswerPermit::from_authorised_boundary(writer_permit(1), request, answer)
 }
 
 #[test]
@@ -281,7 +379,8 @@ fn danger_full_access_never_policy_is_exact_and_effective_drift_refuses() {
 #[test]
 fn matching_completion_remains_blocked_while_native_approval_is_pending() {
     let approval = json!({"id":44,"method":"item/commandExecution/requestApproval","params":{
-        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.one"
+        "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.one",
+        "startedAtMs":1
     }});
     let resolved = json!({"method":"serverRequest/resolved","params":{
         "threadId":"thread.one","requestId":44
@@ -639,7 +738,8 @@ fn competing_native_turn_refuses_without_start_or_steer() {
 #[test]
 fn pending_native_approval_blocks_send_and_exposes_exact_request_id() {
     let approval = json!({"id":44,"method":"item/commandExecution/requestApproval","params":{
-        "threadId":"thread.one","turnId":"turn.work","itemId":"item.one"
+        "threadId":"thread.one","turnId":"turn.work","itemId":"item.one",
+        "startedAtMs":1
     }});
     let mut adapter = bootstrapped([approval]);
     adapter.poll_once().unwrap();
@@ -817,4 +917,390 @@ fn stale_resource_or_writer_permit_refuses_before_any_native_rpc() {
         Err(CodexError::Blocked(BlockReason::StaleWriterPermit))
     );
     assert_eq!(adapter.transport().writes.len(), before);
+}
+
+#[test]
+fn all_four_native_request_kinds_write_only_explicit_schema_shaped_answers() {
+    let mut answers = BTreeMap::new();
+    answers.insert("question.one".to_owned(), vec!["A".to_owned()]);
+    let mut user_request = user_input_request(47);
+    user_request["id"] = json!("req.user.1");
+    let cases = [
+        (
+            command_request(44),
+            NativeAnswer::CommandDecision(ApprovalDecision::Accept),
+            json!({"decision":"accept"}),
+        ),
+        (
+            file_request(45),
+            NativeAnswer::FileDecision(ApprovalDecision::Decline),
+            json!({"decision":"decline"}),
+        ),
+        (
+            permissions_request(46),
+            NativeAnswer::PermissionsDenyAll,
+            json!({"permissions":{},"scope":"turn"}),
+        ),
+        (
+            user_request,
+            NativeAnswer::UserInputAnswers(answers),
+            json!({"answers":{"question.one":{"answers":["A"]}}}),
+        ),
+    ];
+    for (request_event, answer, expected_result) in cases {
+        let mut adapter = pending_bootstrap(request_event, []);
+        let pending = adapter.pending_native_requests().pop().unwrap();
+        assert_eq!(pending.native_thread_id, "thread.one");
+        assert_eq!(pending.native_turn_id, "turn.bootstrap");
+        assert_eq!(pending.resource_epoch, Epoch::new(1).unwrap());
+        assert_eq!(pending.stage, NativeRequestStage::Pending);
+        assert_eq!(adapter.transport().answer_write_attempts, 0);
+        assert!(!adapter.bootstrap_ready());
+        let permit = answer_permit(&pending, answer);
+        assert_eq!(
+            adapter.answer_pending(permit.clone()).unwrap(),
+            AnswerWriteOutcome::WrittenAwaitingResolution {
+                request_id: pending.request_id.clone()
+            }
+        );
+        let written = adapter.transport().writes.last().unwrap();
+        let expected_id = match &pending.request_id {
+            NativeRpcId::Number(number) => json!(number),
+            NativeRpcId::Text(text) => json!(text),
+        };
+        assert_eq!(written["id"], expected_id);
+        assert_eq!(written["result"], expected_result);
+        assert_eq!(adapter.transport().answer_write_attempts, 1);
+        assert_eq!(
+            adapter.pending_native_requests()[0].stage,
+            NativeRequestStage::AnswerWritten
+        );
+        assert_eq!(
+            adapter.answer_pending(permit),
+            Err(CodexError::Blocked(BlockReason::AnswerAlreadyWritten))
+        );
+        assert_eq!(adapter.transport().answer_write_attempts, 1);
+    }
+}
+
+#[test]
+fn user_input_answers_require_exact_question_ids_and_no_synthetic_empty_answer() {
+    let mut adapter = pending_bootstrap(user_input_request(51), []);
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    match &pending.kind {
+        NativeRequestKind::UserInput { questions, .. } => {
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].id, "question.one");
+        }
+        other => panic!("wrong parsed request: {other:?}"),
+    }
+    let no_answer = answer_permit(&pending, NativeAnswer::UserInputAnswers(BTreeMap::new()));
+    assert_eq!(
+        adapter.answer_pending(no_answer),
+        Err(CodexError::InvalidInput("answer shape is invalid"))
+    );
+    let mut wrong = BTreeMap::new();
+    wrong.insert("question.other".to_owned(), vec!["A".to_owned()]);
+    assert_eq!(
+        adapter.answer_pending(answer_permit(
+            &pending,
+            NativeAnswer::UserInputAnswers(wrong)
+        )),
+        Err(CodexError::InvalidInput("answer shape is invalid"))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 0);
+    assert_eq!(
+        adapter.pending_native_requests()[0].stage,
+        NativeRequestStage::Pending
+    );
+}
+
+#[test]
+fn valid_multiline_user_text_is_preserved_and_null_command_kind_is_unsupported() {
+    let mut input = user_input_request(52);
+    input["params"]["questions"][0]["question"] = json!("First line\nSecond line");
+    let mut adapter = pending_bootstrap(input, []);
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    let mut answers = BTreeMap::new();
+    answers.insert("question.one".to_owned(), vec!["A\nB".to_owned()]);
+    adapter
+        .answer_pending(answer_permit(
+            &pending,
+            NativeAnswer::UserInputAnswers(answers),
+        ))
+        .unwrap();
+    assert_eq!(
+        adapter.transport().writes.last().unwrap()["result"]["answers"]["question.one"]["answers"]
+            [0],
+        "A\nB"
+    );
+
+    let mut malformed = command_request(53);
+    malformed["params"]["kind"] = Value::Null;
+    let mut adapter = pending_bootstrap(malformed, []);
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    assert!(matches!(&pending.kind, NativeRequestKind::Unsupported(_)));
+    assert_eq!(
+        adapter.answer_pending(answer_permit(
+            &pending,
+            NativeAnswer::CommandDecision(ApprovalDecision::Accept),
+        )),
+        Err(CodexError::Blocked(BlockReason::UnsupportedNativeAnswer))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 0);
+}
+
+#[test]
+fn answer_resolution_waits_for_fresh_native_no_waiting_status() {
+    let resolved = json!({"method":"serverRequest/resolved","params":{
+        "threadId":"thread.one","requestId":44
+    }});
+    let mut adapter = pending_bootstrap(
+        command_request(44),
+        [
+            completed("turn.bootstrap", "completed"),
+            status("active", &["waitingOnApproval"]),
+            resolved,
+            status("idle", &[]),
+        ],
+    );
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    let permit = answer_permit(
+        &pending,
+        NativeAnswer::CommandDecision(ApprovalDecision::Accept),
+    );
+    adapter.answer_pending(permit.clone()).unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 1);
+    assert_eq!(
+        adapter.pending_native_requests()[0].stage,
+        NativeRequestStage::ResolvedAwaitingStatus
+    );
+    assert!(!adapter.bootstrap_ready());
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 0);
+    assert!(adapter.bootstrap_ready());
+    assert_eq!(
+        adapter.answer_pending(permit),
+        Err(CodexError::Blocked(BlockReason::StaleNativeRequest))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 1);
+}
+
+#[test]
+fn malformed_active_status_cannot_retire_resolved_request() {
+    let resolved = json!({"method":"serverRequest/resolved","params":{
+        "threadId":"thread.one","requestId":54
+    }});
+    let malformed = json!({"method":"thread/status/changed","params":{
+        "threadId":"thread.one","status":{"type":"active"}
+    }});
+    let mut adapter = pending_bootstrap(
+        command_request(54),
+        [
+            completed("turn.bootstrap", "completed"),
+            resolved,
+            malformed,
+        ],
+    );
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    adapter
+        .answer_pending(answer_permit(
+            &pending,
+            NativeAnswer::CommandDecision(ApprovalDecision::Decline),
+        ))
+        .unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 1);
+    assert_eq!(
+        adapter.poll_once(),
+        Err(CodexError::Protocol("active status omitted flags"))
+    );
+    assert_eq!(adapter.pending_request_count(), 1);
+    assert!(!adapter.bootstrap_ready());
+}
+
+#[test]
+fn not_loaded_status_does_not_retire_resolved_request() {
+    let resolved = json!({"method":"serverRequest/resolved","params":{
+        "threadId":"thread.one","requestId":57
+    }});
+    let mut adapter = pending_bootstrap(
+        command_request(57),
+        [
+            completed("turn.bootstrap", "completed"),
+            resolved,
+            status("notLoaded", &[]),
+            status("idle", &[]),
+        ],
+    );
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 1);
+    assert!(!adapter.bootstrap_ready());
+    adapter.poll_once().unwrap();
+    assert_eq!(adapter.pending_request_count(), 0);
+    assert!(adapter.bootstrap_ready());
+}
+
+#[test]
+fn wrong_request_turn_resource_or_writer_epoch_refuses_before_response_write() {
+    let mut adapter = pending_bootstrap(file_request(55), []);
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    let answer = NativeAnswer::FileDecision(ApprovalDecision::Decline);
+    let mut wrong_turn = pending.clone();
+    wrong_turn.native_turn_id = "turn.other".into();
+    assert_eq!(
+        adapter.answer_pending(answer_permit(&wrong_turn, answer.clone())),
+        Err(CodexError::Blocked(BlockReason::StaleNativeRequest))
+    );
+    let mut wrong_id = pending.clone();
+    wrong_id.request_id = NativeRpcId::Number(56);
+    assert_eq!(
+        adapter.answer_pending(answer_permit(&wrong_id, answer.clone())),
+        Err(CodexError::Blocked(BlockReason::StaleNativeRequest))
+    );
+    let mut wrong_epoch = pending.clone();
+    wrong_epoch.resource_epoch = Epoch::new(2).unwrap();
+    assert_eq!(
+        adapter.answer_pending(answer_permit(&wrong_epoch, answer.clone())),
+        Err(CodexError::Blocked(BlockReason::StaleResourcePermit))
+    );
+    let wrong_writer =
+        WriterPermit::from_trusted_boundary(identity("resource.other"), Epoch::new(1).unwrap());
+    assert_eq!(
+        adapter.answer_pending(AuthorizedAnswerPermit::from_authorised_boundary(
+            wrong_writer,
+            &pending,
+            answer.clone(),
+        )),
+        Err(CodexError::Blocked(BlockReason::StaleResourcePermit))
+    );
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        adapter.answer_pending(answer_permit(&pending, answer)),
+        Err(CodexError::Blocked(BlockReason::StaleWriterPermit))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 0);
+}
+
+#[test]
+fn ambiguous_answer_write_is_recorded_once_and_never_retried() {
+    let fake = FakeTransport::with_reads(pending_bootstrap_reads(command_request(60), []))
+        .fail_answer_write();
+    let mut adapter = pending_bootstrap_with_fake(fake);
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    let permit = answer_permit(
+        &pending,
+        NativeAnswer::CommandDecision(ApprovalDecision::Decline),
+    );
+    assert_eq!(
+        adapter.answer_pending(permit.clone()).unwrap(),
+        AnswerWriteOutcome::Uncertain {
+            request_id: NativeRpcId::Number(60)
+        }
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 1);
+    assert_eq!(
+        adapter.pending_native_requests()[0].stage,
+        NativeRequestStage::AnswerWriteUncertain
+    );
+    assert_eq!(
+        adapter.answer_pending(permit),
+        Err(CodexError::Blocked(BlockReason::AnswerAlreadyWritten))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 1);
+    assert!(!adapter.bootstrap_ready());
+}
+
+#[test]
+fn duplicate_native_request_id_poison_blocks_any_answer_write() {
+    let duplicate = command_request(61);
+    let mut adapter = pending_bootstrap(command_request(61), [duplicate]);
+    assert_eq!(
+        adapter.poll_once(),
+        Err(CodexError::Protocol("native request id was reused"))
+    );
+    let pending = adapter.pending_native_requests().pop().unwrap();
+    assert_eq!(
+        adapter.answer_pending(answer_permit(
+            &pending,
+            NativeAnswer::CommandDecision(ApprovalDecision::Decline),
+        )),
+        Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+    );
+    assert_eq!(adapter.transport().answer_write_attempts, 0);
+}
+
+#[test]
+fn unsupported_grants_amendments_and_unknown_request_stay_redacted_pending() {
+    for (request, answer) in [
+        (
+            command_request(70),
+            NativeAnswer::CommandExecPolicyAmendmentUnsupported,
+        ),
+        (
+            command_request(71),
+            NativeAnswer::CommandNetworkPolicyAmendmentUnsupported,
+        ),
+        (
+            permissions_request(72),
+            NativeAnswer::PermissionsGrantUnsupported,
+        ),
+        (
+            json!({"id":73,"method":"item/tool/unknownApproval","params":{
+                "threadId":"thread.one","turnId":"turn.bootstrap","itemId":"item.unknown",
+                "opaqueSecret":"do not echo"
+            }}),
+            NativeAnswer::CommandDecision(ApprovalDecision::Accept),
+        ),
+    ] {
+        let mut adapter = pending_bootstrap(request, []);
+        let pending = adapter.pending_native_requests().pop().unwrap();
+        assert!(pending.redacted.field_names.contains(&"itemId".to_owned()));
+        assert!(!format!("{:?}", pending.redacted).contains("do not echo"));
+        assert_eq!(
+            adapter.answer_pending(answer_permit(&pending, answer)),
+            Err(CodexError::Blocked(BlockReason::UnsupportedNativeAnswer))
+        );
+        assert_eq!(adapter.pending_request_count(), 1);
+        assert_eq!(adapter.transport().answer_write_attempts, 0);
+    }
+}
+
+#[test]
+fn debug_of_pending_requests_answers_and_permits_redacts_private_values() {
+    let secret = "PB10C_PRIVATE_SENTINEL";
+    let mut command = command_request(80);
+    command["params"]["command"] = json!(secret);
+    let command_adapter = pending_bootstrap(command, []);
+    let command_pending = command_adapter.pending_native_requests().pop().unwrap();
+    assert!(!format!("{command_pending:?}").contains(secret));
+
+    let mut file = file_request(81);
+    file["params"]["reason"] = json!(secret);
+    file["params"]["grantRoot"] = json!(format!("/tmp/{secret}"));
+    let file_adapter = pending_bootstrap(file, []);
+    let file_pending = file_adapter.pending_native_requests().pop().unwrap();
+    assert!(!format!("{file_pending:?}").contains(secret));
+
+    let mut input = user_input_request(82);
+    input["params"]["questions"][0]["question"] = json!(secret);
+    input["params"]["questions"][0]["options"][0]["description"] = json!(secret);
+    input["params"]["questions"][0]["isSecret"] = json!(true);
+    let input_adapter = pending_bootstrap(input, []);
+    let input_pending = input_adapter.pending_native_requests().pop().unwrap();
+    assert!(!format!("{input_pending:?}").contains(secret));
+    let mut answers = BTreeMap::new();
+    answers.insert("question.one".to_owned(), vec![secret.to_owned()]);
+    let answer = NativeAnswer::UserInputAnswers(answers);
+    let permit = answer_permit(&input_pending, answer.clone());
+    assert!(!format!("{answer:?}").contains(secret));
+    assert!(!format!("{permit:?}").contains(secret));
 }

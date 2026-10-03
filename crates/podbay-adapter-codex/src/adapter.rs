@@ -1,4 +1,5 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fmt::{Debug, Formatter};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,10 @@ use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
 
 use crate::codec::{CodecError, decode, encode};
+use crate::host_requests::{
+    NativeAnswer, NativeAnswerError, NativeRequestParseError, NativeRequestStage, NativeRpcId,
+    PendingNativeRequest, answer_value, parse_pending_request,
+};
 
 const MAX_PENDING_NOTIFICATIONS: usize = 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
@@ -44,6 +49,58 @@ impl WriterPermit {
             writer_epoch,
         }
     }
+}
+
+/// The exact answer and native request identity authorised by a higher layer.
+/// Construction is a trusted-boundary contract, not a cryptographic proof.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthorizedAnswerPermit {
+    writer: WriterPermit,
+    request_id: NativeRpcId,
+    native_thread_id: String,
+    native_turn_id: String,
+    native_item_id: String,
+    resource_epoch: Epoch,
+    answer: NativeAnswer,
+}
+
+impl Debug for AuthorizedAnswerPermit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedAnswerPermit")
+            .field("request_id", &self.request_id)
+            .field("native_thread_id", &self.native_thread_id)
+            .field("native_turn_id", &self.native_turn_id)
+            .field("native_item_id", &self.native_item_id)
+            .field("resource_epoch", &self.resource_epoch)
+            .field("writer_epoch", &self.writer.writer_epoch)
+            .field("answer", &self.answer)
+            .finish()
+    }
+}
+
+impl AuthorizedAnswerPermit {
+    pub fn from_authorised_boundary(
+        writer: WriterPermit,
+        request: &PendingNativeRequest,
+        answer: NativeAnswer,
+    ) -> Self {
+        Self {
+            writer,
+            request_id: request.request_id.clone(),
+            native_thread_id: request.native_thread_id.clone(),
+            native_turn_id: request.native_turn_id.clone(),
+            native_item_id: request.native_item_id.clone(),
+            resource_epoch: request.resource_epoch,
+            answer,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AnswerWriteOutcome {
+    WrittenAwaitingResolution { request_id: NativeRpcId },
+    Uncertain { request_id: NativeRpcId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +268,9 @@ pub enum BlockReason {
     ObservationUnknown,
     DuplicateMessageKey,
     InterruptAlreadyRequested,
+    StaleNativeRequest,
+    AnswerAlreadyWritten,
+    UnsupportedNativeAnswer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,7 +309,8 @@ pub struct CodexResource<T: JsonlTransport> {
     poisoned: bool,
     thread: Option<NativeThread>,
     bootstrap: BootstrapState,
-    pending_requests: HashSet<String>,
+    pending_requests: BTreeMap<String, PendingNativeRequest>,
+    retired_requests: HashSet<String>,
     native_status: ThreadStatus,
     observed_active_turn_id: Option<String>,
     owned_active_turn_id: Option<String>,
@@ -273,7 +334,8 @@ impl<T: JsonlTransport> CodexResource<T> {
             poisoned: false,
             thread: None,
             bootstrap: BootstrapState::NotStarted,
-            pending_requests: HashSet::new(),
+            pending_requests: BTreeMap::new(),
+            retired_requests: HashSet::new(),
             native_status: ThreadStatus::NotLoaded,
             observed_active_turn_id: None,
             owned_active_turn_id: None,
@@ -322,7 +384,7 @@ impl<T: JsonlTransport> CodexResource<T> {
     }
 
     pub fn turn_control_state(&self) -> TurnControlState {
-        let mut pending_request_ids: Vec<_> = self.pending_requests.iter().cloned().collect();
+        let mut pending_request_ids: Vec<_> = self.pending_requests.keys().cloned().collect();
         pending_request_ids.sort();
         TurnControlState {
             native_status: self.native_status,
@@ -335,6 +397,10 @@ impl<T: JsonlTransport> CodexResource<T> {
             last_submission: self.last_submission.clone(),
             interrupt: self.interrupt.clone(),
         }
+    }
+
+    pub fn pending_native_requests(&self) -> Vec<PendingNativeRequest> {
+        self.pending_requests.values().cloned().collect()
     }
 
     /// Records a monotonically advancing fence asserted by the authenticated
@@ -352,6 +418,76 @@ impl<T: JsonlTransport> CodexResource<T> {
         }
         self.current_writer_epoch = Some(writer_epoch);
         Ok(())
+    }
+
+    /// Writes one answer frame at most. A successful pipe write is not native
+    /// settlement; only `serverRequest/resolved` followed by fresh no-waiting
+    /// native status retires the pending request.
+    pub fn answer_pending(
+        &mut self,
+        permit: AuthorizedAnswerPermit,
+    ) -> Result<AnswerWriteOutcome, CodexError> {
+        self.check_permit(&permit.writer)?;
+        if permit.resource_epoch != self.identity.resource_epoch {
+            return Err(CodexError::Blocked(BlockReason::StaleResourcePermit));
+        }
+        let key = permit.request_id.key();
+        let request = self
+            .pending_requests
+            .get(&key)
+            .cloned()
+            .ok_or(CodexError::Blocked(BlockReason::StaleNativeRequest))?;
+        if request.request_id != permit.request_id
+            || request.native_thread_id != permit.native_thread_id
+            || request.native_turn_id != permit.native_turn_id
+            || request.native_item_id != permit.native_item_id
+            || request.resource_epoch != permit.resource_epoch
+        {
+            return Err(CodexError::Blocked(BlockReason::StaleNativeRequest));
+        }
+        if request.stage != NativeRequestStage::Pending {
+            return Err(CodexError::Blocked(BlockReason::AnswerAlreadyWritten));
+        }
+        if self.poisoned {
+            return Err(CodexError::Blocked(BlockReason::ObservationUnknown));
+        }
+        let bootstrap_turn = match &self.bootstrap {
+            BootstrapState::Submitted { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        };
+        if bootstrap_turn != Some(request.native_turn_id.as_str())
+            && self.owned_active_turn_id.as_deref() != Some(request.native_turn_id.as_str())
+        {
+            return Err(CodexError::Blocked(BlockReason::StaleNativeRequest));
+        }
+        let answer = answer_value(&request, &permit.answer).map_err(|error| match error {
+            NativeAnswerError::Unsupported => {
+                CodexError::Blocked(BlockReason::UnsupportedNativeAnswer)
+            }
+            NativeAnswerError::WrongKind => {
+                CodexError::InvalidInput("answer kind does not match native request")
+            }
+            NativeAnswerError::InvalidShape => CodexError::InvalidInput("answer shape is invalid"),
+        })?;
+        let frame = encode(&json!({"id":permit.request_id.wire_value(),"result":answer}))
+            .map_err(CodexError::Codec)?;
+        self.pending_requests
+            .get_mut(&key)
+            .ok_or(CodexError::Blocked(BlockReason::StaleNativeRequest))?
+            .stage = NativeRequestStage::AnswerWriteUncertain;
+        if self.io.write_line(&frame).is_err() {
+            self.poisoned = true;
+            return Ok(AnswerWriteOutcome::Uncertain {
+                request_id: permit.request_id,
+            });
+        }
+        self.pending_requests
+            .get_mut(&key)
+            .ok_or(CodexError::Blocked(BlockReason::StaleNativeRequest))?
+            .stage = NativeRequestStage::AnswerWritten;
+        Ok(AnswerWriteOutcome::WrittenAwaitingResolution {
+            request_id: permit.request_id,
+        })
     }
 
     pub fn initialize(&mut self) -> Result<(), CodexError> {
@@ -519,12 +655,15 @@ impl<T: JsonlTransport> CodexResource<T> {
         self.thread = Some(thread.clone());
         self.native_status = thread.status;
         self.observed_active_turn_id = observed_active_turn_id;
-        self.status_waiting = waiting_flag(result.pointer("/thread/status"));
+        self.status_waiting = waiting_flag(result.pointer("/thread/status")).inspect_err(|_| {
+            self.poisoned = true;
+        })?;
         if thread.status == ThreadStatus::Idle
             && matches!(self.bootstrap, BootstrapState::Completed { .. })
         {
             self.idle_after_completion = true;
         }
+        self.retire_resolved_requests();
         self.apply_queued()?;
         Ok(thread)
     }
@@ -764,13 +903,15 @@ impl<T: JsonlTransport> CodexResource<T> {
         Ok(())
     }
 
-    /// Handles one native event frame. Server requests are observed and block
-    /// readiness; this atom deliberately has no permission-answer API.
+    /// Handles one native event frame. Pending host requests remain blocked
+    /// until native resolution and a fresh no-waiting status observation.
     pub fn poll_once(&mut self) -> Result<(), CodexError> {
         if self.poisoned || !self.initialized {
             return Err(CodexError::InvalidState("native connection is unavailable"));
         }
-        self.apply_queued()?;
+        if let Some(event) = self.queued.pop_front() {
+            return self.apply_event_or_poison(&event);
+        }
         let line = self.read_frame()?;
         let value = decode(&line).map_err(|error| self.poison_codec(error))?;
         if nonempty_string(value.get("method")).is_none() {
@@ -962,6 +1103,27 @@ impl<T: JsonlTransport> CodexResource<T> {
         Ok(())
     }
 
+    fn retire_resolved_requests(&mut self) {
+        if self.status_waiting
+            || matches!(
+                self.native_status,
+                ThreadStatus::NotLoaded | ThreadStatus::SystemError
+            )
+        {
+            return;
+        }
+        let resolved: Vec<_> = self
+            .pending_requests
+            .iter()
+            .filter(|(_, request)| request.stage == NativeRequestStage::ResolvedAwaitingStatus)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in resolved {
+            self.pending_requests.remove(&key);
+            self.retired_requests.insert(key);
+        }
+    }
+
     fn apply_event_or_poison(&mut self, event: &Value) -> Result<(), CodexError> {
         let result = self.apply_event(event);
         if result.is_err() {
@@ -986,20 +1148,35 @@ impl<T: JsonlTransport> CodexResource<T> {
             return Ok(());
         }
         if event.get("id").is_some() {
-            let key = request_key(event.get("id"))
-                .ok_or(CodexError::Protocol("native request has invalid id"))?;
+            let request =
+                parse_pending_request(event, self.identity.resource_epoch).map_err(|error| {
+                    match error {
+                        NativeRequestParseError::MissingIdentity => {
+                            CodexError::Protocol("native request omitted identity")
+                        }
+                        NativeRequestParseError::InvalidRequestId => {
+                            CodexError::Protocol("native request has invalid id")
+                        }
+                    }
+                })?;
+            let key = request.key();
             if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
                 self.poisoned = true;
                 return Err(CodexError::Protocol("pending host request limit exceeded"));
             }
-            self.pending_requests.insert(key);
+            if self.retired_requests.contains(&key) || self.pending_requests.contains_key(&key) {
+                return Err(CodexError::Protocol("native request id was reused"));
+            }
+            self.pending_requests.insert(key, request);
             return Ok(());
         }
         match method {
             "serverRequest/resolved" => {
                 let key = request_key(params.get("requestId"))
                     .ok_or(CodexError::Protocol("resolved request omitted id"))?;
-                self.pending_requests.remove(&key);
+                if let Some(request) = self.pending_requests.get_mut(&key) {
+                    request.stage = NativeRequestStage::ResolvedAwaitingStatus;
+                }
             }
             "thread/status/changed" => {
                 let status = params.get("status");
@@ -1022,7 +1199,8 @@ impl<T: JsonlTransport> CodexResource<T> {
                 if self.native_status == ThreadStatus::Idle {
                     self.observed_active_turn_id = None;
                 }
-                self.status_waiting = waiting_flag(status);
+                self.status_waiting = waiting_flag(status)?;
+                self.retire_resolved_requests();
                 if self.native_status == ThreadStatus::Idle
                     && matches!(self.bootstrap, BootstrapState::Completed { .. })
                 {
@@ -1107,18 +1285,30 @@ fn request_key(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn waiting_flag(status: Option<&Value>) -> bool {
-    status
-        .and_then(|value| value.get("activeFlags"))
-        .and_then(Value::as_array)
-        .is_some_and(|flags| {
-            flags.iter().any(|flag| {
-                matches!(
-                    flag.as_str(),
-                    Some("waitingOnApproval" | "waitingOnUserInput")
-                )
-            })
-        })
+fn waiting_flag(status: Option<&Value>) -> Result<bool, CodexError> {
+    let status = status.ok_or(CodexError::Protocol("native status is missing"))?;
+    match status.get("type").and_then(Value::as_str) {
+        Some("active") => {
+            let flags = status
+                .get("activeFlags")
+                .and_then(Value::as_array)
+                .ok_or(CodexError::Protocol("active status omitted flags"))?;
+            if flags.len() > 64 {
+                return Err(CodexError::Protocol("active status has too many flags"));
+            }
+            let mut waiting = false;
+            for flag in flags {
+                match flag.as_str() {
+                    Some("waitingOnApproval" | "waitingOnUserInput") => waiting = true,
+                    Some(_) => waiting = true, // unknown flag cannot prove dispatchable status
+                    None => return Err(CodexError::Protocol("active status flag is invalid")),
+                }
+            }
+            Ok(waiting)
+        }
+        Some("notLoaded" | "idle" | "systemError") => Ok(false),
+        _ => Err(CodexError::Protocol("native status type is invalid")),
+    }
 }
 
 fn active_turn_from_thread(response: &Value) -> Result<Option<String>, CodexError> {
