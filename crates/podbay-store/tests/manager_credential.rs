@@ -190,7 +190,7 @@ fn v9_migration_has_no_fictitious_current_manager_claim() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     restore_historical_rebind_tables(&connection);
     connection
-        .execute_batch("DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
+        .execute_batch("DROP TABLE manager_rebind_prior_observations; DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
         .unwrap();
     drop(connection);
 
@@ -220,7 +220,8 @@ fn malformed_v10_name_refuses_migration_without_owner_change() {
     restore_historical_rebind_tables(&connection);
     connection
         .execute_batch(
-            "DROP TABLE manager_peer_bindings;
+            "DROP TABLE manager_rebind_prior_observations;
+         DROP TABLE manager_peer_bindings;
          DROP TABLE manager_credential_claims;
          CREATE TABLE manager_credential_claims(singleton INTEGER PRIMARY KEY) STRICT;
          PRAGMA user_version=9;",

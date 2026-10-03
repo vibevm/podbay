@@ -19,11 +19,13 @@ pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
     AuthoritySnapshot, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
-    EventCursor, EventReference, HostAcceptanceProof, LaunchDispatchStage, LaunchDispatchStatus,
-    LaunchIntentBinding, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
-    ObservedStage, QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder,
-    StoreError, StoredEffect, VerifiedPrincipal,
+    EventCursor, EventReference, HostAcceptanceProof, HostObservedPriorCheckpoint,
+    LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding, LaunchLookupRequest,
+    LaunchPortResult, ManagerCredentialClaim, ObservedStage, QuarantinedSourceEvent, Receipt,
+    ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
-pub use rebind::{DurableRebindPhase, DurableRebindReceipt, SqliteRebindLedger};
+pub use rebind::{
+    DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection, SqliteRebindLedger,
+};
 pub use store::PodBayStore;

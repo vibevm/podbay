@@ -5,12 +5,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use podbay_core::{PodFenceIdentity, RebindLedger, RebindProposal};
+use podbay_core::{PodFenceIdentity, RebindLedger, RebindPhase, RebindProposal};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 
-use crate::model::StoreError;
+use crate::model::{HostObservedPriorCheckpoint, StoreError};
 use crate::store::PodBayStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +28,95 @@ pub struct DurableRebindReceipt {
     pub pod_checkpoint_ref: Option<String>,
 }
 
+/// Read-only recovery view of an exact proof-bearing command. This is durable
+/// evidence, not permission to apply the pod-side rebind effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriorObservedRebindInspection {
+    pub receipt: DurableRebindReceipt,
+    pub checkpoint_digest: String,
+    pub supervisor_pid: u32,
+    pub supervisor_start_ticks: u64,
+    pub boot_id: String,
+    pub unit_name: String,
+    pub cgroup_path: String,
+}
+
+const PRIOR_OBSERVATION_SCHEMA: &str = "podbay.prior-checkpoint/1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredPriorObservation {
+    schema_version: String,
+    checkpoint_digest: String,
+    supervisor_pid: i64,
+    supervisor_start_ticks: i64,
+    boot_id: String,
+    unit_name: String,
+    cgroup_path: String,
+}
+
+impl StoredPriorObservation {
+    fn from_host(value: &HostObservedPriorCheckpoint) -> Result<Self, StoreError> {
+        Ok(Self {
+            schema_version: PRIOR_OBSERVATION_SCHEMA.into(),
+            checkpoint_digest: value.checkpoint_digest.clone(),
+            supervisor_pid: sqlite_counter(u64::from(value.supervisor_pid))?,
+            supervisor_start_ticks: sqlite_counter(value.supervisor_start_ticks)?,
+            boot_id: value.boot_id.clone(),
+            unit_name: value.unit_name.clone(),
+            cgroup_path: value.cgroup_path.clone(),
+        })
+    }
+
+    fn inspection(
+        self,
+        receipt: DurableRebindReceipt,
+    ) -> Result<PriorObservedRebindInspection, StoreError> {
+        if self.schema_version != PRIOR_OBSERVATION_SCHEMA {
+            return Err(StoreError::Conflict(
+                "prior checkpoint observation version differs",
+            ));
+        }
+        Ok(PriorObservedRebindInspection {
+            receipt,
+            checkpoint_digest: self.checkpoint_digest,
+            supervisor_pid: u32::try_from(self.supervisor_pid)
+                .map_err(|_| StoreError::Conflict("prior supervisor PID is malformed"))?,
+            supervisor_start_ticks: u64::try_from(self.supervisor_start_ticks)
+                .map_err(|_| StoreError::Conflict("prior supervisor birth is malformed"))?,
+            boot_id: self.boot_id,
+            unit_name: self.unit_name,
+            cgroup_path: self.cgroup_path,
+        })
+    }
+}
+
 impl PodBayStore {
+    /// Exact-key read-only recovery of a proof-bearing rebind. A changed
+    /// proposal conflicts; no live Active pod inspection is required to read
+    /// the original Pending receipt after a crash.
+    pub fn lookup_prior_observed_rebind(
+        &mut self,
+        proposal: &RebindProposal,
+    ) -> Result<Option<PriorObservedRebindInspection>, StoreError> {
+        let lineage = self.store_lineage.clone();
+        if proposal.identity.store_lineage.as_str() != lineage {
+            return Err(StoreError::WrongScope);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let Some((rowid, receipt)) = load_by_key(&transaction, proposal)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        verify_stored(&transaction, rowid, proposal, &lineage)?;
+        let observation = read_prior_observation(&transaction, rowid)?.ok_or(
+            StoreError::Conflict("legacy rebind has no prior checkpoint observation"),
+        )?;
+        transaction.commit()?;
+        Ok(Some(observation.inspection(receipt)?))
+    }
+
     /// Records a host-reviewed rebind intent after the owner/input epoch replay.
     /// It creates no pod, child, lease, grant, or provider effect.
     pub fn prepare_manager_rebind(
@@ -45,6 +133,11 @@ impl PodBayStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((rowid, receipt)) = load_by_key(&transaction, proposal)? {
             verify_stored(&transaction, rowid, proposal, &lineage)?;
+            if prior_observation_exists(&transaction, rowid)? {
+                return Err(StoreError::Conflict(
+                    "proof-bearing rebind requires observation path",
+                ));
+            }
             transaction.commit()?;
             return Ok(receipt);
         }
@@ -119,6 +212,118 @@ impl PodBayStore {
         Ok(receipt(proposal, DurableRebindPhase::Pending, None))
     }
 
+    /// Low-level trusted-host admission of a prior pod checkpoint observed
+    /// over an OS-attested live socket. This DTO is forgeable Rust data: the
+    /// store proves durable association and destination fences, not the host's
+    /// socket evidence, pod fsync, liveness or manager lifetime lock.
+    /// A proof-bearing Pending row is intentionally invisible to the pod
+    /// ledger until a later digest-before-effect prepare implementation.
+    pub fn prepare_manager_rebind_from_host_observation(
+        &mut self,
+        proposal: &RebindProposal,
+        observed: &HostObservedPriorCheckpoint,
+    ) -> Result<DurableRebindReceipt, StoreError> {
+        validate_host_observation(proposal, observed)?;
+        let lineage = self.store_lineage.clone();
+        if proposal.identity.store_lineage.as_str() != lineage {
+            return Err(StoreError::WrongScope);
+        }
+        let expected_observation = StoredPriorObservation::from_host(observed)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((rowid, receipt)) = load_by_key(&transaction, proposal)? {
+            verify_stored(&transaction, rowid, proposal, &lineage)?;
+            let prior = read_prior_observation(&transaction, rowid)?.ok_or(
+                StoreError::Conflict("legacy rebind has no prior checkpoint observation"),
+            )?;
+            if prior != expected_observation {
+                return Err(StoreError::Conflict("prior checkpoint observation changed"));
+            }
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        verify_current_fences_with_mode(&transaction, proposal, &lineage, true)?;
+        verify_current_manager_destination(&transaction, proposal, &lineage)?;
+        let unfinished: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM manager_rebinds WHERE scope_id=?1 AND pod_id=?2
+               AND pod_incarnation=?3 AND phase!='activated'",
+            params![
+                proposal.identity.scope_id.as_str(),
+                proposal.identity.pod_id.as_str(),
+                sqlite_counter(proposal.identity.incarnation.get())?
+            ],
+            |row| row.get(0),
+        )?;
+        if unfinished != 0 {
+            return Err(StoreError::Conflict("another manager rebind is pending"));
+        }
+        let latest: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT next_owner_epoch,next_credential_epoch FROM manager_rebinds
+             WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3 AND phase='activated'
+             ORDER BY next_owner_epoch DESC LIMIT 1",
+                params![
+                    proposal.identity.scope_id.as_str(),
+                    proposal.identity.pod_id.as_str(),
+                    sqlite_counter(proposal.identity.incarnation.get())?
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let prior_owner = sqlite_counter(proposal.expected_owner_epoch.get())?;
+        let prior_credential = sqlite_counter(proposal.expected_credential_epoch.get())?;
+        if latest.is_some_and(|(owner, credential)| {
+            owner != prior_owner || credential != prior_credential
+        }) {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.execute(
+            "INSERT INTO manager_rebinds(
+               store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+               expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
+               manager_os_identity,manager_process_id,manager_boot_identity,
+               manager_birth_identity,manager_containment,command_key,request_digest,
+               resource_count,phase)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,'pending')",
+            params![lineage,proposal.identity.scope_id.as_str(),proposal.identity.pod_id.as_str(),
+                proposal.identity.attempt_id.as_str(),sqlite_counter(proposal.identity.incarnation.get())?,
+                sqlite_counter(proposal.expected_owner_epoch.get())?,sqlite_counter(proposal.next_owner_epoch.get())?,
+                sqlite_counter(proposal.expected_credential_epoch.get())?,sqlite_counter(proposal.next_credential_epoch.get())?,
+                proposal.next_manager.os_identity(),proposal.next_manager.native_process_id(),
+                proposal.next_manager.boot_identity(),proposal.next_manager.birth_identity(),
+                proposal.next_manager.containment_identity(),proposal.command_key.as_str(),
+                proposal.digest.as_str(),proposal.next_input_epochs.len() as i64],
+        )?;
+        let rowid = transaction.last_insert_rowid();
+        for (resource_id, next) in &proposal.next_input_epochs {
+            let old = proposal
+                .expected_input_epochs
+                .get(resource_id)
+                .ok_or(StoreError::Conflict("rebind resource set differs"))?;
+            transaction.execute(
+                "INSERT INTO manager_rebind_resources(rebind_rowid,resource_id,
+                   expected_input_epoch,next_input_epoch) VALUES(?1,?2,?3,?4)",
+                params![
+                    rowid,
+                    resource_id.as_str(),
+                    sqlite_counter(old.get())?,
+                    sqlite_counter(next.get())?
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO manager_rebind_prior_observations(rebind_rowid,schema_version,
+               checkpoint_digest,supervisor_pid,supervisor_start_ticks,boot_id,unit_name,cgroup_path)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![rowid,expected_observation.schema_version,expected_observation.checkpoint_digest,
+                expected_observation.supervisor_pid,expected_observation.supervisor_start_ticks,
+                expected_observation.boot_id,expected_observation.unit_name,expected_observation.cgroup_path],
+        )?;
+        transaction.commit()?;
+        Ok(receipt(proposal, DurableRebindPhase::Pending, None))
+    }
+
     /// Records a trusted pod checkpoint reference. The store cannot prove the
     /// pod's durable fsync or native peer evidence from this string alone.
     pub fn acknowledge_pod_rebind(
@@ -171,6 +376,11 @@ fn transition(
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (rowid, prior) = load_by_key(&transaction, proposal)?.ok_or(StoreError::NotFound)?;
     verify_stored(&transaction, rowid, proposal, &lineage)?;
+    if prior_observation_exists(&transaction, rowid)? {
+        return Err(StoreError::Conflict(
+            "proof-bearing rebind awaits pod digest check",
+        ));
+    }
     if prior.phase == target {
         if prior.pod_checkpoint_ref.as_deref() != Some(checkpoint) {
             return Err(StoreError::Conflict("pod checkpoint reference changed"));
@@ -285,6 +495,127 @@ fn validate_shape(proposal: &RebindProposal) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_host_observation(
+    proposal: &RebindProposal,
+    observed: &HostObservedPriorCheckpoint,
+) -> Result<(), StoreError> {
+    if observed.identity != proposal.identity {
+        return Err(StoreError::WrongScope);
+    }
+    if observed.owner_epoch != proposal.expected_owner_epoch
+        || observed.credential_epoch != proposal.expected_credential_epoch
+        || observed.input_epochs != proposal.expected_input_epochs
+    {
+        return Err(StoreError::Conflict(
+            "prior checkpoint observation differs from proposal",
+        ));
+    }
+    if observed.phase != RebindPhase::Active
+        || observed.input_epochs.is_empty()
+        || observed.input_epochs.len() > 64
+        || observed.input_epochs.len() != proposal.next_input_epochs.len()
+        || proposal.next_owner_epoch.get() <= proposal.expected_owner_epoch.get()
+        || proposal.next_credential_epoch.get() <= proposal.expected_credential_epoch.get()
+        || observed.supervisor_pid == 0
+        || observed.supervisor_start_ticks == 0
+        || observed.checkpoint_digest.len() != 64
+        || !observed
+            .checkpoint_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StoreError::InvalidInput(
+            "prior Active checkpoint observation is invalid",
+        ));
+    }
+    for value in [observed.boot_id.as_str(), observed.unit_name.as_str()] {
+        if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            return Err(StoreError::InvalidInput(
+                "prior pod process evidence is invalid",
+            ));
+        }
+    }
+    if !observed.cgroup_path.starts_with('/')
+        || observed.cgroup_path.len() > 4096
+        || observed.cgroup_path.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidInput("prior pod containment is invalid"));
+    }
+    for value in [
+        proposal.expected_owner_epoch.get(),
+        proposal.next_owner_epoch.get(),
+        proposal.expected_credential_epoch.get(),
+        proposal.next_credential_epoch.get(),
+        u64::from(observed.supervisor_pid),
+        observed.supervisor_start_ticks,
+    ] {
+        sqlite_counter(value)?;
+    }
+    for (id, old) in &observed.input_epochs {
+        let next = proposal
+            .next_input_epochs
+            .get(id)
+            .ok_or(StoreError::InvalidInput("rebind resource set differs"))?;
+        sqlite_counter(old.get())?;
+        sqlite_counter(next.get())?;
+        if next.get() <= old.get() {
+            return Err(StoreError::InvalidInput(
+                "rebind input epoch did not advance",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_current_manager_destination(
+    transaction: &Transaction<'_>,
+    proposal: &RebindProposal,
+    lineage: &str,
+) -> Result<(), StoreError> {
+    let owner = sqlite_counter(proposal.next_owner_epoch.get())?;
+    let credential = sqlite_counter(proposal.next_credential_epoch.get())?;
+    let claim: Option<(String, i64, i64)> = transaction
+        .query_row(
+            "SELECT store_lineage,owner_epoch,credential_epoch
+         FROM manager_credential_claims WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if claim != Some((lineage.into(), owner, credential)) {
+        return Err(StoreError::StaleEpoch);
+    }
+    let peer: Option<(String, String, String, String, String)> = transaction
+        .query_row(
+            "SELECT os_identity,process_identity,boot_identity,birth_identity,containment_identity
+         FROM manager_peer_bindings WHERE store_lineage=?1 AND owner_epoch=?2
+           AND credential_epoch=?3 AND peer_schema='podbay.attested-peer/1'",
+            params![lineage, owner, credential],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if peer
+        != Some((
+            proposal.next_manager.os_identity().into(),
+            proposal.next_manager.native_process_id().into(),
+            proposal.next_manager.boot_identity().into(),
+            proposal.next_manager.birth_identity().into(),
+            proposal.next_manager.containment_identity().into(),
+        ))
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(())
+}
+
 fn load_by_key(
     transaction: &Transaction<'_>,
     proposal: &RebindProposal,
@@ -317,6 +648,36 @@ fn load_by_key(
         ))
     })
     .transpose()
+}
+
+fn prior_observation_exists(transaction: &Transaction<'_>, rowid: i64) -> Result<bool, StoreError> {
+    Ok(read_prior_observation(transaction, rowid)?.is_some())
+}
+
+fn read_prior_observation(
+    transaction: &Transaction<'_>,
+    rowid: i64,
+) -> Result<Option<StoredPriorObservation>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT schema_version,checkpoint_digest,supervisor_pid,supervisor_start_ticks,
+                boot_id,unit_name,cgroup_path
+         FROM manager_rebind_prior_observations WHERE rebind_rowid=?1",
+            [rowid],
+            |row| {
+                Ok(StoredPriorObservation {
+                    schema_version: row.get(0)?,
+                    checkpoint_digest: row.get(1)?,
+                    supervisor_pid: row.get(2)?,
+                    supervisor_start_ticks: row.get(3)?,
+                    boot_id: row.get(4)?,
+                    unit_name: row.get(5)?,
+                    cgroup_path: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
 }
 
 fn verify_stored(
@@ -437,6 +798,15 @@ fn verify_current_fences(
     proposal: &RebindProposal,
     lineage: &str,
 ) -> Result<(), StoreError> {
+    verify_current_fences_with_mode(transaction, proposal, lineage, false)
+}
+
+fn verify_current_fences_with_mode(
+    transaction: &Transaction<'_>,
+    proposal: &RebindProposal,
+    lineage: &str,
+    allow_skip: bool,
+) -> Result<(), StoreError> {
     if proposal.identity.store_lineage.as_str() != lineage {
         return Err(StoreError::WrongScope);
     }
@@ -548,14 +918,17 @@ fn verify_current_fences(
         let current = authorities
             .get(id.as_str())
             .ok_or(StoreError::Conflict("rebind authority resource is missing"))?;
-        if old.get().checked_add(1) != Some(next.get())
-            || current
-                != (&(
-                    scope.into(),
-                    incarnation,
-                    *resource_epoch,
-                    sqlite_counter(next.get())?,
-                ))
+        if (if allow_skip {
+            old.get() >= next.get()
+        } else {
+            old.get().checked_add(1) != Some(next.get())
+        }) || current
+            != (&(
+                scope.into(),
+                incarnation,
+                *resource_epoch,
+                sqlite_counter(next.get())?,
+            ))
         {
             return Err(StoreError::StaleEpoch);
         }
@@ -582,6 +955,10 @@ impl SqliteRebindLedger {
         if proposal.identity != self.identity {
             return None;
         }
+        // V13 proof-bearing rows are durable intent only until the pod adds
+        // a digest-before-effect prepare path. Legacy +1 remains the sole
+        // ledger-visible path in this atom.
+        validate_shape(proposal).ok()?;
         let mut connection =
             Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
         connection.busy_timeout(Duration::from_millis(250)).ok()?;
@@ -596,6 +973,9 @@ impl SqliteRebindLedger {
             )
             .ok()?;
         let (rowid, record) = load_by_key(&transaction, proposal).ok()??;
+        if prior_observation_exists(&transaction, rowid).ok()? {
+            return None;
+        }
         verify_stored(&transaction, rowid, proposal, &lineage).ok()?;
         verify_current_fences(&transaction, proposal, &lineage).ok()?;
         transaction.commit().ok()?;

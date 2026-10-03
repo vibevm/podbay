@@ -234,7 +234,7 @@ fn migrated_v10_owner_has_no_synthetic_manager_peer() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     restore_historical_rebind_tables(&connection);
     connection
-        .execute_batch("DROP TABLE manager_peer_bindings; PRAGMA user_version=10;")
+        .execute_batch("DROP TABLE manager_rebind_prior_observations; DROP TABLE manager_peer_bindings; PRAGMA user_version=10;")
         .unwrap();
     drop(connection);
     let mut migrated = PodBayStore::open(&fixture.database).unwrap();
@@ -299,7 +299,8 @@ fn malformed_v11_name_refuses_migration_atomically() {
     restore_historical_rebind_tables(&connection);
     connection
         .execute_batch(
-            "DROP TABLE manager_peer_bindings;
+            "DROP TABLE manager_rebind_prior_observations;
+         DROP TABLE manager_peer_bindings;
          CREATE TABLE manager_peer_bindings(owner_epoch INTEGER PRIMARY KEY) STRICT;
          PRAGMA user_version=10;",
         )

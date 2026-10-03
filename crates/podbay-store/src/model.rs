@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+
+use podbay_core::{
+    CredentialEpoch, InputEpoch, OwnerEpoch, PodFenceIdentity, RebindPhase, ResourceId,
+};
 
 /// The caller supplies canonical request bytes; this store hashes those exact bytes.
 /// Semantic JSON normalization belongs to the PB03 wire layer.
@@ -435,6 +440,24 @@ pub struct ManagerCredentialClaim {
     pub(crate) store_lineage: String,
     pub(crate) owner_epoch: u64,
     pub(crate) credential_epoch: u64,
+}
+
+/// Data copied by the trusted host from an OS-attested, live pod inspection.
+/// This public DTO is forgeable as Rust data; the store validates associations
+/// and destination fences but cannot prove socket, PID, cgroup or manager lock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostObservedPriorCheckpoint {
+    pub identity: PodFenceIdentity,
+    pub phase: RebindPhase,
+    pub owner_epoch: OwnerEpoch,
+    pub credential_epoch: CredentialEpoch,
+    pub input_epochs: BTreeMap<ResourceId, InputEpoch>,
+    pub checkpoint_digest: String,
+    pub supervisor_pid: u32,
+    pub supervisor_start_ticks: u64,
+    pub boot_id: String,
+    pub unit_name: String,
+    pub cgroup_path: String,
 }
 
 impl ManagerCredentialClaim {

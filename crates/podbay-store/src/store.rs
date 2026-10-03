@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -162,6 +162,22 @@ const MANAGER_PEER_BINDINGS_V11: &str = "CREATE TABLE manager_peer_bindings (
   birth_identity TEXT NOT NULL CHECK(length(birth_identity) BETWEEN 1 AND 256),
   containment_identity TEXT NOT NULL CHECK(length(containment_identity) BETWEEN 1 AND 4096),
   PRIMARY KEY(store_lineage,owner_epoch,credential_epoch)
+) STRICT";
+
+// A v13 observation is a trusted-host record of a pod's prior Active
+// checkpoint. The store validates association and durable fences, not OS peer.
+// Legacy v9/v12 rebinds have no child row and gain no implied proof.
+const MANAGER_REBIND_PRIOR_OBSERVATIONS_V13: &str =
+    "CREATE TABLE manager_rebind_prior_observations (
+  rebind_rowid INTEGER PRIMARY KEY REFERENCES manager_rebinds(rebind_rowid),
+  schema_version TEXT NOT NULL CHECK(schema_version='podbay.prior-checkpoint/1'),
+  checkpoint_digest TEXT NOT NULL CHECK(length(checkpoint_digest)=64
+    AND checkpoint_digest NOT GLOB '*[^0-9a-f]*'),
+  supervisor_pid INTEGER NOT NULL CHECK(supervisor_pid>=1),
+  supervisor_start_ticks INTEGER NOT NULL CHECK(supervisor_start_ticks>=1),
+  boot_id TEXT NOT NULL CHECK(length(boot_id) BETWEEN 1 AND 256),
+  unit_name TEXT NOT NULL CHECK(length(unit_name) BETWEEN 1 AND 256),
+  cgroup_path TEXT NOT NULL CHECK(length(cgroup_path) BETWEEN 1 AND 4096)
 ) STRICT";
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -512,11 +528,25 @@ impl PodBayStore {
             verify_rebind_schema_v9(&transaction)?;
             rebuild_rebind_schema_v12(&transaction)?;
         }
+        if version < 13 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_rebind_prior_observations'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v13 prior observation schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{MANAGER_REBIND_PRIOR_OBSERVATIONS_V13};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
+        verify_prior_observation_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -2093,6 +2123,19 @@ fn verify_manager_peer_schema(transaction: &rusqlite::Transaction<'_>) -> Result
         .optional()?;
     if actual.as_deref() != Some(MANAGER_PEER_BINDINGS_V11) {
         return Err(StoreError::Conflict("v11 manager peer schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_prior_observation_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='manager_rebind_prior_observations'",
+        [], |row| row.get(0),
+    ).optional()?;
+    if actual.as_deref() != Some(MANAGER_REBIND_PRIOR_OBSERVATIONS_V13) {
+        return Err(StoreError::Conflict("v13 prior observation schema differs"));
     }
     Ok(())
 }
