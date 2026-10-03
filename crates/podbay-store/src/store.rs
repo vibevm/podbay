@@ -10,7 +10,7 @@ use crate::model::{
     Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -203,6 +203,37 @@ impl PodBayStore {
                  ) STRICT;",
             )?;
         }
+        let has_effect_digest = {
+            let mut statement = transaction.prepare("PRAGMA table_info(outbox)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "effect_digest")
+        };
+        if version < 6 && !has_effect_digest {
+            transaction.execute_batch("ALTER TABLE outbox ADD COLUMN effect_digest TEXT;")?;
+        } else if version >= 6 && !has_effect_digest {
+            return Err(StoreError::Conflict(
+                "outbox effect digest column is missing",
+            ));
+        }
+        if version < 6 {
+            let prior_effects = {
+                let mut statement = transaction.prepare("SELECT outbox_id,payload FROM outbox")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (outbox_id, payload) in prior_effects {
+                transaction.execute(
+                    "UPDATE outbox SET effect_digest=?1 WHERE outbox_id=?2",
+                    params![sha256_hex(&payload), outbox_id],
+                )?;
+            }
+        }
         verify_authority_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -291,6 +322,7 @@ impl PodBayStore {
     pub fn admit(&mut self, request: &CommandRequest) -> Result<Admission, StoreError> {
         validate_request(request)?;
         let digest = digest_request(request);
+        let effect_digest = sha256_hex(&request.effect_payload);
         let command_id = stable_command_id(request);
         let owner_epoch = integer(request.expected_owner_epoch)?;
         let target_epoch = integer(request.expected_target_epoch)?;
@@ -419,7 +451,8 @@ impl PodBayStore {
         let event_sequence = transaction.last_insert_rowid();
         transaction.execute(
             "INSERT INTO outbox(command_rowid,scope_id,target_id,owner_epoch,target_epoch,
-              kind,payload,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'prepared')",
+              kind,payload,effect_digest,state)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'prepared')",
             params![
                 command_rowid,
                 request.scope_id,
@@ -427,7 +460,8 @@ impl PodBayStore {
                 owner_epoch,
                 target_epoch,
                 request.effect_kind,
-                request.effect_payload
+                request.effect_payload,
+                effect_digest
             ],
         )?;
         let outbox_id = transaction.last_insert_rowid();
@@ -465,7 +499,8 @@ impl PodBayStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
-                "SELECT scope_id,target_id,target_epoch,state,claim_key,kind
+                "SELECT scope_id,target_id,target_epoch,state,claim_key,kind,
+                        payload,effect_digest
                  FROM outbox WHERE outbox_id=?1",
                 [outbox_id],
                 |row| {
@@ -476,6 +511,8 @@ impl PodBayStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -491,6 +528,9 @@ impl PodBayStore {
         }
         if !supported_effect_kind(&row.5) {
             return Err(StoreError::UnsupportedEffectKind);
+        }
+        if sha256_hex(&row.6) != row.7 {
+            return Err(StoreError::Conflict("outbox effect digest changed"));
         }
         let result = match row.3.as_str() {
             "prepared" => {
@@ -547,7 +587,7 @@ impl PodBayStore {
                 "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
                         o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
                         o.claim_owner_epoch,o.observation_key,o.observation_payload,
-                        o.observation_stage,o.observation_event_sequence
+                        o.observation_stage,o.observation_event_sequence,o.effect_digest
                  FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
                  WHERE o.outbox_id=?1",
                 [outbox_id],
@@ -579,7 +619,7 @@ impl PodBayStore {
             "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
                     o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
                     o.claim_owner_epoch,o.observation_key,o.observation_payload,
-                    o.observation_stage,o.observation_event_sequence
+                    o.observation_stage,o.observation_event_sequence,o.effect_digest
              FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
              WHERE o.scope_id=?1 AND o.outbox_id>?2 AND o.state!='observed'
              ORDER BY o.outbox_id LIMIT ?3",
@@ -869,7 +909,7 @@ impl PodBayStore {
                 "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
                         o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
                         o.claim_owner_epoch,o.observation_key,o.observation_payload,
-                        o.observation_stage,o.observation_event_sequence
+                        o.observation_stage,o.observation_event_sequence,o.effect_digest
                  FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
                  WHERE o.scope_id=?1 ORDER BY o.outbox_id",
             )?;
@@ -1053,6 +1093,11 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
         None => None,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
+    let payload: Vec<u8> = row.get(7)?;
+    let effect_digest: String = row.get(15)?;
+    if sha256_hex(&payload) != effect_digest {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(StoredEffect {
         outbox_id: row.get(0)?,
         command_id: row.get(1)?,
@@ -1061,7 +1106,8 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
         admission_owner_epoch: row.get::<_, i64>(4)? as u64,
         admission_target_epoch: row.get::<_, i64>(5)? as u64,
         kind: row.get(6)?,
-        payload: row.get(7)?,
+        payload,
+        effect_digest,
         state,
         claim_key: row.get(9)?,
         claim_owner_epoch: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
@@ -1214,6 +1260,13 @@ fn stable_command_id(request: &CommandRequest) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {

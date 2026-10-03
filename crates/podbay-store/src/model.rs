@@ -310,6 +310,8 @@ pub struct StoredEffect {
     pub admission_target_epoch: u64,
     pub kind: String,
     pub payload: Vec<u8>,
+    /// SHA-256 of the exact immutable outbox payload bytes.
+    pub effect_digest: String,
     pub state: EffectState,
     pub claim_key: Option<String>,
     pub claim_owner_epoch: Option<u64>,

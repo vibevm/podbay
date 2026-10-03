@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 use podbay_core::{ActorId, PodId, ResourceId, Role, ScopeId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
-    AuthorisedDispatch, CredentialGeneration, CredentialRef, GrantId, GrantMode, GrantSpec,
-    GuardSet, HostAction, HostAuthority, HostDispatchPort, HostError, HostPlatform, HostRequest,
-    InputEpoch, ManagerEpoch, Operation, PodIncarnation, PodRegistration, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, ResourceEpoch, ResourceRegistration, Right, Target,
+    AuthorisedDispatch, AuthorisedLaunch, CredentialGeneration, CredentialRef, GrantId, GrantMode,
+    GrantSpec, GuardSet, HostAction, HostAuthority, HostDispatchPort, HostError, HostPlatform,
+    HostRequest, InputEpoch, ManagerEpoch, Operation, PodIncarnation, PodRegistration,
+    PortDispatchError, PortDispatchOutcome, PortReceiptRef, ResourceEpoch, ResourceRegistration,
+    Right, Target,
 };
 
 #[derive(Clone)]
@@ -53,6 +54,13 @@ impl HostDispatchPort for FakePort {
             }),
             FakePortMode::Refused => unreachable!(),
         }
+    }
+
+    fn launch(
+        &mut self,
+        _launch: AuthorisedLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
     }
 }
 

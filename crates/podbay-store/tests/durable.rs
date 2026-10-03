@@ -1460,3 +1460,56 @@ fn schema_four_open_adds_launch_dispatch_outcome_table() {
         LaunchDispatchStage::RefusedBeforeEffect
     );
 }
+
+#[test]
+fn schema_five_backfills_effect_digest_and_tampering_refuses_claim() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let input = request("scope.fixture", "request.effect-digest", b"effect-digest");
+    let receipt = match store.admit(&input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    drop(store);
+    let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    injector
+        .execute_batch(
+            "ALTER TABLE outbox DROP COLUMN effect_digest;
+             PRAGMA user_version=5;",
+        )
+        .unwrap();
+    drop(injector);
+    let mut migrated = fixture.open();
+    assert_eq!(
+        migrated.admit(&input).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
+    let effect = migrated
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    assert_eq!(effect.effect_digest.len(), 64);
+    assert_eq!(effect.payload, b"effect.fixture");
+    let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    injector
+        .execute(
+            "UPDATE outbox SET payload=X'74616d7065726564' WHERE outbox_id=?1",
+            [receipt.outbox_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        migrated.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.tampered",
+        ),
+        Err(StoreError::Conflict("outbox effect digest changed"))
+    ));
+    assert_eq!(
+        migrated.effect_state(receipt.outbox_id).unwrap(),
+        EffectState::Prepared
+    );
+}
