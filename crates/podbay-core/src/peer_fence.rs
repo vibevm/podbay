@@ -51,19 +51,22 @@ impl Display for FenceError {
 }
 impl Error for FenceError {}
 
-fn checked_next<T>(
-    value: T,
-    next: T,
-    step: impl FnOnce(T) -> Result<T, crate::IdError>,
-) -> Result<(), FenceError>
+fn strictly_advanced<T>(value: T, next: T, counter: impl Fn(T) -> u64) -> Result<(), FenceError>
 where
-    T: Copy + Eq,
+    T: Copy,
 {
-    if step(value).map_err(|_| FenceError::CounterOverflow)? == next {
-        Ok(())
-    } else {
-        Err(FenceError::StaleEpoch)
+    let old = counter(value);
+    let new = counter(next);
+    if old == 0 || new == 0 {
+        return Err(FenceError::InvalidEvidence);
     }
+    if old == u64::MAX {
+        return Err(FenceError::CounterOverflow);
+    }
+    if new <= old {
+        return Err(FenceError::StaleEpoch);
+    }
+    Ok(())
 }
 
 fn valid_piece(value: &str, maximum: usize) -> bool {
@@ -416,15 +419,21 @@ impl PodFenceCheckpoint {
          -> Result<(), FenceError> {
             if proposal.identity != self.identity
                 || proposal.next_manager.containment_identity() != self.manager_containment.as_ref()
-                || proposal.expected_owner_epoch.checked_next().ok()
-                    != Some(proposal.next_owner_epoch)
-                || proposal.expected_credential_epoch.checked_next().ok()
-                    != Some(proposal.next_credential_epoch)
                 || proposal.expected_input_epochs.len() != self.input_epochs.len()
                 || proposal.next_input_epochs.len() != self.input_epochs.len()
             {
                 return Err(FenceError::WrongAssociation);
             }
+            strictly_advanced(
+                proposal.expected_owner_epoch,
+                proposal.next_owner_epoch,
+                OwnerEpoch::get,
+            )?;
+            strictly_advanced(
+                proposal.expected_credential_epoch,
+                proposal.next_credential_epoch,
+                CredentialEpoch::get,
+            )?;
             for (id, next) in &proposal.next_input_epochs {
                 let old = proposal
                     .expected_input_epochs
@@ -434,10 +443,8 @@ impl PodFenceCheckpoint {
                     .input_epochs
                     .get(id)
                     .ok_or(FenceError::WrongAssociation)?;
-                if old.checked_next().ok() != Some(*next)
-                    || (exact_inputs && current != next)
-                    || (!exact_inputs && current < next)
-                {
+                strictly_advanced(*old, *next, InputEpoch::get)?;
+                if (exact_inputs && current != next) || (!exact_inputs && current < next) {
                     return Err(FenceError::StaleEpoch);
                 }
             }
@@ -879,17 +886,17 @@ impl PodPeerFence {
             if *expected != resource.epoch {
                 return Err(FenceError::StaleEpoch);
             }
-            checked_next(*expected, *next, InputEpoch::checked_next)?;
+            strictly_advanced(*expected, *next, InputEpoch::get)?;
         }
-        checked_next(
+        strictly_advanced(
             proposal.expected_owner_epoch,
             proposal.next_owner_epoch,
-            OwnerEpoch::checked_next,
+            OwnerEpoch::get,
         )?;
-        checked_next(
+        strictly_advanced(
             proposal.expected_credential_epoch,
             proposal.next_credential_epoch,
-            CredentialEpoch::checked_next,
+            CredentialEpoch::get,
         )?;
         if !ledger.pending(&proposal) {
             return Err(FenceError::NotAdmitted);
@@ -2037,6 +2044,280 @@ mod tests {
         assert_eq!(
             PodPeerFence::restore_after_crash(pending_without_proposal),
             Err(FenceError::InvalidEvidence)
+        );
+    }
+
+    #[test]
+    fn direct_rebind_skips_multiple_manager_generations_without_reviving_grants() {
+        let mut fence = fence();
+        let old = Witness::new(Some(owner(1)));
+        fence
+            .install_grant(
+                &manager(),
+                controller(manager(), owner(1), credential(1)),
+                &old,
+                120,
+            )
+            .unwrap();
+        let old_request = request(
+            "grant.controller",
+            FenceOperation::ObserveResource,
+            None,
+            owner(1),
+            credential(1),
+        );
+        assert_eq!(fence.authorize(&manager(), &old_request, &old, 140), Ok(()));
+        let mut proposed = proposal(input(1), input(1));
+        proposed.next_owner_epoch = owner(4);
+        proposed.next_credential_epoch = credential(5);
+        proposed.next_input_epochs =
+            BTreeMap::from([(resource(), input(4)), (resource_two(), input(3))]);
+        let advanced = Witness::new(Some(owner(4)));
+        let mut ledger = Ledger {
+            proposal: proposed.clone(),
+            pending: true,
+            active: false,
+        };
+        assert_eq!(
+            fence.authorize(&manager(), &old_request, &advanced, 150),
+            Err(FenceError::OwnerUnverified)
+        );
+        assert_eq!(
+            fence.prepare_rebind(
+                proposed.clone(),
+                &successor(),
+                ManagerLiveness::DeadAttested,
+                &advanced,
+                &ledger,
+                170
+            ),
+            Ok(RebindPhase::PendingStore)
+        );
+        let mut resumed = PodPeerFence::restore_after_crash(fence.checkpoint()).unwrap();
+        assert_eq!(resumed.input_epoch(&resource()), Some(input(4)));
+        assert_eq!(resumed.input_epoch(&resource_two()), Some(input(3)));
+        assert_eq!(
+            resumed.authorize(&manager(), &old_request, &advanced, 180),
+            Err(FenceError::PendingRebind)
+        );
+        assert_eq!(
+            resumed.confirm_pod_bound(&proposed, &successor(), &advanced, &ledger),
+            Ok(RebindPhase::PendingPod)
+        );
+        ledger.active = true;
+        assert_eq!(
+            resumed.activate_rebind(&proposed, &successor(), &advanced, &ledger),
+            Ok(RebindPhase::Active)
+        );
+        let mut active = PodPeerFence::restore_after_crash(resumed.checkpoint()).unwrap();
+        assert_eq!(active.owner_epoch(), owner(4));
+        assert_eq!(active.credential_epoch(), credential(5));
+        assert_eq!(active.input_epoch(&resource()), Some(input(4)));
+        assert_eq!(active.input_epoch(&resource_two()), Some(input(3)));
+        active
+            .renew_manager_lease(&successor(), &advanced, 200, 500)
+            .unwrap();
+        let fresh = request(
+            "grant.controller",
+            FenceOperation::ObserveResource,
+            None,
+            owner(4),
+            credential(5),
+        );
+        assert_eq!(
+            active.authorize(&successor(), &fresh, &advanced, 210),
+            Err(FenceError::GrantDenied)
+        );
+        assert_eq!(
+            active.prepare_rebind(
+                proposed.clone(),
+                &successor(),
+                ManagerLiveness::Unknown,
+                &advanced,
+                &ledger,
+                220
+            ),
+            Ok(RebindPhase::Active)
+        );
+        let mut changed = proposed.clone();
+        changed.digest = RequestDigest::parse(&"b".repeat(64)).unwrap();
+        assert_eq!(
+            active.prepare_rebind(
+                changed,
+                &successor(),
+                ManagerLiveness::Unknown,
+                &advanced,
+                &ledger,
+                220
+            ),
+            Err(FenceError::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn equal_decreasing_and_exhausted_rebind_epochs_refuse_without_state_change() {
+        let cases = [
+            (4, 5, 5, 5, FenceError::StaleEpoch), // equal owner
+            (3, 5, 5, 5, FenceError::StaleEpoch), // decreasing owner
+            (5, 4, 5, 5, FenceError::StaleEpoch), // equal credential
+            (5, 3, 5, 5, FenceError::StaleEpoch), // decreasing credential
+            (5, 5, 4, 5, FenceError::StaleEpoch), // equal first input
+            (5, 5, 3, 5, FenceError::StaleEpoch), // decreasing first input
+        ];
+        for (next_owner, next_credential, next_first, next_second, expected) in cases {
+            let mut fence = PodPeerFence::new(
+                id(),
+                manager(),
+                owner(4),
+                credential(4),
+                BTreeMap::from([(resource(), input(4)), (resource_two(), input(4))]),
+                100,
+                800,
+            )
+            .unwrap();
+            let mut proposed = proposal(input(4), input(4));
+            proposed.expected_owner_epoch = owner(4);
+            proposed.next_owner_epoch = owner(next_owner);
+            proposed.expected_credential_epoch = credential(4);
+            proposed.next_credential_epoch = credential(next_credential);
+            proposed.next_input_epochs = BTreeMap::from([
+                (resource(), input(next_first)),
+                (resource_two(), input(next_second)),
+            ]);
+            let witness = Witness::new(Some(owner(next_owner)));
+            let ledger = Ledger {
+                proposal: proposed.clone(),
+                pending: true,
+                active: false,
+            };
+            let before = fence.checkpoint();
+            assert_eq!(
+                fence.prepare_rebind(
+                    proposed,
+                    &successor(),
+                    ManagerLiveness::DeadAttested,
+                    &witness,
+                    &ledger,
+                    170
+                ),
+                Err(expected)
+            );
+            assert_eq!(fence.checkpoint(), before);
+            let restored = PodPeerFence::restore_after_crash(before).unwrap();
+            assert_eq!(restored.phase(), RebindPhase::Active);
+        }
+        let mut exhausted = PodPeerFence::new(
+            id(),
+            manager(),
+            owner(u64::MAX),
+            credential(4),
+            BTreeMap::from([(resource(), input(4)), (resource_two(), input(4))]),
+            100,
+            800,
+        )
+        .unwrap();
+        let mut proposed = proposal(input(4), input(4));
+        proposed.expected_owner_epoch = owner(u64::MAX);
+        proposed.next_owner_epoch = owner(u64::MAX);
+        proposed.expected_credential_epoch = credential(4);
+        proposed.next_credential_epoch = credential(5);
+        proposed.next_input_epochs =
+            BTreeMap::from([(resource(), input(5)), (resource_two(), input(5))]);
+        let witness = Witness::new(Some(owner(u64::MAX)));
+        let ledger = Ledger {
+            proposal: proposed.clone(),
+            pending: true,
+            active: false,
+        };
+        assert_eq!(
+            exhausted.prepare_rebind(
+                proposed,
+                &successor(),
+                ManagerLiveness::DeadAttested,
+                &witness,
+                &ledger,
+                170
+            ),
+            Err(FenceError::CounterOverflow)
+        );
+        assert!(OwnerEpoch::new(0).is_err());
+        assert!(CredentialEpoch::new(0).is_err());
+        assert!(InputEpoch::new(0).is_err());
+        let mut input_exhausted = PodPeerFence::new(
+            id(),
+            manager(),
+            owner(4),
+            credential(4),
+            BTreeMap::from([(resource(), input(u64::MAX)), (resource_two(), input(4))]),
+            100,
+            800,
+        )
+        .unwrap();
+        let mut proposed = proposal(input(4), input(4));
+        proposed.expected_owner_epoch = owner(4);
+        proposed.next_owner_epoch = owner(5);
+        proposed.expected_credential_epoch = credential(4);
+        proposed.next_credential_epoch = credential(5);
+        proposed.expected_input_epochs =
+            BTreeMap::from([(resource(), input(u64::MAX)), (resource_two(), input(4))]);
+        proposed.next_input_epochs =
+            BTreeMap::from([(resource(), input(u64::MAX)), (resource_two(), input(5))]);
+        let witness = Witness::new(Some(owner(5)));
+        let ledger = Ledger {
+            proposal: proposed.clone(),
+            pending: true,
+            active: false,
+        };
+        assert_eq!(
+            input_exhausted.prepare_rebind(
+                proposed,
+                &successor(),
+                ManagerLiveness::DeadAttested,
+                &witness,
+                &ledger,
+                170
+            ),
+            Err(FenceError::CounterOverflow)
+        );
+    }
+
+    #[test]
+    fn restored_pending_checkpoint_rejects_nonmonotonic_or_wrong_prior_binding() {
+        let original = fence().checkpoint();
+        let mut equal = proposal(input(1), input(1));
+        equal.next_owner_epoch = owner(1);
+        assert_eq!(
+            PodFenceCheckpoint::from_durable_parts(
+                original.version(),
+                original.identity().clone(),
+                original.manager_containment().into(),
+                original.manager_peer().clone(),
+                original.owner_epoch(),
+                original.credential_epoch(),
+                equal.next_input_epochs.clone(),
+                RebindPhase::PendingStore,
+                Some(equal.clone()),
+                Some(equal)
+            ),
+            Err(FenceError::StaleEpoch)
+        );
+        let mut wrong_prior = proposal(input(1), input(1));
+        wrong_prior.expected_owner_epoch = owner(2);
+        wrong_prior.next_owner_epoch = owner(4);
+        assert_eq!(
+            PodFenceCheckpoint::from_durable_parts(
+                original.version(),
+                original.identity().clone(),
+                original.manager_containment().into(),
+                original.manager_peer().clone(),
+                original.owner_epoch(),
+                original.credential_epoch(),
+                wrong_prior.next_input_epochs.clone(),
+                RebindPhase::PendingPod,
+                Some(wrong_prior.clone()),
+                Some(wrong_prior)
+            ),
+            Err(FenceError::StaleEpoch)
         );
     }
 }
