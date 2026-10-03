@@ -16,6 +16,22 @@ const MAGIC: &[u8] = b"podbay.peer-fence-checkpoint/1\0";
 const MAX_CHECKPOINT_BYTES: usize = 65_536;
 const MAX_RESOURCES: usize = 64;
 const DIGEST_BYTES: usize = 32;
+const OBSERVATION_DOMAIN: &[u8] = b"podbay.peer-checkpoint-observation/1\0";
+
+/// Read-only observation of one validated private checkpoint file. The digest
+/// names the exact bytes read, not a reconstructed logical summary.
+pub(crate) struct PeerCheckpointObservation {
+    checkpoint: PodFenceCheckpoint,
+    digest: String,
+}
+impl PeerCheckpointObservation {
+    pub(crate) fn checkpoint(&self) -> &PodFenceCheckpoint {
+        &self.checkpoint
+    }
+    pub(crate) fn digest(&self) -> &str {
+        &self.digest
+    }
+}
 
 #[derive(Debug)]
 pub enum PeerCheckpointError {
@@ -466,7 +482,7 @@ mod linux_file {
     fn read_at_path(
         path: &Path,
         expected: &PodFenceIdentity,
-    ) -> Result<PodPeerFence, PeerCheckpointError> {
+    ) -> Result<(PodFenceCheckpoint, Vec<u8>), PeerCheckpointError> {
         let directory = parent(path)?;
         let owner = fs::metadata(directory)?.uid();
         let file = OpenOptions::new()
@@ -493,7 +509,7 @@ mod linux_file {
         if checkpoint.identity() != expected {
             return Err(PeerCheckpointError::ForeignIdentity);
         }
-        PodPeerFence::restore_after_crash(checkpoint).map_err(Into::into)
+        Ok((checkpoint, bytes))
     }
 
     /// The trusted identity, rather than a caller-selected filename, chooses
@@ -513,9 +529,151 @@ mod linux_file {
         directory: &Path,
         expected: &PodFenceIdentity,
     ) -> Result<PodPeerFence, PeerCheckpointError> {
-        read_at_path(&checkpoint_path(directory, expected), expected)
+        let (checkpoint, _bytes) = read_at_path(&checkpoint_path(directory, expected), expected)?;
+        PodPeerFence::restore_after_crash(checkpoint).map_err(Into::into)
+    }
+
+    pub(crate) fn read_peer_checkpoint_observation(
+        directory: &Path,
+        expected: &PodFenceIdentity,
+    ) -> Result<PeerCheckpointObservation, PeerCheckpointError> {
+        let (checkpoint, bytes) = read_at_path(&checkpoint_path(directory, expected), expected)?;
+        let mut hash = Sha256::new();
+        hash.update(OBSERVATION_DOMAIN);
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(&bytes);
+        let digest = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(PeerCheckpointObservation { checkpoint, digest })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        use podbay_core::{
+            AttemptId, AttestedPeer, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PodId,
+            PodPeerFence, ResourceId, ScopeId, StoreLineageId,
+        };
+
+        fn private_fixture() -> std::path::PathBuf {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("podbay-observation-{}-{stamp}", std::process::id()));
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            directory
+        }
+        fn identity(pod: &str) -> PodFenceIdentity {
+            PodFenceIdentity {
+                scope_id: ScopeId::try_from("scope.fixture").unwrap(),
+                pod_id: PodId::try_from(pod).unwrap(),
+                attempt_id: AttemptId::try_from("attempt.fixture").unwrap(),
+                incarnation: Epoch::new(1).unwrap(),
+                store_lineage: StoreLineageId::try_from("store.fixture").unwrap(),
+            }
+        }
+        fn checkpoint(id: PodFenceIdentity, epoch: u64) -> PodFenceCheckpoint {
+            PodPeerFence::new(
+                id,
+                AttestedPeer::from_port(
+                    "uid.1000",
+                    "pid.100",
+                    "boot.fixture",
+                    "birth.100",
+                    "manager.unit",
+                )
+                .unwrap(),
+                OwnerEpoch::new(epoch).unwrap(),
+                CredentialEpoch::new(epoch).unwrap(),
+                BTreeMap::from([(
+                    ResourceId::try_from("resource.fixture").unwrap(),
+                    InputEpoch::new(epoch).unwrap(),
+                )]),
+                100,
+                800,
+            )
+            .unwrap()
+            .checkpoint()
+        }
+
+        #[test]
+        fn observation_hashes_exact_private_file_bytes_and_changes_after_update() {
+            let directory = private_fixture();
+            let id = identity("pod.fixture");
+            let first = checkpoint(id.clone(), 1);
+            write_peer_checkpoint(&directory, &id, &first).unwrap();
+            let path = checkpoint_path(&directory, &id);
+            let original = fs::read(&path).unwrap();
+            let observed = read_peer_checkpoint_observation(&directory, &id).unwrap();
+            assert_eq!(observed.checkpoint(), &first);
+            let mut expected = Sha256::new();
+            expected.update(OBSERVATION_DOMAIN);
+            expected.update((original.len() as u64).to_be_bytes());
+            expected.update(&original);
+            let expected = expected
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(observed.digest(), expected);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "observation is read-only"
+            );
+            assert_eq!(
+                read_peer_checkpoint_observation(&directory, &id)
+                    .unwrap()
+                    .digest(),
+                expected
+            );
+            let second = checkpoint(id.clone(), 2);
+            write_peer_checkpoint(&directory, &id, &second).unwrap();
+            let updated = read_peer_checkpoint_observation(&directory, &id).unwrap();
+            assert_eq!(updated.checkpoint(), &second);
+            assert_ne!(updated.digest(), observed.digest());
+            assert_ne!(fs::read(&path).unwrap(), original);
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn observation_refuses_missing_corrupt_or_foreign_checkpoint() {
+            let directory = private_fixture();
+            let id = identity("pod.fixture");
+            assert!(matches!(
+                read_peer_checkpoint_observation(&directory, &id),
+                Err(PeerCheckpointError::Io(_))
+            ));
+            let first = checkpoint(id.clone(), 1);
+            write_peer_checkpoint(&directory, &id, &first).unwrap();
+            let path = checkpoint_path(&directory, &id);
+            let mut corrupt = fs::read(&path).unwrap();
+            corrupt[10] ^= 1;
+            fs::write(&path, &corrupt).unwrap();
+            assert!(matches!(
+                read_peer_checkpoint_observation(&directory, &id),
+                Err(PeerCheckpointError::DigestMismatch)
+            ));
+            let foreign = checkpoint(identity("pod.foreign"), 1);
+            fs::write(&path, encode_peer_checkpoint(&foreign).unwrap()).unwrap();
+            assert!(matches!(
+                read_peer_checkpoint_observation(&directory, &id),
+                Err(PeerCheckpointError::ForeignIdentity)
+            ));
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux_file::read_peer_checkpoint_observation;
 #[cfg(target_os = "linux")]
 pub use linux_file::{read_peer_checkpoint, write_peer_checkpoint};
