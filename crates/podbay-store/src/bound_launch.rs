@@ -1,14 +1,16 @@
 //! Initial root-run admission. Every row, including authority and the outbox,
 //! commits under one SQLite writer transaction. This module performs no OS effect.
 use podbay_core::{
-    AdmissionState, DesiredMode, ExecutionState, LaunchBinding, ResourceKind, Revision, Role, Run,
-    Session, SessionState, WorkKind,
+    AdmissionState, AttemptId, DesiredMode, Epoch, ExecutionState, InputEpoch, LaunchBinding,
+    OwnerEpoch, PodId, ResourceId, ResourceKind, Revision, Role, Run, ScopeId, Session,
+    SessionState, StoreLineageId, WorkKind,
 };
 use podbay_wire::{
     EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract, ImmutableLaunchDescriptor,
     LAUNCH_DESCRIPTOR_SCHEMA, NativeResourceKind, NativeRole, NativeWorkKind,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use std::collections::BTreeMap;
 
 use crate::model::{
     CommandRequest, DIGEST_VERSION, LaunchLookupRequest, Receipt, StoreError, VerifiedPrincipal,
@@ -18,6 +20,13 @@ use crate::store::{
 };
 
 const NAMESPACE: &str = "podbay.launch";
+
+fn positive_stored_epoch(value: i64, reason: &'static str) -> Result<u64, StoreError> {
+    if value <= 0 {
+        return Err(StoreError::Conflict(reason));
+    }
+    Ok(value as u64)
+}
 
 /// Authenticated caller identity and exact caller bytes. A duplicate can omit
 /// the proposal, so a profile change never changes the original receipt.
@@ -67,6 +76,81 @@ pub struct BoundLaunchRecord {
     pub descriptor: Vec<u8>,
 }
 
+/// One read-only, active-run candidate. It proves database associations at
+/// one committed SQLite snapshot, not process liveness, launch authority or
+/// a control grant; the host must still obtain fresh OS and pod evidence.
+pub struct CurrentBoundPodSnapshot {
+    store_lineage: StoreLineageId,
+    owner_epoch: OwnerEpoch,
+    authority_revision: u64,
+    scope_id: ScopeId,
+    pod_id: PodId,
+    pod_incarnation: Epoch,
+    attempt_id: AttemptId,
+    attempt_ordinal: u64,
+    attempt_epoch: Epoch,
+    launch: BoundLaunchRecord,
+    resources: Vec<CurrentBoundResource>,
+}
+
+pub struct CurrentBoundResource {
+    id: ResourceId,
+    kind: ResourceKind,
+    epoch: Epoch,
+    input_epoch: InputEpoch,
+}
+
+impl CurrentBoundPodSnapshot {
+    pub fn store_lineage(&self) -> &StoreLineageId {
+        &self.store_lineage
+    }
+    pub fn owner_epoch(&self) -> OwnerEpoch {
+        self.owner_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+    pub fn pod_id(&self) -> &PodId {
+        &self.pod_id
+    }
+    pub fn pod_incarnation(&self) -> Epoch {
+        self.pod_incarnation
+    }
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+    pub fn attempt_ordinal(&self) -> u64 {
+        self.attempt_ordinal
+    }
+    pub fn attempt_epoch(&self) -> Epoch {
+        self.attempt_epoch
+    }
+    pub fn launch(&self) -> &BoundLaunchRecord {
+        &self.launch
+    }
+    pub fn resources(&self) -> &[CurrentBoundResource] {
+        &self.resources
+    }
+}
+
+impl CurrentBoundResource {
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+    pub fn kind(&self) -> ResourceKind {
+        self.kind
+    }
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    pub fn input_epoch(&self) -> InputEpoch {
+        self.input_epoch
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BoundLaunchAdmission {
     Committed(BoundLaunchRecord),
@@ -74,6 +158,232 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
+    /// Current bound Pod and resource context from one DEFERRED SQLite
+    /// snapshot. Caller supplies only scope/PodId; historical command keys,
+    /// principals and caller bytes cannot select or revive a stale launch.
+    pub fn current_bound_pod_snapshot(
+        &mut self,
+        scope_id: &str,
+        pod_id: &str,
+    ) -> Result<CurrentBoundPodSnapshot, StoreError> {
+        valid_id(scope_id)?;
+        valid_id(pod_id)?;
+        let scope = ScopeId::try_from(scope_id)
+            .map_err(|_| StoreError::InvalidInput("scope ID is invalid"))?;
+        let pod =
+            PodId::try_from(pod_id).map_err(|_| StoreError::InvalidInput("Pod ID is invalid"))?;
+        let cached_lineage = self.store_lineage.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (lineage, owner, revision): (String, i64, i64) = transaction.query_row(
+            "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),
+                    (SELECT value FROM metadata WHERE key='owner_epoch'),
+                    (SELECT value FROM metadata WHERE key='authority_revision')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if lineage != cached_lineage {
+            return Err(StoreError::WrongScope);
+        }
+        let owner = positive_stored_epoch(owner, "current owner epoch is invalid")?;
+        let authority_revision =
+            positive_stored_epoch(revision, "current authority revision is invalid")?;
+        let registered: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT scope_id,incarnation FROM authority_pods WHERE pod_id=?1",
+                [pod_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((registered_scope, incarnation)) = registered else {
+            return Err(StoreError::NotFound);
+        };
+        if registered_scope != scope_id {
+            return Err(StoreError::WrongScope);
+        }
+        let incarnation = positive_stored_epoch(incarnation, "current Pod incarnation is invalid")?;
+        let target: Option<i64> = transaction
+            .query_row(
+                "SELECT epoch FROM target_epochs WHERE scope_id=?1 AND target_id=?2",
+                params![scope_id, pod_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if target != Some(incarnation as i64) {
+            return Err(StoreError::StaleEpoch);
+        }
+        let binding_rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM launch_bindings
+             WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+                params![scope_id, pod_id, incarnation as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(binding_rowid) = binding_rowid else {
+            let historical: Option<i64> = transaction
+                .query_row(
+                    "SELECT command_rowid FROM launch_slots
+                 WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+                    params![scope_id, pod_id, incarnation as i64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return if historical.is_some() {
+                Err(StoreError::Conflict(
+                    "historical launch has no bound v8 descriptor",
+                ))
+            } else {
+                Err(StoreError::NotFound)
+            };
+        };
+        let (bound_ordinal, bound_attempt_epoch): (i64, i64) = transaction.query_row(
+            "SELECT attempt_ordinal,attempt_epoch FROM launch_bindings WHERE command_rowid=?1",
+            [binding_rowid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let bound_ordinal =
+            positive_stored_epoch(bound_ordinal, "bound attempt ordinal is invalid")?;
+        let bound_attempt_epoch =
+            positive_stored_epoch(bound_attempt_epoch, "bound attempt epoch is invalid")?;
+        let launch = read_bound_record(&transaction, binding_rowid)?;
+        let descriptor = ImmutableLaunchDescriptor::decode_json(&launch.descriptor)
+            .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
+        if descriptor.attempt_ordinal() != bound_ordinal
+            || descriptor.attempt_epoch() != bound_attempt_epoch
+        {
+            return Err(StoreError::Conflict(
+                "bound attempt differs from descriptor",
+            ));
+        }
+        if launch.scope_id != scope_id
+            || launch.pod_id != pod_id
+            || launch.pod_incarnation != incarnation
+        {
+            return Err(StoreError::Conflict("current Pod binding differs"));
+        }
+        let session: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state,current_run_id FROM runtime_sessions WHERE session_id=?1",
+                [&launch.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if session != Some(("open".into(), Some(launch.run_id.clone()))) {
+            return Err(StoreError::Conflict(
+                "current Session no longer points at bound Run",
+            ));
+        }
+        let run: Option<(String, String, String, Option<String>, i64)> = transaction
+            .query_row(
+                "SELECT admission_state,desired_mode,execution_state,current_attempt_id,
+                        last_attempt_ordinal FROM runtime_runs WHERE run_id=?1",
+                [&launch.run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if !run.is_some_and(
+            |(admission, desired, execution, current_attempt, ordinal)| {
+                admission == "admitted"
+                    && desired == "run"
+                    && matches!(execution.as_str(), "starting" | "running")
+                    && current_attempt.as_deref() == Some(launch.attempt_id.as_str())
+                    && ordinal == bound_ordinal as i64
+            },
+        ) {
+            return Err(StoreError::Conflict(
+                "current Run is not active at the bound Attempt",
+            ));
+        }
+        let mut authority = BTreeMap::new();
+        let mut statement = transaction.prepare(
+            "SELECT resource_id,scope_id,pod_incarnation,resource_epoch,input_epoch
+             FROM authority_resources WHERE pod_id=?1 ORDER BY resource_id",
+        )?;
+        let rows = statement.query_map([pod_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, resource_scope, pod_incarnation, resource_epoch, input_epoch) = row?;
+            if authority
+                .insert(
+                    id,
+                    (resource_scope, pod_incarnation, resource_epoch, input_epoch),
+                )
+                .is_some()
+            {
+                return Err(StoreError::Conflict("duplicate current resource identity"));
+            }
+        }
+        if authority.len() != launch.resources.len() {
+            return Err(StoreError::Conflict(
+                "current resource inventory differs from launch",
+            ));
+        }
+        let mut resources = Vec::with_capacity(launch.resources.len());
+        for bound in &launch.resources {
+            let current = authority.remove(&bound.id).ok_or(StoreError::Conflict(
+                "bound resource lacks current authority",
+            ))?;
+            if current.0 != scope_id
+                || current.1 != incarnation as i64
+                || current.2 != bound.epoch as i64
+            {
+                return Err(StoreError::Conflict("current resource association differs"));
+            }
+            let input = positive_stored_epoch(current.3, "current input epoch is invalid")?;
+            let kind = match bound.kind.as_str() {
+                "pty" => ResourceKind::Pty,
+                "structured_provider" => ResourceKind::StructuredProvider,
+                "auxiliary" => ResourceKind::Auxiliary,
+                _ => return Err(StoreError::Conflict("unknown bound resource kind")),
+            };
+            resources.push(CurrentBoundResource {
+                id: ResourceId::try_from(bound.id.as_str())
+                    .map_err(|_| StoreError::Conflict("bound resource ID is invalid"))?,
+                kind,
+                epoch: Epoch::new(bound.epoch)
+                    .map_err(|_| StoreError::Conflict("bound resource epoch is invalid"))?,
+                input_epoch: InputEpoch::new(input)
+                    .map_err(|_| StoreError::Conflict("current input epoch is invalid"))?,
+            });
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(CurrentBoundPodSnapshot {
+            store_lineage: StoreLineageId::try_from(lineage.as_str())
+                .map_err(|_| StoreError::Conflict("store lineage is invalid"))?,
+            owner_epoch: OwnerEpoch::new(owner).map_err(|_| StoreError::StaleEpoch)?,
+            authority_revision,
+            scope_id: scope,
+            pod_id: pod,
+            pod_incarnation: Epoch::new(incarnation)
+                .map_err(|_| StoreError::Conflict("current Pod incarnation is invalid"))?,
+            attempt_id: AttemptId::try_from(launch.attempt_id.as_str())
+                .map_err(|_| StoreError::Conflict("bound Attempt ID is invalid"))?,
+            attempt_ordinal: bound_ordinal,
+            attempt_epoch: Epoch::new(bound_attempt_epoch)
+                .map_err(|_| StoreError::Conflict("bound attempt epoch is invalid"))?,
+            launch,
+            resources,
+        })
+    }
+
     /// Read-only pre-profile duplicate lookup. `None` is only a genuinely new
     /// caller key; an existing unbound command is a conflict, never a proposal.
     pub fn lookup_bound_launch(

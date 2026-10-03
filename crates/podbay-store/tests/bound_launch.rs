@@ -9,10 +9,11 @@ use podbay_core::{
     SessionId, WorkKind,
 };
 use podbay_store::{
-    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityRightRecord,
-    BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRequest, CommandRequest, EffectClaim,
-    EffectObservation, HostAcceptanceProof, LaunchDispatchStage, LaunchIntentBinding,
-    LaunchLookupRequest, LaunchPortResult, PodBayStore, StoreError, VerifiedPrincipal,
+    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
+    AuthorityRightRecord, BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRequest,
+    CommandRequest, EffectClaim, EffectObservation, HostAcceptanceProof, LaunchDispatchStage,
+    LaunchIntentBinding, LaunchLookupRequest, LaunchPortResult, PodBayStore, StoreError,
+    VerifiedPrincipal,
 };
 use podbay_wire::{
     EffectiveLaunchContract, ImmutableLaunchDescriptor, ResourceDriver, ReviewedNativePolicy,
@@ -295,6 +296,168 @@ fn count(path: &PathBuf, table: &str) -> i64 {
             row.get(0)
         })
         .unwrap()
+}
+
+#[test]
+fn current_bound_pod_snapshot_tracks_owner_and_input_replay_without_caller_key() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task, "pod.root.fixture");
+    let record = match store
+        .admit_bound_launch(proposal.request("key.root.fixture", b"caller.intent"))
+        .unwrap()
+    {
+        BoundLaunchAdmission::Committed(record) => record,
+        other => panic!("{other:?}"),
+    };
+    let lineage = store
+        .initial_cursor("scope.root.fixture")
+        .unwrap()
+        .store_lineage;
+    let first = store
+        .current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture")
+        .unwrap();
+    assert_eq!(first.store_lineage().as_str(), lineage);
+    assert_eq!(first.owner_epoch().get(), 1);
+    assert_eq!(first.authority_revision(), 1);
+    assert_eq!(first.scope_id().as_str(), "scope.root.fixture");
+    assert_eq!(first.pod_id().as_str(), "pod.root.fixture");
+    assert_eq!(first.pod_incarnation().get(), 1);
+    assert_eq!(first.attempt_id().as_str(), "attempt.root.fixture");
+    assert_eq!(first.attempt_ordinal(), 1);
+    assert_eq!(first.attempt_epoch().get(), 1);
+    assert_eq!(first.launch(), &record);
+    assert_eq!(first.resources().len(), 2);
+    assert_eq!(first.resources()[0].id().as_str(), "resource.pty.fixture");
+    assert_eq!(first.resources()[0].kind(), ResourceKind::Pty);
+    assert_eq!(
+        first.resources()[1].kind(),
+        ResourceKind::StructuredProvider
+    );
+    assert!(
+        first
+            .resources()
+            .iter()
+            .all(|resource| resource.epoch().get() == 1 && resource.input_epoch().get() == 1)
+    );
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE runtime_runs SET execution_state='running' WHERE run_id='run.root.fixture'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        store
+            .current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture")
+            .is_ok()
+    );
+    store.begin_authority_replay(1, 2).unwrap();
+    let replayed = store
+        .current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture")
+        .unwrap();
+    assert_eq!(replayed.owner_epoch().get(), 2);
+    assert_eq!(replayed.authority_revision(), 2);
+    assert_eq!(replayed.launch(), &record);
+    assert!(
+        replayed
+            .resources()
+            .iter()
+            .all(|resource| resource.input_epoch().get() == 2)
+    );
+}
+
+#[test]
+fn current_bound_pod_snapshot_refuses_wrong_scope_target_or_current_pointer() {
+    for mutation in [
+        "UPDATE runtime_sessions SET current_run_id='run.foreign' WHERE session_id='session.root.fixture'",
+        "UPDATE runtime_runs SET current_attempt_id='attempt.foreign' WHERE run_id='run.root.fixture'",
+        "UPDATE runtime_sessions SET state='closed' WHERE session_id='session.root.fixture'",
+        "UPDATE runtime_runs SET execution_state='ended' WHERE run_id='run.root.fixture'",
+        "UPDATE runtime_runs SET desired_mode='stop' WHERE run_id='run.root.fixture'",
+        "UPDATE runtime_runs SET admission_state='proposed' WHERE run_id='run.root.fixture'",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        setup(&mut store);
+        let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task, "pod.root.fixture");
+        store
+            .admit_bound_launch(proposal.request("key.root.fixture", b"caller.intent"))
+            .unwrap();
+        assert!(matches!(
+            store.current_bound_pod_snapshot("scope.foreign", "pod.root.fixture"),
+            Err(StoreError::WrongScope)
+        ));
+        assert!(matches!(
+            store.current_bound_pod_snapshot("scope.root.fixture", "pod.missing"),
+            Err(StoreError::NotFound)
+        ));
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection.execute_batch(mutation).unwrap();
+        assert!(matches!(
+            store.current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture"),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+}
+
+#[test]
+fn later_attempt_ordinal_requires_a_matching_supported_immutable_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task, "pod.root.fixture");
+    store
+        .admit_bound_launch(proposal.request("key.root.fixture", b"caller.intent"))
+        .unwrap();
+    // The v8 writer/readback currently admits only first root attempts. A
+    // future ordinal cannot be inferred merely from Run's mutable pointer.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE launch_bindings SET attempt_ordinal=2;
+         UPDATE runtime_runs SET last_attempt_ordinal=2;",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture"),
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[test]
+fn current_bound_pod_snapshot_refuses_stale_or_changed_authority_resources() {
+    for mutation in [
+        "DELETE FROM authority_resources WHERE resource_id='resource.provider.fixture'",
+        "INSERT INTO authority_resources(resource_id,scope_id,pod_id,pod_incarnation,resource_epoch,input_epoch)
+           VALUES('resource.extra','scope.root.fixture','pod.root.fixture',1,1,1)",
+        "UPDATE authority_resources SET resource_epoch=2 WHERE resource_id='resource.pty.fixture'",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        setup(&mut store);
+        let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task, "pod.root.fixture");
+        store.admit_bound_launch(proposal.request("key.root.fixture", b"caller.intent")).unwrap();
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection.execute_batch(mutation).unwrap();
+        assert!(matches!(store.current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture"),
+            Err(StoreError::Conflict(_))));
+    }
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task, "pod.root.fixture");
+    store
+        .admit_bound_launch(proposal.request("key.root.fixture", b"caller.intent"))
+        .unwrap();
+    store
+        .advance_target_epoch("scope.root.fixture", "pod.root.fixture", 1, 2)
+        .unwrap();
+    assert!(matches!(
+        store.current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture"),
+        Err(StoreError::StaleEpoch)
+    ));
 }
 
 #[test]
@@ -828,6 +991,23 @@ fn historical_unbound_command_cannot_become_bound_by_retry() {
     assert!(matches!(
         store.admit(&legacy).unwrap(),
         Admission::Committed(_)
+    ));
+    store
+        .apply_authority_mutation(
+            1,
+            0,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.root.fixture".into(),
+                pod_id: "pod.root.fixture".into(),
+                incarnation: 1,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(
+        store.current_bound_pod_snapshot("scope.root.fixture", "pod.root.fixture"),
+        Err(StoreError::Conflict(
+            "historical launch has no bound v8 descriptor"
+        ))
     ));
     let result = store.admit_bound_launch(BoundLaunchRequest {
         principal: principal(),

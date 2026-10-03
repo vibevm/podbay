@@ -12,7 +12,7 @@ mod store;
 
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
-    BoundLaunchResource,
+    BoundLaunchResource, CurrentBoundPodSnapshot, CurrentBoundResource,
 };
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
