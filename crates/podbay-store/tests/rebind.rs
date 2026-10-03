@@ -9,7 +9,8 @@ use podbay_core::{
     ScopeId, StoreLineageId,
 };
 use podbay_store::{
-    DurableRebindPhase, HostObservedPriorCheckpoint, PodBayStore, SqliteRebindLedger, StoreError,
+    DurableRebindPhase, HostObservedPriorCheckpoint, PodBayStore, SqlitePriorObservedPendingLedger,
+    SqliteRebindLedger, StoreError,
 };
 
 struct Fixture {
@@ -148,7 +149,10 @@ fn restore_v11_rebind_checks(connection: &rusqlite::Connection) {
 }
 
 fn table_rows(connection: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
-    let ordering = if table == "manager_rebinds" {
+    let ordering = if matches!(
+        table,
+        "manager_rebinds" | "manager_rebind_prior_observations"
+    ) {
         "rebind_rowid"
     } else {
         "rebind_rowid,resource_id"
@@ -1015,4 +1019,157 @@ fn malformed_preexisting_v9_schema_refuses_migration_atomically() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 8);
+}
+
+#[test]
+fn prior_pending_ledger_exact_proof_is_read_only_and_never_activates() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store
+        .prepare_manager_rebind_from_host_observation(&proposal, &observed)
+        .unwrap();
+    let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, observed);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let before_parent = table_rows(&connection, "manager_rebinds");
+    let before_resources = table_rows(&connection, "manager_rebind_resources");
+    let before_proof = table_rows(&connection, "manager_rebind_prior_observations");
+    assert!(ledger.pending(&proposal));
+    assert!(ledger.pending(&proposal));
+    assert!(!ledger.activated(&proposal));
+    assert!(!fixture.ledger(&proposal).pending(&proposal));
+    assert_eq!(table_rows(&connection, "manager_rebinds"), before_parent);
+    assert_eq!(
+        table_rows(&connection, "manager_rebind_resources"),
+        before_resources
+    );
+    assert_eq!(
+        table_rows(&connection, "manager_rebind_prior_observations"),
+        before_proof
+    );
+
+    // Emulate a future acknowledged row without opening today's ACK API.
+    connection.execute("UPDATE manager_rebinds SET phase='pod_acknowledged',pod_checkpoint_ref='checkpoint.test'", []).unwrap();
+    assert!(ledger.pending(&proposal));
+    assert!(!ledger.activated(&proposal));
+    connection
+        .execute("UPDATE manager_rebinds SET phase='activated'", [])
+        .unwrap();
+    assert!(!ledger.pending(&proposal));
+    assert!(!ledger.activated(&proposal));
+}
+
+#[test]
+fn prior_pending_ledger_refuses_changed_digest_identity_vectors_and_process_evidence() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store
+        .prepare_manager_rebind_from_host_observation(&proposal, &observed)
+        .unwrap();
+    macro_rules! reject_changed {
+        ($field:ident, $value:expr) => {{
+            let mut changed = observed.clone();
+            changed.$field = $value;
+            let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, changed);
+            assert!(!ledger.pending(&proposal), stringify!($field));
+            assert!(!ledger.activated(&proposal));
+        }};
+    }
+    reject_changed!(checkpoint_digest, "d".repeat(64));
+    reject_changed!(supervisor_pid, observed.supervisor_pid + 1);
+    reject_changed!(supervisor_start_ticks, observed.supervisor_start_ticks + 1);
+    reject_changed!(boot_id, "boot.other".into());
+    reject_changed!(unit_name, "podbay-pod-other.service".into());
+    reject_changed!(
+        cgroup_path,
+        "/other.slice/podbay-pod-fixture.service".into()
+    );
+    reject_changed!(phase, RebindPhase::PendingPod);
+    reject_changed!(owner_epoch, owner(2));
+    reject_changed!(credential_epoch, credential(2));
+    reject_changed!(input_epochs, BTreeMap::new());
+    let mut foreign = observed.identity.clone();
+    foreign.store_lineage = StoreLineageId::try_from("store.foreign").unwrap();
+    reject_changed!(identity, foreign);
+
+    let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, observed);
+    let mut changed = proposal.clone();
+    changed.digest = RequestDigest::parse(&"e".repeat(64)).unwrap();
+    assert!(!ledger.pending(&changed));
+    changed = proposal.clone();
+    changed.next_owner_epoch = owner(u64::MAX);
+    assert!(!ledger.pending(&changed));
+    changed = proposal.clone();
+    changed.next_credential_epoch = changed.expected_credential_epoch;
+    assert!(!ledger.pending(&changed));
+    changed = proposal.clone();
+    changed.next_input_epochs.remove(&resource("resource.pty"));
+    assert!(!ledger.pending(&changed));
+    assert!(ledger.pending(&proposal));
+}
+
+#[test]
+fn prior_pending_ledger_refuses_fresh_destination_or_stored_proof_drift() {
+    for mutation in [
+        "UPDATE metadata SET value=5 WHERE key='owner_epoch'",
+        "UPDATE manager_credential_claims SET credential_epoch=5",
+        "UPDATE manager_peer_bindings SET birth_identity='birth.changed'",
+        "UPDATE authority_resources SET input_epoch=5 WHERE resource_id='resource.pty'",
+        "DELETE FROM authority_resources WHERE resource_id='resource.pty'",
+        "DELETE FROM manager_rebind_resources WHERE resource_id='resource.pty'",
+        "UPDATE manager_rebinds SET manager_birth_identity='birth.changed'",
+        "UPDATE manager_rebind_prior_observations SET checkpoint_digest='0000000000000000000000000000000000000000000000000000000000000000'",
+        "DELETE FROM manager_rebind_prior_observations",
+        "PRAGMA ignore_check_constraints=ON; UPDATE manager_rebind_prior_observations SET schema_version='unknown';",
+        "PRAGMA ignore_check_constraints=ON; UPDATE manager_rebinds SET phase='unknown';",
+        "PRAGMA ignore_check_constraints=ON; UPDATE manager_rebinds SET pod_checkpoint_ref='unexpected';",
+        "PRAGMA ignore_check_constraints=ON; UPDATE manager_rebinds SET phase='pod_acknowledged',pod_checkpoint_ref=NULL;",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+        store
+            .prepare_manager_rebind_from_host_observation(&proposal, &observed)
+            .unwrap();
+        let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, observed);
+        assert!(ledger.pending(&proposal));
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection.execute_batch(mutation).unwrap();
+        assert!(!ledger.pending(&proposal), "{mutation}");
+        assert!(!ledger.activated(&proposal));
+    }
+}
+
+#[test]
+fn prior_pending_ledger_refuses_legacy_and_missing_or_corrupt_database() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let proposal = seed_existing_bound_pod(&mut store, &fixture);
+    store.prepare_manager_rebind(&proposal).unwrap();
+    let observed = HostObservedPriorCheckpoint {
+        identity: proposal.identity.clone(),
+        phase: RebindPhase::Active,
+        owner_epoch: proposal.expected_owner_epoch,
+        credential_epoch: proposal.expected_credential_epoch,
+        input_epochs: proposal.expected_input_epochs.clone(),
+        checkpoint_digest: "c".repeat(64),
+        supervisor_pid: 987,
+        supervisor_start_ticks: 123,
+        boot_id: "boot.fixture".into(),
+        unit_name: "podbay-pod-fixture.service".into(),
+        cgroup_path: "/user.slice/podbay-pod-fixture.service".into(),
+    };
+    let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, observed.clone());
+    assert!(!ledger.pending(&proposal));
+    assert!(fixture.ledger(&proposal).pending(&proposal));
+    let missing_path = fixture.directory.join("missing-prior.sqlite");
+    let missing = SqlitePriorObservedPendingLedger::for_pod(&missing_path, observed.clone());
+    assert!(!missing.pending(&proposal));
+    assert!(!missing_path.exists());
+    let corrupt_path = fixture.directory.join("corrupt-prior.sqlite");
+    std::fs::write(&corrupt_path, b"not a database").unwrap();
+    let corrupt = SqlitePriorObservedPendingLedger::for_pod(&corrupt_path, observed);
+    assert!(!corrupt.pending(&proposal));
+    assert_eq!(std::fs::read(corrupt_path).unwrap(), b"not a database");
 }

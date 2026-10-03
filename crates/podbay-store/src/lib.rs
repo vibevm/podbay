@@ -26,6 +26,7 @@ pub use model::{
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{
-    DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection, SqliteRebindLedger,
+    DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection,
+    SqlitePriorObservedPendingLedger, SqliteRebindLedger,
 };
 pub use store::PodBayStore;

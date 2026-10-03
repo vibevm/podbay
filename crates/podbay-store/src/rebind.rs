@@ -994,3 +994,71 @@ impl RebindLedger for SqliteRebindLedger {
         self.fresh_phase(proposal) == Some(DurableRebindPhase::Activated)
     }
 }
+
+/// Fresh read-only Pending proof for a pod that has independently verified its
+/// exact fsynced PRIOR checkpoint and current supervisor process evidence.
+///
+/// `prior` is data, not OS attestation. Only the trusted pod runtime should
+/// construct it from its checkpoint and live self observations. The runtime
+/// must separately authenticate the new manager socket and enforce its lock/
+/// liveness protocol. This ledger never activates a rebind or writes a row.
+pub struct SqlitePriorObservedPendingLedger {
+    database: PathBuf,
+    prior: HostObservedPriorCheckpoint,
+}
+
+impl SqlitePriorObservedPendingLedger {
+    pub fn for_pod(database: impl AsRef<Path>, prior: HostObservedPriorCheckpoint) -> Self {
+        Self {
+            database: database.as_ref().to_path_buf(),
+            prior,
+        }
+    }
+
+    fn fresh_pending(&self, proposal: &RebindProposal) -> Option<bool> {
+        // Includes exact identity and old vector equality, Active-only prior,
+        // strict destination advancement, complete key set and SQLite bounds.
+        validate_host_observation(proposal, &self.prior).ok()?;
+        let expected = StoredPriorObservation::from_host(&self.prior).ok()?;
+        let mut connection =
+            Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        connection.busy_timeout(Duration::from_millis(250)).ok()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .ok()?;
+        let lineage = self.prior.identity.store_lineage.as_str();
+        let (rowid, receipt) = load_by_key(&transaction, proposal).ok()??;
+        let valid_phase = match (receipt.phase, receipt.pod_checkpoint_ref.as_deref()) {
+            (DurableRebindPhase::Pending, None) => true,
+            (DurableRebindPhase::PodAcknowledged, Some(reference)) => {
+                !reference.is_empty()
+                    && reference.len() <= 256
+                    && !reference.chars().any(char::is_control)
+            }
+            _ => false,
+        };
+        if !valid_phase {
+            return Some(false);
+        }
+        let observed = read_prior_observation(&transaction, rowid).ok()??;
+        if observed != expected {
+            return Some(false);
+        }
+        verify_stored(&transaction, rowid, proposal, lineage).ok()?;
+        verify_current_fences_with_mode(&transaction, proposal, lineage, true).ok()?;
+        verify_current_manager_destination(&transaction, proposal, lineage).ok()?;
+        transaction.commit().ok()?;
+        Some(true)
+    }
+}
+
+impl RebindLedger for SqlitePriorObservedPendingLedger {
+    fn pending(&self, proposal: &RebindProposal) -> bool {
+        self.fresh_pending(proposal).unwrap_or(false)
+    }
+
+    fn activated(&self, _proposal: &RebindProposal) -> bool {
+        // The proof-bearing activation protocol is a separate, unopened gate.
+        false
+    }
+}
