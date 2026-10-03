@@ -175,3 +175,37 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
     assert!(snapshot.actors.is_empty());
     assert!(snapshot.grants.is_empty());
 }
+
+#[test]
+fn pod_registration_and_replay_share_command_target_epoch() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let initial = store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            initial.revision,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.main".into(),
+                pod_id: "pod.worker".into(),
+                incarnation: 1,
+            }),
+        )
+        .unwrap();
+    assert_eq!(store.target_epoch("scope.main", "pod.worker").unwrap(), 1);
+    let restarted = store.begin_authority_replay(1, 2).unwrap();
+    assert_eq!(restarted.revision, revision + 1);
+    assert_eq!(store.target_epoch("scope.main", "pod.worker").unwrap(), 1);
+    store
+        .apply_authority_mutation(
+            2,
+            restarted.revision,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.main".into(),
+                pod_id: "pod.worker".into(),
+                incarnation: 2,
+            }),
+        )
+        .unwrap();
+    assert_eq!(store.target_epoch("scope.main", "pod.worker").unwrap(), 2);
+}

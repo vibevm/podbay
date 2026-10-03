@@ -141,6 +141,30 @@ pub enum EffectObservation {
     AlreadyObserved(EventReference),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchDispatchStage {
+    Prepared,
+    ClaimedUncertain,
+    RefusedBeforeEffect,
+    UncertainAfterPossibleEffect,
+    HostAccepted,
+    PortSettled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchDispatchStatus {
+    pub stage: LaunchDispatchStage,
+    pub receipt_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaunchPortResult {
+    RefusedBeforeEffect,
+    UncertainAfterPossibleEffect { receipt_ref: Option<String> },
+    HostAccepted { receipt_ref: Option<String> },
+    PortSettled { receipt_ref: Option<String> },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventReference {
     pub event_id: String,

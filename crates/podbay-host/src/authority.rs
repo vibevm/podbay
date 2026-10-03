@@ -10,8 +10,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{ActorId, PodId, ResourceId, Role, ScopeId};
 use podbay_store::{
-    AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, PodBayStore, StoreError,
+    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
+    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, CommandRequest, EffectClaim,
+    LaunchDispatchStatus, LaunchPortResult, PodBayStore, Receipt, StoreError, VerifiedPrincipal,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -508,6 +509,60 @@ pub trait HostDispatchPort {
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError>;
 }
 
+pub trait StablePortReceipt {
+    fn stable_reference(&self) -> &str;
+}
+
+impl StablePortReceipt for PortReceiptRef {
+    fn stable_reference(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LaunchPodRequest {
+    pub host_request: HostRequest,
+    /// Exact normalised request bytes for caller-key idempotency. PB09b must
+    /// bind a reviewed executable/profile/workspace/model/args LaunchSpec here.
+    pub canonical_request: Vec<u8>,
+    /// Admission epochs stay fixed across retries; host_request.guards are current.
+    pub admission_owner_epoch: ManagerEpoch,
+    pub admission_pod_incarnation: PodIncarnation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchPodReceipt {
+    pub receipt: Receipt,
+    pub status: LaunchDispatchStatus,
+    pub duplicate: bool,
+    pub port_called: bool,
+}
+
+#[derive(Debug)]
+pub enum LaunchPodError {
+    Host(HostError),
+    Store(StoreError),
+    WrongOperation,
+    /// The port returned, but the durable stage write failed; query the original receipt.
+    OutcomeNotRecorded {
+        receipt: Receipt,
+        observed: LaunchPortResult,
+        source: StoreError,
+    },
+}
+
+impl From<HostError> for LaunchPodError {
+    fn from(value: HostError) -> Self {
+        Self::Host(value)
+    }
+}
+
+impl From<StoreError> for LaunchPodError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
 /// Host-local authority. A fresh instance has no recovered grants and fails closed.
 pub struct HostAuthority<P: HostDispatchPort> {
     port: P,
@@ -969,11 +1024,11 @@ impl<P: HostDispatchPort> HostAuthority<P> {
         Ok(())
     }
 
-    pub fn dispatch<T: AuthenticatedTransport>(
-        &mut self,
+    fn authorise_request<T: AuthenticatedTransport>(
+        &self,
         transport: &T,
-        request: HostRequest,
-    ) -> Result<PortDispatchOutcome<P::Receipt>, HostError> {
+        request: &HostRequest,
+    ) -> Result<AuthorisedDispatch, HostError> {
         request.action.validate()?;
         if !valid_token(&request.command_key) || !valid_token(&request.correlation_id) {
             return Err(HostError::InvalidInput);
@@ -1012,14 +1067,22 @@ impl<P: HostDispatchPort> HostAuthority<P> {
         {
             self.check_lease(&actor.actor_id, &request.scope_id, resource_id, lease)?;
         }
-        let authorised = AuthorisedDispatch {
+        Ok(AuthorisedDispatch {
             actor_id: actor.actor_id.clone(),
             role: actor.role,
-            scope_id: request.scope_id,
-            command_key: request.command_key,
-            correlation_id: request.correlation_id,
-            action: request.action,
-        };
+            scope_id: request.scope_id.clone(),
+            command_key: request.command_key.clone(),
+            correlation_id: request.correlation_id.clone(),
+            action: request.action.clone(),
+        })
+    }
+
+    pub fn dispatch<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: HostRequest,
+    ) -> Result<PortDispatchOutcome<P::Receipt>, HostError> {
+        let authorised = self.authorise_request(transport, &request)?;
         let command_key = authorised.command_key.clone();
         match self.port.dispatch(authorised) {
             Ok(outcome) => Ok(outcome),
@@ -1299,8 +1362,158 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         transport: &T,
         request: HostRequest,
     ) -> Result<PortDispatchOutcome<P::Receipt>, HostError> {
+        if matches!(request.action, HostAction::LaunchPod { .. }) {
+            return Err(HostError::Unsupported);
+        }
         self.ensure_current_owner_epoch()?;
         self.host.dispatch(transport, request)
+    }
+
+    /// One durable LaunchPod path. A persisted intent precedes the claim, and
+    /// the port call occurs only after the claim transaction has committed.
+    /// HostAccepted and PortSettled describe the launch port only: neither is
+    /// provider insertion or run/task completion. A proven refusal remains
+    /// non-dispatchable under this claim; retry needs a new command and policy.
+    pub fn launch_pod<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: LaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        let (authorised, receipt, duplicate) = self.admit_launch_intent(transport, &request)?;
+        let HostAction::LaunchPod { pod_id, .. } = &authorised.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let claim_key = format!("claim.{}", receipt.command_id);
+        let claim = self.store.claim_effect(
+            receipt.outbox_id,
+            authorised.scope_id.as_str(),
+            pod_id.as_str(),
+            self.host.manager_epoch.get(),
+            request.host_request.guards.pod_incarnation.get(),
+            &claim_key,
+        )?;
+        if claim != EffectClaim::NewClaim {
+            return Ok(LaunchPodReceipt {
+                status: self.store.launch_dispatch_status(
+                    receipt.outbox_id,
+                    authorised.scope_id.as_str(),
+                    pod_id.as_str(),
+                )?,
+                receipt,
+                duplicate,
+                port_called: false,
+            });
+        }
+        // A noncooperative owner-epoch write between claim and port call still
+        // fences this instance. The claim remains uncertain and is not replayed.
+        self.ensure_current_owner_epoch()?;
+        let port_result = match self.host.port.dispatch(authorised.clone()) {
+            Ok(PortDispatchOutcome::Accepted(port_receipt)) => LaunchPortResult::HostAccepted {
+                receipt_ref: Some(port_receipt.stable_reference().to_owned()),
+            },
+            Ok(PortDispatchOutcome::Settled(port_receipt)) => LaunchPortResult::PortSettled {
+                receipt_ref: Some(port_receipt.stable_reference().to_owned()),
+            },
+            Err(PortDispatchError::RefusedBeforeEffect) => LaunchPortResult::RefusedBeforeEffect,
+            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
+                LaunchPortResult::UncertainAfterPossibleEffect {
+                    receipt_ref: receipt_ref.map(|reference| reference.as_str().to_owned()),
+                }
+            }
+        };
+        let status = self
+            .store
+            .record_launch_port_result(
+                receipt.outbox_id,
+                authorised.scope_id.as_str(),
+                pod_id.as_str(),
+                self.host.manager_epoch.get(),
+                &claim_key,
+                port_result.clone(),
+            )
+            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
+                receipt: receipt.clone(),
+                observed: port_result,
+                source,
+            })?;
+        Ok(LaunchPodReceipt {
+            receipt,
+            status,
+            duplicate,
+            port_called: true,
+        })
+    }
+
+    /// Commits intent only. Its receipt proves persistence, not a port call.
+    pub fn admit_launch_pod<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: LaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        let (authorised, receipt, duplicate) = self.admit_launch_intent(transport, &request)?;
+        let HostAction::LaunchPod { pod_id, .. } = &authorised.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let status = self.store.launch_dispatch_status(
+            receipt.outbox_id,
+            authorised.scope_id.as_str(),
+            pod_id.as_str(),
+        )?;
+        Ok(LaunchPodReceipt {
+            receipt,
+            status,
+            duplicate,
+            port_called: false,
+        })
+    }
+
+    fn admit_launch_intent<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &LaunchPodRequest,
+    ) -> Result<(AuthorisedDispatch, Receipt, bool), LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        let authorised = self
+            .host
+            .authorise_request(transport, &request.host_request)?;
+        let HostAction::LaunchPod { pod_id, .. } = &authorised.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let effect_payload = launch_effect_payload(&authorised.action)?;
+        let command = CommandRequest {
+            principal: VerifiedPrincipal::from_authenticated_boundary(
+                authorised.actor_id.as_str(),
+            )?,
+            namespace: "podbay.launch".to_owned(),
+            command_key: authorised.command_key.clone(),
+            scope_id: authorised.scope_id.as_str().to_owned(),
+            target_id: pod_id.as_str().to_owned(),
+            expected_owner_epoch: request.admission_owner_epoch.get(),
+            expected_target_epoch: request.admission_pod_incarnation.get(),
+            canonical_request: request.canonical_request.clone(),
+            event_kind: "command.admitted".to_owned(),
+            event_payload: br#"{"kind":"command_admitted"}"#.to_vec(),
+            effect_kind: "pod.offer".to_owned(),
+            effect_payload: effect_payload.clone(),
+        };
+        let (receipt, duplicate) = match self.store.admit(&command)? {
+            Admission::Committed(receipt) => (receipt, false),
+            Admission::Duplicate(receipt) => (receipt, true),
+        };
+        let effect = self.store.load_effect(
+            receipt.outbox_id,
+            authorised.scope_id.as_str(),
+            pod_id.as_str(),
+        )?;
+        if effect.kind != "pod.offer" || effect.payload != effect_payload {
+            return Err(LaunchPodError::Store(StoreError::Conflict(
+                "durable launch effect differs from authorised action",
+            )));
+        }
+        Ok((authorised, receipt, duplicate))
     }
 
     fn ensure_current_owner_epoch(&self) -> Result<(), HostError> {
@@ -1589,6 +1802,42 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
         rights,
         remaining_delegation_depth: record.remaining_delegation_depth,
     })
+}
+
+fn launch_effect_payload(action: &HostAction) -> Result<Vec<u8>, HostError> {
+    // PB09a fake-port envelope only. It is not a complete OS launch manifest;
+    // PB09b must bind the reviewed LaunchSpec before a real process is started.
+    let HostAction::LaunchPod {
+        pod_id,
+        role,
+        credential,
+    } = action
+    else {
+        return Err(HostError::InvalidInput);
+    };
+    let role = match role {
+        Role::Coordinator => "coordinator",
+        Role::Worker => "worker",
+        Role::Advisor => "advisor",
+    };
+    let mut payload = b"podbay.launch/1\0".to_vec();
+    append_effect_field(&mut payload, pod_id.as_str().as_bytes())?;
+    append_effect_field(&mut payload, role.as_bytes())?;
+    if let Some(reference) = credential {
+        append_effect_field(&mut payload, reference.scope_id.as_str().as_bytes())?;
+        append_effect_field(&mut payload, reference.as_str().as_bytes())?;
+    } else {
+        append_effect_field(&mut payload, b"")?;
+        append_effect_field(&mut payload, b"")?;
+    }
+    Ok(payload)
+}
+
+fn append_effect_field(payload: &mut Vec<u8>, field: &[u8]) -> Result<(), HostError> {
+    let length = u32::try_from(field.len()).map_err(|_| HostError::InvalidInput)?;
+    payload.extend_from_slice(&length.to_be_bytes());
+    payload.extend_from_slice(field);
+    Ok(())
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {

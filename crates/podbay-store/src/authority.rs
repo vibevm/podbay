@@ -165,6 +165,24 @@ impl PodBayStore {
         if exhausted != 0 {
             return Err(StoreError::InvalidInput("input epoch exhausted"));
         }
+        // target_epochs has existed since schema one. Reconcile old PB08b pods
+        // before any PB09a outbox claim can use their incarnation fence.
+        let newer_target: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authority_pods p JOIN target_epochs t
+             ON t.scope_id=p.scope_id AND t.target_id=p.pod_id
+             WHERE t.epoch>p.incarnation",
+            [],
+            |row| row.get(0),
+        )?;
+        if newer_target != 0 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.execute_batch(
+            "INSERT INTO target_epochs(scope_id,target_id,epoch)
+             SELECT scope_id,pod_id,incarnation FROM authority_pods WHERE true
+             ON CONFLICT(scope_id,target_id) DO UPDATE SET epoch=excluded.epoch
+             WHERE target_epochs.epoch<=excluded.epoch;",
+        )?;
         transaction.execute(
             "UPDATE authority_resources SET input_epoch=input_epoch+1",
             [],
@@ -222,6 +240,22 @@ impl PodBayStore {
                 if changed != 1 {
                     return Err(StoreError::WrongScope);
                 }
+                // The same transaction advances the PB04 command target fence.
+                let existing_target: Option<i64> = transaction
+                    .query_row(
+                        "SELECT epoch FROM target_epochs WHERE scope_id=?1 AND target_id=?2",
+                        params![record.scope_id, record.pod_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if existing_target.is_some_and(|epoch| epoch > incarnation) {
+                    return Err(StoreError::StaleEpoch);
+                }
+                transaction.execute(
+                    "INSERT INTO target_epochs(scope_id,target_id,epoch) VALUES(?1,?2,?3)
+                     ON CONFLICT(scope_id,target_id) DO UPDATE SET epoch=excluded.epoch",
+                    params![record.scope_id, record.pod_id, incarnation],
+                )?;
             }
             AuthorityMutation::PutResource(record) => {
                 valid_identity(&record.scope_id)?;

@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
     Admission, CommandRequest, EffectClaim, EffectObservation, EffectState, HostAcceptanceProof,
-    ObservedStage, PodBayStore, SourceOrder, StoreError, VerifiedPrincipal,
+    LaunchDispatchStage, LaunchPortResult, ObservedStage, PodBayStore, SourceOrder, StoreError,
+    VerifiedPrincipal,
 };
 use sha2::{Digest, Sha256};
 
@@ -1331,4 +1332,131 @@ fn schema_two_migration_preserves_lineage_cursor_and_legacy_evidence_stage() {
         .unwrap();
     assert_eq!(replay.len(), 1);
     assert_eq!(replay[0].sequence, next.event_sequence);
+}
+
+#[test]
+fn proven_launch_refusal_is_durable_and_cannot_be_relabelled() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request("scope.fixture", "request.refused", b"refused"))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    assert_eq!(
+        store
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                "claim.refused",
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+    let first = store
+        .record_launch_port_result(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            "claim.refused",
+            LaunchPortResult::RefusedBeforeEffect,
+        )
+        .unwrap();
+    assert_eq!(first.stage, LaunchDispatchStage::RefusedBeforeEffect);
+    assert_eq!(
+        store
+            .record_launch_port_result(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                "claim.refused",
+                LaunchPortResult::RefusedBeforeEffect,
+            )
+            .unwrap(),
+        first
+    );
+    assert!(matches!(
+        store.record_launch_port_result(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            "claim.refused",
+            LaunchPortResult::HostAccepted {
+                receipt_ref: Some("receipt.changed".into()),
+            },
+        ),
+        Err(StoreError::Conflict("launch port outcome changed"))
+    ));
+    assert_eq!(
+        store.effect_state(receipt.outbox_id).unwrap(),
+        EffectState::ClaimedUncertain
+    );
+    drop(store);
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .launch_dispatch_status(receipt.outbox_id, "scope.fixture", "target.fixture")
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn schema_four_open_adds_launch_dispatch_outcome_table() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_dispatch_outcomes;
+             PRAGMA user_version=4;",
+        )
+        .unwrap();
+    drop(connection);
+    let mut migrated = fixture.open();
+    ready(&mut migrated);
+    let receipt = match migrated
+        .admit(&request(
+            "scope.fixture",
+            "request.schema-five",
+            b"schema-five",
+        ))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    migrated
+        .claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.schema-five",
+        )
+        .unwrap();
+    assert_eq!(
+        migrated
+            .record_launch_port_result(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                "claim.schema-five",
+                LaunchPortResult::RefusedBeforeEffect,
+            )
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::RefusedBeforeEffect
+    );
 }

@@ -10,7 +10,7 @@ use crate::model::{
     Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -187,6 +187,19 @@ impl PodBayStore {
                    operation TEXT NOT NULL, target_kind TEXT NOT NULL,
                    target_id TEXT NOT NULL,
                    PRIMARY KEY(grant_id,operation,target_kind,target_id)
+                 ) STRICT;",
+            )?;
+        }
+        if version < 5 {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS launch_dispatch_outcomes (
+                   outbox_id INTEGER PRIMARY KEY REFERENCES outbox(outbox_id),
+                   claim_key TEXT NOT NULL,
+                   stage TEXT NOT NULL CHECK(stage IN
+                     ('refused_before_effect','uncertain_after_possible_effect',
+                      'host_accepted','port_settled')),
+                   receipt_ref TEXT,
+                   recorded_at TEXT NOT NULL
                  ) STRICT;",
             )?;
         }
@@ -1249,6 +1262,16 @@ fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()
         (
             "authority_grant_rights",
             &["grant_id", "operation", "target_kind", "target_id"][..],
+        ),
+        (
+            "launch_dispatch_outcomes",
+            &[
+                "outbox_id",
+                "claim_key",
+                "stage",
+                "receipt_ref",
+                "recorded_at",
+            ][..],
         ),
     ] {
         let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
