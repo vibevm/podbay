@@ -14,6 +14,7 @@ use podbay_pod::{
 struct Fixture {
     directory: PathBuf,
     unit: String,
+    parent_unit: Option<String>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -26,7 +27,11 @@ impl Fixture {
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let unit = String::new();
-        Self { directory, unit }
+        Self {
+            directory,
+            unit,
+            parent_unit: None,
+        }
     }
     fn descriptor(&self) -> LaunchDescriptor {
         LaunchDescriptor {
@@ -69,6 +74,13 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
+        if let Some(unit) = &self.parent_unit {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -88,6 +100,22 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     .unwrap();
     let status = client.status().unwrap();
     assert!(status.child_running && status.child_start_ticks > 0);
+    let parent_unit = format!("podbay-parent-pty-{}.service", std::process::id());
+    fixture.parent_unit = Some(parent_unit.clone());
+    assert!(
+        Command::new("systemd-run")
+            .args([
+                "--user",
+                "--no-ask-password",
+                "--collect",
+                "--service-type=exec"
+            ])
+            .arg(format!("--unit={parent_unit}"))
+            .args(["/bin/sleep", "60"])
+            .status()
+            .unwrap()
+            .success()
+    );
     let viewer_a = client.viewer().unwrap();
     let viewer_b = client.viewer().unwrap();
     let ready = wait_until(|| {
@@ -122,6 +150,44 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     assert!(matches!(
         client
             .terminal_control(TerminalCommand::Write {
+                command_id: Some("command.write.hello".into()),
+                resource_id: descriptor.resource_id.clone(),
+                incarnation: descriptor.incarnation,
+                actor_id: lease.actor_id.clone(),
+                lease_id: lease.lease_id.clone(),
+                epoch: lease.epoch,
+                bytes: b"hello\n".to_vec(),
+            })
+            .unwrap(),
+        TerminalReply::BytesWritten
+    ));
+    // A new manager connection can replay the same command ID after losing
+    // its reply. The pod ledger returns the prior receipt without input again.
+    assert!(
+        Command::new("systemctl")
+            .args(["--user", "restart", &parent_unit])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let reattached = podbay_pod::PodClient::connect(client.manifest_path()).unwrap();
+    let after_restart = reattached.status().unwrap();
+    assert_eq!(
+        (
+            after_restart.supervisor_pid,
+            after_restart.child_pid,
+            after_restart.child_start_ticks
+        ),
+        (
+            status.supervisor_pid,
+            status.child_pid,
+            status.child_start_ticks
+        )
+    );
+    assert!(matches!(
+        reattached
+            .terminal_control(TerminalCommand::Write {
+                command_id: Some("command.write.hello".into()),
                 resource_id: descriptor.resource_id.clone(),
                 incarnation: descriptor.incarnation,
                 actor_id: lease.actor_id.clone(),
@@ -148,6 +214,24 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
             .contains("ECHO:hello")
             .then_some(page)
     });
+    std::thread::sleep(Duration::from_millis(80));
+    let dedup_page = viewer_b.events_after(cursor_b, 256).unwrap();
+    let dedup_bytes = dedup_page
+        .events
+        .iter()
+        .filter_map(|event| match &event.value {
+            TerminalEventKind::Output { bytes, .. } => Some(bytes.as_slice()),
+            TerminalEventKind::Resize { .. } => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        String::from_utf8_lossy(&dedup_bytes)
+            .matches("ECHO:hello")
+            .count(),
+        1
+    );
     assert!(
         output
             .events
@@ -180,6 +264,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     assert!(
         client
             .terminal_control(TerminalCommand::Resize {
+                command_id: Some("command.resize.stale-incarnation".into()),
                 resource_id: descriptor.resource_id.clone(),
                 incarnation: descriptor.incarnation + 1,
                 actor_id: human.actor_id.clone(),
@@ -194,6 +279,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     assert!(
         client
             .terminal_control(TerminalCommand::Write {
+                command_id: Some("command.write.stale-lease".into()),
                 resource_id: descriptor.resource_id.clone(),
                 incarnation: descriptor.incarnation,
                 actor_id: lease.actor_id.clone(),
@@ -205,6 +291,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     );
     let resized = client
         .terminal_control(TerminalCommand::Resize {
+            command_id: Some("command.resize.first".into()),
             resource_id: descriptor.resource_id.clone(),
             incarnation: descriptor.incarnation,
             actor_id: human.actor_id.clone(),
@@ -220,6 +307,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     for cols in 91..=96 {
         client
             .terminal_control(TerminalCommand::Resize {
+                command_id: Some(format!("command.resize.{cols}")),
                 resource_id: descriptor.resource_id.clone(),
                 incarnation: descriptor.incarnation,
                 actor_id: human.actor_id.clone(),

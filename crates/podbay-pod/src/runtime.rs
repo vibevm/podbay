@@ -376,7 +376,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         .to_owned();
     let descriptor = &manifest.descriptor;
     let mut child = match descriptor.pty {
-        Some(spec) => ChildResource::Pty(PtyProcess::spawn(descriptor, spec)?),
+        Some(spec) => {
+            ChildResource::Pty(PtyProcess::spawn(descriptor, spec, manifest_path.as_ref())?)
+        }
         None => ChildResource::Pipe(
             Command::new(&descriptor.executable)
                 .args(&descriptor.args)

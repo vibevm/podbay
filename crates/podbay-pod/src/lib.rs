@@ -3,6 +3,7 @@
 
 mod manifest;
 mod runtime;
+mod spool;
 mod terminal;
 
 pub use manifest::{

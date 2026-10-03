@@ -2,6 +2,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use vt100::Parser;
 
 use crate::manifest::{LaunchDescriptor, PodError, PtySpec, hex};
+use crate::spool::{CommandStage, PodSpool, digest_command};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +96,8 @@ pub enum TerminalCommand {
         ttl_ms: u64,
     },
     Write {
+        #[serde(default)]
+        command_id: Option<String>,
         resource_id: String,
         incarnation: u64,
         actor_id: String,
@@ -102,6 +106,8 @@ pub enum TerminalCommand {
         bytes: Vec<u8>,
     },
     Resize {
+        #[serde(default)]
+        command_id: Option<String>,
         resource_id: String,
         incarnation: u64,
         actor_id: String,
@@ -203,6 +209,7 @@ struct TerminalState {
     retention: usize,
     lease_epoch: u64,
     lease: Option<LeaseState>,
+    spool: Option<PodSpool>,
 }
 
 #[derive(Clone)]
@@ -231,27 +238,66 @@ impl TerminalProjection {
                 retention: spec.retention_events,
                 lease_epoch: 0,
                 lease: None,
+                spool: None,
             })),
         }
+    }
+
+    fn with_spool(
+        resource_id: String,
+        incarnation: u64,
+        spec: PtySpec,
+        manifest_path: &Path,
+    ) -> Result<Self, PodError> {
+        let result = Self::new(resource_id, incarnation, spec);
+        let spool = PodSpool::open(
+            manifest_path,
+            spec.retention_events,
+            &result.resource_id,
+            incarnation,
+        )?;
+        // A previous pod process is not reattached here. Its WAL is retained
+        // as evidence, and fresh child admission must not rewrite that history.
+        if spool.has_history() || !spool.integrity() {
+            return Err(PodError::Uncertain(
+                "prior PTY spool requires explicit recovery",
+            ));
+        }
+        result.state.lock().expect("terminal state poisoned").spool = Some(spool);
+        Ok(result)
     }
 
     pub fn apply_output(&self, bytes: &[u8]) {
         let mut state = self.state.lock().expect("terminal state poisoned");
         for chunk in bytes.chunks(4_096) {
-            state.parser.process(chunk);
-            state.byte_position += chunk.len() as u64;
-            state.revision += 1;
-            state.sequence += 1;
             let event = TerminalEvent {
-                sequence: state.sequence,
+                sequence: state.sequence + 1,
                 resource_id: self.resource_id.clone(),
                 incarnation: self.incarnation,
                 value: TerminalEventKind::Output {
                     bytes: chunk.to_vec(),
-                    source_byte_position: state.byte_position,
+                    source_byte_position: state.byte_position + chunk.len() as u64,
                 },
             };
+            if let Some(spool) = &mut state.spool
+                && spool.append_event(&event).is_err()
+            {
+                state.fidelity = ScreenFidelity::Unknown {
+                    reason: "PTY output WAL did not commit".into(),
+                };
+                return;
+            }
+            state.parser.process(chunk);
+            state.byte_position += chunk.len() as u64;
+            state.revision += 1;
+            state.sequence += 1;
             retain(&mut state, event);
+            if checkpoint_spool(&mut state).is_err() {
+                state.fidelity = ScreenFidelity::Unknown {
+                    reason: "PTY screen checkpoint failed".into(),
+                };
+                return;
+            }
         }
     }
 
@@ -431,19 +477,89 @@ impl TerminalProjection {
         // The reader cannot append post-resize output until the geometry event
         // follows the actual master resize under this same projection barrier.
         physical_resize()?;
+        let event = TerminalEvent {
+            sequence: state.sequence + 1,
+            resource_id: self.resource_id.clone(),
+            incarnation: self.incarnation,
+            value: TerminalEventKind::Resize { rows, cols },
+        };
+        if let Some(spool) = &mut state.spool
+            && spool.append_event(&event).is_err()
+        {
+            state.fidelity = ScreenFidelity::Unknown {
+                reason: "PTY resize WAL did not commit".into(),
+            };
+            return Err(PodError::Uncertain(
+                "PTY resize occurred without durable event",
+            ));
+        }
         state.rows = rows;
         state.cols = cols;
         state.parser.screen_mut().set_size(rows, cols);
         state.revision += 1;
         state.sequence += 1;
-        let event = TerminalEvent {
-            sequence: state.sequence,
-            resource_id: self.resource_id.clone(),
-            incarnation: self.incarnation,
-            value: TerminalEventKind::Resize { rows, cols },
-        };
         retain(&mut state, event);
+        if checkpoint_spool(&mut state).is_err() {
+            state.fidelity = ScreenFidelity::Unknown {
+                reason: "PTY screen checkpoint failed".into(),
+            };
+            return Err(PodError::Uncertain(
+                "PTY resize event committed but checkpoint failed",
+            ));
+        }
         Ok(())
+    }
+
+    fn durable_effect(
+        &self,
+        command_id: &str,
+        digest: &str,
+        actor: &str,
+        lease: &str,
+        epoch: u64,
+        kind: &str,
+        effect: impl FnOnce() -> Result<(), PodError>,
+    ) -> Result<(), PodError> {
+        {
+            let mut state = self.state.lock().expect("terminal state poisoned");
+            let spool = state
+                .spool
+                .as_mut()
+                .ok_or(PodError::Uncertain("PTY spool absent"))?;
+            match spool.lookup_command(command_id, digest)? {
+                Some(CommandStage::BytesWritten) => return Ok(()),
+                Some(CommandStage::Intent | CommandStage::Uncertain) => {
+                    return Err(PodError::Uncertain(
+                        "PTY command outcome unknown; do not replay",
+                    ));
+                }
+                None => {}
+            }
+        }
+        self.require_lease(actor, lease, epoch)?;
+        {
+            let mut state = self.state.lock().expect("terminal state poisoned");
+            state.spool.as_mut().unwrap().record_command(
+                command_id,
+                digest,
+                &self.resource_id,
+                self.incarnation,
+                epoch,
+                kind,
+                CommandStage::Intent,
+            )?;
+        }
+        effect()?;
+        let mut state = self.state.lock().expect("terminal state poisoned");
+        state.spool.as_mut().unwrap().record_command(
+            command_id,
+            digest,
+            &self.resource_id,
+            self.incarnation,
+            epoch,
+            kind,
+            CommandStage::BytesWritten,
+        )
     }
 }
 
@@ -454,6 +570,58 @@ fn retain(state: &mut TerminalState, event: TerminalEvent) {
     }
 }
 
+fn checkpoint_spool(state: &mut TerminalState) -> Result<(), PodError> {
+    if !state.spool.as_ref().is_some_and(PodSpool::needs_checkpoint) {
+        return Ok(());
+    }
+    let screen = state.parser.screen();
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    let mut plain_text = screen.contents();
+    let mut formatted_bytes = screen.contents_formatted();
+    let truncated = plain_text.len() > 64 * 1_024 || formatted_bytes.len() > 128 * 1_024;
+    if plain_text.len() > 64 * 1_024 {
+        let mut end = 64 * 1_024;
+        while !plain_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        plain_text.truncate(end);
+    }
+    formatted_bytes.truncate(128 * 1_024);
+    let checkpoint = ScreenCheckpoint {
+        parser_version: "vt100/0.16.2-pb06".into(),
+        revision: state.revision,
+        through: state.sequence,
+        source_byte_position: state.byte_position,
+        rows: state.rows,
+        cols: state.cols,
+        cursor_row,
+        cursor_col,
+        alternate_screen: screen.alternate_screen(),
+        plain_text,
+        formatted_bytes,
+        fidelity: if truncated {
+            ScreenFidelity::Partial {
+                reason: "checkpoint screen exceeded response bound".into(),
+            }
+        } else {
+            state.fidelity.clone()
+        },
+    };
+    let spool = state.spool.as_mut().unwrap();
+    spool.checkpoint_if_needed(&checkpoint)?;
+    let first_retained = spool.events().front().map(|event| event.sequence);
+    if let Some(first) = first_retained {
+        while state
+            .events
+            .front()
+            .is_some_and(|event| event.sequence < first)
+        {
+            state.events.pop_front();
+        }
+    }
+    Ok(())
+}
+
 pub struct PtyProcess {
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
@@ -462,7 +630,17 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
-    pub fn spawn(descriptor: &LaunchDescriptor, spec: PtySpec) -> Result<Self, PodError> {
+    pub fn spawn(
+        descriptor: &LaunchDescriptor,
+        spec: PtySpec,
+        manifest_path: &Path,
+    ) -> Result<Self, PodError> {
+        let projection = TerminalProjection::with_spool(
+            descriptor.resource_id.clone(),
+            descriptor.incarnation,
+            spec,
+            manifest_path,
+        )?;
         let system = NativePtySystem::default();
         let pair = system
             .openpty(PtySize {
@@ -491,8 +669,6 @@ impl PtyProcess {
             .master
             .take_writer()
             .map_err(|_| PodError::Invalid("PTY writer unavailable"))?;
-        let projection =
-            TerminalProjection::new(descriptor.resource_id.clone(), descriptor.incarnation, spec);
         let feed = projection.clone();
         std::thread::spawn(move || read_output(reader, feed));
         Ok(Self {
@@ -546,16 +722,37 @@ impl PtyProcess {
                     .acquire(&actor_id, holder, expected_epoch, ttl_ms)?,
             }),
             TerminalCommand::Write {
+                command_id,
                 actor_id,
                 lease_id,
                 epoch,
                 bytes,
                 ..
             } => {
-                self.write(&actor_id, &lease_id, epoch, &bytes)?;
+                let id = command_id.ok_or(PodError::Invalid("PTY command ID required"))?;
+                let digest = digest_command(&(
+                    "write",
+                    &self.projection.resource_id,
+                    self.projection.incarnation,
+                    &actor_id,
+                    &lease_id,
+                    epoch,
+                    &bytes,
+                ))?;
+                let projection = self.projection.clone();
+                projection.durable_effect(
+                    &id,
+                    &digest,
+                    &actor_id,
+                    &lease_id,
+                    epoch,
+                    "write",
+                    || self.write(&actor_id, &lease_id, epoch, &bytes),
+                )?;
                 Ok(TerminalReply::BytesWritten)
             }
             TerminalCommand::Resize {
+                command_id,
                 actor_id,
                 lease_id,
                 epoch,
@@ -563,7 +760,27 @@ impl PtyProcess {
                 cols,
                 ..
             } => {
-                self.resize(&actor_id, &lease_id, epoch, rows, cols)?;
+                let id = command_id.ok_or(PodError::Invalid("PTY command ID required"))?;
+                let digest = digest_command(&(
+                    "resize",
+                    &self.projection.resource_id,
+                    self.projection.incarnation,
+                    &actor_id,
+                    &lease_id,
+                    epoch,
+                    rows,
+                    cols,
+                ))?;
+                let projection = self.projection.clone();
+                projection.durable_effect(
+                    &id,
+                    &digest,
+                    &actor_id,
+                    &lease_id,
+                    epoch,
+                    "resize",
+                    || self.resize(&actor_id, &lease_id, epoch, rows, cols),
+                )?;
                 Ok(TerminalReply::Resized {
                     through: self.projection.snapshot().through,
                 })
@@ -640,6 +857,8 @@ fn read_output(mut reader: Box<dyn Read + Send>, projection: TerminalProjection)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parser_checkpoint_and_retention_gap_are_explicit() {
@@ -773,5 +992,103 @@ mod tests {
             TerminalEventKind::Resize { rows: 30, cols: 90 }
         ));
         assert!(matches!(events[1].value, TerminalEventKind::Output { .. }));
+    }
+
+    #[test]
+    fn failed_physical_input_stays_uncertain_and_retry_never_replays() {
+        let directory = std::env::temp_dir().join(format!("podbay-input-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("fixture.json");
+        let projection = TerminalProjection::with_spool(
+            "resource.fixture".into(),
+            3,
+            PtySpec {
+                rows: 24,
+                cols: 80,
+                retention_events: 8,
+            },
+            &path,
+        )
+        .unwrap();
+        let lease = projection
+            .acquire("actor.fixture", LeaseKind::Automation, 0, 5_000)
+            .unwrap();
+        let mut physical_calls = 0;
+        assert!(matches!(
+            projection.durable_effect(
+                "command.failed",
+                &"a".repeat(64),
+                &lease.actor_id,
+                &lease.lease_id,
+                lease.epoch,
+                "write",
+                || {
+                    physical_calls += 1;
+                    Err(PodError::Uncertain("synthetic partial write"))
+                }
+            ),
+            Err(PodError::Uncertain(_))
+        ));
+        assert!(matches!(
+            projection.durable_effect(
+                "command.failed",
+                &"a".repeat(64),
+                &lease.actor_id,
+                &lease.lease_id,
+                lease.epoch,
+                "write",
+                || {
+                    physical_calls += 1;
+                    Ok(())
+                }
+            ),
+            Err(PodError::Uncertain(_))
+        ));
+        assert_eq!(physical_calls, 1);
+        projection
+            .durable_effect(
+                "command.success",
+                &"b".repeat(64),
+                &lease.actor_id,
+                &lease.lease_id,
+                lease.epoch,
+                "write",
+                || {
+                    physical_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        projection
+            .durable_effect(
+                "command.success",
+                &"b".repeat(64),
+                &lease.actor_id,
+                &lease.lease_id,
+                lease.epoch,
+                "write",
+                || {
+                    physical_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(physical_calls, 2);
+        drop(projection);
+        assert!(matches!(
+            TerminalProjection::with_spool(
+                "resource.fixture".into(),
+                3,
+                PtySpec {
+                    rows: 24,
+                    cols: 80,
+                    retention_events: 8
+                },
+                &path
+            ),
+            Err(PodError::Uncertain(_))
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 }
