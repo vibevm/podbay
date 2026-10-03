@@ -3,6 +3,8 @@
 
 mod authority;
 mod launch_spec;
+#[cfg(target_os = "linux")]
+mod linux_manager_peer;
 
 pub use authority::*;
 pub use launch_spec::*;
