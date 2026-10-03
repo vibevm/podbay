@@ -1,6 +1,8 @@
 //! PB05 Linux pod process boundary. No provider turns or PTY semantics are inferred here.
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod linux_peer;
 mod manifest;
 mod ports;
 #[cfg(target_os = "linux")]
@@ -13,6 +15,8 @@ mod terminal_protocol;
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
 
+#[cfg(target_os = "linux")]
+pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 pub use manifest::{LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path};
 #[cfg(target_os = "linux")]
 pub use manifest::{PodManifest, PodStatus};

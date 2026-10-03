@@ -12,6 +12,7 @@ sha2 = "0.11.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+nix = { version = "=0.28.0", features = ["socket"] }
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
 
