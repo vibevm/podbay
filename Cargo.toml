@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/podbay-core",
+  "crates/podbay-wire",
   "crates/podbay-store",
   "crates/podbay-host",
   "crates/podbay-pod",

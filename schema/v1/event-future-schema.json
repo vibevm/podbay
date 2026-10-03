@@ -1,0 +1,13 @@
+{
+  "protocol": "podbay/1",
+  "eventId": "event.future.schema.1",
+  "schema": "podbay.event/2",
+  "cursor": { "storeLineage": "store.fixture", "scopeId": "project.fixture", "sequence": "9007199254740994" },
+  "source": { "sourceId": "source.future", "kind": "pod" },
+  "sourceEpoch": "2",
+  "sourceSequence": "9",
+  "target": { "kind": "run", "runId": "run.fixture" },
+  "recordedAt": "2026-10-03T12:00:01Z",
+  "provenance": "pod",
+  "payload": { "kind": "run_admitted", "futureSemantics": { "doNotInterpretAsGrant": true } }
+}

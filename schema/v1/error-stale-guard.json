@@ -1,0 +1,10 @@
+{
+  "protocol": "podbay/1",
+  "requestId": "request.pb03.1",
+  "error": {
+    "code": "stale_guard",
+    "message": "The guarded resource epoch changed.",
+    "retry": "refresh",
+    "commandId": "command.fixture.1"
+  }
+}

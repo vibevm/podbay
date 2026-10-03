@@ -1,0 +1,8 @@
+{
+  "protocol": "podbay/1",
+  "scopeId": "project.fixture",
+  "state": { "runId": "run.fixture", "execution": "active", "foreground": "unknown" },
+  "revision": "14",
+  "cursor": { "storeLineage": "store.fixture", "scopeId": "project.fixture", "sequence": "9007199254740993" },
+  "futureObservation": { "retained": true }
+}

@@ -1,0 +1,15 @@
+{
+  "protocol": "podbay/1",
+  "eventId": "event.future.1",
+  "schema": "podbay.event/1",
+  "cursor": { "storeLineage": "store.fixture", "scopeId": "project.fixture", "sequence": "9007199254740993" },
+  "source": { "sourceId": "source.future", "kind": "pod" },
+  "sourceEpoch": "2",
+  "sourceSequence": "8",
+  "sourceOrder": { "state": "gap", "expectedNext": "7" },
+  "target": { "kind": "run", "runId": "run.fixture" },
+  "recordedAt": "2026-10-03T12:00:00Z",
+  "provenance": "pod",
+  "payload": { "kind": "future_observation", "newField": { "opaque": true } },
+  "futureTopLevel": ["retained"]
+}
