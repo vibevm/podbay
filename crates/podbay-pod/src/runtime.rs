@@ -8,11 +8,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use podbay_core::{
-    AttemptId, CredentialEpoch, FenceOperation, FenceTarget, GrantKind, InputEpoch, OwnerEpoch,
-    OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest, PodFenceIdentity, PodId, PodPeerFence,
-    ResourceId, ScopeId, StoreLineageId,
+    AttemptId, AttestedPeer, CredentialEpoch, FenceOperation, FenceTarget, GrantKind, InputEpoch,
+    OwnerEpoch, OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest, PodFenceCheckpoint,
+    PodFenceIdentity, PodId, PodPeerFence, RebindPhase, ResourceId, ScopeId, StoreLineageId,
 };
-use podbay_store::{BoundLaunchRecord, SqliteOwnerEpochWitness};
+use podbay_store::{BoundLaunchRecord, SqliteManagerPeerWitness, SqliteOwnerEpochWitness};
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,10 @@ use crate::manifest::{
     PodManifest, PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
     private_directory, read_manifest, unit_name, write_manifest,
 };
-use crate::peer_checkpoint::{PeerCheckpointError, read_peer_checkpoint, write_peer_checkpoint};
+use crate::peer_checkpoint::{
+    PeerCheckpointError, read_peer_checkpoint, read_peer_checkpoint_observation,
+    write_peer_checkpoint,
+};
 use crate::ports::{
     DurableFiles, LocalControlTransport, PodControlPort, PodObservation, SupervisorBackend,
     TerminalBackend, TerminalResource, TerminalViewerPort,
@@ -30,6 +33,7 @@ use crate::ports::{
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
 const FRAME_LIMIT: u64 = 1_048_576;
+const INSPECT_PROTOCOL: &str = "podbay.rebind-inspect/1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +58,98 @@ struct Response {
     error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal: Option<TerminalReply>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebindInspectRequest {
+    protocol: String,
+    operation: String,
+    nonce: String,
+    scope_id: String,
+    pod_id: String,
+    attempt_id: String,
+    incarnation: u64,
+    store_lineage: String,
+    owner_epoch: u64,
+    credential_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebindInspection {
+    pub protocol: String,
+    pub nonce: String,
+    pub scope_id: String,
+    pub pod_id: String,
+    pub attempt_id: String,
+    pub incarnation: u64,
+    pub store_lineage: String,
+    pub prior_owner_epoch: u64,
+    pub prior_credential_epoch: u64,
+    pub prior_input_epochs: BTreeMap<String, u64>,
+    pub checkpoint_digest: String,
+    pub supervisor_pid: u32,
+    pub supervisor_start_ticks: u64,
+    pub child_pid: u32,
+    pub child_start_ticks: u64,
+    pub boot_id: String,
+    pub unit_name: String,
+    pub cgroup_path: String,
+}
+
+trait CurrentManagerPeerMatch {
+    fn matches_current(&self, owner: u64, credential: u64, peer: &AttestedPeer) -> bool;
+}
+impl CurrentManagerPeerMatch for SqliteManagerPeerWitness {
+    fn matches_current(&self, owner: u64, credential: u64, peer: &AttestedPeer) -> bool {
+        SqliteManagerPeerWitness::matches_current(self, owner, credential, peer)
+    }
+}
+
+fn valid_inspect_nonce(nonce: &str) -> bool {
+    (16..=128).contains(&nonce.len())
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn inspect_allowed(
+    request: &RebindInspectRequest,
+    identity: &PodFenceIdentity,
+    checkpoint: &PodFenceCheckpoint,
+    fence: &PodPeerFence,
+    observed_peer: &AttestedPeer,
+    owner_witness: &impl OwnerEpochWitness,
+    manager_witness: &impl CurrentManagerPeerMatch,
+) -> bool {
+    if !valid_inspect_nonce(&request.nonce)
+        || request.protocol != INSPECT_PROTOCOL
+        || request.operation != "rebind.inspect"
+        || request.scope_id != identity.scope_id.as_str()
+        || request.pod_id != identity.pod_id.as_str()
+        || request.attempt_id != identity.attempt_id.as_str()
+        || request.incarnation != identity.incarnation.get()
+        || request.store_lineage != identity.store_lineage.as_str()
+        || checkpoint.identity() != identity
+        || checkpoint != &fence.checkpoint()
+        || checkpoint.phase() != RebindPhase::Active
+        || observed_peer == checkpoint.manager_peer()
+        || observed_peer.containment_identity() != checkpoint.manager_containment()
+        || request.owner_epoch <= checkpoint.owner_epoch().get()
+        || request.credential_epoch <= checkpoint.credential_epoch().get()
+    {
+        return false;
+    }
+    let Ok(owner) = OwnerEpoch::new(request.owner_epoch) else {
+        return false;
+    };
+    owner_witness.current_owner_epoch(&identity.store_lineage, &identity.scope_id) == Some(owner)
+        && manager_witness.matches_current(
+            request.owner_epoch,
+            request.credential_epoch,
+            observed_peer,
+        )
 }
 
 enum ChildResource {
@@ -208,6 +304,101 @@ impl PodControlPort for PodClient {
 }
 
 impl PodClient {
+    /// A restarted manager can inspect without the old status handshake or
+    /// old manifest bearer. The pod authenticates this socket's OS peer.
+    pub fn inspect_rebind(
+        manifest_path: impl AsRef<Path>,
+        expected: &PodFenceIdentity,
+        owner_epoch: u64,
+        credential_epoch: u64,
+    ) -> Result<RebindInspection, PodError> {
+        if owner_epoch == 0 || credential_epoch == 0 {
+            return Err(PodError::Invalid("rebind inspect request bounds"));
+        }
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let manifest = read_manifest(manifest_path.as_ref())?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "unbound rebind inspect is unavailable",
+        ))?;
+        if bound_identity(&manifest.descriptor, binding)? != *expected {
+            return Err(PodError::Refused("rebind inspect identity differs"));
+        }
+        let request = RebindInspectRequest {
+            protocol: INSPECT_PROTOCOL.into(),
+            operation: "rebind.inspect".into(),
+            nonce: nonce.clone(),
+            scope_id: expected.scope_id.as_str().into(),
+            pod_id: expected.pod_id.as_str().into(),
+            attempt_id: expected.attempt_id.as_str().into(),
+            incarnation: expected.incarnation.get(),
+            store_lineage: expected.store_lineage.as_str().into(),
+            owner_epoch,
+            credential_epoch,
+        };
+        let (bytes, server_peer) =
+            inspect_exchange(&manifest.socket_path, &serde_json::to_vec(&request)?)?;
+        if !unit_cgroup_exact(server_peer.cgroup(), &manifest.unit_name)
+            || server_peer.attested_peer().os_identity() != binding.manager_os_identity
+            || server_peer.attested_peer().boot_identity() != binding.manager_boot_identity
+        {
+            return Err(PodError::Refused(
+                "inspect server is outside bound pod identity",
+            ));
+        }
+        let response: RebindInspection = match serde_json::from_slice(&bytes) {
+            Ok(response) => response,
+            Err(_) => {
+                if serde_json::from_slice::<Response>(&bytes).is_ok_and(|response| !response.ok) {
+                    return Err(PodError::Refused("rebind inspect refused"));
+                }
+                return Err(PodError::Invalid("rebind inspect response malformed"));
+            }
+        };
+        let digest_valid = response.checkpoint_digest.len() == 64
+            && response
+                .checkpoint_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if response.protocol != INSPECT_PROTOCOL
+            || response.nonce != nonce
+            || response.scope_id != expected.scope_id.as_str()
+            || response.pod_id != expected.pod_id.as_str()
+            || response.attempt_id != expected.attempt_id.as_str()
+            || response.incarnation != expected.incarnation.get()
+            || response.store_lineage != expected.store_lineage.as_str()
+            || response.prior_owner_epoch >= owner_epoch
+            || response.prior_credential_epoch >= credential_epoch
+            || response.prior_input_epochs.is_empty()
+            || !response
+                .prior_input_epochs
+                .keys()
+                .eq(binding.resource_input_epochs.keys())
+            || response
+                .prior_input_epochs
+                .values()
+                .any(|epoch| *epoch == 0)
+            || !digest_valid
+            || response.supervisor_pid == 0
+            || response.supervisor_start_ticks == 0
+            || response.child_pid == 0
+            || response.child_start_ticks == 0
+            || response.boot_id.is_empty()
+            || response.unit_name != manifest.unit_name
+            || !unit_cgroup_exact(&response.cgroup_path, &manifest.unit_name)
+            || response.supervisor_pid != server_peer.pid() as u32
+            || response.supervisor_start_ticks != server_peer.start_ticks()
+            || response.boot_id != server_peer.boot_id()
+            || response.cgroup_path != server_peer.cgroup()
+        {
+            return Err(PodError::Invalid(
+                "rebind inspect response identity differs",
+            ));
+        }
+        Ok(response)
+    }
+
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, PodError> {
         let path = path.as_ref();
         let manifest = read_manifest(path)?;
@@ -423,6 +614,33 @@ fn terminal_transport(error: PodError, mutation: bool) -> PodError {
     }
 }
 
+fn inspect_exchange(
+    endpoint: &Path,
+    request: &[u8],
+) -> Result<(Vec<u8>, LinuxPeerEvidence), PodError> {
+    if request.len() as u64 > FRAME_LIMIT {
+        return Err(PodError::Invalid("inspect request exceeds bound"));
+    }
+    let mut socket = UnixStream::connect(endpoint)?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let observed = LinuxPeerEvidence::from_connected(&socket)
+        .map_err(|_| PodError::Refused("pod server OS identity unavailable"))?;
+    socket.write_all(request)?;
+    socket.shutdown(std::net::Shutdown::Write)?;
+    let mut bytes = Vec::new();
+    (&mut socket)
+        .take(FRAME_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > FRAME_LIMIT {
+        return Err(PodError::Invalid("inspect response exceeds bound"));
+    }
+    observed
+        .recheck_connected(&socket)
+        .map_err(|_| PodError::Refused("pod server process changed during inspect"))?;
+    Ok((bytes, observed))
+}
+
 /// Admits one exact manifest. Existing ambiguous state is never launched again.
 pub fn launch(
     descriptor: LaunchDescriptor,
@@ -626,6 +844,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         );
     }
     let witness = SqliteOwnerEpochWitness::for_pod(&binding.store_path, identity.clone());
+    let manager_witness = SqliteManagerPeerWitness::for_pod(&binding.store_path, identity.clone());
     if witness.current_owner_epoch(&identity.store_lineage, &identity.scope_id) != Some(owner_epoch)
     {
         return Err(PodError::Refused("bound owner witness unavailable"));
@@ -737,6 +956,110 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             (&mut stream)
                 .take(FRAME_LIMIT + 1)
                 .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(inspect) = serde_json::from_slice::<RebindInspectRequest>(&bytes)
+            {
+                let observed = peer_evidence.as_ref().ok();
+                let checkpoint = read_peer_checkpoint_observation(
+                    manifest_path.as_ref().parent().unwrap(),
+                    &identity,
+                );
+                let verified =
+                    observed
+                        .zip(checkpoint.as_ref().ok())
+                        .is_some_and(|(peer, checkpoint)| {
+                            peer.recheck_before_effect(&stream, peer.attested_peer())
+                                .is_ok()
+                                && inspect_allowed(
+                                    &inspect,
+                                    &identity,
+                                    checkpoint.checkpoint(),
+                                    &fence,
+                                    peer.attested_peer(),
+                                    &witness,
+                                    &manager_witness,
+                                )
+                                && child_attested_running(
+                                    &mut child,
+                                    child_pid,
+                                    child_start_ticks,
+                                    &cgroup_path,
+                                )
+                                && crate::runtime::cgroup_path().ok().as_deref()
+                                    == Some(cgroup_path.as_str())
+                        });
+                if !verified {
+                    respond(
+                        &mut stream,
+                        Response {
+                            ok: false,
+                            status: None,
+                            error: Some("request refused".into()),
+                            error_code: Some("refused".into()),
+                            terminal: None,
+                        },
+                    )?;
+                    return Ok(false);
+                }
+                let checkpoint = checkpoint.expect("checked canonical checkpoint");
+                let prior = checkpoint.checkpoint();
+                let response = RebindInspection {
+                    protocol: INSPECT_PROTOCOL.into(),
+                    nonce: inspect.nonce.clone(),
+                    scope_id: identity.scope_id.as_str().into(),
+                    pod_id: identity.pod_id.as_str().into(),
+                    attempt_id: identity.attempt_id.as_str().into(),
+                    incarnation: identity.incarnation.get(),
+                    store_lineage: identity.store_lineage.as_str().into(),
+                    prior_owner_epoch: prior.owner_epoch().get(),
+                    prior_credential_epoch: prior.credential_epoch().get(),
+                    prior_input_epochs: prior
+                        .input_epochs()
+                        .iter()
+                        .map(|(id, epoch)| (id.as_str().to_owned(), epoch.get()))
+                        .collect(),
+                    checkpoint_digest: checkpoint.digest().into(),
+                    supervisor_pid: std::process::id(),
+                    supervisor_start_ticks: start_ticks(std::process::id())?,
+                    child_pid,
+                    child_start_ticks,
+                    boot_id: boot_id.clone(),
+                    unit_name: manifest.unit_name.clone(),
+                    cgroup_path: cgroup_path.clone(),
+                };
+                let encoded = serde_json::to_vec(&response)?;
+                if encoded.len() as u64 > FRAME_LIMIT {
+                    return Err(PodError::Invalid("rebind inspect response exceeds bound"));
+                }
+                let peer = observed.expect("checked OS peer");
+                if peer
+                    .recheck_before_effect(&stream, peer.attested_peer())
+                    .is_err()
+                    || !inspect_allowed(
+                        &inspect,
+                        &identity,
+                        prior,
+                        &fence,
+                        peer.attested_peer(),
+                        &witness,
+                        &manager_witness,
+                    )
+                {
+                    respond(
+                        &mut stream,
+                        Response {
+                            ok: false,
+                            status: None,
+                            error: Some("request refused".into()),
+                            error_code: Some("refused".into()),
+                            terminal: None,
+                        },
+                    )?;
+                    return Ok(false);
+                }
+                stream.write_all(&encoded)?;
+                return Ok(false);
+            }
             let parsed = if bytes.len() as u64 > FRAME_LIMIT {
                 Err(PodError::Invalid("pod request frame exceeded bound"))
             } else {
@@ -961,12 +1284,30 @@ fn unit_cgroup_exact(cgroup: &str, unit: &str) -> bool {
 }
 
 fn cgroup_path() -> Result<String, PodError> {
-    let content = fs::read_to_string("/proc/self/cgroup")?;
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .map(str::to_owned)
-        .ok_or(PodError::Invalid("unified cgroup evidence unavailable"))
+    process_cgroup_path(std::process::id())
+}
+
+fn process_cgroup_path(pid: u32) -> Result<String, PodError> {
+    let content = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    let mut unified = content.lines().filter_map(|line| line.strip_prefix("0::"));
+    let value = unified
+        .next()
+        .ok_or(PodError::Invalid("unified cgroup evidence unavailable"))?;
+    if unified.next().is_some() || !value.starts_with('/') || value.chars().any(char::is_control) {
+        return Err(PodError::Invalid("unified cgroup evidence malformed"));
+    }
+    Ok(value.into())
+}
+
+fn child_attested_running(
+    child: &mut ChildResource,
+    pid: u32,
+    birth: u64,
+    expected_cgroup: &str,
+) -> bool {
+    matches!(child.try_wait(), Ok(None))
+        && start_ticks(pid).ok() == Some(birth)
+        && process_cgroup_path(pid).ok().as_deref() == Some(expected_cgroup)
 }
 
 fn start_ticks(pid: u32) -> Result<u64, PodError> {
@@ -998,6 +1339,290 @@ mod tests {
     use crate::manifest::PodRole;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct InspectOwnerWitness {
+        identity: PodFenceIdentity,
+        owner: Option<OwnerEpoch>,
+    }
+    impl OwnerEpochWitness for InspectOwnerWitness {
+        fn current_owner_epoch(
+            &self,
+            lineage: &StoreLineageId,
+            scope: &ScopeId,
+        ) -> Option<OwnerEpoch> {
+            (lineage == &self.identity.store_lineage && scope == &self.identity.scope_id)
+                .then_some(self.owner)
+                .flatten()
+        }
+    }
+    struct InspectManagerWitness {
+        peer: Option<AttestedPeer>,
+        owner: u64,
+        credential: u64,
+    }
+    impl CurrentManagerPeerMatch for InspectManagerWitness {
+        fn matches_current(&self, owner: u64, credential: u64, peer: &AttestedPeer) -> bool {
+            owner == self.owner && credential == self.credential && self.peer.as_ref() == Some(peer)
+        }
+    }
+    fn inspect_fixture() -> (
+        PodFenceIdentity,
+        PodPeerFence,
+        AttestedPeer,
+        RebindInspectRequest,
+        InspectOwnerWitness,
+        InspectManagerWitness,
+    ) {
+        let identity = PodFenceIdentity {
+            scope_id: ScopeId::try_from("scope.inspect.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.inspect.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.inspect.fixture").unwrap(),
+            incarnation: podbay_core::Epoch::new(1).unwrap(),
+            store_lineage: StoreLineageId::try_from("store.inspect.fixture").unwrap(),
+        };
+        let old = AttestedPeer::from_port(
+            "uid.1000",
+            "pid.100",
+            "boot.fixture",
+            "birth.100",
+            "manager.unit",
+        )
+        .unwrap();
+        let next = AttestedPeer::from_port(
+            "uid.1000",
+            "pid.200",
+            "boot.fixture",
+            "birth.200",
+            "manager.unit",
+        )
+        .unwrap();
+        let fence = PodPeerFence::new(
+            identity.clone(),
+            old,
+            OwnerEpoch::new(1).unwrap(),
+            CredentialEpoch::new(1).unwrap(),
+            BTreeMap::from([(
+                ResourceId::try_from("resource.inspect.fixture").unwrap(),
+                InputEpoch::new(1).unwrap(),
+            )]),
+            100,
+            800,
+        )
+        .unwrap();
+        let request = RebindInspectRequest {
+            protocol: INSPECT_PROTOCOL.into(),
+            operation: "rebind.inspect".into(),
+            nonce: "nonce.rebind.0001".into(),
+            scope_id: identity.scope_id.as_str().into(),
+            pod_id: identity.pod_id.as_str().into(),
+            attempt_id: identity.attempt_id.as_str().into(),
+            incarnation: identity.incarnation.get(),
+            store_lineage: identity.store_lineage.as_str().into(),
+            owner_epoch: 2,
+            credential_epoch: 2,
+        };
+        let owner = InspectOwnerWitness {
+            identity: identity.clone(),
+            owner: Some(OwnerEpoch::new(2).unwrap()),
+        };
+        let manager = InspectManagerWitness {
+            peer: Some(next.clone()),
+            owner: 2,
+            credential: 2,
+        };
+        (identity, fence, next, request, owner, manager)
+    }
+
+    #[test]
+    fn rebind_inspect_predicate_refuses_sibling_wrong_birth_or_stale_claim() {
+        let (identity, fence, next, request, owner, manager) = inspect_fixture();
+        let checkpoint = fence.checkpoint();
+        assert!(inspect_allowed(
+            &request,
+            &identity,
+            &checkpoint,
+            &fence,
+            &next,
+            &owner,
+            &manager
+        ));
+        let sibling = AttestedPeer::from_port(
+            "uid.1000",
+            "pid.300",
+            "boot.fixture",
+            "birth.300",
+            "sibling.unit",
+        )
+        .unwrap();
+        assert!(!inspect_allowed(
+            &request,
+            &identity,
+            &checkpoint,
+            &fence,
+            &sibling,
+            &owner,
+            &manager
+        ));
+        let reused = AttestedPeer::from_port(
+            "uid.1000",
+            "pid.200",
+            "boot.fixture",
+            "birth.reused",
+            "manager.unit",
+        )
+        .unwrap();
+        assert!(!inspect_allowed(
+            &request,
+            &identity,
+            &checkpoint,
+            &fence,
+            &reused,
+            &owner,
+            &manager
+        ));
+        let missing = InspectManagerWitness {
+            peer: None,
+            owner: 2,
+            credential: 2,
+        };
+        assert!(!inspect_allowed(
+            &request,
+            &identity,
+            &checkpoint,
+            &fence,
+            &next,
+            &owner,
+            &missing
+        ));
+        let stale_owner = InspectOwnerWitness {
+            identity: identity.clone(),
+            owner: None,
+        };
+        assert!(!inspect_allowed(
+            &request,
+            &identity,
+            &checkpoint,
+            &fence,
+            &next,
+            &stale_owner,
+            &manager
+        ));
+        let mut wrong = request;
+        wrong.store_lineage = "store.foreign".into();
+        assert!(!inspect_allowed(
+            &wrong,
+            &identity,
+            &checkpoint,
+            &fence,
+            &next,
+            &owner,
+            &manager
+        ));
+        wrong.store_lineage = identity.store_lineage.as_str().into();
+        wrong.nonce = "short".into();
+        assert!(!inspect_allowed(
+            &wrong,
+            &identity,
+            &checkpoint,
+            &fence,
+            &next,
+            &owner,
+            &manager
+        ));
+        let changed = PodPeerFence::new(
+            identity.clone(),
+            next.clone(),
+            OwnerEpoch::new(2).unwrap(),
+            CredentialEpoch::new(2).unwrap(),
+            BTreeMap::from([(
+                ResourceId::try_from("resource.inspect.fixture").unwrap(),
+                InputEpoch::new(2).unwrap(),
+            )]),
+            100,
+            800,
+        )
+        .unwrap()
+        .checkpoint();
+        let valid = inspect_fixture().3;
+        assert!(!inspect_allowed(
+            &valid, &identity, &changed, &fence, &next, &owner, &manager
+        ));
+    }
+
+    #[test]
+    fn rebind_inspect_corrupt_file_or_exited_child_is_not_success() {
+        let (identity, fence, _next, _request, _owner, _manager) = inspect_fixture();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("podbay-inspect-{}-{stamp}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_peer_checkpoint_observation(&directory, &identity).is_err());
+        write_peer_checkpoint(&directory, &identity, &fence.checkpoint()).unwrap();
+        assert_eq!(
+            read_peer_checkpoint_observation(&directory, &identity)
+                .unwrap()
+                .checkpoint(),
+            &fence.checkpoint()
+        );
+        let path = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "chk"))
+            .unwrap();
+        fs::write(&path, b"corrupt checkpoint").unwrap();
+        assert!(read_peer_checkpoint_observation(&directory, &identity).is_err());
+        fs::remove_dir_all(directory).unwrap();
+        let mut child = ChildResource::Pipe(Command::new("/bin/true").spawn().unwrap());
+        let pid = child.id().unwrap();
+        let birth = start_ticks(pid).unwrap_or(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!child_attested_running(
+            &mut child,
+            pid,
+            birth,
+            "/user.slice/fixture.service"
+        ));
+    }
+
+    #[test]
+    fn rebind_inspect_exchange_attests_connected_server_before_and_after_reply() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-inspect-socket-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("inspect.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"inspect.fixture");
+            stream.write_all(b"response.fixture").unwrap();
+        });
+        let (response, peer) = inspect_exchange(&path, b"inspect.fixture").unwrap();
+        worker.join().unwrap();
+        assert_eq!(response, b"response.fixture");
+        assert_eq!(peer.pid(), std::process::id() as i32);
+        assert!(peer.start_ticks() > 0);
+        assert_eq!(
+            peer.cgroup(),
+            process_cgroup_path(std::process::id()).unwrap()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn lost_response_after_possible_input_is_uncertain() {

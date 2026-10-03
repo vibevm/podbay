@@ -60,6 +60,16 @@ impl LinuxPeerEvidence {
     /// `socket` must be the accepted connection, not an outgoing client socket.
     /// Failure to read any component refuses before a control effect.
     pub fn from_accepted(socket: &UnixStream) -> Result<Self, LinuxPeerError> {
+        Self::observe_socket_peer(socket)
+    }
+
+    /// Observe the server endpoint from a connected client socket. A JSON
+    /// response is not a substitute for this kernel/process evidence.
+    pub fn from_connected(socket: &UnixStream) -> Result<Self, LinuxPeerError> {
+        Self::observe_socket_peer(socket)
+    }
+
+    fn observe_socket_peer(socket: &UnixStream) -> Result<Self, LinuxPeerError> {
         let credentials = getsockopt(socket, PeerCredentials)
             .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
         let pid = credentials.pid();
@@ -132,8 +142,17 @@ impl LinuxPeerEvidence {
         socket: &UnixStream,
         expected: &AttestedPeer,
     ) -> Result<(), LinuxPeerError> {
-        let fresh = Self::from_accepted(socket)?;
+        let fresh = Self::observe_socket_peer(socket)?;
         if fresh == *self && fresh.peer == *expected {
+            Ok(())
+        } else {
+            Err(LinuxPeerError::EvidenceChanged)
+        }
+    }
+
+    pub fn recheck_connected(&self, socket: &UnixStream) -> Result<(), LinuxPeerError> {
+        let fresh = Self::from_connected(socket)?;
+        if fresh == *self {
             Ok(())
         } else {
             Err(LinuxPeerError::EvidenceChanged)
@@ -217,6 +236,17 @@ mod tests {
             observed.attested_peer().containment_identity(),
             format!("linux.cgroup.{}", observed.cgroup())
         );
+    }
+
+    #[test]
+    fn connected_socket_observes_and_rechecks_the_server_birth() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let observed = LinuxPeerEvidence::from_connected(&client).unwrap();
+        assert_eq!(observed.pid(), std::process::id() as i32);
+        assert!(observed.start_ticks() > 0);
+        observed.recheck_connected(&client).unwrap();
+        let accepted = LinuxPeerEvidence::from_accepted(&server).unwrap();
+        assert_eq!(observed, accepted);
     }
 
     #[test]

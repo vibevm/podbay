@@ -30,7 +30,7 @@ pub use ports::{
     TerminalViewerPort,
 };
 #[cfg(target_os = "linux")]
-pub use runtime::{LinuxBackend, PodClient, TerminalViewer, launch, launch_bound, serve};
+pub use runtime::{LinuxBackend, PodClient, RebindInspection, TerminalViewer, launch, launch_bound, serve};
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
     TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,

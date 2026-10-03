@@ -8,13 +8,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
-    Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
-    SessionId, WorkKind,
+    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod,
+    PodFenceIdentity, PodId, Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId,
+    ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
 use podbay_pod::{
-    LaunchDescriptor, LinuxPeerEvidence, PodError, PodManifest, PodPeerBootstrap, PodRole, launch,
-    launch_bound,
+    LaunchDescriptor, LinuxPeerEvidence, PodClient, PodError, PodManifest, PodPeerBootstrap,
+    PodRole, RebindInspection, launch, launch_bound,
 };
 use podbay_store::{
     BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRequest, PodBayStore, VerifiedPrincipal,
@@ -456,4 +456,140 @@ json.dump(responses,open(result,'w'))
     drop(client);
     std::thread::sleep(Duration::from_millis(100));
     assert!(fs::metadata(format!("/proc/{}", status.child.native_id)).is_ok());
+}
+
+#[test]
+fn rebind_inspect_helper_process() {
+    let Ok(manifest_path) = std::env::var("PODBAY_REBIND_HELPER_MANIFEST") else {
+        return;
+    };
+    let result_path = std::env::var("PODBAY_REBIND_HELPER_RESULT").unwrap();
+    let manifest: PodManifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let binding = manifest.peer_binding.as_ref().unwrap();
+    let identity = PodFenceIdentity {
+        scope_id: ScopeId::try_from(manifest.descriptor.scope_id.as_str()).unwrap(),
+        pod_id: PodId::try_from(manifest.descriptor.pod_id.as_str()).unwrap(),
+        attempt_id: AttemptId::try_from(manifest.descriptor.attempt_id.as_str()).unwrap(),
+        incarnation: Epoch::new(manifest.descriptor.incarnation).unwrap(),
+        store_lineage: StoreLineageId::try_from(binding.store_lineage.as_str()).unwrap(),
+    };
+    let mut store = PodBayStore::open(&binding.store_path).unwrap();
+    let claim = store.current_manager_credential_claim(2).unwrap();
+    let peer = LinuxPeerEvidence::for_current_process().unwrap();
+    store
+        .register_current_manager_peer(&claim, peer.attested_peer())
+        .unwrap();
+    let response = PodClient::inspect_rebind(&manifest_path, &identity, 2, 2).unwrap();
+    fs::write(result_path, serde_json::to_vec(&response).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and Linux peer evidence"]
+fn bound_pod_read_only_inspect_hands_off_to_new_same_containment_peer() {
+    assert_eq!(std::env::var("PODBAY_TEST_SYSTEMD").as_deref(), Ok("1"));
+    let fixture = Fixture::new();
+    let (record, bootstrap) = bound_record(&fixture);
+    let client = launch_bound(
+        record,
+        bootstrap,
+        &fixture.directory,
+        PathBuf::from(env!("CARGO_BIN_EXE_podbay-pod")),
+    )
+    .unwrap();
+    let before = client.status().unwrap();
+    let manifest_path = fixture.manifest_path();
+    PodBayStore::open(&fixture.database)
+        .unwrap()
+        .begin_authority_replay(1, 2)
+        .unwrap();
+    assert!(matches!(client.status(), Err(PodError::Refused(_))));
+    let result_path = fixture.directory.join("inspect-result.json");
+    let helper = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "rebind_inspect_helper_process", "--nocapture"])
+        .env("PODBAY_REBIND_HELPER_MANIFEST", &manifest_path)
+        .env("PODBAY_REBIND_HELPER_RESULT", &result_path)
+        .status()
+        .unwrap();
+    assert!(
+        helper.success(),
+        "new same-cgroup manager peer inspection failed"
+    );
+    let response: RebindInspection =
+        serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
+    assert_eq!(response.prior_owner_epoch, 1);
+    assert_eq!(response.prior_credential_epoch, 1);
+    assert_eq!(
+        response.prior_input_epochs,
+        BTreeMap::from([("resource.fixture".into(), 1)])
+    );
+    assert_eq!(response.child_pid.to_string(), before.child.native_id);
+    assert_eq!(
+        format!("{}:{}", response.boot_id, response.child_start_ticks),
+        before.child.start_identity.unwrap()
+    );
+    assert_eq!(response.checkpoint_digest.len(), 64);
+
+    let script = fixture.directory.join("sibling_inspect.py");
+    fs::write(
+        &script,
+        r#"import json,socket,sys
+manifest=json.load(open(sys.argv[1]))
+binding=manifest['peer_binding']
+descriptor=manifest['descriptor']
+request={'protocol':'podbay.rebind-inspect/1','operation':'rebind.inspect',
+ 'nonce':'nonce.sibling.inspect.0001','scope_id':descriptor['scope_id'],
+ 'pod_id':descriptor['pod_id'],'attempt_id':descriptor['attempt_id'],
+ 'incarnation':descriptor['incarnation'],'store_lineage':binding['store_lineage'],
+ 'owner_epoch':2,'credential_epoch':2}
+sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+sock.settimeout(4)
+sock.connect(manifest['socket_path'])
+sock.sendall(json.dumps(request).encode())
+sock.shutdown(socket.SHUT_WR)
+reply=b''
+while True:
+ chunk=sock.recv(65536)
+ if not chunk: break
+ reply+=chunk
+sock.close()
+response=json.loads(reply)
+assert response.get('ok') is False and response.get('status') is None
+"#,
+    )
+    .unwrap();
+    let python = Command::new("sh")
+        .args(["-c", "command -v python3"])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let python = fs::canonicalize(String::from_utf8(python.stdout).unwrap().trim()).unwrap();
+    let sibling_unit = format!(
+        "podbay-inspect-sibling-{}-{}.service",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let sibling = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--no-ask-password",
+            "--wait",
+            "--collect",
+            "--service-type=exec",
+        ])
+        .arg(format!("--unit={sibling_unit}"))
+        .arg(python)
+        .arg(script)
+        .arg(manifest_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        sibling.success(),
+        "different-cgroup sibling inspection was not refused"
+    );
+    assert!(fs::metadata(format!("/proc/{}", response.child_pid)).is_ok());
 }
