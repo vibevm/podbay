@@ -273,7 +273,9 @@ version = "0.1.0"
 name = "podbay-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "podbay-core",
+ "podbay-store",
 ]
 
 [[package]]

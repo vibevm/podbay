@@ -10,12 +10,12 @@ use crate::model::{
     Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
     store_lineage: String,
 }
 
@@ -148,6 +148,49 @@ impl PodBayStore {
              CREATE INDEX IF NOT EXISTS quarantine_scope_id
                ON event_quarantine(scope_id,quarantine_id);",
         )?;
+        if version < 4 {
+            transaction.execute_batch(
+                "INSERT OR IGNORE INTO metadata(key,value) VALUES('authority_revision',0);
+                 CREATE TABLE IF NOT EXISTS authority_pods (
+                   pod_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
+                   incarnation INTEGER NOT NULL CHECK(incarnation >= 1)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS authority_resources (
+                   resource_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
+                   pod_id TEXT NOT NULL REFERENCES authority_pods(pod_id),
+                   pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation >= 1),
+                   resource_epoch INTEGER NOT NULL CHECK(resource_epoch >= 1),
+                   input_epoch INTEGER NOT NULL CHECK(input_epoch >= 1)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS authority_actors (
+                   actor_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
+                   role TEXT NOT NULL, origin TEXT NOT NULL,
+                   parent_actor_id TEXT, pod_id TEXT REFERENCES authority_pods(pod_id),
+                   pod_incarnation INTEGER, credential_generation INTEGER NOT NULL
+                     CHECK(credential_generation >= 1),
+                   platform TEXT NOT NULL, os_identity TEXT NOT NULL,
+                   process_identity TEXT NOT NULL,
+                   start_identity INTEGER NOT NULL CHECK(start_identity >= 1),
+                   containment_identity TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS authority_grants (
+                   grant_id INTEGER PRIMARY KEY CHECK(grant_id >= 1),
+                   scope_id TEXT NOT NULL,
+                   actor_id TEXT NOT NULL REFERENCES authority_actors(actor_id),
+                   credential_generation INTEGER NOT NULL CHECK(credential_generation >= 1),
+                   mode TEXT NOT NULL,
+                   remaining_depth INTEGER NOT NULL CHECK(remaining_depth BETWEEN 0 AND 255)
+                 ) STRICT;
+                 CREATE TABLE IF NOT EXISTS authority_grant_rights (
+                   grant_id INTEGER NOT NULL REFERENCES authority_grants(grant_id)
+                     ON DELETE CASCADE,
+                   operation TEXT NOT NULL, target_kind TEXT NOT NULL,
+                   target_id TEXT NOT NULL,
+                   PRIMARY KEY(grant_id,operation,target_kind,target_id)
+                 ) STRICT;",
+            )?;
+        }
+        verify_authority_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -1158,4 +1201,65 @@ fn stable_command_id(request: &CommandRequest) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (table, expected) in [
+        ("authority_pods", &["pod_id", "scope_id", "incarnation"][..]),
+        (
+            "authority_resources",
+            &[
+                "resource_id",
+                "scope_id",
+                "pod_id",
+                "pod_incarnation",
+                "resource_epoch",
+                "input_epoch",
+            ][..],
+        ),
+        (
+            "authority_actors",
+            &[
+                "actor_id",
+                "scope_id",
+                "role",
+                "origin",
+                "parent_actor_id",
+                "pod_id",
+                "pod_incarnation",
+                "credential_generation",
+                "platform",
+                "os_identity",
+                "process_identity",
+                "start_identity",
+                "containment_identity",
+            ][..],
+        ),
+        (
+            "authority_grants",
+            &[
+                "grant_id",
+                "scope_id",
+                "actor_id",
+                "credential_generation",
+                "mode",
+                "remaining_depth",
+            ][..],
+        ),
+        (
+            "authority_grant_rights",
+            &["grant_id", "operation", "target_kind", "target_id"][..],
+        ),
+    ] {
+        let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.iter().map(String::as_str).collect::<Vec<_>>() != expected {
+            return Err(StoreError::Conflict(
+                "authority schema columns do not match",
+            ));
+        }
+    }
+    Ok(())
 }

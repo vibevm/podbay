@@ -309,6 +309,77 @@ pub struct QuarantinedSourceEvent {
     pub recorded_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityPodRecord {
+    pub scope_id: String,
+    pub pod_id: String,
+    pub incarnation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityResourceRecord {
+    pub scope_id: String,
+    pub resource_id: String,
+    pub pod_id: String,
+    pub pod_incarnation: u64,
+    pub resource_epoch: u64,
+    pub input_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityActorRecord {
+    pub scope_id: String,
+    pub actor_id: String,
+    pub role: String,
+    pub origin: String,
+    pub parent_actor_id: Option<String>,
+    pub pod_id: Option<String>,
+    pub pod_incarnation: Option<u64>,
+    pub credential_generation: u64,
+    pub platform: String,
+    pub os_identity: String,
+    pub process_identity: String,
+    pub start_identity: u64,
+    pub containment_identity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityRightRecord {
+    pub operation: String,
+    pub target_kind: String,
+    pub target_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityGrantRecord {
+    pub grant_id: u64,
+    pub scope_id: String,
+    pub actor_id: String,
+    pub credential_generation: u64,
+    pub mode: String,
+    pub remaining_delegation_depth: u8,
+    pub rights: Vec<AuthorityRightRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoritySnapshot {
+    pub owner_epoch: u64,
+    pub revision: u64,
+    pub pods: Vec<AuthorityPodRecord>,
+    pub resources: Vec<AuthorityResourceRecord>,
+    pub actors: Vec<AuthorityActorRecord>,
+    pub grants: Vec<AuthorityGrantRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityMutation {
+    PutPod(AuthorityPodRecord),
+    PutResource(AuthorityResourceRecord),
+    PutActor(AuthorityActorRecord),
+    PutGrant(AuthorityGrantRecord),
+    RevokeGrant(u64),
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidInput(&'static str),
