@@ -76,6 +76,13 @@ pub enum CheckpointRecovery {
     Unknown(Unknown),
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReopenState {
+    pub(crate) last_event: u64,
+    pub(crate) last_commit: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurabilityEvidence {
     /// File FlushFileBuffers returned; NTFS directory-entry power-loss
@@ -194,12 +201,47 @@ pub fn decode_log(
 
 pub fn recover_checkpoint(
     commit_log: &[u8],
-    mut load_generation: impl FnMut(u64) -> Option<Vec<u8>>,
+    load_generation: impl FnMut(u64) -> Option<Vec<u8>>,
 ) -> CheckpointRecovery {
     let commits = match decode_log(commit_log, RecordKind::Commit, None) {
         Ok(commits) => commits,
         Err(unknown) => return CheckpointRecovery::Unknown(unknown),
     };
+    recover_committed_records(&commits, load_generation)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn validate_reopen(
+    event_log: &[u8],
+    commit_log: &[u8],
+    load_generation: impl FnMut(u64) -> Option<Vec<u8>>,
+) -> Result<ReopenState, Unknown> {
+    let events = decode_log(event_log, RecordKind::Event, Some(1))?;
+    let commits = decode_log(commit_log, RecordKind::Commit, None)?;
+    let last_event = events.last().map_or(0, |record| record.sequence);
+    let last_commit = commits.last().map_or(0, |record| record.sequence);
+    match recover_committed_records(&commits, load_generation) {
+        CheckpointRecovery::None => {}
+        CheckpointRecovery::Ready { sequence, .. } if sequence <= last_event => {}
+        CheckpointRecovery::Ready { .. } => {
+            return Err(Unknown {
+                last_valid_sequence: Some(last_event).filter(|sequence| *sequence > 0),
+                gap_at: last_event.checked_add(1),
+                reason: "checkpoint exceeds event tail",
+            });
+        }
+        CheckpointRecovery::Unknown(unknown) => return Err(unknown),
+    }
+    Ok(ReopenState {
+        last_event,
+        last_commit,
+    })
+}
+
+fn recover_committed_records(
+    commits: &[Record],
+    mut load_generation: impl FnMut(u64) -> Option<Vec<u8>>,
+) -> CheckpointRecovery {
     let Some(latest) = commits.last() else {
         return CheckpointRecovery::None;
     };
@@ -258,6 +300,19 @@ mod tests {
         .encode()
         .unwrap()
     }
+    fn events_through(last: u64) -> Vec<u8> {
+        (1..=last)
+            .flat_map(|sequence| {
+                Record {
+                    kind: RecordKind::Event,
+                    sequence,
+                    payload: vec![sequence as u8],
+                }
+                .encode()
+                .unwrap()
+            })
+            .collect()
+    }
     #[test]
     fn committed_generation_roundtrip_and_orphan_exclusion() {
         let generation = snapshot(9, b"screen at nine");
@@ -302,6 +357,46 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn mutable_reopen_requires_intact_latest_generation_with_event_watermark() {
+        let older = snapshot(9, b"older screen");
+        let latest = snapshot(10, b"latest screen");
+        let mut commits = commit(9, &older);
+        commits.extend_from_slice(&commit(10, &latest));
+        let events = events_through(10);
+        assert_eq!(
+            validate_reopen(&events, &commits, |sequence| match sequence {
+                9 => Some(older.clone()),
+                10 => Some(latest.clone()),
+                _ => None,
+            }),
+            Ok(ReopenState {
+                last_event: 10,
+                last_commit: 10,
+            })
+        );
+        assert_eq!(
+            validate_reopen(&events, &commits, |sequence| (sequence == 9)
+                .then(|| older.clone()))
+            .unwrap_err()
+            .reason,
+            "committed generation missing"
+        );
+        let mut changed = latest.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            validate_reopen(&events, &commits, |_| Some(changed.clone()))
+                .unwrap_err()
+                .reason,
+            "committed generation digest changed"
+        );
+        assert_eq!(
+            validate_reopen(&events_through(9), &commits, |_| Some(latest.clone()))
+                .unwrap_err()
+                .gap_at,
+            Some(10)
+        );
     }
     #[test]
     fn event_log_gap_and_torn_tail_are_explicit() {

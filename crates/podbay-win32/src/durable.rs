@@ -78,8 +78,8 @@ impl DurableDirectory {
         })
     }
 
-    /// Reopen after a manager/pod restart. Corrupt logs refuse mutation; the
-    /// caller can still inspect raw files through a separate forensic path.
+    /// Reopen after a manager/pod restart. Corrupt logs or a missing/changed
+    /// committed checkpoint refuse mutation; raw files remain for forensics.
     pub fn reopen(root: &Path) -> Result<Self, Win32Error> {
         validate_root(root, true)?;
         let (directory, volume_serial) = open_directory(root)?;
@@ -87,18 +87,20 @@ impl DurableDirectory {
         let mut commit_log = open_file(&root.join("commit.wal"), volume_serial)?;
         let events = read_all(&mut event_log)?;
         let commits = read_all(&mut commit_log)?;
-        let event_rows = durable_model::decode_log(&events, RecordKind::Event, Some(1))
-            .map_err(|_| Win32Error::Uncertain("event log gap or corruption"))?;
-        let commit_rows = durable_model::decode_log(&commits, RecordKind::Commit, None)
-            .map_err(|_| Win32Error::Uncertain("checkpoint commit log corrupt"))?;
+        let state = durable_model::validate_reopen(&events, &commits, |sequence| {
+            let path = root.join(format!("checkpoint-{sequence:016x}.bin"));
+            let mut file = open_file(&path, volume_serial).ok()?;
+            read_all(&mut file).ok()
+        })
+        .map_err(|unknown| Win32Error::Uncertain(unknown.reason))?;
         Ok(Self {
             root: root.to_path_buf(),
             directory,
             volume_serial,
             event_log,
             commit_log,
-            last_event: event_rows.last().map_or(0, |record| record.sequence),
-            last_commit: commit_rows.last().map_or(0, |record| record.sequence),
+            last_event: state.last_event,
+            last_commit: state.last_commit,
             write_fence: WriteFence::default(),
         })
     }
