@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
-    Admission, CommandRequest, EffectClaim, EffectObservation, EffectState, PodBayStore,
-    StoreError, VerifiedPrincipal,
+    Admission, CommandRequest, EffectClaim, EffectObservation, EffectState, HostAcceptanceProof,
+    ObservedStage, PodBayStore, SourceOrder, StoreError, VerifiedPrincipal,
 };
 use sha2::{Digest, Sha256};
 
@@ -84,6 +84,20 @@ fn fixture_request_digest(request: &CommandRequest) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn host_proof(sequence: u64, receipt_id: &str, evidence: &[u8]) -> HostAcceptanceProof {
+    HostAcceptanceProof::from_authenticated_host_boundary(
+        "host.fixture",
+        1,
+        sequence,
+        receipt_id,
+        evidence,
+        Some("2026-10-03T12:00:00Z"),
+        "correlation.fixture",
+        Some("causation.fixture"),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -293,33 +307,47 @@ fn outbox_insert_refusal_rolls_back_command_and_admission_event() {
 }
 
 #[test]
-fn first_slice_allows_only_one_admission_event_per_command() {
+fn host_acceptance_adds_event_without_changing_admission_receipt() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     ready(&mut store);
-    let receipt = match store
-        .admit(&request("scope.fixture", "request.one-event", b"one"))
-        .unwrap()
-    {
+    let input = request("scope.fixture", "request.two-events", b"two");
+    let receipt = match store.admit(&input).unwrap() {
         Admission::Committed(receipt) => receipt,
         other => panic!("expected commit: {other:?}"),
     };
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
-    let rowid: i64 = connection
-        .query_row(
-            "SELECT command_rowid FROM commands WHERE command_id=?1",
-            [&receipt.command_id],
-            |row| row.get(0),
+    let before = store.scope_snapshot("scope.fixture").unwrap();
+    assert_eq!(before.cursor.sequence, receipt.event_sequence);
+    store
+        .claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.two-events",
         )
         .unwrap();
-    assert!(connection
-        .execute(
-            "INSERT INTO events(command_rowid,scope_id,owner_epoch,
-        target_epoch,kind,payload) VALUES(?1,'scope.fixture',1,1,'provider.observed',X'01')",
-            [rowid]
+    let observation = store
+        .observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.two-events",
+            &host_proof(1, "host-receipt.two", b"host-ack"),
         )
-        .is_err());
+        .unwrap();
+    let event_ref = match observation {
+        EffectObservation::NewObservation(reference) => reference,
+        other => panic!("expected new observation: {other:?}"),
+    };
+    assert!(event_ref.cursor.sequence > receipt.event_sequence);
+    assert_eq!(
+        store.admit(&input).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
     assert_eq!(
         store
             .events_after(
@@ -329,8 +357,85 @@ fn first_slice_allows_only_one_admission_event_per_command() {
             )
             .unwrap()
             .len(),
-        1
+        2
     );
+    assert_eq!(
+        store.scope_snapshot("scope.fixture").unwrap().receipts,
+        vec![receipt]
+    );
+}
+
+#[test]
+fn observation_event_insert_failure_keeps_claim_uncertain() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request("scope.fixture", "request.obs-atomic", b"atomic"))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    store
+        .claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.obs-atomic",
+        )
+        .unwrap();
+    let before = store.scope_snapshot("scope.fixture").unwrap().cursor;
+    let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    injector
+        .execute_batch(
+            "CREATE TRIGGER refuse_host_event BEFORE INSERT ON events
+             WHEN NEW.kind='effect.host_accepted'
+             BEGIN SELECT RAISE(ABORT, 'synthetic host event refusal'); END;",
+        )
+        .unwrap();
+    let proof = host_proof(1, "host-receipt.atomic", b"host-ack");
+    assert!(matches!(
+        store.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.obs-atomic",
+            &proof,
+        ),
+        Err(StoreError::Storage(_))
+    ));
+    assert_eq!(
+        store.effect_state(receipt.outbox_id).unwrap(),
+        EffectState::ClaimedUncertain
+    );
+    assert_eq!(
+        store.scope_snapshot("scope.fixture").unwrap().cursor,
+        before
+    );
+    assert!(store
+        .events_after("scope.fixture", &before, 10)
+        .unwrap()
+        .is_empty());
+    injector
+        .execute_batch("DROP TRIGGER refuse_host_event")
+        .unwrap();
+    assert!(matches!(
+        store.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.obs-atomic",
+            &proof,
+        ),
+        Ok(EffectObservation::NewObservation(_))
+    ));
 }
 
 #[test]
@@ -473,6 +578,7 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
         Admission::Committed(receipt) => receipt,
         other => panic!("expected commit: {other:?}"),
     };
+    let proof = host_proof(1, "host-receipt.one", b"host-ack");
     drop(store);
 
     let mut reopened = fixture.open();
@@ -493,8 +599,7 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
             1,
             1,
             "claim.observe",
-            "observation.one",
-            b"provider-ack"
+            &proof
         ),
         Err(StoreError::Conflict(_))
     ));
@@ -525,11 +630,26 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
             1,
             1,
             "claim.other",
-            "observation.one",
-            b"provider-ack"
+            &proof
         ),
         Err(StoreError::Conflict(_))
     ));
+    let before = recovered.scope_snapshot("scope.fixture").unwrap();
+    let first = recovered
+        .observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.observe",
+            &proof,
+        )
+        .unwrap();
+    let event_ref = match first {
+        EffectObservation::NewObservation(reference) => reference,
+        other => panic!("expected new observation: {other:?}"),
+    };
     assert_eq!(
         recovered
             .observe_effect(
@@ -539,26 +659,10 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
                 1,
                 1,
                 "claim.observe",
-                "observation.one",
-                b"provider-ack"
+                &proof,
             )
             .unwrap(),
-        EffectObservation::NewObservation
-    );
-    assert_eq!(
-        recovered
-            .observe_effect(
-                receipt.outbox_id,
-                "scope.fixture",
-                "target.fixture",
-                1,
-                1,
-                "claim.observe",
-                "observation.one",
-                b"provider-ack"
-            )
-            .unwrap(),
-        EffectObservation::AlreadyObserved
+        EffectObservation::AlreadyObserved(event_ref.clone())
     );
     assert!(matches!(
         recovered.observe_effect(
@@ -568,10 +672,9 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
             1,
             1,
             "claim.observe",
-            "observation.one",
-            b"changed-ack"
+            &host_proof(1, "host-receipt.one", b"changed-ack")
         ),
-        Err(StoreError::Conflict(_))
+        Err(StoreError::SourceIdentityQuarantined)
     ));
     assert!(recovered
         .pending_effects("scope.fixture", 0, 10)
@@ -581,11 +684,299 @@ fn restart_recovers_effect_and_observation_requires_exact_evidence() {
         .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
         .unwrap();
     assert_eq!(observed.state, EffectState::Observed);
-    assert_eq!(observed.observation_key.as_deref(), Some("observation.one"));
+    assert_eq!(observed.observed_stage, Some(ObservedStage::HostAccepted));
+    assert_eq!(
+        observed.observation_event_sequence,
+        Some(event_ref.cursor.sequence)
+    );
+    assert_eq!(
+        observed.observation_key.as_deref(),
+        Some("host-receipt.one")
+    );
     assert_eq!(
         observed.observation_payload.as_deref(),
-        Some(b"provider-ack".as_slice())
+        Some(b"host-ack".as_slice())
     );
+    let replay = recovered
+        .events_after("scope.fixture", &before.cursor, 10)
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].event_id, event_ref.event_id);
+    assert_eq!(replay[0].cursor, event_ref.cursor);
+    assert_eq!(replay[0].kind, "effect.host_accepted");
+    assert_eq!(replay[0].source_kind, "host");
+    assert_eq!(replay[0].provenance, "authenticated.host.acceptance");
+    assert_eq!(replay[0].source_order, SourceOrder::Contiguous);
+    assert!(!String::from_utf8_lossy(&replay[0].payload).contains("host-ack"));
+    let snapshot = recovered.scope_snapshot("scope.fixture").unwrap();
+    assert_eq!(snapshot.cursor, event_ref.cursor);
+    assert_eq!(
+        snapshot.effects[0].observed_stage,
+        Some(ObservedStage::HostAccepted)
+    );
+    assert_eq!(
+        recovered
+            .quarantined_events("scope.fixture", 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(recovered);
+    let mut reopened_again = fixture.open();
+    assert_eq!(
+        reopened_again
+            .observe_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                "claim.observe",
+                &proof,
+            )
+            .unwrap(),
+        EffectObservation::AlreadyObserved(event_ref)
+    );
+}
+
+#[test]
+fn source_conflict_quarantines_without_settling_and_gap_is_replayed() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let mut receipts = Vec::new();
+    for index in 0..3 {
+        let receipt = match store
+            .admit(&request(
+                "scope.fixture",
+                &format!("request.source.{index}"),
+                b"source",
+            ))
+            .unwrap()
+        {
+            Admission::Committed(receipt) => receipt,
+            other => panic!("expected commit: {other:?}"),
+        };
+        store
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                &format!("claim.source.{index}"),
+            )
+            .unwrap();
+        receipts.push(receipt);
+    }
+    let first = store
+        .observe_effect(
+            receipts[0].outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.source.0",
+            &host_proof(1, "host-receipt.source0", b"ack-zero"),
+        )
+        .unwrap();
+    let first_ref = match first {
+        EffectObservation::NewObservation(reference) => reference,
+        other => panic!("expected new observation: {other:?}"),
+    };
+    let before_conflict = store.scope_snapshot("scope.fixture").unwrap().cursor;
+    assert!(matches!(
+        store.observe_effect(
+            receipts[1].outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.source.1",
+            &host_proof(1, "host-receipt.source1", b"ack-one"),
+        ),
+        Err(StoreError::SourceIdentityQuarantined)
+    ));
+    assert_eq!(
+        store.effect_state(receipts[1].outbox_id).unwrap(),
+        EffectState::ClaimedUncertain
+    );
+    assert_eq!(
+        store.scope_snapshot("scope.fixture").unwrap().cursor,
+        before_conflict
+    );
+    let quarantined = store.quarantined_events("scope.fixture", 0, 10).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].existing_event_id, first_ref.event_id);
+    assert_eq!(quarantined[0].source_sequence, 1);
+    assert_eq!(quarantined[0].incoming_evidence, b"ack-one");
+
+    let gap = store
+        .observe_effect(
+            receipts[1].outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.source.1",
+            &host_proof(3, "host-receipt.source1", b"ack-one"),
+        )
+        .unwrap();
+    let gap_ref = match gap {
+        EffectObservation::NewObservation(reference) => reference,
+        other => panic!("expected new gap observation: {other:?}"),
+    };
+    let replay = store
+        .events_after("scope.fixture", &before_conflict, 10)
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].event_id, gap_ref.event_id);
+    assert_eq!(replay[0].source_sequence, 3);
+    assert_eq!(
+        replay[0].source_order,
+        SourceOrder::Gap { expected_next: 2 }
+    );
+    assert_eq!(
+        store
+            .scope_snapshot("scope.fixture")
+            .unwrap()
+            .source_anomalies
+            .len(),
+        1
+    );
+
+    store
+        .observe_effect(
+            receipts[2].outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.source.2",
+            &host_proof(2, "host-receipt.source2", b"ack-two"),
+        )
+        .unwrap();
+    let snapshot = store.scope_snapshot("scope.fixture").unwrap();
+    assert_eq!(snapshot.source_anomalies.len(), 2);
+    assert_eq!(
+        snapshot.source_anomalies[1].order,
+        SourceOrder::OutOfOrder { highest_seen: 3 }
+    );
+    drop(store);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .scope_snapshot("scope.fixture")
+            .unwrap()
+            .source_anomalies,
+        snapshot.source_anomalies
+    );
+}
+
+#[test]
+fn host_proof_refuses_unsequenced_or_malformed_evidence() {
+    assert!(matches!(
+        HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            0,
+            1,
+            "host-receipt.invalid",
+            b"ack",
+            None,
+            "correlation.fixture",
+            None,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            1,
+            0,
+            "host-receipt.invalid",
+            b"ack",
+            None,
+            "correlation.fixture",
+            None,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            1,
+            i64::MAX as u64,
+            "host-receipt.invalid",
+            b"ack",
+            None,
+            "correlation.fixture",
+            None,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            1,
+            1,
+            "host-receipt.invalid",
+            b"ack",
+            Some("not-a-valid-T-timeZ"),
+            "correlation.fixture",
+            None,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
+    for invalid_time in [
+        "2026-13-03T12:00:00Z",
+        "2026-10-32T12:00:00Z",
+        "2026-10-03T25:00:00Z",
+        "2026-10-03T12:00:00.Z",
+        "2026-10-03T12:00:00.12xZ",
+        "2026-10-03T12:00:00.1234567890Z",
+        "2025-02-29T12:00:00Z",
+        "1900-02-29T12:00:00Z",
+    ] {
+        assert!(matches!(
+            HostAcceptanceProof::from_authenticated_host_boundary(
+                "host.fixture",
+                1,
+                1,
+                "host-receipt.invalid",
+                b"ack",
+                Some(invalid_time),
+                "correlation.fixture",
+                None,
+            ),
+            Err(StoreError::InvalidInput(_))
+        ));
+    }
+    for valid_time in ["2024-02-29T12:00:00Z", "2000-02-29T23:59:60.123456789Z"] {
+        assert!(HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            1,
+            1,
+            "host-receipt.valid",
+            b"ack",
+            Some(valid_time),
+            "correlation.fixture",
+            None,
+        )
+        .is_ok());
+    }
+    assert!(matches!(
+        HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.fixture",
+            1,
+            1,
+            "host-receipt.invalid",
+            b"",
+            None,
+            "correlation.fixture",
+            None,
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
 }
 
 #[test]
@@ -787,6 +1178,19 @@ fn schema_one_open_migrates_without_changing_original_receipt() {
                kind,payload,state,claim_key,claim_owner_epoch FROM outbox;
              DROP TABLE outbox;
              ALTER TABLE outbox_legacy RENAME TO outbox;
+             CREATE TABLE events_legacy (
+               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
+               scope_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL,
+               target_epoch INTEGER NOT NULL, kind TEXT NOT NULL, payload BLOB NOT NULL
+             ) STRICT;
+             INSERT INTO events_legacy(sequence,command_rowid,scope_id,owner_epoch,
+               target_epoch,kind,payload)
+             SELECT sequence,command_rowid,scope_id,owner_epoch,target_epoch,kind,payload
+               FROM events;
+             DROP TABLE events;
+             ALTER TABLE events_legacy RENAME TO events;
+             CREATE INDEX events_scope_sequence ON events(scope_id,sequence);
              DROP TABLE store_identity;
              PRAGMA user_version=1;
              COMMIT;",
@@ -809,4 +1213,122 @@ fn schema_one_open_migrates_without_changing_original_receipt() {
         migrated.scope_snapshot("scope.fixture").unwrap().receipts,
         vec![receipt]
     );
+}
+
+#[test]
+fn schema_two_migration_preserves_lineage_cursor_and_legacy_evidence_stage() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let input = request("scope.fixture", "request.schema-two", b"schema-two");
+    let receipt = match store.admit(&input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    let original_cursor = store.scope_snapshot("scope.fixture").unwrap().cursor;
+    store
+        .claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.schema-two",
+        )
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE outbox_v2 (
+               outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
+               scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
+               owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
+               kind TEXT NOT NULL, payload BLOB NOT NULL,
+               state TEXT NOT NULL CHECK(state IN ('prepared','claimed_uncertain','observed')),
+               claim_key TEXT, claim_owner_epoch INTEGER,
+               observation_key TEXT, observation_payload BLOB
+             ) STRICT;
+             INSERT INTO outbox_v2(outbox_id,command_rowid,scope_id,target_id,
+               owner_epoch,target_epoch,kind,payload,state,claim_key,claim_owner_epoch,
+               observation_key,observation_payload)
+             SELECT outbox_id,command_rowid,scope_id,target_id,owner_epoch,target_epoch,
+               kind,payload,'observed',claim_key,claim_owner_epoch,
+               'legacy.evidence',X'01' FROM outbox;
+             DROP TABLE outbox;
+             ALTER TABLE outbox_v2 RENAME TO outbox;
+             CREATE TABLE events_v2 (
+               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
+               scope_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL,
+               target_epoch INTEGER NOT NULL, kind TEXT NOT NULL, payload BLOB NOT NULL
+             ) STRICT;
+             INSERT INTO events_v2(sequence,command_rowid,scope_id,owner_epoch,
+               target_epoch,kind,payload)
+             SELECT sequence,command_rowid,scope_id,owner_epoch,target_epoch,kind,payload
+               FROM events;
+             DROP TABLE events;
+             ALTER TABLE events_v2 RENAME TO events;
+             CREATE INDEX events_scope_sequence ON events(scope_id,sequence);
+             PRAGMA user_version=2;
+             COMMIT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut migrated = fixture.open();
+    assert_eq!(
+        migrated.admit(&input).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
+    assert_eq!(
+        migrated.scope_snapshot("scope.fixture").unwrap().cursor,
+        original_cursor
+    );
+    assert_eq!(
+        migrated
+            .events_after("scope.fixture", &original_cursor, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    let effect = migrated
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    assert_eq!(effect.state, EffectState::Observed);
+    assert_eq!(effect.observed_stage, Some(ObservedStage::LegacyUnverified));
+    assert_eq!(effect.observation_event_sequence, None);
+    assert!(matches!(
+        migrated.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.schema-two",
+            &host_proof(1, "host-receipt.schema-two", b"host-ack"),
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+    let next = match migrated
+        .admit(&request(
+            "scope.fixture",
+            "request.after-schema-two",
+            b"after",
+        ))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected post-migration commit: {other:?}"),
+    };
+    assert!(next.event_sequence > original_cursor.sequence);
+    let replay = migrated
+        .events_after("scope.fixture", &original_cursor, 10)
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].sequence, next.event_sequence);
 }

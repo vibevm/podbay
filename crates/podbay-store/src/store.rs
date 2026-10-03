@@ -6,10 +6,11 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{
     Admission, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
-    EventCursor, Receipt, ScopeSnapshot, StoreError, StoredEffect, DIGEST_VERSION,
+    EventCursor, EventReference, HostAcceptanceProof, ObservedStage, QuarantinedSourceEvent,
+    Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -58,8 +59,8 @@ impl PodBayStore {
                event_sequence INTEGER, outbox_id INTEGER,
                UNIQUE(principal,namespace,command_key)
              ) STRICT;
-             -- PB04 has exactly one admission event per command. PB07 will extend
-             -- this ledger for independent provider and resource observations.
+             -- Versions one and two have exactly one admission event per command.
+             -- The schema-three migration below expands this journal.
              CREATE TABLE IF NOT EXISTS events (
                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
@@ -90,6 +91,63 @@ impl PodBayStore {
                  ALTER TABLE outbox ADD COLUMN observation_payload BLOB;",
             )?;
         }
+        if version < 3 {
+            transaction.execute_batch(
+                "CREATE TABLE events_v3 (
+                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                   event_id TEXT NOT NULL UNIQUE,
+                   schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+                   command_rowid INTEGER NOT NULL REFERENCES commands(command_rowid),
+                   scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                   owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
+                   source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
+                   source_epoch INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+                   source_digest TEXT NOT NULL,
+                   source_order TEXT NOT NULL CHECK(source_order IN
+                     ('contiguous','gap','out_of_order')),
+                   source_order_reference INTEGER,
+                   kind TEXT NOT NULL, payload BLOB NOT NULL,
+                   recorded_at TEXT NOT NULL, occurred_at TEXT,
+                   provenance TEXT NOT NULL, correlation_id TEXT, causation_id TEXT,
+                   UNIQUE(scope_id,source_id,source_epoch,source_sequence)
+                 ) STRICT;
+                 INSERT INTO events_v3(
+                   sequence,event_id,schema_version,command_rowid,scope_id,target_id,
+                   owner_epoch,target_epoch,source_id,source_kind,source_epoch,
+                   source_sequence,source_digest,source_order,kind,payload,recorded_at,
+                   provenance)
+                 SELECT e.sequence,
+                   'event.pb07.legacy.' || (SELECT lineage FROM store_identity WHERE singleton=1)
+                     || '.' || e.sequence,
+                   1,e.command_rowid,e.scope_id,c.target_id,e.owner_epoch,e.target_epoch,
+                   c.command_id,'manager.admission',e.owner_epoch,1,c.request_digest,
+                   'contiguous',e.kind,e.payload,
+                   strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                   'legacy.admission.recorded_time_unavailable'
+                 FROM events e JOIN commands c ON c.command_rowid=e.command_rowid;
+                 DROP TABLE events;
+                 ALTER TABLE events_v3 RENAME TO events;
+                 CREATE INDEX events_scope_sequence ON events(scope_id,sequence);
+                 ALTER TABLE outbox ADD COLUMN observation_stage TEXT;
+                 ALTER TABLE outbox ADD COLUMN observation_event_sequence INTEGER
+                   REFERENCES events(sequence);
+                 UPDATE outbox SET observation_stage='legacy_unverified'
+                   WHERE state='observed';",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS event_quarantine (
+               quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               scope_id TEXT NOT NULL, source_id TEXT NOT NULL,
+               source_epoch INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+               existing_event_id TEXT NOT NULL, incoming_digest TEXT NOT NULL,
+               incoming_payload BLOB NOT NULL, incoming_evidence BLOB NOT NULL,
+               recorded_at TEXT NOT NULL,
+               UNIQUE(scope_id,source_id,source_epoch,source_sequence,incoming_digest)
+             ) STRICT;
+             CREATE INDEX IF NOT EXISTS quarantine_scope_id
+               ON event_quarantine(scope_id,quarantine_id);",
+        )?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -281,13 +339,23 @@ impl PodBayStore {
         )?;
         let command_rowid = transaction.last_insert_rowid();
         transaction.execute(
-            "INSERT INTO events(command_rowid,scope_id,owner_epoch,target_epoch,kind,payload)
-             VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO events(
+               event_id,schema_version,command_rowid,scope_id,target_id,
+               owner_epoch,target_epoch,source_id,source_kind,source_epoch,
+               source_sequence,source_digest,source_order,kind,payload,recorded_at,
+               provenance,causation_id)
+             VALUES('event.pb07.' || lower(hex(randomblob(16))),1,?1,?2,?3,
+                    ?4,?5,?6,'manager.admission',?4,1,?7,'contiguous',?8,?9,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'authenticated.manager.admission',?6)",
             params![
                 command_rowid,
                 request.scope_id,
+                request.target_id,
                 owner_epoch,
                 target_epoch,
+                command_id,
+                digest,
                 request.event_kind,
                 request.event_payload
             ],
@@ -422,7 +490,8 @@ impl PodBayStore {
             .query_row(
                 "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
                         o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
-                        o.claim_owner_epoch,o.observation_key,o.observation_payload
+                        o.claim_owner_epoch,o.observation_key,o.observation_payload,
+                        o.observation_stage,o.observation_event_sequence
                  FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
                  WHERE o.outbox_id=?1",
                 [outbox_id],
@@ -453,7 +522,8 @@ impl PodBayStore {
         let mut statement = self.connection.prepare(
             "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
                     o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
-                    o.claim_owner_epoch,o.observation_key,o.observation_payload
+                    o.claim_owner_epoch,o.observation_key,o.observation_payload,
+                    o.observation_stage,o.observation_event_sequence
              FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
              WHERE o.scope_id=?1 AND o.outbox_id>?2 AND o.state!='observed'
              ORDER BY o.outbox_id LIMIT ?3",
@@ -466,8 +536,8 @@ impl PodBayStore {
             .map_err(StoreError::from)
     }
 
-    /// Records an authenticated observation after a previously committed claim.
-    /// The manager must verify the external evidence before calling this method.
+    /// Records host acceptance, never provider insertion or task completion.
+    /// The authenticated host boundary must validate the proof before construction.
     pub fn observe_effect(
         &mut self,
         outbox_id: i64,
@@ -476,44 +546,45 @@ impl PodBayStore {
         expected_owner_epoch: u64,
         expected_target_epoch: u64,
         claim_key: &str,
-        observation_key: &str,
-        evidence: &[u8],
+        proof: &HostAcceptanceProof,
     ) -> Result<EffectObservation, StoreError> {
         valid_id(scope_id)?;
         valid_id(target_id)?;
         valid_id(claim_key)?;
-        valid_id(observation_key)?;
-        if evidence.is_empty() || evidence.len() > MAX_BYTES {
-            return Err(StoreError::InvalidInput(
-                "observation evidence size is invalid",
-            ));
-        }
         let owner_epoch = integer(expected_owner_epoch)?;
         let target_epoch = integer(expected_target_epoch)?;
+        let source_epoch = integer(proof.source_epoch)?;
+        let source_sequence = integer(proof.source_sequence)?;
+        let source_digest = digest_host_proof(outbox_id, scope_id, target_id, claim_key, proof);
+        let public_payload = host_event_payload(proof);
+        let store_lineage = self.store_lineage.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
-                "SELECT scope_id,target_id,kind,state,claim_key,
-                        observation_key,observation_payload
-                 FROM outbox WHERE outbox_id=?1",
+                "SELECT command_rowid,scope_id,target_id,kind,state,claim_key,
+                        observation_key,observation_payload,observation_stage,
+                        observation_event_sequence FROM outbox WHERE outbox_id=?1",
                 [outbox_id],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 },
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        if row.0 != scope_id || row.1 != target_id {
+        if row.1 != scope_id || row.2 != target_id {
             return Err(StoreError::WrongScope);
         }
         if current_owner(&transaction)? != owner_epoch
@@ -521,31 +592,182 @@ impl PodBayStore {
         {
             return Err(StoreError::StaleEpoch);
         }
-        if !supported_effect_kind(&row.2) {
+        if !supported_effect_kind(&row.3) {
             return Err(StoreError::UnsupportedEffectKind);
         }
-        if row.4.as_deref() != Some(claim_key) {
+        if row.5.as_deref() != Some(claim_key) {
             return Err(StoreError::Conflict("effect claim identity changed"));
         }
-        let result = match row.3.as_str() {
-            "claimed_uncertain" => {
+        let existing: Option<(String, i64, String)> = transaction
+            .query_row(
+                "SELECT event_id,sequence,source_digest FROM events
+                 WHERE scope_id=?1 AND source_id=?2 AND source_epoch=?3
+                   AND source_sequence=?4",
+                params![scope_id, proof.source_id, source_epoch, source_sequence],
+                |event| Ok((event.get(0)?, event.get(1)?, event.get(2)?)),
+            )
+            .optional()?;
+        if let Some((event_id, event_sequence, prior_digest)) = existing {
+            if prior_digest != source_digest {
                 transaction.execute(
-                    "UPDATE outbox SET state='observed',observation_key=?1,
-                     observation_payload=?2 WHERE outbox_id=?3 AND state='claimed_uncertain'",
-                    params![observation_key, evidence, outbox_id],
+                    "INSERT OR IGNORE INTO event_quarantine(
+                       scope_id,source_id,source_epoch,source_sequence,
+                       existing_event_id,incoming_digest,incoming_payload,
+                       incoming_evidence,recorded_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,
+                       strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    params![
+                        scope_id,
+                        proof.source_id,
+                        source_epoch,
+                        source_sequence,
+                        event_id,
+                        source_digest,
+                        public_payload,
+                        proof.evidence,
+                    ],
                 )?;
-                EffectObservation::NewObservation
+                transaction.commit()?;
+                return Err(StoreError::SourceIdentityQuarantined);
             }
-            "observed"
-                if row.5.as_deref() == Some(observation_key)
-                    && row.6.as_deref() == Some(evidence) =>
+            if row.4 != "observed"
+                || row.6.as_deref() != Some(proof.host_receipt_id.as_str())
+                || row.7.as_deref() != Some(proof.evidence.as_slice())
+                || row.8.as_deref() != Some("host_accepted")
+                || row.9 != Some(event_sequence)
             {
-                EffectObservation::AlreadyObserved
+                return Err(StoreError::Conflict(
+                    "source identity belongs to another effect",
+                ));
             }
-            _ => return Err(StoreError::Conflict("effect observation identity changed")),
+            transaction.commit()?;
+            return Ok(EffectObservation::AlreadyObserved(EventReference {
+                event_id,
+                cursor: EventCursor {
+                    store_lineage,
+                    scope_id: scope_id.to_owned(),
+                    sequence: event_sequence,
+                },
+            }));
+        }
+        if row.4 != "claimed_uncertain" {
+            return Err(StoreError::Conflict("effect observation identity changed"));
+        }
+        let highest_seen: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(source_sequence),0) FROM events
+             WHERE scope_id=?1 AND source_id=?2 AND source_epoch=?3",
+            params![scope_id, proof.source_id, source_epoch],
+            |event| event.get(0),
+        )?;
+        let (source_order, order_reference) = if source_sequence == highest_seen + 1 {
+            ("contiguous", None)
+        } else if source_sequence > highest_seen + 1 {
+            ("gap", Some(highest_seen + 1))
+        } else {
+            ("out_of_order", Some(highest_seen))
         };
+        transaction.execute(
+            "INSERT INTO events(
+               event_id,schema_version,command_rowid,scope_id,target_id,
+               owner_epoch,target_epoch,source_id,source_kind,source_epoch,
+               source_sequence,source_digest,source_order,source_order_reference,
+               kind,payload,recorded_at,occurred_at,provenance,correlation_id,
+               causation_id)
+             VALUES('event.pb07.' || lower(hex(randomblob(16))),1,?1,?2,?3,
+                    ?4,?5,?6,'host',?7,?8,?9,?10,?11,
+                    'effect.host_accepted',?12,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),?13,
+                    'authenticated.host.acceptance',?14,?15)",
+            params![
+                row.0,
+                scope_id,
+                target_id,
+                owner_epoch,
+                target_epoch,
+                proof.source_id,
+                source_epoch,
+                source_sequence,
+                source_digest,
+                source_order,
+                order_reference,
+                public_payload,
+                proof.occurred_at,
+                proof.correlation_id,
+                proof.causation_id,
+            ],
+        )?;
+        let event_sequence = transaction.last_insert_rowid();
+        let event_id: String = transaction.query_row(
+            "SELECT event_id FROM events WHERE sequence=?1",
+            [event_sequence],
+            |event| event.get(0),
+        )?;
+        let changed = transaction.execute(
+            "UPDATE outbox SET state='observed',observation_key=?1,
+             observation_payload=?2,observation_stage='host_accepted',
+             observation_event_sequence=?3
+             WHERE outbox_id=?4 AND state='claimed_uncertain'",
+            params![
+                proof.host_receipt_id,
+                proof.evidence,
+                event_sequence,
+                outbox_id
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "effect changed while recording observation",
+            ));
+        }
         transaction.commit()?;
-        Ok(result)
+        Ok(EffectObservation::NewObservation(EventReference {
+            event_id,
+            cursor: EventCursor {
+                store_lineage,
+                scope_id: scope_id.to_owned(),
+                sequence: event_sequence,
+            },
+        }))
+    }
+
+    pub fn quarantined_events(
+        &self,
+        scope_id: &str,
+        after_quarantine_id: i64,
+        limit: usize,
+    ) -> Result<Vec<QuarantinedSourceEvent>, StoreError> {
+        valid_id(scope_id)?;
+        if after_quarantine_id < 0 || !(1..=512).contains(&limit) {
+            return Err(StoreError::InvalidInput(
+                "quarantine cursor or limit is invalid",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT quarantine_id,scope_id,source_id,source_epoch,source_sequence,
+                    existing_event_id,incoming_digest,incoming_payload,incoming_evidence,
+                    recorded_at
+             FROM event_quarantine WHERE scope_id=?1 AND quarantine_id>?2
+             ORDER BY quarantine_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![scope_id, after_quarantine_id, limit as i64],
+            |row| {
+                Ok(QuarantinedSourceEvent {
+                    quarantine_id: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    source_epoch: row.get::<_, i64>(3)? as u64,
+                    source_sequence: row.get::<_, i64>(4)? as u64,
+                    existing_event_id: row.get(5)?,
+                    incoming_digest: row.get(6)?,
+                    incoming_payload: row.get(7)?,
+                    incoming_evidence: row.get(8)?,
+                    recorded_at: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Snapshot and cursor are read from one SQLite transaction; events after cursor cannot vanish.
@@ -586,6 +808,40 @@ impl PodBayStore {
             })
             .collect::<Result<Vec<_>, StoreError>>()?
         };
+        let effects = {
+            let mut statement = transaction.prepare(
+                "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
+                        o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
+                        o.claim_owner_epoch,o.observation_key,o.observation_payload,
+                        o.observation_stage,o.observation_event_sequence
+                 FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+                 WHERE o.scope_id=?1 ORDER BY o.outbox_id",
+            )?;
+            statement
+                .query_map([scope_id], stored_effect_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let source_anomalies = {
+            let mut statement = transaction.prepare(
+                "SELECT event_id,source_id,source_epoch,source_sequence,
+                        source_order,source_order_reference
+                 FROM events WHERE scope_id=?1 AND source_order!='contiguous'
+                 ORDER BY sequence",
+            )?;
+            statement
+                .query_map([scope_id], |row| {
+                    let order: String = row.get(4)?;
+                    let reference: Option<i64> = row.get(5)?;
+                    Ok(SourceAnomaly {
+                        event_id: row.get(0)?,
+                        source_id: row.get(1)?,
+                        source_epoch: row.get::<_, i64>(2)? as u64,
+                        source_sequence: row.get::<_, i64>(3)? as u64,
+                        order: source_order_from_row(&order, reference)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         transaction.commit()?;
         Ok(ScopeSnapshot {
             cursor: EventCursor {
@@ -594,6 +850,8 @@ impl PodBayStore {
                 sequence: cursor,
             },
             receipts,
+            effects,
+            source_anomalies,
         })
     }
 
@@ -630,17 +888,16 @@ impl PodBayStore {
             return Err(StoreError::WrongCursor);
         }
         let mut statement = self.connection.prepare(
-            "SELECT e.sequence,c.command_id,e.kind,e.payload FROM events e
+            "SELECT e.sequence,e.event_id,e.schema_version,c.command_id,e.target_id,
+                    e.source_id,e.source_kind,e.source_epoch,e.source_sequence,
+                    e.source_order,e.source_order_reference,e.recorded_at,e.occurred_at,
+                    e.provenance,e.correlation_id,e.causation_id,e.kind,e.payload
+             FROM events e
              JOIN commands c ON c.command_rowid=e.command_rowid
              WHERE e.scope_id=?1 AND e.sequence>?2 ORDER BY e.sequence LIMIT ?3",
         )?;
         let rows = statement.query_map(params![scope_id, after.sequence, limit as i64], |row| {
-            Ok(CommittedEvent {
-                sequence: row.get(0)?,
-                command_id: row.get(1)?,
-                kind: row.get(2)?,
-                payload: row.get(3)?,
-            })
+            committed_event_from_row(row, &self.store_lineage, scope_id)
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
@@ -734,6 +991,12 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
         "observed" => EffectState::Observed,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
+    let observed_stage = match row.get::<_, Option<String>>(13)?.as_deref() {
+        Some("host_accepted") => Some(ObservedStage::HostAccepted),
+        Some("legacy_unverified") => Some(ObservedStage::LegacyUnverified),
+        None => None,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
     Ok(StoredEffect {
         outbox_id: row.get(0)?,
         command_id: row.get(1)?,
@@ -748,7 +1011,105 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
         claim_owner_epoch: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
         observation_key: row.get(11)?,
         observation_payload: row.get(12)?,
+        observed_stage,
+        observation_event_sequence: row.get(14)?,
     })
+}
+
+fn source_order_from_row(value: &str, reference: Option<i64>) -> rusqlite::Result<SourceOrder> {
+    match (value, reference) {
+        ("contiguous", None) => Ok(SourceOrder::Contiguous),
+        ("gap", Some(expected_next)) if expected_next >= 1 => Ok(SourceOrder::Gap {
+            expected_next: expected_next as u64,
+        }),
+        ("out_of_order", Some(highest_seen)) if highest_seen >= 1 => Ok(SourceOrder::OutOfOrder {
+            highest_seen: highest_seen as u64,
+        }),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn committed_event_from_row(
+    row: &rusqlite::Row<'_>,
+    store_lineage: &str,
+    scope_id: &str,
+) -> rusqlite::Result<CommittedEvent> {
+    let sequence: i64 = row.get(0)?;
+    let order: String = row.get(9)?;
+    let reference: Option<i64> = row.get(10)?;
+    Ok(CommittedEvent {
+        sequence,
+        event_id: row.get(1)?,
+        cursor: EventCursor {
+            store_lineage: store_lineage.to_owned(),
+            scope_id: scope_id.to_owned(),
+            sequence,
+        },
+        schema_version: row.get::<_, i64>(2)? as u32,
+        command_id: row.get(3)?,
+        target_id: row.get(4)?,
+        source_id: row.get(5)?,
+        source_kind: row.get(6)?,
+        source_epoch: row.get::<_, i64>(7)? as u64,
+        source_sequence: row.get::<_, i64>(8)? as u64,
+        source_order: source_order_from_row(&order, reference)?,
+        recorded_at: row.get(11)?,
+        occurred_at: row.get(12)?,
+        provenance: row.get(13)?,
+        correlation_id: row.get(14)?,
+        causation_id: row.get(15)?,
+        kind: row.get(16)?,
+        payload: row.get(17)?,
+    })
+}
+
+fn digest_host_proof(
+    outbox_id: i64,
+    scope_id: &str,
+    target_id: &str,
+    claim_key: &str,
+    proof: &HostAcceptanceProof,
+) -> String {
+    let mut digest = Sha256::new();
+    let outbox_bytes = outbox_id.to_be_bytes();
+    let source_epoch_bytes = proof.source_epoch.to_be_bytes();
+    let source_sequence_bytes = proof.source_sequence.to_be_bytes();
+    for field in [
+        b"podbay-host-acceptance/1".as_slice(),
+        outbox_bytes.as_slice(),
+        scope_id.as_bytes(),
+        target_id.as_bytes(),
+        claim_key.as_bytes(),
+        proof.source_id.as_bytes(),
+        source_epoch_bytes.as_slice(),
+        source_sequence_bytes.as_slice(),
+        proof.host_receipt_id.as_bytes(),
+        proof.evidence.as_slice(),
+        proof.occurred_at.as_deref().unwrap_or("").as_bytes(),
+        proof.correlation_id.as_bytes(),
+        proof.causation_id.as_deref().unwrap_or("").as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn host_event_payload(proof: &HostAcceptanceProof) -> Vec<u8> {
+    let evidence_digest = Sha256::digest(&proof.evidence)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{{\"kind\":\"delivery_changed\",\"observedStage\":\"host_accepted\",\
+         \"hostReceiptId\":\"{}\",\"evidenceDigest\":\"{}\"}}",
+        proof.host_receipt_id, evidence_digest
+    )
+    .into_bytes()
 }
 
 fn digest_request(request: &CommandRequest) -> String {
