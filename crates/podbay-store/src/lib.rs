@@ -4,6 +4,7 @@
 mod authority;
 mod bound_launch;
 mod launch;
+mod manager_peer;
 mod model;
 mod peer_witness;
 mod rebind;
@@ -13,6 +14,7 @@ pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
     BoundLaunchResource,
 };
+pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,

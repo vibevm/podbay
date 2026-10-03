@@ -348,7 +348,8 @@ fn v8_to_v9_migration_preserves_existing_launch_without_inventing_rebind() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE manager_credential_claims;
+            "DROP TABLE manager_peer_bindings;
+      DROP TABLE manager_credential_claims;
       DROP TABLE manager_rebind_resources;
       DROP TABLE manager_rebinds; PRAGMA user_version=8;",
         )
@@ -382,7 +383,7 @@ fn first_v10_manager_claim_stays_above_v9_pod_rebind_credential_highwater() {
     // manager claim. The old rebind remains evidence, not a manager identity.
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
+        .execute_batch("DROP TABLE manager_peer_bindings; DROP TABLE manager_credential_claims; PRAGMA user_version=9;")
         .unwrap();
     drop(connection);
     let mut migrated = fixture.open();
@@ -403,7 +404,8 @@ fn malformed_preexisting_v9_schema_refuses_migration_atomically() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE manager_credential_claims;
+            "DROP TABLE manager_peer_bindings;
+      DROP TABLE manager_credential_claims;
       DROP TABLE manager_rebind_resources;
       DROP TABLE manager_rebinds;
       CREATE TABLE manager_rebinds(rebind_rowid INTEGER PRIMARY KEY) STRICT;

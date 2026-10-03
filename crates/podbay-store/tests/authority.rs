@@ -333,6 +333,7 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE manager_peer_bindings;
              DROP TABLE manager_credential_claims;
              DROP TABLE manager_rebind_resources;
              DROP TABLE manager_rebinds;

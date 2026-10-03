@@ -14,7 +14,7 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -126,6 +126,21 @@ const MANAGER_CREDENTIAL_CLAIMS_V10: &str = "CREATE TABLE manager_credential_cla
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
   owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
   credential_epoch INTEGER NOT NULL CHECK(credential_epoch>=1)
+) STRICT";
+
+// Only the trusted host may register a kernel-attested peer after the v10
+// owner claim. Migration creates no peer for a historical manager.
+const MANAGER_PEER_BINDINGS_V11: &str = "CREATE TABLE manager_peer_bindings (
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  credential_epoch INTEGER NOT NULL CHECK(credential_epoch>=1),
+  peer_schema TEXT NOT NULL CHECK(peer_schema='podbay.attested-peer/1'),
+  os_identity TEXT NOT NULL CHECK(length(os_identity) BETWEEN 1 AND 256),
+  process_identity TEXT NOT NULL CHECK(length(process_identity) BETWEEN 1 AND 256),
+  boot_identity TEXT NOT NULL CHECK(length(boot_identity) BETWEEN 1 AND 256),
+  birth_identity TEXT NOT NULL CHECK(length(birth_identity) BETWEEN 1 AND 256),
+  containment_identity TEXT NOT NULL CHECK(length(containment_identity) BETWEEN 1 AND 4096),
+  PRIMARY KEY(store_lineage,owner_epoch,credential_epoch)
 ) STRICT";
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
@@ -459,10 +474,24 @@ impl PodBayStore {
             }
             transaction.execute_batch(&format!("{MANAGER_CREDENTIAL_CLAIMS_V10};"))?;
         }
+        if version < 11 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_peer_bindings'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v11 manager peer schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{MANAGER_PEER_BINDINGS_V11};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
+        verify_manager_peer_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -1924,6 +1953,20 @@ fn verify_manager_credential_schema(
         return Err(StoreError::Conflict(
             "v10 manager credential schema differs",
         ));
+    }
+    Ok(())
+}
+
+fn verify_manager_peer_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='manager_peer_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(MANAGER_PEER_BINDINGS_V11) {
+        return Err(StoreError::Conflict("v11 manager peer schema differs"));
     }
     Ok(())
 }
