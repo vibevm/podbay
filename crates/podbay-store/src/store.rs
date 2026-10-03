@@ -1,20 +1,21 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    Admission, CommandRequest, CommittedEvent, DIGEST_VERSION, EffectClaim, EffectState, Receipt,
-    ScopeSnapshot, StoreError,
+    Admission, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
+    EventCursor, Receipt, ScopeSnapshot, StoreError, StoredEffect, DIGEST_VERSION,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_BYTES: usize = 1_048_576;
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
     connection: Connection,
+    store_lineage: String,
 }
 
 impl PodBayStore {
@@ -31,11 +32,11 @@ impl PodBayStore {
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 0 && version != SCHEMA_VERSION {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (
                key TEXT PRIMARY KEY, value INTEGER NOT NULL CHECK(value >= 0)
@@ -76,10 +77,30 @@ impl PodBayStore {
                claim_key TEXT,
                claim_owner_epoch INTEGER
              ) STRICT;
-             PRAGMA user_version=1;",
+             CREATE TABLE IF NOT EXISTS store_identity (
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               lineage TEXT NOT NULL UNIQUE
+             ) STRICT;
+             INSERT OR IGNORE INTO store_identity(singleton,lineage)
+               VALUES(1,lower(hex(randomblob(16))));",
         )?;
+        if version < 2 {
+            transaction.execute_batch(
+                "ALTER TABLE outbox ADD COLUMN observation_key TEXT;
+                 ALTER TABLE outbox ADD COLUMN observation_payload BLOB;",
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
-        Ok(Self { connection })
+        let store_lineage: String = connection.query_row(
+            "SELECT lineage FROM store_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Self {
+            connection,
+            store_lineage,
+        })
     }
 
     pub fn owner_epoch(&self) -> Result<u64, StoreError> {
@@ -222,6 +243,9 @@ impl PodBayStore {
                 request_digest: digest,
             }));
         }
+        if !supported_effect_kind(&request.effect_kind) {
+            return Err(StoreError::UnsupportedEffectKind);
+        }
         let actual_owner: i64 = transaction.query_row(
             "SELECT value FROM metadata WHERE key='owner_epoch'",
             [],
@@ -317,7 +341,7 @@ impl PodBayStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
-                "SELECT scope_id,target_id,owner_epoch,target_epoch,state,claim_key
+                "SELECT scope_id,target_id,target_epoch,state,claim_key,kind
                  FROM outbox WHERE outbox_id=?1",
                 [outbox_id],
                 |row| {
@@ -325,9 +349,9 @@ impl PodBayStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -336,15 +360,19 @@ impl PodBayStore {
         if row.0 != scope_id || row.1 != target_id {
             return Err(StoreError::WrongScope);
         }
-        if row.2 != owner_epoch
-            || row.3 != target_epoch
-            || current_owner(&transaction)? != owner_epoch
+        if current_owner(&transaction)? != owner_epoch
             || current_target(&transaction, scope_id, target_id)? != target_epoch
         {
             return Err(StoreError::StaleEpoch);
         }
-        let result = match row.4.as_str() {
+        if !supported_effect_kind(&row.5) {
+            return Err(StoreError::UnsupportedEffectKind);
+        }
+        let result = match row.3.as_str() {
             "prepared" => {
+                if row.2 != target_epoch {
+                    return Err(StoreError::TargetReconciliationRequired);
+                }
                 transaction.execute(
                     "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,
                      claim_owner_epoch=?2 WHERE outbox_id=?3 AND state='prepared'",
@@ -352,10 +380,10 @@ impl PodBayStore {
                 )?;
                 EffectClaim::NewClaim
             }
-            "claimed_uncertain" if row.5.as_deref() == Some(claim_key) => {
+            "claimed_uncertain" if row.4.as_deref() == Some(claim_key) => {
                 EffectClaim::ExistingUncertain
             }
-            "observed" if row.5.as_deref() == Some(claim_key) => EffectClaim::AlreadyObserved,
+            "observed" if row.4.as_deref() == Some(claim_key) => EffectClaim::AlreadyObserved,
             _ => return Err(StoreError::Conflict("effect claim identity changed")),
         };
         transaction.commit()?;
@@ -380,9 +408,150 @@ impl PodBayStore {
         }
     }
 
+    /// Reads durable dispatch material only within the caller's chosen scope and target.
+    pub fn load_effect(
+        &self,
+        outbox_id: i64,
+        scope_id: &str,
+        target_id: &str,
+    ) -> Result<StoredEffect, StoreError> {
+        valid_id(scope_id)?;
+        valid_id(target_id)?;
+        let effect = self
+            .connection
+            .query_row(
+                "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
+                        o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
+                        o.claim_owner_epoch,o.observation_key,o.observation_payload
+                 FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+                 WHERE o.outbox_id=?1",
+                [outbox_id],
+                stored_effect_from_row,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if effect.scope_id != scope_id || effect.target_id != target_id {
+            return Err(StoreError::WrongScope);
+        }
+        Ok(effect)
+    }
+
+    /// Enumerates unobserved effects for a known authorised scope after restart.
+    /// Unknown kinds remain visible for reconciliation, but cannot be claimed.
+    pub fn pending_effects(
+        &self,
+        scope_id: &str,
+        after_outbox_id: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredEffect>, StoreError> {
+        valid_id(scope_id)?;
+        if after_outbox_id < 0 || !(1..=512).contains(&limit) {
+            return Err(StoreError::InvalidInput(
+                "effect cursor or page limit is invalid",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
+                    o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
+                    o.claim_owner_epoch,o.observation_key,o.observation_payload
+             FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+             WHERE o.scope_id=?1 AND o.outbox_id>?2 AND o.state!='observed'
+             ORDER BY o.outbox_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![scope_id, after_outbox_id, limit as i64],
+            stored_effect_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Records an authenticated observation after a previously committed claim.
+    /// The manager must verify the external evidence before calling this method.
+    pub fn observe_effect(
+        &mut self,
+        outbox_id: i64,
+        scope_id: &str,
+        target_id: &str,
+        expected_owner_epoch: u64,
+        expected_target_epoch: u64,
+        claim_key: &str,
+        observation_key: &str,
+        evidence: &[u8],
+    ) -> Result<EffectObservation, StoreError> {
+        valid_id(scope_id)?;
+        valid_id(target_id)?;
+        valid_id(claim_key)?;
+        valid_id(observation_key)?;
+        if evidence.is_empty() || evidence.len() > MAX_BYTES {
+            return Err(StoreError::InvalidInput(
+                "observation evidence size is invalid",
+            ));
+        }
+        let owner_epoch = integer(expected_owner_epoch)?;
+        let target_epoch = integer(expected_target_epoch)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT scope_id,target_id,kind,state,claim_key,
+                        observation_key,observation_payload
+                 FROM outbox WHERE outbox_id=?1",
+                [outbox_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        if row.0 != scope_id || row.1 != target_id {
+            return Err(StoreError::WrongScope);
+        }
+        if current_owner(&transaction)? != owner_epoch
+            || current_target(&transaction, scope_id, target_id)? != target_epoch
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        if !supported_effect_kind(&row.2) {
+            return Err(StoreError::UnsupportedEffectKind);
+        }
+        if row.4.as_deref() != Some(claim_key) {
+            return Err(StoreError::Conflict("effect claim identity changed"));
+        }
+        let result = match row.3.as_str() {
+            "claimed_uncertain" => {
+                transaction.execute(
+                    "UPDATE outbox SET state='observed',observation_key=?1,
+                     observation_payload=?2 WHERE outbox_id=?3 AND state='claimed_uncertain'",
+                    params![observation_key, evidence, outbox_id],
+                )?;
+                EffectObservation::NewObservation
+            }
+            "observed"
+                if row.5.as_deref() == Some(observation_key)
+                    && row.6.as_deref() == Some(evidence) =>
+            {
+                EffectObservation::AlreadyObserved
+            }
+            _ => return Err(StoreError::Conflict("effect observation identity changed")),
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Snapshot and cursor are read from one SQLite transaction; events after cursor cannot vanish.
     pub fn scope_snapshot(&mut self, scope_id: &str) -> Result<ScopeSnapshot, StoreError> {
         valid_id(scope_id)?;
+        let store_lineage = self.store_lineage.clone();
         let transaction = self.connection.transaction()?;
         let cursor: i64 =
             transaction.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |row| {
@@ -418,27 +587,54 @@ impl PodBayStore {
             .collect::<Result<Vec<_>, StoreError>>()?
         };
         transaction.commit()?;
-        Ok(ScopeSnapshot { cursor, receipts })
+        Ok(ScopeSnapshot {
+            cursor: EventCursor {
+                store_lineage,
+                scope_id: scope_id.to_owned(),
+                sequence: cursor,
+            },
+            receipts,
+        })
+    }
+
+    pub fn initial_cursor(&self, scope_id: &str) -> Result<EventCursor, StoreError> {
+        valid_id(scope_id)?;
+        Ok(EventCursor {
+            store_lineage: self.store_lineage.clone(),
+            scope_id: scope_id.to_owned(),
+            sequence: 0,
+        })
     }
 
     pub fn events_after(
         &self,
         scope_id: &str,
-        after_sequence: i64,
+        after: &EventCursor,
         limit: usize,
     ) -> Result<Vec<CommittedEvent>, StoreError> {
         valid_id(scope_id)?;
-        if after_sequence < 0 || !(1..=512).contains(&limit) {
+        if after.store_lineage != self.store_lineage || after.scope_id != scope_id {
+            return Err(StoreError::WrongCursor);
+        }
+        if after.sequence < 0 || !(1..=512).contains(&limit) {
             return Err(StoreError::InvalidInput(
                 "event cursor or page limit is invalid",
             ));
+        }
+        let current_max: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM events",
+            [],
+            |row| row.get(0),
+        )?;
+        if after.sequence > current_max {
+            return Err(StoreError::WrongCursor);
         }
         let mut statement = self.connection.prepare(
             "SELECT e.sequence,c.command_id,e.kind,e.payload FROM events e
              JOIN commands c ON c.command_rowid=e.command_rowid
              WHERE e.scope_id=?1 AND e.sequence>?2 ORDER BY e.sequence LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![scope_id, after_sequence, limit as i64], |row| {
+        let rows = statement.query_map(params![scope_id, after.sequence, limit as i64], |row| {
             Ok(CommittedEvent {
                 sequence: row.get(0)?,
                 command_id: row.get(1)?,
@@ -476,6 +672,10 @@ fn validate_request(request: &CommandRequest) -> Result<(), StoreError> {
     integer(request.expected_owner_epoch)?;
     integer(request.expected_target_epoch)?;
     Ok(())
+}
+
+fn supported_effect_kind(kind: &str) -> bool {
+    matches!(kind, "pod.offer")
 }
 
 fn valid_id(value: &str) -> Result<(), StoreError> {
@@ -525,6 +725,30 @@ fn current_target(
         )
         .optional()?
         .unwrap_or(0))
+}
+
+fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEffect> {
+    let state = match row.get::<_, String>(8)?.as_str() {
+        "prepared" => EffectState::Prepared,
+        "claimed_uncertain" => EffectState::ClaimedUncertain,
+        "observed" => EffectState::Observed,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(StoredEffect {
+        outbox_id: row.get(0)?,
+        command_id: row.get(1)?,
+        scope_id: row.get(2)?,
+        target_id: row.get(3)?,
+        admission_owner_epoch: row.get::<_, i64>(4)? as u64,
+        admission_target_epoch: row.get::<_, i64>(5)? as u64,
+        kind: row.get(6)?,
+        payload: row.get(7)?,
+        state,
+        claim_key: row.get(9)?,
+        claim_owner_epoch: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        observation_key: row.get(11)?,
+        observation_payload: row.get(12)?,
+    })
 }
 
 fn digest_request(request: &CommandRequest) -> String {

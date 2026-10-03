@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
-    Admission, CommandRequest, EffectClaim, EffectState, PodBayStore, StoreError, VerifiedPrincipal,
+    Admission, CommandRequest, EffectClaim, EffectObservation, EffectState, PodBayStore,
+    StoreError, VerifiedPrincipal,
 };
+use sha2::{Digest, Sha256};
 
 struct Fixture {
     directory: PathBuf,
@@ -55,6 +57,33 @@ fn ready(store: &mut PodBayStore) {
     store
         .advance_target_epoch("scope.fixture", "target.fixture", 0, 1)
         .unwrap();
+}
+
+fn fixture_request_digest(request: &CommandRequest) -> String {
+    let mut digest = Sha256::new();
+    for field in [
+        b"pb04-request-bytes/1".as_slice(),
+        request.principal.as_str().as_bytes(),
+        request.namespace.as_bytes(),
+        request.command_key.as_bytes(),
+        request.scope_id.as_bytes(),
+        request.target_id.as_bytes(),
+        request.canonical_request.as_slice(),
+        request.event_kind.as_bytes(),
+        request.event_payload.as_slice(),
+        request.effect_kind.as_bytes(),
+        request.effect_payload.as_slice(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.update(request.expected_owner_epoch.to_be_bytes());
+    digest.update(request.expected_target_epoch.to_be_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[test]
@@ -210,12 +239,19 @@ fn snapshot_cursor_and_following_event_have_no_gap_or_cross_scope_leak() {
         .admit(&request("scope.fixture", "request.after", b"after"))
         .unwrap();
     let following = store
-        .events_after("scope.fixture", snapshot.cursor, 32)
+        .events_after("scope.fixture", &snapshot.cursor, 32)
         .unwrap();
     assert_eq!(following.len(), 1);
-    assert_eq!(following[0].sequence, snapshot.cursor + 1);
+    assert_eq!(following[0].sequence, snapshot.cursor.sequence + 1);
     assert_eq!(following[0].kind, "command.admitted");
-    assert!(store.events_after("scope.other", 0, 32).unwrap().is_empty());
+    assert!(store
+        .events_after(
+            "scope.other",
+            &store.initial_cursor("scope.other").unwrap(),
+            32
+        )
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -234,19 +270,19 @@ fn outbox_insert_refusal_rolls_back_command_and_admission_event() {
         store.admit(&request("scope.fixture", "request.atomic", b"atomic")),
         Err(StoreError::Storage(_))
     ));
-    assert!(
-        store
-            .scope_snapshot("scope.fixture")
-            .unwrap()
-            .receipts
-            .is_empty()
-    );
-    assert!(
-        store
-            .events_after("scope.fixture", 0, 32)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store
+        .scope_snapshot("scope.fixture")
+        .unwrap()
+        .receipts
+        .is_empty());
+    assert!(store
+        .events_after(
+            "scope.fixture",
+            &store.initial_cursor("scope.fixture").unwrap(),
+            32,
+        )
+        .unwrap()
+        .is_empty());
     injector
         .execute_batch("DROP TRIGGER refuse_outbox")
         .unwrap();
@@ -277,14 +313,500 @@ fn first_slice_allows_only_one_admission_event_per_command() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        connection
-            .execute(
-                "INSERT INTO events(command_rowid,scope_id,owner_epoch,
+    assert!(connection
+        .execute(
+            "INSERT INTO events(command_rowid,scope_id,owner_epoch,
         target_epoch,kind,payload) VALUES(?1,'scope.fixture',1,1,'provider.observed',X'01')",
-                [rowid]
+            [rowid]
+        )
+        .is_err());
+    assert_eq!(
+        store
+            .events_after(
+                "scope.fixture",
+                &store.initial_cursor("scope.fixture").unwrap(),
+                32,
             )
-            .is_err()
+            .unwrap()
+            .len(),
+        1
     );
-    assert_eq!(store.events_after("scope.fixture", 0, 32).unwrap().len(), 1);
+}
+
+#[test]
+fn owner_takeover_claims_prepared_work_and_fences_old_owner() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request("scope.fixture", "request.takeover", b"takeover"))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    store.advance_owner_epoch(1, 2).unwrap();
+    assert!(matches!(
+        store.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.takeover"
+        ),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert_eq!(
+        store
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                2,
+                1,
+                "claim.takeover"
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+    let effect = store
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    assert_eq!(effect.admission_owner_epoch, 1);
+    assert_eq!(effect.claim_owner_epoch, Some(2));
+    assert_eq!(effect.state, EffectState::ClaimedUncertain);
+    drop(store);
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                2,
+                1,
+                "claim.takeover"
+            )
+            .unwrap(),
+        EffectClaim::ExistingUncertain
+    );
+    reopened
+        .advance_target_epoch("scope.fixture", "target.fixture", 1, 2)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                2,
+                2,
+                "claim.takeover"
+            )
+            .unwrap(),
+        EffectClaim::ExistingUncertain
+    );
+    assert!(matches!(
+        reopened.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            2,
+            2,
+            "claim.other"
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[test]
+fn target_takeover_blocks_prepared_old_incarnation_payload() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request(
+            "scope.fixture",
+            "request.old-target",
+            b"old-target",
+        ))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    store
+        .advance_target_epoch("scope.fixture", "target.fixture", 1, 2)
+        .unwrap();
+    assert!(matches!(
+        store.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            2,
+            "claim.new-target"
+        ),
+        Err(StoreError::TargetReconciliationRequired)
+    ));
+    assert_eq!(
+        store.effect_state(receipt.outbox_id).unwrap(),
+        EffectState::Prepared
+    );
+    assert_eq!(
+        store.pending_effects("scope.fixture", 0, 10).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn restart_recovers_effect_and_observation_requires_exact_evidence() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let receipt = match store
+        .admit(&request("scope.fixture", "request.observe", b"observe"))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    drop(store);
+
+    let mut reopened = fixture.open();
+    let pending = reopened.pending_effects("scope.fixture", 0, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].outbox_id, receipt.outbox_id);
+    assert_eq!(pending[0].kind, "pod.offer");
+    assert_eq!(pending[0].payload, b"effect.fixture");
+    assert!(matches!(
+        reopened.load_effect(receipt.outbox_id, "scope.other", "target.fixture"),
+        Err(StoreError::WrongScope)
+    ));
+    assert!(matches!(
+        reopened.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.observe",
+            "observation.one",
+            b"provider-ack"
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        reopened
+            .claim_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                "claim.observe"
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+    drop(reopened);
+
+    let mut recovered = fixture.open();
+    let uncertain = recovered.pending_effects("scope.fixture", 0, 10).unwrap();
+    assert_eq!(uncertain[0].claim_key.as_deref(), Some("claim.observe"));
+    assert_eq!(uncertain[0].state, EffectState::ClaimedUncertain);
+    assert!(matches!(
+        recovered.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.other",
+            "observation.one",
+            b"provider-ack"
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        recovered
+            .observe_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                "claim.observe",
+                "observation.one",
+                b"provider-ack"
+            )
+            .unwrap(),
+        EffectObservation::NewObservation
+    );
+    assert_eq!(
+        recovered
+            .observe_effect(
+                receipt.outbox_id,
+                "scope.fixture",
+                "target.fixture",
+                1,
+                1,
+                "claim.observe",
+                "observation.one",
+                b"provider-ack"
+            )
+            .unwrap(),
+        EffectObservation::AlreadyObserved
+    );
+    assert!(matches!(
+        recovered.observe_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.observe",
+            "observation.one",
+            b"changed-ack"
+        ),
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(recovered
+        .pending_effects("scope.fixture", 0, 10)
+        .unwrap()
+        .is_empty());
+    let observed = recovered
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    assert_eq!(observed.state, EffectState::Observed);
+    assert_eq!(observed.observation_key.as_deref(), Some("observation.one"));
+    assert_eq!(
+        observed.observation_payload.as_deref(),
+        Some(b"provider-ack".as_slice())
+    );
+}
+
+#[test]
+fn cursor_refuses_foreign_scope_lineage_and_future_position() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    store
+        .admit(&request("scope.fixture", "request.cursor", b"cursor"))
+        .unwrap();
+    let snapshot = store.scope_snapshot("scope.fixture").unwrap();
+    assert!(matches!(
+        store.events_after("scope.other", &snapshot.cursor, 10),
+        Err(StoreError::WrongCursor)
+    ));
+    let other_fixture = Fixture::new();
+    let other = other_fixture.open();
+    assert!(matches!(
+        other.events_after("scope.fixture", &snapshot.cursor, 10),
+        Err(StoreError::WrongCursor)
+    ));
+    let mut future = snapshot.cursor.clone();
+    future.sequence += 1;
+    assert!(matches!(
+        store.events_after("scope.fixture", &future, 10),
+        Err(StoreError::WrongCursor)
+    ));
+    let mut negative = snapshot.cursor.clone();
+    negative.sequence = -1;
+    assert!(matches!(
+        store.events_after("scope.fixture", &negative, 10),
+        Err(StoreError::InvalidInput(_))
+    ));
+    drop(store);
+    let reopened = fixture.open();
+    assert!(reopened
+        .events_after("scope.fixture", &snapshot.cursor, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn unknown_effect_refuses_admission_and_cannot_be_claimed_after_downgrade() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let mut unsupported = request("scope.fixture", "request.unknown", b"unknown");
+    unsupported.effect_kind = "future.effect".into();
+    assert!(matches!(
+        store.admit(&unsupported),
+        Err(StoreError::UnsupportedEffectKind)
+    ));
+    assert!(store
+        .scope_snapshot("scope.fixture")
+        .unwrap()
+        .receipts
+        .is_empty());
+
+    let receipt = match store
+        .admit(&request("scope.fixture", "request.known", b"known"))
+        .unwrap()
+    {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    injector
+        .execute(
+            "UPDATE outbox SET kind='future.effect' WHERE outbox_id=?1",
+            [receipt.outbox_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.unknown"
+        ),
+        Err(StoreError::UnsupportedEffectKind)
+    ));
+    assert_eq!(
+        store.effect_state(receipt.outbox_id).unwrap(),
+        EffectState::Prepared
+    );
+    assert_eq!(
+        store.pending_effects("scope.fixture", 0, 10).unwrap()[0].kind,
+        "future.effect"
+    );
+}
+
+#[test]
+fn downgrade_returns_prior_receipt_for_exact_unknown_effect_retry() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let mut input = request("scope.fixture", "request.future-retry", b"future-retry");
+    let receipt = match store.admit(&input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    input.effect_kind = "future.effect".into();
+    let future_digest = fixture_request_digest(&input);
+    let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    injector
+        .execute(
+            "UPDATE commands SET request_digest=?1 WHERE command_id=?2",
+            rusqlite::params![future_digest, receipt.command_id],
+        )
+        .unwrap();
+    injector
+        .execute(
+            "UPDATE outbox SET kind='future.effect' WHERE outbox_id=?1",
+            [receipt.outbox_id],
+        )
+        .unwrap();
+
+    let replay = match store.admit(&input).unwrap() {
+        Admission::Duplicate(receipt) => receipt,
+        other => panic!("expected duplicate: {other:?}"),
+    };
+    assert_eq!(replay.command_id, receipt.command_id);
+    assert_eq!(replay.event_sequence, receipt.event_sequence);
+    assert_eq!(replay.outbox_id, receipt.outbox_id);
+    assert_eq!(replay.request_digest, future_digest);
+    assert!(matches!(
+        store.claim_effect(
+            receipt.outbox_id,
+            "scope.fixture",
+            "target.fixture",
+            1,
+            1,
+            "claim.future"
+        ),
+        Err(StoreError::UnsupportedEffectKind)
+    ));
+}
+
+#[test]
+fn pending_effects_paginates_past_one_full_page() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    for index in 0..513 {
+        store
+            .admit(&request(
+                "scope.fixture",
+                &format!("request.page.{index}"),
+                b"page",
+            ))
+            .unwrap();
+    }
+    let first = store.pending_effects("scope.fixture", 0, 512).unwrap();
+    assert_eq!(first.len(), 512);
+    let second = store
+        .pending_effects("scope.fixture", first[511].outbox_id, 512)
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(second[0].outbox_id > first[511].outbox_id);
+    assert!(matches!(
+        store.pending_effects("scope.fixture", -1, 10),
+        Err(StoreError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn schema_one_open_migrates_without_changing_original_receipt() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let input = request("scope.fixture", "request.legacy", b"legacy");
+    let receipt = match store.admit(&input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected commit: {other:?}"),
+    };
+    drop(store);
+
+    // Reconstruct the schema-one outbox around a committed row. The next open
+    // must migrate it without changing command identity or admission lineage.
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE outbox_legacy (
+               outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
+               scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
+               owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
+               kind TEXT NOT NULL, payload BLOB NOT NULL,
+               state TEXT NOT NULL CHECK(state IN ('prepared','claimed_uncertain','observed')),
+               claim_key TEXT, claim_owner_epoch INTEGER
+             ) STRICT;
+             INSERT INTO outbox_legacy(outbox_id,command_rowid,scope_id,target_id,
+               owner_epoch,target_epoch,kind,payload,state,claim_key,claim_owner_epoch)
+             SELECT outbox_id,command_rowid,scope_id,target_id,owner_epoch,target_epoch,
+               kind,payload,state,claim_key,claim_owner_epoch FROM outbox;
+             DROP TABLE outbox;
+             ALTER TABLE outbox_legacy RENAME TO outbox;
+             DROP TABLE store_identity;
+             PRAGMA user_version=1;
+             COMMIT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut migrated = fixture.open();
+    assert_eq!(
+        migrated.admit(&input).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
+    let effect = migrated
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    assert_eq!(effect.command_id, receipt.command_id);
+    assert_eq!(effect.state, EffectState::Prepared);
+    assert_eq!(effect.payload, b"effect.fixture");
+    assert_eq!(
+        migrated.scope_snapshot("scope.fixture").unwrap().receipts,
+        vec![receipt]
+    );
 }

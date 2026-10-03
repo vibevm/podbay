@@ -5,7 +5,7 @@ mod model;
 mod store;
 
 pub use model::{
-    Admission, CommandRequest, CommittedEvent, EffectClaim, EffectState, Receipt, ScopeSnapshot,
-    StoreError, VerifiedPrincipal,
+    Admission, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
+    EventCursor, Receipt, ScopeSnapshot, StoreError, StoredEffect, VerifiedPrincipal,
 };
 pub use store::PodBayStore;

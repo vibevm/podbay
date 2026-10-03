@@ -68,8 +68,16 @@ pub struct CommittedEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeSnapshot {
     /// Global committed event sequence, captured in the same read transaction.
-    pub cursor: i64,
+    pub cursor: EventCursor,
     pub receipts: Vec<Receipt>,
+}
+
+/// An event position is valid only for the store and scope that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventCursor {
+    pub store_lineage: String,
+    pub scope_id: String,
+    pub sequence: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,12 +95,39 @@ pub enum EffectClaim {
     AlreadyObserved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectObservation {
+    NewObservation,
+    AlreadyObserved,
+}
+
+/// Durable dispatch material. Admission epochs remain unchanged after takeover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredEffect {
+    pub outbox_id: i64,
+    pub command_id: String,
+    pub scope_id: String,
+    pub target_id: String,
+    pub admission_owner_epoch: u64,
+    pub admission_target_epoch: u64,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub state: EffectState,
+    pub claim_key: Option<String>,
+    pub claim_owner_epoch: Option<u64>,
+    pub observation_key: Option<String>,
+    pub observation_payload: Option<Vec<u8>>,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     InvalidInput(&'static str),
     Conflict(&'static str),
     StaleEpoch,
+    TargetReconciliationRequired,
     WrongScope,
+    WrongCursor,
+    UnsupportedEffectKind,
     NotFound,
     UnsupportedSchema(i64),
     Storage(rusqlite::Error),
@@ -105,7 +140,17 @@ impl fmt::Display for StoreError {
             Self::InvalidInput(message) => write!(formatter, "invalid store input: {message}"),
             Self::Conflict(message) => write!(formatter, "store identity conflict: {message}"),
             Self::StaleEpoch => write!(formatter, "owner or target epoch is stale"),
+            Self::TargetReconciliationRequired => {
+                write!(
+                    formatter,
+                    "prepared effect targets an older target incarnation"
+                )
+            }
             Self::WrongScope => write!(formatter, "effect belongs to another scope or target"),
+            Self::WrongCursor => {
+                write!(formatter, "event cursor belongs to another store or scope")
+            }
+            Self::UnsupportedEffectKind => write!(formatter, "effect kind is unsupported"),
             Self::NotFound => write!(formatter, "durable record was not found"),
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported store schema {version}")
