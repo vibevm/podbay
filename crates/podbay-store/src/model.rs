@@ -57,6 +57,33 @@ pub enum Admission {
     Duplicate(Receipt),
 }
 
+/// A verified manager principal supplies these exact caller-intent bytes.
+/// Current launch-profile resolution is intentionally absent from lookup.
+#[derive(Clone, Debug)]
+pub struct LaunchLookupRequest {
+    pub principal: VerifiedPrincipal,
+    pub namespace: String,
+    pub command_key: String,
+    pub scope_id: String,
+    pub target_id: String,
+    pub canonical_intent: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchIntentBinding {
+    /// Schema v7 has no field binding the stored effect to a reviewed current
+    /// profile. It is inspection evidence, never a new dispatch admission.
+    HistoricalUnboundV7,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedLaunchInspection {
+    pub receipt: Receipt,
+    pub effect: StoredEffect,
+    pub status: LaunchDispatchStatus,
+    pub binding: LaunchIntentBinding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedEvent {
     pub sequence: i64,

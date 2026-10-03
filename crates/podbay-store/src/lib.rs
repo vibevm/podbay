@@ -8,12 +8,13 @@ mod peer_witness;
 mod store;
 
 pub use model::{
-    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, CommandRequest,
-    CommittedEvent, EffectClaim, EffectObservation, EffectState, EventCursor, EventReference,
-    HostAcceptanceProof, LaunchDispatchStage, LaunchDispatchStatus, LaunchPortResult,
-    ObservedStage, QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder,
-    StoreError, StoredEffect, VerifiedPrincipal,
+    Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
+    AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
+    AuthoritySnapshot, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
+    EventCursor, EventReference, HostAcceptanceProof, LaunchDispatchStage, LaunchDispatchStatus,
+    LaunchIntentBinding, LaunchLookupRequest, LaunchPortResult, ObservedStage,
+    QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError,
+    StoredEffect, VerifiedPrincipal,
 };
-pub use store::PodBayStore;
 pub use peer_witness::SqliteOwnerEpochWitness;
+pub use store::PodBayStore;

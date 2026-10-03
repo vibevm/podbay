@@ -1,13 +1,15 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
-    Admission, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
-    EventCursor, EventReference, HostAcceptanceProof, ObservedStage, QuarantinedSourceEvent,
-    Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, DIGEST_VERSION,
+    Admission, AdmittedLaunchInspection, CommandRequest, CommittedEvent, DIGEST_VERSION,
+    EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
+    LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding, LaunchLookupRequest,
+    ObservedStage, QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder,
+    StoreError, StoredEffect,
 };
 
 const SCHEMA_VERSION: i64 = 7;
@@ -564,6 +566,233 @@ impl PodBayStore {
             digest_version: DIGEST_VERSION,
             request_digest: digest,
         }))
+    }
+
+    /// Inspection-only duplicate lookup. It performs SELECTs in one deferred
+    /// snapshot, never resolves today's profile, advances an epoch, claims an
+    /// outbox item, or calls a host port. Every schema-v7 result is explicitly
+    /// historical/unbound and cannot itself authorize dispatch.
+    pub fn lookup_admitted_launch(
+        &mut self,
+        request: &LaunchLookupRequest,
+    ) -> Result<AdmittedLaunchInspection, StoreError> {
+        for value in [
+            &request.namespace,
+            &request.command_key,
+            &request.scope_id,
+            &request.target_id,
+        ] {
+            valid_id(value)?;
+        }
+        if request.namespace != "podbay.launch" {
+            return Err(StoreError::NotFound);
+        }
+        if request.canonical_intent.is_empty() || request.canonical_intent.len() > MAX_BYTES {
+            return Err(StoreError::InvalidInput(
+                "canonical caller intent size is invalid",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let row: Option<(
+            i64,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        )> = transaction
+            .query_row(
+                "SELECT command_rowid,command_id,digest_version,request_digest,
+                        canonical_request,owner_epoch,target_epoch,event_sequence,outbox_id
+                 FROM commands WHERE principal=?1 AND namespace=?2 AND command_key=?3
+                   AND scope_id=?4 AND target_id=?5",
+                params![
+                    request.principal.as_str(),
+                    request.namespace,
+                    request.command_key,
+                    request.scope_id,
+                    request.target_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (
+            command_rowid,
+            command_id,
+            version,
+            request_digest,
+            canonical,
+            owner,
+            target_epoch,
+            event,
+            outbox,
+        ) = row.ok_or(StoreError::NotFound)?;
+        if canonical != request.canonical_intent {
+            return Err(StoreError::Conflict(
+                "command key changed canonical caller intent",
+            ));
+        }
+        if version != DIGEST_VERSION || owner < 0 || target_epoch <= 0 {
+            return Err(StoreError::Conflict(
+                "launch admission lineage is malformed",
+            ));
+        }
+        let event_sequence = event
+            .filter(|id| *id > 0)
+            .ok_or(StoreError::Conflict("incomplete committed event"))?;
+        let outbox_id = outbox
+            .filter(|id| *id > 0)
+            .ok_or(StoreError::Conflict("incomplete committed outbox"))?;
+        let reserved: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM launch_slots
+             WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+                params![request.scope_id, request.target_id, target_epoch],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if reserved != Some(command_rowid) {
+            return Err(StoreError::Conflict(
+                "launch slot does not bind admitted command",
+            ));
+        }
+        let admission_event: Option<(String, Vec<u8>, String, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT kind,payload,scope_id,target_id,owner_epoch,target_epoch
+                 FROM events WHERE sequence=?1 AND command_rowid=?2",
+                params![event_sequence, command_rowid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (event_kind, event_payload, event_scope, event_target, event_owner, event_target_epoch) =
+            admission_event.ok_or(StoreError::Conflict("admission event is missing"))?;
+        if event_scope != request.scope_id
+            || event_target != request.target_id
+            || event_owner != owner
+            || event_target_epoch != target_epoch
+        {
+            return Err(StoreError::Conflict("admission event lineage differs"));
+        }
+        let raw_effect: Option<(Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT payload,effect_digest FROM outbox
+             WHERE outbox_id=?1 AND command_rowid=?2",
+                params![outbox_id, command_rowid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (effect_payload, effect_digest) =
+            raw_effect.ok_or(StoreError::Conflict("admitted outbox effect is missing"))?;
+        if sha256_hex(&effect_payload) != effect_digest {
+            return Err(StoreError::Conflict("outbox effect digest changed"));
+        }
+        let effect = transaction.query_row(
+            "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
+                    o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
+                    o.claim_owner_epoch,o.observation_key,o.observation_payload,
+                    o.observation_stage,o.observation_event_sequence,o.effect_digest
+             FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+             WHERE o.outbox_id=?1 AND o.command_rowid=?2",
+            params![outbox_id, command_rowid],
+            stored_effect_from_row,
+        )?;
+        if effect.kind != "pod.offer" {
+            return Err(StoreError::UnsupportedEffectKind);
+        }
+        if effect.command_id != command_id
+            || effect.scope_id != request.scope_id
+            || effect.target_id != request.target_id
+            || effect.admission_owner_epoch != owner as u64
+            || effect.admission_target_epoch != target_epoch as u64
+        {
+            return Err(StoreError::Conflict("outbox launch lineage differs"));
+        }
+        let reconstructed = CommandRequest {
+            principal: request.principal.clone(),
+            namespace: request.namespace.clone(),
+            command_key: request.command_key.clone(),
+            scope_id: request.scope_id.clone(),
+            target_id: request.target_id.clone(),
+            expected_owner_epoch: owner as u64,
+            expected_target_epoch: target_epoch as u64,
+            canonical_request: canonical,
+            event_kind,
+            event_payload,
+            effect_kind: effect.kind.clone(),
+            effect_payload,
+        };
+        if digest_request(&reconstructed) != request_digest {
+            return Err(StoreError::Conflict("stored launch request digest changed"));
+        }
+        let outcome: (String, Option<String>, Option<String>) = transaction.query_row(
+            "SELECT o.state,d.stage,d.receipt_ref FROM outbox o
+             LEFT JOIN launch_dispatch_outcomes d ON d.outbox_id=o.outbox_id
+             WHERE o.outbox_id=?1",
+            [outbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let status = match (outcome.0.as_str(), outcome.1.as_deref()) {
+            ("prepared", None) => LaunchDispatchStatus {
+                stage: LaunchDispatchStage::Prepared,
+                receipt_ref: None,
+            },
+            ("claimed_uncertain" | "observed", None) => LaunchDispatchStatus {
+                stage: LaunchDispatchStage::ClaimedUncertain,
+                receipt_ref: None,
+            },
+            ("claimed_uncertain" | "observed", Some(stage)) => LaunchDispatchStatus {
+                stage: match stage {
+                    "refused_before_effect" => LaunchDispatchStage::RefusedBeforeEffect,
+                    "uncertain_after_possible_effect" => {
+                        LaunchDispatchStage::UncertainAfterPossibleEffect
+                    }
+                    "host_accepted" => LaunchDispatchStage::HostAccepted,
+                    "port_settled" => LaunchDispatchStage::PortSettled,
+                    _ => return Err(StoreError::Conflict("unknown launch dispatch stage")),
+                },
+                receipt_ref: outcome.2,
+            },
+            _ => return Err(StoreError::Conflict("launch dispatch state is malformed")),
+        };
+        transaction.commit()?;
+        Ok(AdmittedLaunchInspection {
+            receipt: Receipt {
+                command_id,
+                event_sequence,
+                outbox_id,
+                digest_version: DIGEST_VERSION,
+                request_digest,
+            },
+            effect,
+            status,
+            binding: LaunchIntentBinding::HistoricalUnboundV7,
+        })
     }
 
     /// A claimed effect may already have happened. Reopen must not dispatch it again.
