@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 podbay-core = { path = "../podbay-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.11.0"
 
 [lib]
 path = "src/lib.rs"
