@@ -1,10 +1,14 @@
+#![cfg(target_os = "linux")]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use podbay_pod::{LaunchDescriptor, PodClient, PodError, PodRole, launch, manifest_path};
+use podbay_pod::{
+    LaunchDescriptor, PodClient, PodError, PodRole, SupervisorEvidence, launch, manifest_path,
+};
 
 struct Fixture {
     directory: PathBuf,
@@ -136,8 +140,16 @@ fn pod_and_child_survive_restart_of_a_separate_user_manager_unit() {
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let launched = launch(descriptor.clone(), &fixture.directory, &pod_binary)?;
         let first = launched.status()?;
-        assert!(first.child_running && first.child_start_ticks > 0);
-        assert!(first.cgroup_path.contains(&first.unit_name));
+        assert!(first.child_running && first.child.start_identity.is_some());
+        let SupervisorEvidence::LinuxSystemd {
+            unit_name,
+            cgroup_path,
+            ..
+        } = &first.evidence
+        else {
+            panic!("Linux fixture must produce Linux systemd evidence");
+        };
+        assert!(cgroup_path.contains(unit_name));
         let marker = fixture.directory.join("child-saw-socket");
         let deadline = Instant::now() + Duration::from_secs(1);
         while !marker.exists() && Instant::now() < deadline {
@@ -165,19 +177,11 @@ fn pod_and_child_survive_restart_of_a_separate_user_manager_unit() {
         let attached = PodClient::connect(&manifest)?;
         let after = attached.status()?;
         assert_eq!(
-            (
-                after.supervisor_pid,
-                after.child_pid,
-                after.child_start_ticks
-            ),
-            (
-                first.supervisor_pid,
-                first.child_pid,
-                first.child_start_ticks
-            )
+            (&after.supervisor, &after.child),
+            (&first.supervisor, &first.child)
         );
         assert_eq!(after.manifest_digest, first.manifest_digest);
-        assert_eq!(after.boot_id, first.boot_id);
+        assert_eq!(after.evidence, first.evidence);
         let stopped = attached.stop()?;
         assert!(!stopped.child_running);
         Ok(())

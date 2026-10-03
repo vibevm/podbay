@@ -1,6 +1,9 @@
 use std::fmt;
+#[cfg(target_os = "linux")]
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -93,6 +96,7 @@ impl LaunchDescriptor {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PodManifest {
@@ -105,6 +109,7 @@ pub struct PodManifest {
     pub unit_name: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PodStatus {
@@ -114,6 +119,8 @@ pub struct PodStatus {
     pub incarnation: u64,
     pub manifest_digest: String,
     pub supervisor_pid: u32,
+    #[serde(default)]
+    pub supervisor_start_ticks: u64,
     pub child_pid: u32,
     pub child_start_ticks: u64,
     pub boot_id: String,
@@ -129,6 +136,7 @@ pub enum PodError {
     Conflict(&'static str),
     Uncertain(&'static str),
     Refused(&'static str),
+    Unsupported(&'static str),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -140,6 +148,7 @@ impl fmt::Display for PodError {
             Self::Conflict(message) => write!(f, "pod identity conflict: {message}"),
             Self::Uncertain(message) => write!(f, "pod outcome uncertain: {message}"),
             Self::Refused(message) => write!(f, "pod control refused: {message}"),
+            Self::Unsupported(message) => write!(f, "pod backend unsupported: {message}"),
             Self::Io(error) => write!(f, "pod I/O failed: {error}"),
             Self::Json(error) => write!(f, "pod JSON failed: {error}"),
         }
@@ -169,6 +178,7 @@ pub fn manifest_path(directory: &Path, descriptor: &LaunchDescriptor) -> Result<
     Ok(directory.join(format!("{}.json", &hex(&hash.finalize())[..32])))
 }
 
+#[cfg(target_os = "linux")]
 pub fn private_directory(directory: &Path) -> Result<(), PodError> {
     let metadata = fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir()
@@ -183,6 +193,7 @@ pub fn private_directory(directory: &Path) -> Result<(), PodError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub fn write_manifest(path: &Path, manifest: &PodManifest) -> Result<(), PodError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -196,6 +207,7 @@ pub fn write_manifest(path: &Path, manifest: &PodManifest) -> Result<(), PodErro
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub fn read_manifest(path: &Path) -> Result<PodManifest, PodError> {
     private_directory(path.parent().ok_or(PodError::Invalid("manifest parent"))?)?;
     let mut file = OpenOptions::new()
@@ -232,6 +244,7 @@ pub fn read_manifest(path: &Path) -> Result<PodManifest, PodError> {
     Ok(manifest)
 }
 
+#[cfg(target_os = "linux")]
 pub fn unit_name(path: &Path) -> Result<String, PodError> {
     let stem = path
         .file_stem()
@@ -243,6 +256,7 @@ pub fn unit_name(path: &Path) -> Result<String, PodError> {
     Ok(format!("podbay-pod-{stem}.service"))
 }
 
+#[cfg(target_os = "linux")]
 fn effective_uid() -> Result<u32, PodError> {
     let status = fs::read_to_string("/proc/self/status")?;
     let line = status

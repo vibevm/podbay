@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -99,7 +101,7 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
     )
     .unwrap();
     let status = client.status().unwrap();
-    assert!(status.child_running && status.child_start_ticks > 0);
+    assert!(status.child_running && status.child.start_identity.is_some());
     let parent_unit = format!("podbay-parent-pty-{}.service", std::process::id());
     fixture.parent_unit = Some(parent_unit.clone());
     assert!(
@@ -170,19 +172,11 @@ fn two_viewers_replay_and_takeover_fence_one_real_pty() {
             .unwrap()
             .success()
     );
-    let reattached = podbay_pod::PodClient::connect(client.manifest_path()).unwrap();
+    let reattached = podbay_pod::PodClient::connect(client.manifest_path().unwrap()).unwrap();
     let after_restart = reattached.status().unwrap();
     assert_eq!(
-        (
-            after_restart.supervisor_pid,
-            after_restart.child_pid,
-            after_restart.child_start_ticks
-        ),
-        (
-            status.supervisor_pid,
-            status.child_pid,
-            status.child_start_ticks
-        )
+        (&after_restart.supervisor, &after_restart.child),
+        (&status.supervisor, &status.child)
     );
     assert!(matches!(
         reattached
@@ -346,7 +340,7 @@ fn a_viewer_token_cannot_authorize_a_raw_input_command() {
     )
     .unwrap();
     let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(client.manifest_path()).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(client.manifest_path().unwrap()).unwrap()).unwrap();
     let mut socket = UnixStream::connect(manifest["socket_path"].as_str().unwrap()).unwrap();
     let forged = serde_json::json!({
         "protocol":"podbay-pod/1", "pod_id": descriptor.pod_id,

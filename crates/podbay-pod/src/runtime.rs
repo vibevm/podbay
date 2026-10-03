@@ -1,6 +1,6 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{
     LaunchDescriptor, PROTOCOL, PodError, PodManifest, PodStatus, hex, manifest_path,
     private_directory, read_manifest, unit_name, write_manifest,
+};
+use crate::ports::{
+    DurableFiles, LocalControlTransport, PodControlPort, PodObservation, SupervisorBackend,
+    TerminalBackend, TerminalResource, TerminalViewerPort,
 };
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
@@ -43,14 +47,17 @@ struct Response {
 
 enum ChildResource {
     Pipe(Child),
-    Pty(PtyProcess),
+    Pty(Box<dyn TerminalResource>),
 }
 
 impl ChildResource {
     fn id(&self) -> Result<u32, PodError> {
         match self {
             Self::Pipe(child) => Ok(child.id()),
-            Self::Pty(pty) => pty.process_id(),
+            Self::Pty(pty) => pty
+                .process_identity()?
+                .parse()
+                .map_err(|_| PodError::Invalid("Linux PTY process ID")),
         }
     }
     fn try_wait(&mut self) -> Result<Option<Option<i32>>, PodError> {
@@ -62,12 +69,12 @@ impl ChildResource {
     fn kill(&mut self) -> Result<(), PodError> {
         match self {
             Self::Pipe(child) => child.kill().map_err(PodError::from),
-            Self::Pty(pty) => pty.kill(),
+            Self::Pty(pty) => pty.stop(),
         }
     }
-    fn terminal(&mut self) -> Option<&mut PtyProcess> {
+    fn terminal(&mut self) -> Option<&mut dyn TerminalResource> {
         match self {
-            Self::Pty(pty) => Some(pty),
+            Self::Pty(pty) => Some(pty.as_mut()),
             Self::Pipe(_) => None,
         }
     }
@@ -76,6 +83,123 @@ impl ChildResource {
 pub struct PodClient {
     manifest_path: PathBuf,
     manifest: PodManifest,
+}
+
+/// Linux backend adapter; the manifest and socket protocol retain their PB05
+/// shape while public observations use portable PodBay identities.
+pub struct LinuxBackend;
+
+impl SupervisorBackend for LinuxBackend {
+    fn launch(
+        &self,
+        descriptor: LaunchDescriptor,
+        directory: &Path,
+        binary: &Path,
+    ) -> Result<Box<dyn PodControlPort>, PodError> {
+        launch(descriptor, directory, binary)
+            .map(|client| Box::new(client) as Box<dyn PodControlPort>)
+    }
+    fn connect(&self, path: &Path) -> Result<Box<dyn PodControlPort>, PodError> {
+        PodClient::connect(path).map(|client| Box::new(client) as Box<dyn PodControlPort>)
+    }
+}
+
+impl TerminalBackend for LinuxBackend {
+    fn spawn(
+        &self,
+        descriptor: &LaunchDescriptor,
+        spec: crate::manifest::PtySpec,
+        manifest_path: &Path,
+    ) -> Result<Box<dyn TerminalResource>, PodError> {
+        PtyProcess::spawn(descriptor, spec, manifest_path)
+            .map(|pty| Box::new(pty) as Box<dyn TerminalResource>)
+    }
+}
+
+impl LocalControlTransport for LinuxBackend {
+    fn exchange(&self, endpoint: &Path, request: &[u8]) -> Result<Vec<u8>, PodError> {
+        let mut socket = UnixStream::connect(endpoint)?;
+        socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        socket.write_all(request)?;
+        socket.shutdown(std::net::Shutdown::Write)?;
+        let mut bytes = Vec::new();
+        socket.take(FRAME_LIMIT + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("pod response frame exceeded bound"));
+        }
+        Ok(bytes)
+    }
+}
+
+impl DurableFiles for LinuxBackend {
+    fn create_private(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError> {
+        let parent = path
+            .parent()
+            .ok_or(PodError::Invalid("durable file parent"))?;
+        private_directory(parent)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    fn append_durable(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError> {
+        let parent = path
+            .parent()
+            .ok_or(PodError::Invalid("durable file parent"))?;
+        private_directory(parent)?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.mode() & 0o077 != 0
+            || metadata.uid() != fs::metadata(parent)?.uid()
+        {
+            return Err(PodError::Invalid("durable file is not private and regular"));
+        }
+        file.write_all(bytes)
+            .map_err(|_| PodError::Uncertain("durable append outcome unknown"))?;
+        file.sync_data()
+            .map_err(|_| PodError::Uncertain("durable append sync outcome unknown"))?;
+        Ok(())
+    }
+    fn replace_durable(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError> {
+        let temporary = path.with_extension("podbay-new");
+        self.create_private(&temporary, bytes)?;
+        fs::rename(&temporary, path)
+            .map_err(|_| PodError::Uncertain("durable replace outcome unknown"))?;
+        File::open(
+            path.parent()
+                .ok_or(PodError::Invalid("durable file parent"))?,
+        )?
+        .sync_all()
+        .map_err(|_| PodError::Uncertain("durable replace sync outcome unknown"))?;
+        Ok(())
+    }
+}
+
+impl PodControlPort for PodClient {
+    fn status(&self) -> Result<PodObservation, PodError> {
+        PodClient::status(self)
+    }
+    fn stop(&self) -> Result<PodObservation, PodError> {
+        PodClient::stop(self)
+    }
+    fn terminal_control(&self, command: TerminalCommand) -> Result<TerminalReply, PodError> {
+        PodClient::terminal_control(self, command)
+    }
+    fn viewer(&self) -> Result<Box<dyn TerminalViewerPort>, PodError> {
+        PodClient::viewer(self).map(|viewer| Box::new(viewer) as Box<dyn TerminalViewerPort>)
+    }
 }
 
 impl PodClient {
@@ -90,23 +214,20 @@ impl PodClient {
         Ok(client)
     }
 
-    pub fn manifest_path(&self) -> &Path {
-        &self.manifest_path
+    pub fn manifest_path(&self) -> Result<&Path, PodError> {
+        Ok(&self.manifest_path)
     }
 
-    pub fn status(&self) -> Result<PodStatus, PodError> {
-        self.request("status")
+    pub fn status(&self) -> Result<PodObservation, PodError> {
+        self.request("status").map(Into::into)
     }
 
     /// Stop is explicit and bounded; an ambiguous transport result stays uncertain.
-    pub fn stop(&self) -> Result<PodStatus, PodError> {
-        self.request("stop")
+    pub fn stop(&self) -> Result<PodObservation, PodError> {
+        self.request("stop").map(Into::into)
     }
 
     fn request(&self, operation: &str) -> Result<PodStatus, PodError> {
-        let mut socket = UnixStream::connect(&self.manifest.socket_path)?;
-        socket.set_read_timeout(Some(Duration::from_secs(3)))?;
-        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
         let request = Request {
             protocol: PROTOCOL.to_owned(),
             pod_id: self.manifest.descriptor.pod_id.clone(),
@@ -116,21 +237,37 @@ impl PodClient {
             operation: operation.to_owned(),
             terminal: None,
         };
-        socket.write_all(&serde_json::to_vec(&request)?)?;
-        socket.shutdown(std::net::Shutdown::Write)?;
-        let mut bytes = Vec::new();
-        socket.take(FRAME_LIMIT + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > FRAME_LIMIT {
-            return Err(PodError::Invalid("pod response frame exceeded bound"));
-        }
-        let response: Response = serde_json::from_slice(&bytes)?;
+        let bytes = LinuxBackend
+            .exchange(&self.manifest.socket_path, &serde_json::to_vec(&request)?)
+            .map_err(|error| {
+                if operation == "stop" {
+                    PodError::Uncertain("pod stop transport outcome unknown")
+                } else {
+                    error
+                }
+            })?;
+        let response: Response = serde_json::from_slice(&bytes).map_err(|error| {
+            if operation == "stop" {
+                PodError::Uncertain("pod stop response malformed after possible effect")
+            } else {
+                PodError::Json(error)
+            }
+        })?;
         if !response.ok {
             return Err(PodError::Refused("pod rejected authenticated request"));
         }
-        let status = response
-            .status
-            .ok_or(PodError::Invalid("pod status missing"))?;
-        attest(&self.manifest, &status)?;
+        let status = response.status.ok_or(if operation == "stop" {
+            PodError::Uncertain("pod stop status missing after possible effect")
+        } else {
+            PodError::Invalid("pod status missing")
+        })?;
+        attest(&self.manifest, &status).map_err(|error| {
+            if operation == "stop" {
+                PodError::Uncertain("pod stop identity not attested after possible effect")
+            } else {
+                error
+            }
+        })?;
         Ok(status)
     }
 
@@ -220,6 +357,19 @@ impl TerminalViewer {
     }
 }
 
+impl TerminalViewerPort for TerminalViewer {
+    fn attach(&self) -> Result<crate::terminal_protocol::TerminalView, PodError> {
+        TerminalViewer::attach(self)
+    }
+    fn events_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<crate::terminal_protocol::TerminalEventPage, PodError> {
+        TerminalViewer::events_after(self, after, limit)
+    }
+}
+
 fn terminal_exchange(
     socket_path: &Path,
     pod_id: &str,
@@ -229,9 +379,6 @@ fn terminal_exchange(
     command: TerminalCommand,
 ) -> Result<TerminalReply, PodError> {
     let mutation = !command.read_only();
-    let mut socket = UnixStream::connect(socket_path)?;
-    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(3)))?;
     let request = Request {
         protocol: PROTOCOL.to_owned(),
         pod_id: pod_id.into(),
@@ -241,24 +388,9 @@ fn terminal_exchange(
         operation: "terminal".into(),
         terminal: Some(command),
     };
-    socket
-        .write_all(&serde_json::to_vec(&request)?)
+    let bytes = LinuxBackend
+        .exchange(socket_path, &serde_json::to_vec(&request)?)
         .map_err(|error| terminal_transport(error, mutation))?;
-    socket
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|error| terminal_transport(error, mutation))?;
-    let mut bytes = Vec::new();
-    socket
-        .take(FRAME_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| terminal_transport(error, mutation))?;
-    if bytes.len() as u64 > FRAME_LIMIT {
-        return Err(if mutation {
-            PodError::Uncertain("terminal response oversized after possible input")
-        } else {
-            PodError::Invalid("terminal response frame exceeded bound")
-        });
-    }
     let response: Response = serde_json::from_slice(&bytes).map_err(|error| {
         if mutation {
             PodError::Uncertain("terminal response malformed after possible input")
@@ -278,11 +410,11 @@ fn terminal_exchange(
         .ok_or(PodError::Invalid("terminal response missing"))
 }
 
-fn terminal_transport(error: std::io::Error, mutation: bool) -> PodError {
+fn terminal_transport(error: PodError, mutation: bool) -> PodError {
     if mutation {
         PodError::Uncertain("terminal transport lost after possible input; do not replay")
     } else {
-        PodError::Io(error)
+        error
     }
 }
 
@@ -377,7 +509,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let descriptor = &manifest.descriptor;
     let mut child = match descriptor.pty {
         Some(spec) => {
-            ChildResource::Pty(PtyProcess::spawn(descriptor, spec, manifest_path.as_ref())?)
+            ChildResource::Pty(LinuxBackend.spawn(descriptor, spec, manifest_path.as_ref())?)
         }
         None => ChildResource::Pipe(
             Command::new(&descriptor.executable)
@@ -452,7 +584,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     child
                         .terminal()
                         .ok_or(PodError::Refused("pod has no PTY resource"))?
-                        .handle(command)
+                        .command(command)
                 });
             match result {
                 Ok(value) => respond(
@@ -515,6 +647,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             incarnation: descriptor.incarnation,
             manifest_digest: manifest.digest.clone(),
             supervisor_pid: std::process::id(),
+            supervisor_start_ticks: start_ticks(std::process::id())?,
             child_pid,
             child_start_ticks,
             boot_id: boot_id.clone(),
@@ -542,6 +675,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
 }
 
 fn attest(manifest: &PodManifest, status: &PodStatus) -> Result<(), PodError> {
+    if status.supervisor_start_ticks == 0 {
+        return Err(PodError::Unsupported(
+            "legacy Linux pod status lacks supervisor start identity",
+        ));
+    }
     if status.protocol != PROTOCOL
         || status.pod_id != manifest.descriptor.pod_id
         || status.attempt_id != manifest.descriptor.attempt_id
@@ -621,18 +759,82 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::PodRole;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn lost_response_after_possible_input_is_uncertain() {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic");
         assert!(matches!(
-            terminal_transport(error, true),
+            terminal_transport(PodError::Io(error), true),
             PodError::Uncertain(_)
         ));
         let read_error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic");
         assert!(matches!(
-            terminal_transport(read_error, false),
+            terminal_transport(PodError::Io(read_error), false),
             PodError::Io(_)
         ));
+    }
+
+    #[test]
+    fn legacy_status_without_supervisor_start_identity_is_typed_unsupported() {
+        let descriptor = LaunchDescriptor {
+            protocol: PROTOCOL.into(),
+            pod_id: "pod.fixture".into(),
+            attempt_id: "attempt.fixture".into(),
+            session_id: "session.fixture".into(),
+            run_id: "run.fixture".into(),
+            scope_id: "scope.fixture".into(),
+            role: PodRole::Worker,
+            incarnation: 1,
+            resource_id: "resource.fixture".into(),
+            executable: "/bin/true".into(),
+            args: vec![],
+            cwd: "/tmp".into(),
+            pty: None,
+        };
+        let manifest = PodManifest {
+            descriptor,
+            digest: "digest".into(),
+            token: "a".repeat(64),
+            viewer_token: None,
+            socket_path: "/tmp/fixture.sock".into(),
+            unit_name: "podbay-pod-fixture.service".into(),
+        };
+        let old = serde_json::json!({"protocol":PROTOCOL,"pod_id":"pod.fixture",
+            "attempt_id":"attempt.fixture","incarnation":1,"manifest_digest":"digest",
+            "supervisor_pid":10,"child_pid":11,"child_start_ticks":12,
+            "boot_id":"boot","unit_name":"podbay-pod-fixture.service",
+            "cgroup_path":"/podbay-pod-fixture.service","child_running":true,
+            "exit_code":null});
+        let status: PodStatus = serde_json::from_value(old).unwrap();
+        assert!(matches!(
+            attest(&manifest, &status),
+            Err(PodError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn linux_durable_file_port_is_private_and_refuses_symlink_append() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("podbay-files-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("record");
+        LinuxBackend.create_private(&path, b"a").unwrap();
+        LinuxBackend.append_durable(&path, b"b").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ab");
+        LinuxBackend.replace_durable(&path, b"c").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"c");
+        let link = directory.join("link");
+        symlink(&path, &link).unwrap();
+        assert!(LinuxBackend.append_durable(&link, b"wrong").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"c");
+        fs::remove_dir_all(directory).unwrap();
     }
 }
