@@ -68,9 +68,15 @@ impl PodSpool {
         let event_path = manifest_path.with_extension("events");
         let command_path = manifest_path.with_extension("commands");
         let checkpoint_path = manifest_path.with_extension("checkpoint");
-        let fresh = fs::symlink_metadata(&event_path).is_err()
-            && fs::symlink_metadata(&command_path).is_err()
-            && fs::symlink_metadata(&checkpoint_path).is_err();
+        let event_exists = fs::symlink_metadata(&event_path).is_ok();
+        let command_exists = fs::symlink_metadata(&command_path).is_ok();
+        let checkpoint_exists = fs::symlink_metadata(&checkpoint_path).is_ok();
+        let fresh = !event_exists && !command_exists && !checkpoint_exists;
+        if !fresh && (!event_exists || !command_exists) {
+            return Err(PodError::Uncertain(
+                "incomplete pod spool; no automatic repair",
+            ));
+        }
         let event_file = private_append(&event_path)?;
         let command_file = private_append(&command_path)?;
         File::open(
@@ -727,5 +733,17 @@ mod tests {
         write_frame(&mut file, &wrong).unwrap();
         file.sync_all().unwrap();
         assert!(!fixture.open(8).integrity());
+    }
+
+    #[test]
+    fn incomplete_spool_is_refused_without_creating_missing_file() {
+        let fixture = Fixture::new();
+        let event_path = fixture.manifest.with_extension("events");
+        drop(private_new(&event_path).unwrap());
+        assert!(matches!(
+            PodSpool::open(&fixture.manifest, 8, "resource.fixture", 3),
+            Err(PodError::Uncertain(_))
+        ));
+        assert!(!fixture.manifest.with_extension("commands").exists());
     }
 }
