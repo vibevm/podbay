@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/podbay-core",
+  "crates/podbay-store",
+  "crates/podbay-host",
+  "crates/podbay-pod",
+  "crates/podbay-client",
+  "crates/podbay-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UPL-1.0"

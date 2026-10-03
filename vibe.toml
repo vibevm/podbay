@@ -1,0 +1,39 @@
+[package]
+name = "podbay"
+group = "org.vibevm.podbay"
+kind = "tool"
+version = "0.1.0"
+epoch = 1
+format = "normal"
+authors = ["Oleg Chirukhin"]
+license = "UPL-1.0"
+description = "Independent Rust runtime for durable local agent pods"
+keywords = ["agents", "pods", "supervision", "recovery", "rust"]
+
+[compatibility]
+min_vibe_version = "1.0.0"
+requires_kinds = []
+
+[requires.packages]
+"flow:org.vibevm.world/omnichannel" = "^1.0.0"
+"stack:org.vibevm.ai-native/rust-ai-native" = "^1.0.0"
+"stack:org.vibevm.ai-native/typescript-ai-native" = "^1.0.0"
+
+[requires.packages."flow:org.vibevm.world/multi-user-planning"]
+version = "^1.0.0"
+link = "static-transitive"
+
+[requires.packages."org.vibevm.world/redbook"]
+version = "^1.0.0"
+link = "static-transitive"
+exclude = ["org.vibevm.world/wal", "org.vibevm.world/wal-specspaces"]
+
+[[binary]]
+name = "podbay"
+crate = "crates/podbay-cli"
+description = "PodBay operator CLI (preproduction bootstrap)"
+
+[[binary]]
+name = "podbay-pod"
+crate = "crates/podbay-pod"
+description = "PodBay pod process (preproduction bootstrap)"

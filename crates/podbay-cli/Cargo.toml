@@ -1,0 +1,13 @@
+[package]
+name = "podbay-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+podbay-core = { path = "../podbay-core" }
+podbay-client = { path = "../podbay-client" }
+
+[[bin]]
+name = "podbay"
+path = "src/main.rs"
