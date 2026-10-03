@@ -307,6 +307,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "podbay-launch-linux"
+version = "0.1.0"
+dependencies = [
+ "podbay-core",
+ "podbay-host",
+ "podbay-pod",
+ "podbay-store",
+ "podbay-wire",
+ "sha2",
+]
+
+[[package]]
 name = "podbay-macos-sys"
 version = "0.1.0"
 dependencies = [
