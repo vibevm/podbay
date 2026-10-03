@@ -89,6 +89,15 @@ This probe establishes only the handshake and catalog response shapes. It
 did not start, resume or read a thread; send a turn; exercise permissions;
 verify account/model entitlement; or prove native lifecycle behavior.
 
+The opt-in `isolated_real_app_server_handshake` fixture in
+`tests/process_transport.rs` now repeats those same two RPCs through
+`ProcessJsonlTransport` against an explicitly supplied absolute Codex 0.159.3
+executable. It creates a fresh private HOME/CODEX_HOME, confirms the server
+reports that CODEX_HOME, bounds notifications and I/O, and observes direct-child
+reap. On 2026-10-04 it passed locally (one test, exit 0) with no credentials and
+no thread or turn. Run it explicitly with
+`PODBAY_CODEX_APP_SERVER_EXE=/absolute/path/to/codex cargo test -p podbay-adapter-codex --test process_transport isolated_real_app_server_handshake -- --ignored`.
+
 ## Pod-side stdio transport boundary
 
 The explicit child launcher takes a reviewed absolute executable, exact argv
@@ -104,6 +113,6 @@ reap; escaped-descendant containment is not established.
 
 The current transport discards child stderr, limiting diagnostics. Its child
 birth timestamp is the parent's observation after spawn, not an OS process
-start identity or ownership attestation. Only a disposable fake child has
-exercised this launcher; real Codex, provider accounts and session lifecycle
-remain uncertified.
+start identity or ownership attestation. Fake child fixtures and the isolated
+real Codex handshake have exercised this launcher; provider accounts, session
+and turn lifecycle, and pod ownership remain uncertified.

@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_adapter_codex::{
-    ChildLaunchSpec, CodecError, JsonlTransport, ProcessJsonlTransport, decode, encode,
+    ChildLaunchSpec, CodecError, JsonlTransport, ProcessJsonlTransport, TESTED_CODEX_CLI_VERSION,
+    decode, encode,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +99,140 @@ fn fake_child_handshake_frames_and_direct_child_exit_are_observed() {
     let exit = transport.dispose().unwrap();
     assert_eq!(exit.pid, pid);
     assert!(transport.observe_exit().unwrap().is_some());
+}
+
+/// Manual native conformance fixture. It exercises only the real app-server
+/// handshake and read-only model catalog through PodBay's bounded child pipes.
+/// Run with an absolute, reviewed Codex executable at the pinned CLI version:
+/// PODBAY_CODEX_APP_SERVER_EXE=/absolute/path/to/codex cargo test \
+///   -p podbay-adapter-codex --test process_transport \
+///   isolated_real_app_server_handshake -- --ignored
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires an explicit reviewed Codex 0.159.3 executable"]
+fn isolated_real_app_server_handshake() {
+    let executable = PathBuf::from(
+        std::env::var_os("PODBAY_CODEX_APP_SERVER_EXE")
+            .expect("PODBAY_CODEX_APP_SERVER_EXE must name a reviewed executable"),
+    );
+    assert!(
+        executable.is_absolute(),
+        "Codex executable must be absolute"
+    );
+    let dirs = PrivateDirs::new();
+
+    let version_spec = ChildLaunchSpec::new(
+        executable.clone(),
+        vec!["--version".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut version_child = ProcessJsonlTransport::spawn(version_spec).unwrap();
+    let version = version_child
+        .read_line()
+        .unwrap()
+        .expect("Codex version command closed without a response");
+    assert_eq!(
+        String::from_utf8_lossy(&version).trim(),
+        format!("codex-cli {TESTED_CODEX_CLI_VERSION}"),
+        "Codex CLI version differs from the pinned schema receipt"
+    );
+    version_child.dispose().unwrap();
+
+    let spec = ChildLaunchSpec::new(
+        executable,
+        vec!["app-server".into(), "--listen".into(), "stdio://".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut transport = ProcessJsonlTransport::spawn(spec).unwrap();
+    let pid = transport.birth().pid;
+    transport
+        .write_line(
+            &encode(&json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "podbay-conformance", "version": "0.1.0"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let initialized = read_real_result(&mut transport, 1);
+    for field in ["codexHome", "platformFamily", "platformOs", "userAgent"] {
+        assert!(
+            initialized
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "initialize omitted a required identity field"
+        );
+    }
+    assert_eq!(
+        fs::canonicalize(initialized["codexHome"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&dirs.codex_home).unwrap(),
+        "app-server used a different CODEX_HOME"
+    );
+    transport
+        .write_line(&encode(&json!({"method":"initialized","params":{}})).unwrap())
+        .unwrap();
+    transport
+        .write_line(
+            &encode(&json!({
+                "id": 2,
+                "method": "model/list",
+                "params": {"limit": 5, "includeHidden": false}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let models = read_real_result(&mut transport, 2);
+    assert!(models["data"].is_array(), "model catalog omitted data");
+    assert!(
+        models.get("nextCursor").is_some(),
+        "model catalog omitted cursor"
+    );
+    let exit = transport.dispose().unwrap();
+    assert_eq!(exit.pid, pid);
+    assert!(transport.observe_exit().unwrap().is_some());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_real_result(transport: &mut ProcessJsonlTransport, expected_id: u64) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for _ in 0..64 {
+        assert!(
+            Instant::now() < deadline,
+            "app-server response deadline elapsed"
+        );
+        let frame = transport
+            .read_line()
+            .unwrap()
+            .expect("app-server closed before its response");
+        let value = decode(&frame).unwrap();
+        if value.get("id").and_then(Value::as_u64) == Some(expected_id) {
+            assert!(
+                value.get("error").is_none(),
+                "app-server returned an RPC error"
+            );
+            return value
+                .get("result")
+                .cloned()
+                .expect("app-server response omitted result");
+        }
+        assert!(
+            value.get("method").and_then(Value::as_str).is_some(),
+            "app-server returned an unexpected RPC response"
+        );
+    }
+    panic!("app-server notification limit exceeded before response");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
