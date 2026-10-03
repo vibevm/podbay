@@ -561,6 +561,28 @@ fn resolved_port_receives_only_host_derived_native_paths() {
         std::fs::canonicalize(&fixture.database).unwrap()
     );
     let claim = store.current_manager_credential_claim(1).unwrap();
+    assert!(
+        store
+            .current_manager_peer_matches(&claim, &manager.peer)
+            .unwrap()
+    );
+    let sibling = podbay_core::AttestedPeer::from_port(
+        manager.peer.os_identity(),
+        "linux.pid.999999999",
+        manager.peer.boot_identity(),
+        manager.peer.birth_identity(),
+        manager.peer.containment_identity(),
+    )
+    .unwrap();
+    assert!(
+        !store
+            .current_manager_peer_matches(&claim, &sibling)
+            .unwrap()
+    );
+    assert!(matches!(
+        store.register_current_manager_peer(&claim, &sibling),
+        Err(StoreError::Conflict(_))
+    ));
     assert_eq!(
         manager.claim,
         (
@@ -1527,6 +1549,13 @@ fn resolved_manager_handoff_uses_replayed_manager_epoch_not_actor_generation() {
     let seen = second.port().manager_seen.lock().unwrap();
     assert_eq!(seen[0].claim.1, 2);
     assert_eq!(seen[0].claim.2, 2);
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let claim = store.current_manager_credential_claim(2).unwrap();
+    assert!(
+        store
+            .current_manager_peer_matches(&claim, &seen[0].peer)
+            .unwrap()
+    );
     assert_eq!(seen[0].inputs.len(), 2);
     assert!(seen[0].inputs.values().all(|epoch| *epoch == 2));
 }

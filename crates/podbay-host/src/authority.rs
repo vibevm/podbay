@@ -1636,6 +1636,22 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(DurableAuthorityError::Corrupt("grant id exhausted"))?;
+        // Register only after replay/hydration succeeds, while the lifetime
+        // lock still belongs to this opening manager. Request/actor identity
+        // never supplies the OS peer stored for this credential generation.
+        #[cfg(target_os = "linux")]
+        {
+            manager_peer.recheck()?;
+            store.register_current_manager_peer(&manager_claim, manager_peer.peer())?;
+            manager_peer.recheck()?;
+            if store.current_manager_credential_claim(new_epoch)? != manager_claim
+                || !store.current_manager_peer_matches(&manager_claim, manager_peer.peer())?
+            {
+                return Err(DurableAuthorityError::Corrupt(
+                    "manager binding changed during registration",
+                ));
+            }
+        }
         Ok(Self {
             _manager_lock: manager_lock,
             canonical_database,
@@ -1928,6 +1944,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     .store
                     .current_manager_credential_claim(self.host.manager_epoch.get())?
                     != self.manager_claim
+                || !self
+                    .store
+                    .current_manager_peer_matches(&self.manager_claim, self.manager_peer.peer())?
             {
                 return Err(HostError::StaleGuard.into());
             }
