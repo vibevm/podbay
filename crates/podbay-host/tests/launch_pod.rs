@@ -64,6 +64,16 @@ enum Mode {
     Settled = 3,
 }
 
+struct ResolvedManagerSeen {
+    store_path: PathBuf,
+    claim: (String, u64, u64),
+    peer: podbay_core::AttestedPeer,
+    inputs: std::collections::BTreeMap<String, u64>,
+    outbox_id: i64,
+    descriptor: Vec<u8>,
+    effective: Vec<u8>,
+}
+
 struct FakeLaunchPort {
     mode: Arc<AtomicU8>,
     port_calls: Arc<AtomicUsize>,
@@ -72,6 +82,9 @@ struct FakeLaunchPort {
     fixture_opt_in: bool,
     resolved_opt_in: bool,
     resolved_seen: Mutex<Vec<(PathBuf, PathBuf, String)>>,
+    manager_seen: Mutex<Vec<ResolvedManagerSeen>>,
+    preclaim_change: Mutex<Option<(PathBuf, bool)>>,
+    preclaim_replace: Mutex<Option<PathBuf>>,
 }
 
 impl FakeLaunchPort {
@@ -87,6 +100,9 @@ impl FakeLaunchPort {
                 fixture_opt_in: true,
                 resolved_opt_in: false,
                 resolved_seen: Mutex::new(Vec::new()),
+                manager_seen: Mutex::new(Vec::new()),
+                preclaim_change: Mutex::new(None),
+                preclaim_replace: Mutex::new(None),
             },
             port_calls,
             possible_effects,
@@ -113,6 +129,30 @@ impl HostDispatchPort for FakeLaunchPort {
     }
 
     fn accepts_resolved_native_launch(&self) -> bool {
+        if let Some(path) = self.preclaim_replace.lock().unwrap().take() {
+            let original = path.with_extension("original");
+            std::fs::rename(&path, &original).unwrap();
+            std::fs::copy(&original, &path).unwrap();
+        }
+        if let Some((path, replay)) = self.preclaim_change.lock().unwrap().take() {
+            let mut other = PodBayStore::open(path).unwrap();
+            let snapshot = other.authority_snapshot().unwrap();
+            if replay {
+                other
+                    .begin_authority_replay(snapshot.owner_epoch, snapshot.owner_epoch + 1)
+                    .unwrap();
+            } else {
+                let mut resource = snapshot.resources[0].clone();
+                resource.input_epoch += 1;
+                other
+                    .apply_authority_mutation(
+                        snapshot.owner_epoch,
+                        snapshot.revision,
+                        podbay_store::AuthorityMutation::PutResource(resource),
+                    )
+                    .unwrap();
+            }
+        }
         self.resolved_opt_in
     }
 
@@ -120,6 +160,19 @@ impl HostDispatchPort for FakeLaunchPort {
         &mut self,
         launch: ResolvedNativeLaunch,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        self.manager_seen.lock().unwrap().push(ResolvedManagerSeen {
+            store_path: launch.store_path().to_path_buf(),
+            claim: (
+                launch.store_lineage().to_owned(),
+                launch.owner_epoch(),
+                launch.credential_epoch(),
+            ),
+            peer: launch.manager_peer().clone(),
+            inputs: launch.resource_input_epochs().clone(),
+            outbox_id: launch.outbox_id(),
+            descriptor: launch.descriptor_bytes().to_vec(),
+            effective: launch.effective_spec_bytes().to_vec(),
+        });
         self.resolved_seen.lock().unwrap().push((
             launch.cwd().to_path_buf(),
             launch.executable().to_path_buf(),
@@ -500,6 +553,58 @@ fn resolved_port_receives_only_host_derived_native_paths() {
         )]
     );
     assert!(host.port().reviewed.lock().unwrap().is_empty());
+    let manager_seen = host.port().manager_seen.lock().unwrap();
+    let manager = &manager_seen[0];
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        manager.store_path,
+        std::fs::canonicalize(&fixture.database).unwrap()
+    );
+    let claim = store.current_manager_credential_claim(1).unwrap();
+    assert_eq!(
+        manager.claim,
+        (
+            claim.store_lineage().to_owned(),
+            claim.owner_epoch(),
+            claim.credential_epoch()
+        )
+    );
+    assert_eq!(
+        manager.peer.native_process_id(),
+        format!("linux.pid.{}", std::process::id())
+    );
+    assert!(manager.peer.os_identity().starts_with("linux.uid."));
+    assert!(manager.peer.boot_identity().starts_with("linux.boot."));
+    assert!(manager.peer.birth_identity().starts_with("linux.start."));
+    assert!(
+        manager
+            .peer
+            .containment_identity()
+            .starts_with("linux.cgroup./")
+    );
+    let inputs = store
+        .authority_snapshot()
+        .unwrap()
+        .resources
+        .into_iter()
+        .map(|resource| (resource.resource_id, resource.input_epoch))
+        .collect();
+    assert_eq!(manager.inputs, inputs);
+    assert_eq!(manager.outbox_id, result.receipt.outbox_id);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.resolved");
+    let record = store
+        .lookup_bound_launch(&LaunchLookupRequest {
+            principal: VerifiedPrincipal::from_authenticated_boundary(who.actor.as_str()).unwrap(),
+            namespace: "podbay.launch".into(),
+            command_key: request.host_request.command_key,
+            scope_id: who.scope.as_str().into(),
+            target_id: who.pod.as_str().into(),
+            canonical_intent: request.canonical_request,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(manager.descriptor, record.descriptor);
+    assert_eq!(manager.effective, record.effective_spec);
 }
 
 #[test]
@@ -1397,4 +1502,85 @@ fn committed_claim_without_port_result_is_not_replayed() {
         LaunchDispatchStage::ClaimedUncertain
     );
     assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn resolved_manager_handoff_uses_replayed_manager_epoch_not_actor_generation() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, _, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, grant) = initial_authority(&fixture.database, port.resolved_only(), &who);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.manager-replay");
+    let prepared = first.admit_bound_pod(&who.transport, request).unwrap();
+    drop(first);
+
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut second = DurableAuthority::open(&fixture.database, port.resolved_only()).unwrap();
+    replay(&mut second, &who, grant);
+    let request = launch_request(&who, grant, 2, 1, b"canonical.manager-replay");
+    assert_eq!(request.host_request.guards.credential_generation.get(), 1);
+    let result = second
+        .resume_prepared_bound_pod(&who.transport, request)
+        .unwrap();
+    assert_eq!(result.receipt, prepared.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let seen = second.port().manager_seen.lock().unwrap();
+    assert_eq!(seen[0].claim.1, 2);
+    assert_eq!(seen[0].claim.2, 2);
+    assert_eq!(seen[0].inputs.len(), 2);
+    assert!(seen[0].inputs.values().all(|epoch| *epoch == 2));
+}
+
+#[test]
+fn resolved_manager_handoff_refuses_external_replay_or_resource_change_before_claim() {
+    for change_owner in [true, false] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let port = port.resolved_only();
+        *port.preclaim_change.lock().unwrap() = Some((fixture.database.clone(), change_owner));
+        let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+        let request = launch_request(&who, grant, 1, 1, b"canonical.manager-stale");
+        let prepared = host
+            .admit_bound_pod(&who.transport, request.clone())
+            .unwrap();
+        assert!(matches!(
+            host.resume_prepared_bound_pod(&who.transport, request),
+            Err(LaunchPodError::Store(StoreError::StaleEpoch))
+                | Err(LaunchPodError::Host(HostError::StaleGuard))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(host.port().manager_seen.lock().unwrap().is_empty());
+        let store = PodBayStore::open(&fixture.database).unwrap();
+        assert_eq!(
+            store
+                .launch_dispatch_status(
+                    prepared.receipt.outbox_id,
+                    who.scope.as_str(),
+                    who.pod.as_str()
+                )
+                .unwrap()
+                .stage,
+            LaunchDispatchStage::Prepared
+        );
+    }
+}
+
+#[test]
+fn resolved_manager_handoff_refuses_replaced_database_path_before_claim() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let port = port.resolved_only();
+    *port.preclaim_replace.lock().unwrap() = Some(fixture.database.clone());
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let request = launch_request(&who, grant, 1, 1, b"canonical.manager-db-replaced");
+    host.admit_bound_pod(&who.transport, request.clone())
+        .unwrap();
+    assert!(matches!(
+        host.resume_prepared_bound_pod(&who.transport, request),
+        Err(LaunchPodError::Host(HostError::StaleGuard))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(host.port().manager_seen.lock().unwrap().is_empty());
 }

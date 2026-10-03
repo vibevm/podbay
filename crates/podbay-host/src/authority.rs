@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -8,14 +8,20 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use podbay_core::{ActorId, LaunchBinding, PodId, ResourceId, Role, Run, ScopeId, Session};
+use podbay_core::{
+    ActorId, AttestedPeer, LaunchBinding, PodId, ResourceId, Role, Run, ScopeId, Session,
+};
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
     BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, EffectClaim, LaunchDispatchStatus,
-    LaunchLookupRequest, LaunchPortResult, PodBayStore, Receipt, StoreError, VerifiedPrincipal,
+    LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt,
+    StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor};
+
+#[cfg(target_os = "linux")]
+use crate::linux_manager_peer::LinuxManagerPeer;
 
 use crate::launch_spec::{
     EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile, ResolvedNativePaths,
@@ -510,9 +516,42 @@ pub struct AuthorisedBoundLaunch {
 pub struct ResolvedNativeLaunch {
     committed: AuthorisedBoundLaunch,
     paths: ResolvedNativePaths,
+    store_path: PathBuf,
+    store_lineage: String,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    manager_peer: AttestedPeer,
+    resource_input_epochs: BTreeMap<String, u64>,
 }
 
 impl ResolvedNativeLaunch {
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    pub fn store_lineage(&self) -> &str {
+        &self.store_lineage
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+    }
+    pub fn manager_peer(&self) -> &AttestedPeer {
+        &self.manager_peer
+    }
+    pub fn resource_input_epochs(&self) -> &BTreeMap<String, u64> {
+        &self.resource_input_epochs
+    }
+    pub fn outbox_id(&self) -> i64 {
+        self.committed.record.receipt.outbox_id
+    }
+    pub fn descriptor_bytes(&self) -> &[u8] {
+        &self.committed.record.descriptor
+    }
+    pub fn effective_spec_bytes(&self) -> &[u8] {
+        &self.committed.record.effective_spec
+    }
     pub fn committed(&self) -> &AuthorisedBoundLaunch {
         &self.committed
     }
@@ -706,7 +745,8 @@ pub enum LaunchPodError {
     Host(HostError),
     Store(StoreError),
     WrongOperation,
-    /// The port returned, but the durable stage write failed; query the original receipt.
+    /// A port outcome or pre-port refusal could not be durably recorded.
+    /// Query the original receipt; a committed claim must never be resent.
     OutcomeNotRecorded {
         receipt: Receipt,
         observed: LaunchPortResult,
@@ -1507,6 +1547,12 @@ impl<P: HostDispatchPort> HostAuthority<P> {
 /// admission; PB09 must issue the durable receipt before production effects.
 pub struct DurableAuthority<P: HostDispatchPort> {
     _manager_lock: File,
+    canonical_database: PathBuf,
+    #[cfg(target_os = "linux")]
+    database_identity: (u64, u64),
+    #[cfg(target_os = "linux")]
+    manager_peer: LinuxManagerPeer,
+    manager_claim: ManagerCredentialClaim,
     host: HostAuthority<P>,
     store: PodBayStore,
     recorded: AuthoritySnapshot,
@@ -1521,17 +1567,32 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
         let path = path.as_ref();
         let (manager_lock, canonical_database) = acquire_manager_lock(path)?;
+        #[cfg(target_os = "linux")]
+        let manager_peer = LinuxManagerPeer::capture()?;
         let mut store = PodBayStore::open(&canonical_database)?;
         if std::fs::canonicalize(&canonical_database)? != canonical_database {
             return Err(DurableAuthorityError::Corrupt(
                 "authority database path changed while acquiring lease",
             ));
         }
+        #[cfg(target_os = "linux")]
+        let database_identity = {
+            let metadata = std::fs::metadata(&canonical_database)?;
+            (metadata.dev(), metadata.ino())
+        };
         let old_epoch = store.owner_epoch()?;
         let new_epoch = old_epoch
             .checked_add(1)
             .ok_or(DurableAuthorityError::Corrupt("manager epoch exhausted"))?;
         let recorded = store.begin_authority_replay(old_epoch, new_epoch)?;
+        let manager_claim = store.current_manager_credential_claim(new_epoch)?;
+        if recorded.owner_epoch != new_epoch {
+            return Err(DurableAuthorityError::Corrupt(
+                "owner changed during manager replay",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        manager_peer.recheck()?;
         let mut host = HostAuthority::new(port, ManagerEpoch::new(new_epoch)?);
         for record in &recorded.pods {
             let pod_id = PodId::try_from(record.pod_id.as_str())
@@ -1577,6 +1638,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .ok_or(DurableAuthorityError::Corrupt("grant id exhausted"))?;
         Ok(Self {
             _manager_lock: manager_lock,
+            canonical_database,
+            #[cfg(target_os = "linux")]
+            database_identity,
+            #[cfg(target_os = "linux")]
+            manager_peer,
+            manager_claim,
             host,
             store,
             recorded,
@@ -1839,6 +1906,105 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         })
     }
 
+    /// The OS process and exact v10 claim must still be the ones captured
+    /// under the lifetime lock. Neither is derived from the launch actor.
+    fn recheck_manager_binding(&mut self) -> Result<AttestedPeer, LaunchPodError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            self.manager_peer
+                .recheck()
+                .map_err(|_| HostError::StaleGuard)?;
+            let metadata = std::fs::symlink_metadata(&self.canonical_database)
+                .map_err(|_| HostError::AuthorityStoreUnavailable)?;
+            if !metadata.is_file() || (metadata.dev(), metadata.ino()) != self.database_identity {
+                return Err(HostError::StaleGuard.into());
+            }
+            if std::fs::canonicalize(&self.canonical_database)
+                .map_err(|_| HostError::AuthorityStoreUnavailable)?
+                != self.canonical_database
+                || self
+                    .store
+                    .current_manager_credential_claim(self.host.manager_epoch.get())?
+                    != self.manager_claim
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(self.manager_peer.peer().clone())
+        }
+    }
+
+    fn current_launch_inputs(
+        &mut self,
+        record: &BoundLaunchRecord,
+    ) -> Result<BTreeMap<String, u64>, LaunchPodError> {
+        let snapshot = self.store.authority_snapshot()?;
+        if snapshot.owner_epoch != self.manager_claim.owner_epoch()
+            || snapshot.revision != self.recorded.revision
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let resources = snapshot
+            .resources
+            .iter()
+            .filter(|resource| resource.pod_id == record.pod_id)
+            .collect::<Vec<_>>();
+        if resources.len() != record.resources.len() {
+            return Err(HostError::StaleGuard.into());
+        }
+        let mut inputs = BTreeMap::new();
+        for resource in resources {
+            if resource.scope_id != record.scope_id
+                || resource.pod_incarnation != record.pod_incarnation
+                || resource.input_epoch == 0
+                || !record.resources.iter().any(|bound| {
+                    bound.id == resource.resource_id && bound.epoch == resource.resource_epoch
+                })
+                || inputs
+                    .insert(resource.resource_id.clone(), resource.input_epoch)
+                    .is_some()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        Ok(inputs)
+    }
+
+    /// This manager knows the claimed effect never crossed the OS port.
+    /// Record that refusal; if ownership/storage prevents recording, preserve
+    /// the original receipt and explicitly report the unrecorded outcome.
+    fn refuse_claimed_launch(
+        &mut self,
+        record: BoundLaunchRecord,
+        duplicate: bool,
+        claim_key: &str,
+        _guard_failure: LaunchPodError,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        let observed = LaunchPortResult::RefusedBeforeEffect;
+        let status = self
+            .store
+            .record_launch_port_result(
+                record.receipt.outbox_id,
+                &record.scope_id,
+                &record.pod_id,
+                self.host.manager_epoch.get(),
+                claim_key,
+                observed.clone(),
+            )
+            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
+                receipt: record.receipt.clone(),
+                observed,
+                source,
+            })?;
+        Ok(LaunchPodReceipt {
+            receipt: record.receipt,
+            status,
+            duplicate,
+            port_called: false,
+        })
+    }
+
     fn dispatch_committed_bound(
         &mut self,
         authorised: AuthorisedDispatch,
@@ -1856,6 +2022,13 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         if !fixture_port && !self.host.port.accepts_resolved_native_launch() {
             return Err(HostError::NativeResolutionUnverified.into());
         }
+        let resolved_binding = if fixture_port {
+            None
+        } else {
+            let peer = self.recheck_manager_binding()?;
+            let inputs = self.current_launch_inputs(&record)?;
+            Some((peer, inputs))
+        };
         let claim_key = format!("claim.{}", record.receipt.command_id);
         let claim = self.store.claim_effect(
             record.receipt.outbox_id,
@@ -1869,13 +2042,44 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         if claim != EffectClaim::NewClaim {
             return self.bound_receipt(record, duplicate);
         }
-        self.ensure_current_owner_epoch()?;
+        let postclaim_guard = (|| -> Result<(), LaunchPodError> {
+            self.ensure_current_owner_epoch()?;
+            if !fixture_port {
+                let (peer, inputs) = resolved_binding
+                    .as_ref()
+                    .ok_or(HostError::NativeResolutionUnverified)?;
+                if &self.recheck_manager_binding()? != peer
+                    || &self.current_launch_inputs(&record)? != inputs
+                {
+                    return Err(HostError::StaleGuard.into());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(failure) = postclaim_guard {
+            return self.refuse_claimed_launch(record, duplicate, &claim_key, failure);
+        }
         let port_call = if fixture_port {
             self.host.port.launch_bound(committed)
         } else {
-            self.host
-                .port
-                .launch_resolved(ResolvedNativeLaunch { committed, paths })
+            let Some((manager_peer, resource_input_epochs)) = resolved_binding else {
+                return self.refuse_claimed_launch(
+                    record,
+                    duplicate,
+                    &claim_key,
+                    HostError::NativeResolutionUnverified.into(),
+                );
+            };
+            self.host.port.launch_resolved(ResolvedNativeLaunch {
+                committed,
+                paths,
+                store_path: self.canonical_database.clone(),
+                store_lineage: self.manager_claim.store_lineage().to_owned(),
+                owner_epoch: self.manager_claim.owner_epoch(),
+                credential_epoch: self.manager_claim.credential_epoch(),
+                manager_peer,
+                resource_input_epochs,
+            })
         };
         let port_result = match port_call {
             Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
@@ -2605,5 +2809,320 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             AuthorityMutation::PutResource(durable_resource(&resource.registration)),
             result,
         )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod postclaim_refusal_tests {
+    use super::*;
+    use crate::launch_spec::{
+        ExecutionMode, TrustedDriverTemplate, TrustedLaunchProfileInput, WorkspaceAccess,
+        WorkspaceSelection,
+    };
+    use podbay_core::{
+        Attempt, AttemptId, CommandAdmission, CommandId, Epoch, Pod, Resource, ResourceKind,
+        RunCommandKind, RunId, SessionId, WorkKind,
+    };
+    use podbay_store::LaunchDispatchStage;
+    use podbay_wire::{ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct NoPortCalls(usize);
+    impl HostDispatchPort for NoPortCalls {
+        type Receipt = PortReceiptRef;
+        fn launch_bound(
+            &mut self,
+            _: AuthorisedBoundLaunch,
+        ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+            self.0 += 1;
+            panic!("refusal must not invoke an OS port")
+        }
+        fn dispatch(
+            &mut self,
+            _: AuthorisedDispatch,
+        ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+            self.0 += 1;
+            panic!("refusal must not invoke an OS port")
+        }
+        fn launch_resolved(
+            &mut self,
+            _: ResolvedNativeLaunch,
+        ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+            self.0 += 1;
+            panic!("refusal must not invoke an OS port")
+        }
+    }
+    struct Admitted;
+    impl CommandAdmission for Admitted {
+        fn admits_run(&self, _: &CommandId, _: &RunId, kind: RunCommandKind) -> bool {
+            kind == RunCommandKind::Launch
+        }
+    }
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn claimed() -> (
+        Fixture,
+        DurableAuthority<NoPortCalls>,
+        BoundLaunchRecord,
+        String,
+    ) {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-postclaim-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut host =
+            DurableAuthority::open(directory.join("store.sqlite"), NoPortCalls(0)).unwrap();
+        let scope = ScopeId::try_from("scope.postclaim").unwrap();
+        let actor = ActorId::try_from("actor.postclaim").unwrap();
+        let mut session = Session::new(
+            SessionId::try_from("session.postclaim").unwrap(),
+            actor.clone(),
+            scope.clone(),
+        );
+        let mut run = Run::new(
+            RunId::try_from("run.postclaim").unwrap(),
+            &session,
+            Role::Worker,
+            WorkKind::Task,
+            None,
+        );
+        run.admit(
+            run.revision(),
+            &CommandId::try_from("command.postclaim").unwrap(),
+            &Admitted,
+        )
+        .unwrap();
+        session.bind_run(session.revision(), &run).unwrap();
+        let mut attempt = Attempt::new(
+            AttemptId::try_from("attempt.postclaim").unwrap(),
+            run.id().clone(),
+            1,
+            Epoch::new(1).unwrap(),
+        )
+        .unwrap();
+        run.start_attempt(run.revision(), &attempt).unwrap();
+        let mut pod = Pod::new(
+            PodId::try_from("pod.postclaim").unwrap(),
+            attempt.id().clone(),
+            Epoch::new(1).unwrap(),
+        );
+        attempt.attach_pod(attempt.revision(), &pod).unwrap();
+        let resource = Resource::new(
+            ResourceId::try_from("resource.postclaim").unwrap(),
+            pod.id().clone(),
+            ResourceKind::Auxiliary,
+            Epoch::new(1).unwrap(),
+        );
+        pod.attach_resource(pod.revision(), &resource).unwrap();
+        let binding =
+            LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource]).unwrap();
+        let driver = ResourceDriver::Auxiliary {
+            driver_ref: "process.exec".into(),
+        };
+        let generation = format!("sha256:{}", "0".repeat(64));
+        let profile = RegisteredLaunchProfile::from_trusted_policy(TrustedLaunchProfileInput {
+            profile_ref: "profile.postclaim".into(),
+            profile_generation: 1,
+            executable: "/bin/true".into(),
+            binary_generation: generation.clone(),
+            executable_sha256: "0".repeat(64),
+            workspace_root: directory.clone(),
+            resource_layout: vec![TrustedDriverTemplate {
+                kind: ResourceKind::Auxiliary,
+                driver: driver.clone(),
+            }],
+            execution_mode: ExecutionMode::LinuxCooperative,
+            fixed_arguments: vec![],
+            permitted_extra_arguments: BTreeSet::new(),
+            default_model: "none".into(),
+            allowed_models: BTreeSet::from(["none".into()]),
+            default_effort: "none".into(),
+            allowed_efforts: BTreeSet::from(["none".into()]),
+            workspace_scope: scope.clone(),
+            workspace_basis_ref: "basis.postclaim".into(),
+            allowed_cwd_prefix: ".".into(),
+            allow_write: true,
+            allowed_tool_bundle_refs: BTreeSet::new(),
+            environment_refs: vec![],
+            credential_refs: vec![],
+            max_wall_seconds: 60,
+            max_children: 0,
+            allow_fallback: false,
+        })
+        .unwrap();
+        let spec = profile
+            .resolve(
+                pod.id().clone(),
+                Role::Worker,
+                1,
+                None,
+                &LaunchSelection {
+                    profile_ref: "profile.postclaim".into(),
+                    profile_generation: 1,
+                    model_id: None,
+                    reasoning_effort: None,
+                    fallback_approved: false,
+                    workspace: WorkspaceSelection {
+                        scope_id: scope.clone(),
+                        basis_ref: "basis.postclaim".into(),
+                        relative_cwd: ".".into(),
+                        access: WorkspaceAccess::ReadWrite,
+                    },
+                    arguments: vec![],
+                    tool_bundle_refs: vec![],
+                    authority_ref: "grant.1".into(),
+                    wall_seconds: 60,
+                    max_children: 0,
+                    parent_run_id: None,
+                },
+            )
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let digest = EffectiveLaunchContract::decode(&spec)
+            .unwrap()
+            .digest()
+            .to_owned();
+        let descriptor = ImmutableLaunchDescriptor::from_binding(
+            &binding,
+            ReviewedNativePolicy {
+                target_os: TargetOs::Linux,
+                host_id: "host.postclaim".into(),
+                profile_ref: "profile.postclaim".into(),
+                profile_generation: 1,
+                model_id: "none".into(),
+                reasoning_effort: "none".into(),
+                executable_generation: generation,
+                effective_spec_digest: digest,
+                workspace_basis_ref: "basis.postclaim".into(),
+                executable: "/bin/true".into(),
+                cwd: directory.to_string_lossy().into_owned(),
+                arguments: vec![],
+                environment_refs: vec![],
+                credential_refs: vec![],
+                wall_seconds: 60,
+                max_children: 0,
+                resources: vec![ReviewedResource {
+                    resource_id: binding.resources()[0].id().clone(),
+                    kind: ResourceKind::Auxiliary,
+                    epoch: Epoch::new(1).unwrap(),
+                    driver,
+                }],
+            },
+        )
+        .unwrap();
+        let admission = host
+            .store
+            .admit_bound_launch(BoundLaunchRequest {
+                principal: VerifiedPrincipal::from_authenticated_boundary(actor.as_str()).unwrap(),
+                command_key: "command.postclaim",
+                canonical_intent: b"postclaim fixture",
+                scope_id: scope.as_str(),
+                pod_id: pod.id().as_str(),
+                proposal: Some(BoundLaunchProposal {
+                    session: &session,
+                    run: &run,
+                    binding: &binding,
+                    effective_spec: &spec,
+                    descriptor: &descriptor,
+                    expected_owner_epoch: 1,
+                    expected_authority_revision: host.recorded.revision,
+                }),
+            })
+            .unwrap();
+        let BoundLaunchAdmission::Committed(record) = admission else {
+            panic!("new fixture");
+        };
+        host.recorded = host.store.authority_snapshot().unwrap();
+        let key = format!("claim.{}", record.receipt.command_id);
+        assert_eq!(
+            host.store
+                .claim_effect(
+                    record.receipt.outbox_id,
+                    &record.scope_id,
+                    &record.pod_id,
+                    1,
+                    record.pod_incarnation,
+                    host.recorded.revision,
+                    &key
+                )
+                .unwrap(),
+            EffectClaim::NewClaim
+        );
+        (Fixture(directory), host, record, key)
+    }
+
+    #[test]
+    fn postclaim_resource_drift_records_refusal_without_port_call() {
+        let (_fixture, mut host, record, key) = claimed();
+        let mut resource = host.recorded.resources[0].clone();
+        resource.input_epoch += 1;
+        host.store
+            .apply_authority_mutation(
+                1,
+                host.recorded.revision,
+                AuthorityMutation::PutResource(resource),
+            )
+            .unwrap();
+        let failure = host.current_launch_inputs(&record).unwrap_err();
+        let receipt = record.receipt.clone();
+        let result = host
+            .refuse_claimed_launch(record.clone(), false, &key, failure)
+            .unwrap();
+        assert!(!result.port_called);
+        assert_eq!(result.receipt, receipt);
+        assert_eq!(
+            result.status.stage,
+            LaunchDispatchStage::RefusedBeforeEffect
+        );
+        assert_eq!(
+            host.store
+                .launch_dispatch_status(receipt.outbox_id, &record.scope_id, &record.pod_id)
+                .unwrap()
+                .stage,
+            LaunchDispatchStage::RefusedBeforeEffect
+        );
+        assert_eq!(host.host.port.0, 0);
+    }
+
+    #[test]
+    fn postclaim_owner_drift_returns_receipt_with_unrecorded_refusal() {
+        let (_fixture, mut host, record, key) = claimed();
+        host.store.begin_authority_replay(1, 2).unwrap();
+        let failure = host.recheck_manager_binding().unwrap_err();
+        let receipt = record.receipt.clone();
+        let error = host
+            .refuse_claimed_launch(record.clone(), false, &key, failure)
+            .unwrap_err();
+        match error {
+            LaunchPodError::OutcomeNotRecorded {
+                receipt: actual,
+                observed: LaunchPortResult::RefusedBeforeEffect,
+                source: StoreError::StaleEpoch,
+            } => {
+                assert_eq!(actual, receipt);
+            }
+            other => panic!("wrong postclaim result: {other:?}"),
+        }
+        assert_eq!(
+            host.store
+                .launch_dispatch_status(receipt.outbox_id, &record.scope_id, &record.pod_id)
+                .unwrap()
+                .stage,
+            LaunchDispatchStage::ClaimedUncertain
+        );
+        assert_eq!(host.host.port.0, 0);
     }
 }
