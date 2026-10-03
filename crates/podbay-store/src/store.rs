@@ -12,8 +12,70 @@ use crate::model::{
     StoreError, StoredEffect,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_BYTES: usize = 1_048_576;
+
+// Version eight records immutable launch identities. A binding is absent for
+// every historical v7 launch; no migration guesses a Session, Run or resource.
+const RUNTIME_SESSIONS_V8: &str = "CREATE TABLE runtime_sessions (
+  session_id TEXT PRIMARY KEY CHECK(length(session_id)>0),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  actor_id TEXT NOT NULL CHECK(length(actor_id)>0),
+  revision INTEGER NOT NULL CHECK(revision>=0),
+  state TEXT NOT NULL CHECK(length(state)>0),
+  current_run_id TEXT CHECK(current_run_id IS NULL OR length(current_run_id)>0),
+  UNIQUE(session_id,scope_id)
+) STRICT";
+const RUNTIME_RUNS_V8: &str = "CREATE TABLE runtime_runs (
+  run_id TEXT PRIMARY KEY CHECK(length(run_id)>0),
+  session_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  role TEXT NOT NULL CHECK(length(role)>0),
+  work_kind TEXT NOT NULL CHECK(length(work_kind)>0),
+  parent_run_id TEXT CHECK(parent_run_id IS NULL OR length(parent_run_id)>0),
+  revision INTEGER NOT NULL CHECK(revision>=0),
+  admission_state TEXT NOT NULL CHECK(length(admission_state)>0),
+  desired_mode TEXT NOT NULL CHECK(length(desired_mode)>0),
+  execution_state TEXT NOT NULL CHECK(length(execution_state)>0),
+  current_attempt_id TEXT CHECK(current_attempt_id IS NULL OR length(current_attempt_id)>0),
+  last_attempt_ordinal INTEGER NOT NULL CHECK(last_attempt_ordinal>=0),
+  FOREIGN KEY(session_id,scope_id) REFERENCES runtime_sessions(session_id,scope_id),
+  UNIQUE(run_id,session_id,scope_id)
+) STRICT";
+const LAUNCH_BINDINGS_V8: &str = "CREATE TABLE launch_bindings (
+  command_rowid INTEGER PRIMARY KEY,
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE CHECK(length(attempt_id)>0),
+  attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal>=1),
+  attempt_epoch INTEGER NOT NULL CHECK(attempt_epoch>=1),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_count INTEGER NOT NULL CHECK(resource_count>=1),
+  effective_spec_version TEXT NOT NULL CHECK(length(effective_spec_version)>0),
+  effective_spec_digest TEXT NOT NULL CHECK(length(effective_spec_digest)=64),
+  effective_spec BLOB NOT NULL CHECK(length(effective_spec)>0),
+  descriptor_version TEXT NOT NULL CHECK(length(descriptor_version)>0),
+  descriptor_digest TEXT NOT NULL CHECK(length(descriptor_digest)=64),
+  descriptor BLOB NOT NULL CHECK(length(descriptor)>0),
+  FOREIGN KEY(run_id,session_id,scope_id) REFERENCES runtime_runs(run_id,session_id,scope_id),
+  FOREIGN KEY(scope_id,pod_id,pod_incarnation,command_rowid)
+    REFERENCES launch_slots(scope_id,pod_id,pod_incarnation,command_rowid),
+  UNIQUE(scope_id,pod_id,pod_incarnation),
+  UNIQUE(run_id,attempt_ordinal)
+) STRICT";
+const LAUNCH_RESOURCES_V8: &str = "CREATE TABLE launch_resources (
+  command_rowid INTEGER NOT NULL REFERENCES launch_bindings(command_rowid),
+  resource_ordinal INTEGER NOT NULL CHECK(resource_ordinal>=0),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  resource_kind TEXT NOT NULL CHECK(length(resource_kind)>0),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  PRIMARY KEY(command_rowid,resource_ordinal),
+  UNIQUE(command_rowid,resource_id)
+) STRICT";
+const LAUNCH_SLOT_BINDING_INDEX_V8: &str = "CREATE UNIQUE INDEX launch_slots_binding_identity
+  ON launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)";
 
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
@@ -296,7 +358,31 @@ impl PodBayStore {
                 ));
             }
         }
+        if version < 8 {
+            // A pre-existing v8 name in a v7 database is not evidence of a
+            // completed migration. Refuse it instead of accepting its shape.
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('runtime_sessions','runtime_runs','launch_bindings',
+                  'launch_resources','launch_slots_binding_identity')",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict("v8 schema name already exists"));
+            }
+            for sql in [
+                LAUNCH_SLOT_BINDING_INDEX_V8,
+                RUNTIME_SESSIONS_V8,
+                RUNTIME_RUNS_V8,
+                LAUNCH_BINDINGS_V8,
+                LAUNCH_RESOURCES_V8,
+            ] {
+                transaction.execute_batch(&format!("{sql};"))?;
+            }
+        }
         verify_authority_schema(&transaction)?;
+        verify_runtime_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -1660,6 +1746,32 @@ fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()
             return Err(StoreError::Conflict(
                 "authority schema columns do not match",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_runtime_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (name, kind, expected) in [
+        ("runtime_sessions", "table", RUNTIME_SESSIONS_V8),
+        ("runtime_runs", "table", RUNTIME_RUNS_V8),
+        ("launch_bindings", "table", LAUNCH_BINDINGS_V8),
+        ("launch_resources", "table", LAUNCH_RESOURCES_V8),
+        (
+            "launch_slots_binding_identity",
+            "index",
+            LAUNCH_SLOT_BINDING_INDEX_V8,
+        ),
+    ] {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v8 runtime schema differs"));
         }
     }
     Ok(())

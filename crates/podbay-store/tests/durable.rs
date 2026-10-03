@@ -75,6 +75,20 @@ fn ready(store: &mut PodBayStore) {
         .unwrap();
 }
 
+fn remove_v8_schema(connection: &rusqlite::Connection) {
+    // Downgrade fixtures must really have the older layout, not only an old
+    // user_version attached to the new tables.
+    connection
+        .execute_batch(
+            "DROP TABLE launch_resources;
+             DROP TABLE launch_bindings;
+             DROP TABLE runtime_runs;
+             DROP TABLE runtime_sessions;
+             DROP INDEX launch_slots_binding_identity;",
+        )
+        .unwrap();
+}
+
 fn fixture_request_digest(request: &CommandRequest) -> String {
     let mut digest = Sha256::new();
     for field in [
@@ -378,6 +392,144 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 6);
+}
+
+#[test]
+fn fresh_schema_eight_has_empty_runtime_identity_tables_and_reopens() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    for table in [
+        "runtime_sessions",
+        "runtime_runs",
+        "launch_bindings",
+        "launch_resources",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "fresh {table} must be empty");
+    }
+    drop(connection);
+    drop(fixture.open());
+}
+
+#[test]
+fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    ready(&mut store);
+    let input = request("scope.fixture", "request.v7-to-v8", b"historical");
+    let receipt = match store.admit(&input).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected committed launch: {other:?}"),
+    };
+    let cursor = store.scope_snapshot("scope.fixture").unwrap().cursor;
+    let effect = store
+        .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_resources;
+             DROP TABLE launch_bindings;
+             DROP TABLE runtime_runs;
+             DROP TABLE runtime_sessions;
+             DROP INDEX launch_slots_binding_identity;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut migrated = fixture.open();
+    assert_eq!(migrated.admit(&input).unwrap(), Admission::Duplicate(receipt.clone()));
+    assert_eq!(migrated.scope_snapshot("scope.fixture").unwrap().cursor, cursor);
+    assert_eq!(
+        migrated
+            .load_effect(receipt.outbox_id, "scope.fixture", "target.fixture")
+            .unwrap(),
+        effect
+    );
+    drop(migrated);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    for table in [
+        "runtime_sessions",
+        "runtime_runs",
+        "launch_bindings",
+        "launch_resources",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "v7 cannot invent {table}");
+    }
+    let slot_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM launch_slots", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(slot_count, 1);
+    drop(connection);
+    drop(fixture.open());
+}
+
+#[test]
+fn schema_eight_refuses_preexisting_or_malformed_runtime_tables() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_resources;
+             DROP TABLE launch_bindings;
+             DROP TABLE runtime_runs;
+             DROP TABLE runtime_sessions;
+             DROP INDEX launch_slots_binding_identity;
+             CREATE TABLE runtime_sessions(session_id TEXT PRIMARY KEY) STRICT;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v8 schema name already exists"))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+
+    let malformed = Fixture::new();
+    drop(malformed.open());
+    let connection = rusqlite::Connection::open(&malformed.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_resources;
+             CREATE TABLE launch_resources (
+               command_rowid INTEGER NOT NULL,
+               resource_ordinal INTEGER NOT NULL,
+               resource_id TEXT NOT NULL,
+               resource_kind TEXT NOT NULL,
+               resource_epoch INTEGER NOT NULL,
+               PRIMARY KEY(command_rowid,resource_ordinal)
+             ) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open(&malformed.database),
+        Err(StoreError::Conflict("v8 runtime schema differs"))
+    ));
 }
 
 #[test]
@@ -1434,6 +1586,7 @@ fn schema_one_open_migrates_without_changing_original_receipt() {
     // Reconstruct the schema-one outbox around a committed row. The next open
     // must migrate it without changing command identity or admission lineage.
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_v8_schema(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -1514,6 +1667,7 @@ fn schema_two_migration_preserves_lineage_cursor_and_legacy_evidence_stage() {
     drop(store);
 
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_v8_schema(&connection);
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
@@ -1694,6 +1848,7 @@ fn schema_four_open_adds_launch_dispatch_outcome_table() {
     let fixture = Fixture::new();
     drop(fixture.open());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_v8_schema(&connection);
     connection
         .execute_batch(
             "DROP TABLE launch_dispatch_outcomes;
@@ -1752,6 +1907,7 @@ fn schema_five_backfills_effect_digest_and_tampering_refuses_claim() {
     };
     drop(store);
     let injector = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_v8_schema(&injector);
     injector
         .execute_batch(
             "ALTER TABLE outbox DROP COLUMN effect_digest;
