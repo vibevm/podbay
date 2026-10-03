@@ -1882,6 +1882,119 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         &self.recorded
     }
 
+    /// Resolves a live local transport observation to one active actor. The
+    /// caller must have independently attested the process with the kernel and
+    /// the credential generation with the local credential protocol; neither
+    /// value may come from a request envelope. This method grants no rights.
+    /// Recorded actors remain inert after manager reopen until trusted replay
+    /// has explicitly reattested them into this manager's active actor map.
+    pub fn resolve_observed_actor_from_trusted_transport(
+        &mut self,
+        observed_process: &AuthenticatedProcessSubject,
+        observed_generation: CredentialGeneration,
+    ) -> Result<AuthenticatedPeer, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (observed_process, observed_generation);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if observed_process.platform() != HostPlatform::Linux {
+                return Err(HostError::Unsupported.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if current.owner_epoch != self.manager_claim.owner_epoch()
+                || current.owner_epoch != self.host.manager_epoch.get()
+                || current.revision != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+
+            let mut active = self
+                .host
+                .actors
+                .values()
+                .filter(|actor| actor.process == *observed_process);
+            let actor = active.next().ok_or(HostError::Unauthenticated)?.clone();
+            if active.next().is_some() || actor.credential_generation != observed_generation {
+                return Err(HostError::Unauthenticated.into());
+            }
+            let expected = durable_actor(&actor);
+            for snapshot in [&current, &self.recorded] {
+                let mut matching = snapshot
+                    .actors
+                    .iter()
+                    .filter(|record| actor_record_matches_process(record, observed_process));
+                if matching.next() != Some(&expected) || matching.next().is_some() {
+                    return Err(HostError::Unauthenticated.into());
+                }
+            }
+
+            if let PeerOrigin::Pod {
+                actor_id,
+                pod_id,
+                incarnation,
+            } = &actor.origin
+            {
+                if actor_id != &actor.actor_id {
+                    return Err(HostError::Unauthenticated.into());
+                }
+                let pod = self
+                    .host
+                    .pods
+                    .get(pod_id)
+                    .ok_or(HostError::Unauthenticated)?;
+                if pod.scope_id != actor.scope_id || pod.incarnation != *incarnation {
+                    return Err(HostError::Unauthenticated.into());
+                }
+                let expected = durable_pod(pod);
+                for snapshot in [&current, &self.recorded] {
+                    let mut matching = snapshot
+                        .pods
+                        .iter()
+                        .filter(|record| record.pod_id == pod_id.as_str());
+                    if matching.next() != Some(&expected) || matching.next().is_some() {
+                        return Err(HostError::Unauthenticated.into());
+                    }
+                }
+            }
+
+            self.recheck_actor_resolution_manager()?;
+            let final_snapshot = self.store.authority_snapshot()?;
+            if final_snapshot.owner_epoch != current.owner_epoch
+                || final_snapshot.revision != current.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(AuthenticatedPeer {
+                origin: actor.origin,
+                process: actor.process,
+                credential_generation: actor.credential_generation,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recheck_actor_resolution_manager(&mut self) -> Result<(), DurableAuthorityError> {
+        recheck_current_manager(
+            &mut self.store,
+            &self.canonical_database,
+            self.database_identity,
+            &self.manager_peer,
+            &self.manager_claim,
+        )
+        .map(|_| ())
+        .map_err(|error| match error {
+            RebindContextError::Host(error) => DurableAuthorityError::Host(error),
+            RebindContextError::Store(StoreError::StaleEpoch) => {
+                DurableAuthorityError::Host(HostError::StaleGuard)
+            }
+            RebindContextError::Store(error) => DurableAuthorityError::Store(error),
+        })
+    }
+
     /// Trusted policy must register the effective profile on every manager
     /// incarnation; an old outbox effect alone cannot reactivate a changed policy.
     pub fn register_launch_profile_from_trusted_policy(
@@ -2611,6 +2724,23 @@ fn durable_actor(record: &ActorRegistration) -> AuthorityActorRecord {
         start_identity: record.process.start_identity,
         containment_identity: record.process.containment_identity.to_string(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn actor_record_matches_process(
+    record: &AuthorityActorRecord,
+    process: &AuthenticatedProcessSubject,
+) -> bool {
+    let platform = match process.platform {
+        HostPlatform::Linux => "linux",
+        HostPlatform::MacOs => "macos",
+        HostPlatform::Windows => "windows",
+    };
+    record.platform == platform
+        && record.os_identity == process.os_identity.as_ref()
+        && record.process_identity == process.process_identity.as_ref()
+        && record.start_identity == process.start_identity
+        && record.containment_identity == process.containment_identity.as_ref()
 }
 
 fn durable_grant(id: GrantId, grant: &Grant) -> AuthorityGrantRecord {

@@ -10,7 +10,7 @@ use podbay_host::{
     HostRequest, InputEpoch, ManagerEpoch, Operation, PodIncarnation, PodRegistration,
     PortDispatchError, PortDispatchOutcome, ResourceEpoch, ResourceRegistration, Right, Target,
 };
-use podbay_store::PodBayStore;
+use podbay_store::{AuthorityMutation, PodBayStore, StoreError};
 
 struct Fixture {
     directory: PathBuf,
@@ -149,6 +149,201 @@ fn grant(scope: &ScopeId, resource: &ResourceId) -> GrantSpec {
         .collect::<BTreeSet<_>>(),
         remaining_delegation_depth: 0,
     }
+}
+
+#[test]
+fn observed_owner_cli_resolves_only_exact_active_process_and_current_manager() {
+    let fixture = Fixture::new();
+    let scope = ScopeId::try_from("scope.owner").unwrap();
+    let actor_id = ActorId::try_from("actor.owner").unwrap();
+    let process = subject(701, 801, "/user.slice/owner-cli.scope");
+    let generation = CredentialGeneration::new(1).unwrap();
+    let mut authority = DurableAuthority::open(&fixture.database, FakePort::default()).unwrap();
+    authority
+        .register_actor_from_trusted_policy(ActorRegistration::owner_cli_from_trusted_policy(
+            actor_id,
+            scope,
+            process.clone(),
+            generation,
+        ))
+        .unwrap();
+    let revision = authority.recorded_snapshot().revision;
+    assert_eq!(
+        authority
+            .resolve_observed_actor_from_trusted_transport(&process, generation)
+            .unwrap(),
+        AuthenticatedPeer::owner_cli_from_authenticated_transport(process.clone(), generation)
+    );
+    assert_eq!(authority.recorded_snapshot().revision, revision);
+    for unregistered in [
+        subject(701, 802, "/user.slice/owner-cli.scope"),
+        subject(701, 801, "/user.slice/other.scope"),
+        subject(702, 801, "/user.slice/owner-cli.scope"),
+    ] {
+        assert!(matches!(
+            authority.resolve_observed_actor_from_trusted_transport(&unregistered, generation),
+            Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+        ));
+    }
+    assert_eq!(authority.port().calls.len(), 0);
+
+    let mut external = PodBayStore::open(&fixture.database).unwrap();
+    let actor_record = authority.recorded_snapshot().actors[0].clone();
+    external
+        .apply_authority_mutation(1, revision, AuthorityMutation::PutActor(actor_record))
+        .unwrap();
+    assert!(matches!(
+        authority.resolve_observed_actor_from_trusted_transport(&process, generation),
+        Err(DurableAuthorityError::Host(HostError::StaleGuard))
+    ));
+    external.advance_owner_epoch(1, 2).unwrap();
+    let stale = authority.resolve_observed_actor_from_trusted_transport(&process, generation);
+    assert!(
+        matches!(
+            stale,
+            Err(DurableAuthorityError::Host(HostError::StaleGuard))
+        ),
+        "unexpected stale-owner result: {stale:?}"
+    );
+}
+
+#[test]
+fn observed_pod_resolves_own_scope_and_refuses_stale_incarnation() {
+    let fixture = Fixture::new();
+    let scope_a = ScopeId::try_from("scope.resolve.alpha").unwrap();
+    let scope_b = ScopeId::try_from("scope.resolve.beta").unwrap();
+    let pod_a = PodId::try_from("pod.resolve.alpha").unwrap();
+    let pod_b = PodId::try_from("pod.resolve.beta").unwrap();
+    let actor_a = ActorId::try_from("actor.resolve.alpha").unwrap();
+    let actor_b = ActorId::try_from("actor.resolve.beta").unwrap();
+    let process_a = subject(711, 811, "/user.slice/pod-alpha.scope");
+    let process_b = subject(712, 812, "/user.slice/pod-beta.scope");
+    let generation = CredentialGeneration::new(1).unwrap();
+    let mut authority = DurableAuthority::open(&fixture.database, FakePort::default()).unwrap();
+    for (scope, pod, actor_id, process) in [
+        (&scope_a, &pod_a, &actor_a, &process_a),
+        (&scope_b, &pod_b, &actor_b, &process_b),
+    ] {
+        authority
+            .register_pod_from_trusted_policy(PodRegistration {
+                scope_id: scope.clone(),
+                pod_id: pod.clone(),
+                incarnation: PodIncarnation::new(1).unwrap(),
+            })
+            .unwrap();
+        authority
+            .register_actor_from_trusted_policy(actor(scope, actor_id, pod, process))
+            .unwrap();
+    }
+    assert_eq!(
+        authority
+            .resolve_observed_actor_from_trusted_transport(&process_a, generation)
+            .unwrap(),
+        AuthenticatedPeer::pod_from_authenticated_transport(
+            actor_a,
+            pod_a.clone(),
+            PodIncarnation::new(1).unwrap(),
+            process_a.clone(),
+            generation,
+        )
+    );
+    assert_eq!(
+        authority
+            .resolve_observed_actor_from_trusted_transport(&process_b, generation)
+            .unwrap(),
+        AuthenticatedPeer::pod_from_authenticated_transport(
+            actor_b,
+            pod_b,
+            PodIncarnation::new(1).unwrap(),
+            process_b,
+            generation,
+        )
+    );
+    for sibling_identity in [
+        subject(711, 812, "/user.slice/pod-alpha.scope"),
+        subject(711, 811, "/user.slice/pod-beta.scope"),
+    ] {
+        assert!(matches!(
+            authority.resolve_observed_actor_from_trusted_transport(&sibling_identity, generation),
+            Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+        ));
+    }
+    authority
+        .advance_pod_incarnation_from_trusted_policy(
+            &pod_a,
+            PodIncarnation::new(1).unwrap(),
+            PodIncarnation::new(2).unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        authority.resolve_observed_actor_from_trusted_transport(&process_a, generation),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    assert_eq!(authority.port().calls.len(), 0);
+}
+
+#[test]
+fn reopened_actor_stays_inert_until_reattested_and_old_generation_refuses() {
+    let fixture = Fixture::new();
+    let scope = ScopeId::try_from("scope.resolve.replay").unwrap();
+    let pod = PodId::try_from("pod.resolve.replay").unwrap();
+    let actor_id = ActorId::try_from("actor.resolve.replay").unwrap();
+    let process = subject(721, 821, "/user.slice/pod-replay.scope");
+    let registration = actor(&scope, &actor_id, &pod, &process);
+    let transport = peer(&actor_id, &pod, &process);
+    let old_generation = CredentialGeneration::new(1).unwrap();
+    let new_generation = CredentialGeneration::new(2).unwrap();
+    let mut first = DurableAuthority::open(&fixture.database, FakePort::default()).unwrap();
+    first
+        .register_pod_from_trusted_policy(PodRegistration {
+            scope_id: scope.clone(),
+            pod_id: pod.clone(),
+            incarnation: PodIncarnation::new(1).unwrap(),
+        })
+        .unwrap();
+    first
+        .register_actor_from_trusted_policy(registration.clone())
+        .unwrap();
+    drop(first);
+
+    let mut reopened = DurableAuthority::open(&fixture.database, FakePort::default()).unwrap();
+    assert!(matches!(
+        reopened.resolve_observed_actor_from_trusted_transport(&process, old_generation),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    reopened
+        .reattest_actor_from_trusted_replay(&transport, registration)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .resolve_observed_actor_from_trusted_transport(&process, old_generation)
+            .unwrap(),
+        transport.verified_peer().unwrap()
+    );
+    reopened
+        .advance_credential_generation_from_trusted_policy(
+            &actor_id,
+            old_generation,
+            new_generation,
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.resolve_observed_actor_from_trusted_transport(&process, old_generation),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    assert_eq!(
+        reopened
+            .resolve_observed_actor_from_trusted_transport(&process, new_generation)
+            .unwrap(),
+        AuthenticatedPeer::pod_from_authenticated_transport(
+            actor_id,
+            pod,
+            PodIncarnation::new(1).unwrap(),
+            process,
+            new_generation,
+        )
+    );
+    assert_eq!(reopened.port().calls.len(), 0);
 }
 
 #[test]
@@ -503,9 +698,12 @@ fn manager_lifetime_lock_prevents_dual_effect_owners() {
     assert_eq!(first.port().calls.len(), 1);
     drop(first);
 
-    let reopened = DurableAuthority::open(&fixture.database, FakePort::default()).unwrap();
-    assert_eq!(reopened.owner_epoch().get(), 3);
-    assert_eq!(reopened.port().calls.len(), 0);
+    assert!(matches!(
+        DurableAuthority::open(&fixture.database, FakePort::default()),
+        Err(DurableAuthorityError::Store(StoreError::StaleEpoch))
+    ));
+    let probe = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(probe.owner_epoch().unwrap(), 2);
 }
 
 #[cfg(target_os = "linux")]
