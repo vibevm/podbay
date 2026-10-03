@@ -1,0 +1,18 @@
+{
+  "body": {
+    "expectedRevision": "3",
+    "reason": "Decision no longer applies"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.question-cancel.1",
+  "operation": "question.cancel",
+  "payloadDigest": "1ca48861142f9c7bac900d8117762e02b88e1cb9ca3af8bd0914e81ae7d5d62d",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.question-cancel.1",
+  "target": {
+    "kind": "question",
+    "questionId": "question.fixture"
+  }
+}

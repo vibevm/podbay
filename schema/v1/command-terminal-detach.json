@@ -1,0 +1,18 @@
+{
+  "body": {
+    "viewerId": "viewer.fixture"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.terminal-detach.1",
+  "operation": "terminal.detach",
+  "payloadDigest": "15f18bb6f239275b206162bbfa2b240c51f77d755311f4b1d0a0b28832659836",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.terminal-detach.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

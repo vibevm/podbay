@@ -1,4 +1,6 @@
 //! Regenerate or check the thin TypeScript v1 binding from Rust-owned wire definitions.
+#[path = "generate-ts/fixture_catalog.rs"]
+mod fixture_catalog;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -28,6 +30,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     for (name, command) in command_fixtures()? {
         let value: serde_json::Value = serde_json::from_slice(&command.encode_json()?)?;
+        files.push((
+            root.join("schema/v1").join(name),
+            format!("{}\n", serde_json::to_string_pretty(&value)?),
+        ));
+    }
+    for (name, command) in fixture_catalog::additional_commands()? {
+        let value: serde_json::Value = serde_json::from_slice(&command.encode_json()?)?;
+        files.push((
+            root.join("schema/v1").join(name),
+            format!("{}\n", serde_json::to_string_pretty(&value)?),
+        ));
+    }
+    for (name, request) in fixture_catalog::reads()? {
+        let value: serde_json::Value = serde_json::from_slice(&request.encode_json()?)?;
         files.push((
             root.join("schema/v1").join(name),
             format!("{}\n", serde_json::to_string_pretty(&value)?),

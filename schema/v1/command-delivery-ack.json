@@ -1,0 +1,18 @@
+{
+  "body": {
+    "evidenceRef": "evidence.delivery",
+    "kind": "received"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.delivery-ack.1",
+  "operation": "delivery.ack",
+  "payloadDigest": "a897be7d6e140874076a2821050ca6e9b13f7cc5599953e68884d89dd9869342",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.delivery-ack.1",
+  "target": {
+    "deliveryId": "delivery.fixture",
+    "kind": "delivery"
+  }
+}

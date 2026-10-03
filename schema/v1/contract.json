@@ -14,6 +14,10 @@
     "maxBytes": 1048576,
     "prefix": "u32_be"
   },
+  "interactionKinds": [
+    "question",
+    "permission"
+  ],
   "protocol": "podbay/1",
   "resourceCommandKinds": [
     "write",
@@ -22,11 +26,39 @@
     "stop"
   ],
   "supportedMutationSchemas": [
+    "launch",
+    "session.close",
     "session.send",
+    "run.interrupt",
     "run.pause",
     "run.resume",
     "run.stop",
+    "run.report",
+    "run.finish",
+    "delivery.ack",
+    "delivery.cancel",
+    "control.acquire",
+    "control.release",
+    "terminal.detach",
+    "question.ask",
+    "question.answer",
+    "question.cancel",
+    "permission.request",
+    "permission.decide",
     "resource.command"
+  ],
+  "supportedReadSchemas": [
+    "capabilities.get",
+    "commands.get",
+    "run.get",
+    "session.get",
+    "delivery.get",
+    "snapshot.get",
+    "event.subscribe",
+    "history.read",
+    "terminal.snapshot",
+    "terminal.attach",
+    "terminal.observe"
   ],
   "unknownMutation": "reject_before_effect",
   "unknownObservation": "retain_opaque_json"

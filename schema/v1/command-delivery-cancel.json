@@ -1,0 +1,17 @@
+{
+  "body": {
+    "reason": "Input is no longer needed"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.delivery-cancel.1",
+  "operation": "delivery.cancel",
+  "payloadDigest": "d67c912b0445d7447e0886f123bf216218043dd756326b7e8c6689bac045d135",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.delivery-cancel.1",
+  "target": {
+    "deliveryId": "delivery.fixture",
+    "kind": "delivery"
+  }
+}

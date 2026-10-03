@@ -1,0 +1,34 @@
+{
+  "body": {
+    "context": "A scoped decision is required",
+    "independentWorkAvailable": true,
+    "items": [
+      {
+        "answerMode": "single_choice",
+        "itemId": "item.route",
+        "options": [
+          "A",
+          "B"
+        ],
+        "prompt": "Select one route",
+        "required": true
+      }
+    ],
+    "recipient": {
+      "kind": "human"
+    },
+    "title": "Choose approach"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.question-ask.1",
+  "operation": "question.ask",
+  "payloadDigest": "12c154a0c5799d7ec0b03c59607fb6141cce93f6de7645e6fa9e461f762369cc",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.question-ask.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "body": {
+    "selector": {
+      "key": "key.pb03c.launch.1",
+      "kind": "key"
+    }
+  },
+  "operation": "commands.get",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.commands-get.1",
+  "target": {
+    "kind": "scope",
+    "scopeId": "scope.fixture"
+  }
+}

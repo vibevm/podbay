@@ -1,0 +1,15 @@
+{
+  "body": {},
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.session-close.1",
+  "operation": "session.close",
+  "payloadDigest": "ab429718cdf243635d25e7613cabb38f0ad4f1be8fbd7a11cc415655ec1f042d",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.session-close.1",
+  "target": {
+    "kind": "session",
+    "sessionId": "session.fixture"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "body": {
+    "expectedLeaseEpoch": "0",
+    "holder": "human"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.control-acquire.1",
+  "operation": "control.acquire",
+  "payloadDigest": "f89629a3cbb3522896d7c3f3b4951f2dfb9309fd038a470e1aa621d67be8f834",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.control-acquire.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

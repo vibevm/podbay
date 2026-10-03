@@ -1,0 +1,17 @@
+{
+  "body": {
+    "after": {
+      "scopeId": "scope.fixture",
+      "sequence": "0",
+      "storeLineage": "store.fixture"
+    },
+    "limit": "100"
+  },
+  "operation": "history.read",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.history-read.1",
+  "target": {
+    "kind": "scope",
+    "scopeId": "scope.fixture"
+  }
+}

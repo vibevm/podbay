@@ -31,13 +31,8 @@ function fixture(name: string): unknown {
 
 test("Rust contract manifest and generated TypeScript vocabulary match", () => {
   assert.deepEqual(CONTRACT, fixture("contract.json"));
-  assert.deepEqual(CONTRACT.supportedMutationSchemas, [
-    "session.send",
-    "run.pause",
-    "run.resume",
-    "run.stop",
-    "resource.command",
-  ]);
+  assert.equal(CONTRACT.supportedMutationSchemas.length, 20);
+  assert.equal(CONTRACT.supportedReadSchemas.length, 11);
 });
 
 test("golden resource command digest and strict mutation decoding", async () => {
@@ -56,7 +51,7 @@ test("golden resource command digest and strict mutation decoding", async () => 
     body: command.body,
   });
   assert.deepEqual(generated, command);
-  await assert.rejects(() => decodeCommand({ ...raw, operation: "permission.decide" }));
+  await assert.rejects(() => decodeCommand({ ...raw, operation: "grant.issue" }));
   await assert.rejects(() => decodeCommand({ ...raw, action: "stop" }));
   await assert.rejects(() => decodeCommand({
     ...raw,

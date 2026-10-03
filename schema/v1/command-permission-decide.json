@@ -1,0 +1,21 @@
+{
+  "body": {
+    "decision": {
+      "kind": "allow_once"
+    },
+    "expectedRevision": "3",
+    "requestEpoch": "2"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.permission-decide.1",
+  "operation": "permission.decide",
+  "payloadDigest": "c30532ef7d6839de727118c0bb35883e8779769cadd301d9b6286a32c214a279",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.permission-decide.1",
+  "target": {
+    "kind": "permission",
+    "permissionId": "permission.fixture"
+  }
+}

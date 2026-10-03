@@ -1,0 +1,17 @@
+{
+  "body": {
+    "childPolicy": "join"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.run-finish.1",
+  "operation": "run.finish",
+  "payloadDigest": "0e5b7c722b99b46f36667cc3719fbcba39ef01bbf032287542db05ea4e3d502a",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.run-finish.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

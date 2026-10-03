@@ -1,0 +1,18 @@
+{
+  "body": {
+    "leaseId": "lease.fixture"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.control-release.1",
+  "operation": "control.release",
+  "payloadDigest": "bce27ec90c77932b05b86d81e06310f8f9871e929e17ff355414af2f5dc065ee",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.control-release.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

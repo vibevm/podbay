@@ -1,0 +1,56 @@
+{
+  "body": {
+    "authority": {
+      "grantRef": "grant.fixture"
+    },
+    "limits": {
+      "maxChildren": "4",
+      "wallSeconds": "3600"
+    },
+    "profileRef": "profile.fixture",
+    "role": "worker",
+    "selection": {
+      "fallback": "none",
+      "modelId": "model.fixture"
+    },
+    "session": {
+      "kind": "existing",
+      "sessionId": "session.fixture"
+    },
+    "toolBundleRefs": [
+      "tools.fixture"
+    ],
+    "work": {
+      "input": [
+        {
+          "kind": "text",
+          "text": "Review the result"
+        }
+      ],
+      "kind": "task",
+      "resultContractRef": "contract.fixture",
+      "taskRef": {
+        "id": "task.42",
+        "namespace": "sample"
+      }
+    },
+    "workspace": {
+      "access": "read_write",
+      "basisRef": "revision.fixture",
+      "relativeCwd": ".",
+      "scopeId": "scope.fixture"
+    }
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.launch.1",
+  "operation": "launch",
+  "payloadDigest": "1ad30b7d8728e52228695204c49a573ae89d3b8a9f157321ecb79ae4e90dbf07",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.launch-existing.1",
+  "target": {
+    "kind": "scope",
+    "scopeId": "scope.fixture"
+  }
+}

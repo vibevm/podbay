@@ -1,0 +1,13 @@
+{
+  "body": {
+    "after": "0"
+  },
+  "operation": "terminal.attach",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.terminal-attach.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

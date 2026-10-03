@@ -1,0 +1,10 @@
+{
+  "body": {},
+  "operation": "delivery.get",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.delivery-get.1",
+  "target": {
+    "deliveryId": "delivery.fixture",
+    "kind": "delivery"
+  }
+}

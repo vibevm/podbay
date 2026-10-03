@@ -1,7 +1,7 @@
 //! Machine-readable v1 manifest generated from the Rust-owned wire vocabulary.
 use serde_json::{Value, json};
 
-use crate::{MAX_FRAME_BYTES, MutationOperation};
+use crate::{MAX_FRAME_BYTES, MutationOperation, ReadOperation};
 
 pub fn contract_manifest() -> Value {
     json!({
@@ -14,7 +14,9 @@ pub fn contract_manifest() -> Value {
         },
         "cursorFields": ["storeLineage", "scopeId", "sequence"],
         "supportedMutationSchemas": MutationOperation::SUPPORTED.iter().map(|operation| operation.as_str()).collect::<Vec<_>>(),
+        "supportedReadSchemas": ReadOperation::SUPPORTED.iter().map(|operation| operation.as_str()).collect::<Vec<_>>(),
         "resourceCommandKinds": ["write", "resize", "interrupt", "stop"],
+        "interactionKinds": ["question", "permission"],
         "unknownMutation": "reject_before_effect",
         "unknownObservation": "retain_opaque_json",
         "eventSchemaCompatibility": "unknown_schema_is_opaque_under_podbay/1"

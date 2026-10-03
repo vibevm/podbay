@@ -1,0 +1,24 @@
+{
+  "body": {
+    "artifactRefs": [
+      "artifact.fixture"
+    ],
+    "declaration": "succeeded",
+    "evidenceRefs": [
+      "evidence.fixture"
+    ],
+    "summary": "Worker declared completion"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.run-report.1",
+  "operation": "run.report",
+  "payloadDigest": "7b50d11a3a88082a50e67f34abf8738b297d1838d9c3499ccad1e9872a456c03",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.run-report.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

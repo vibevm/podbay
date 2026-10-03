@@ -167,7 +167,7 @@ fn operation_and_inner_resource_kind_cannot_collide() {
     let mut value: Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(value["operation"], "resource.command");
     assert_eq!(value["body"]["command"]["kind"], "write");
-    value["operation"] = json!("permission.decide");
+    value["operation"] = json!("grant.issue");
     assert!(matches!(
         decode_command_json(&serde_json::to_vec(&value).unwrap()),
         Err(WireError::UnsupportedOperation(_))

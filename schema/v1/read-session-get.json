@@ -1,0 +1,10 @@
+{
+  "body": {},
+  "operation": "session.get",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.session-get.1",
+  "target": {
+    "kind": "session",
+    "sessionId": "session.fixture"
+  }
+}

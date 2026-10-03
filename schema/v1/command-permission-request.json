@@ -1,0 +1,24 @@
+{
+  "body": {
+    "action": "tool.invoke",
+    "attemptId": "attempt.fixture",
+    "expiresAt": "2026-10-03T12:05:00Z",
+    "grantDurationSeconds": "300",
+    "requestEpoch": "2",
+    "runId": "run.fixture",
+    "subjectDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.permission-request.1",
+  "operation": "permission.request",
+  "payloadDigest": "51745c608f1e158cba0b8ca91fe3d44b3ad4c26a700ca5dc5bf6e636f73a3b69",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.permission-request.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

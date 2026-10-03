@@ -1,0 +1,11 @@
+{
+  "body": {},
+  "operation": "terminal.snapshot",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.terminal-snapshot.1",
+  "target": {
+    "kind": "resource",
+    "podId": "pod.fixture",
+    "resourceId": "resource.pty"
+  }
+}

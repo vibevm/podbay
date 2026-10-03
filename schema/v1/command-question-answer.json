@@ -1,0 +1,26 @@
+{
+  "body": {
+    "expectedRevision": "3",
+    "response": {
+      "answers": [
+        {
+          "itemId": "item.route",
+          "value": "A"
+        }
+      ],
+      "kind": "submit"
+    }
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.question-answer.1",
+  "operation": "question.answer",
+  "payloadDigest": "7eeb39e529a86a2532a6d8f1fca27b7c24933422c1ce4b59cac525ab550774ad",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.question-answer.1",
+  "target": {
+    "kind": "question",
+    "questionId": "question.fixture"
+  }
+}

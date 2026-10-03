@@ -1,0 +1,17 @@
+{
+  "body": {
+    "expectedIntervalId": "interval.fixture"
+  },
+  "guard": {
+    "managerEpoch": "42"
+  },
+  "key": "key.pb03c.run-interrupt.1",
+  "operation": "run.interrupt",
+  "payloadDigest": "ee745e8479af9227fdb6dc948f2467e7e94f04354cd80928519157c969c2b133",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.run-interrupt.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

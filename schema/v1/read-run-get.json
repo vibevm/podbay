@@ -1,0 +1,10 @@
+{
+  "body": {},
+  "operation": "run.get",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.run-get.1",
+  "target": {
+    "kind": "run",
+    "runId": "run.fixture"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "body": {
+    "after": {
+      "scopeId": "scope.fixture",
+      "sequence": "0",
+      "storeLineage": "store.fixture"
+    }
+  },
+  "operation": "event.subscribe",
+  "protocol": "podbay/1",
+  "requestId": "request.pb03c.read.event-subscribe.1",
+  "target": {
+    "kind": "scope",
+    "scopeId": "scope.fixture"
+  }
+}

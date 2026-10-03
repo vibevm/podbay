@@ -13,8 +13,12 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 export type DecimalString = string & { readonly __decimalString: unique symbol };
 export type MutationOperation = (typeof CONTRACT.supportedMutationSchemas)[number];
 export type Target =
+  | { kind: "scope"; scopeId: string }
   | { kind: "session"; sessionId: string }
   | { kind: "run"; runId: string }
+  | { kind: "delivery"; deliveryId: string }
+  | { kind: "question"; questionId: string }
+  | { kind: "permission"; permissionId: string }
   | { kind: "resource"; podId: string; resourceId: string };
 export interface Guard {
   managerEpoch?: DecimalString;
@@ -36,6 +40,50 @@ export type ResourceAction =
   | { kind: "resize"; columns: DecimalString; rows: DecimalString }
   | { kind: "interrupt" }
   | { kind: "stop" };
+export type SessionChoice = { kind: "new" } | { kind: "existing"; sessionId: string };
+export interface LaunchBody {
+  session: SessionChoice;
+  role: "coordinator" | "worker" | "advisor";
+  work: {
+    kind: "task" | "service";
+    input?: ContentBlock[];
+    taskRef?: { namespace: string; id: string };
+    resultContractRef: string;
+  };
+  parentRunId?: string;
+  profileRef: string;
+  selection: { modelId?: string; reasoningEffort?: string; fallback: "none" | "approved" };
+  workspace: { scopeId: string; relativeCwd: string; basisRef?: string; access: "read_only" | "read_write" };
+  toolBundleRefs: string[];
+  authority: { grantRef: string };
+  limits: { wallSeconds: DecimalString; maxChildren: DecimalString };
+}
+export interface QuestionAskBody {
+  recipient: { kind: "superior" } | { kind: "human" } | { kind: "actor"; actorId: string };
+  title: string;
+  context: string;
+  items: { itemId: string; prompt: string; required: boolean; answerMode: "single_choice" | "free_text"; options: string[] }[];
+  independentWorkAvailable: boolean;
+  deadlineAt?: string;
+}
+export interface QuestionAnswerBody {
+  expectedRevision: DecimalString;
+  response: { kind: "submit"; answers: { itemId: string; value: string }[] } | { kind: "decline"; reason: string };
+}
+export interface PermissionRequestBody {
+  action: string;
+  subjectDigest: string;
+  runId: string;
+  attemptId: string;
+  requestEpoch: DecimalString;
+  grantDurationSeconds: DecimalString;
+  expiresAt: string;
+}
+export interface PermissionDecideBody {
+  expectedRevision: DecimalString;
+  requestEpoch: DecimalString;
+  decision: { kind: "allow_once" } | { kind: "allow_scoped"; constraintRef: string } | { kind: "deny" };
+}
 interface CommandCommon {
   protocol: typeof PROTOCOL;
   requestId: string;
@@ -45,16 +93,46 @@ interface CommandCommon {
   payloadDigest: string;
 }
 export type CommandEnvelope =
+  | (CommandCommon & { operation: "launch"; target: Extract<Target, { kind: "scope" }>; body: LaunchBody })
+  | (CommandCommon & { operation: "session.close"; target: Extract<Target, { kind: "session" }>; body: Record<string, never> })
   | (CommandCommon & { operation: "session.send"; target: Extract<Target, { kind: "session" }>; body: { content: ContentBlock[]; policy: SendPolicy } })
+  | (CommandCommon & { operation: "run.interrupt"; target: Extract<Target, { kind: "run" }>; body: { expectedIntervalId: string } })
   | (CommandCommon & { operation: "run.pause"; target: Extract<Target, { kind: "run" }>; body: { policy: "drain" | "interrupt_current" } })
   | (CommandCommon & { operation: "run.resume"; target: Extract<Target, { kind: "run" }>; body: { policy: "live_only" | "continue_saved_session" } })
   | (CommandCommon & { operation: "run.stop"; target: Extract<Target, { kind: "run" }>; body: { scope: "self_only" | "subtree" } })
+  | (CommandCommon & { operation: "run.report"; target: Extract<Target, { kind: "run" }>; body: { summary: string; artifactRefs: string[]; evidenceRefs: string[]; declaration: "succeeded" | "needs_follow_up" | "blocked" } })
+  | (CommandCommon & { operation: "run.finish"; target: Extract<Target, { kind: "run" }>; body: { childPolicy: "join" | "cancel" } })
+  | (CommandCommon & { operation: "delivery.ack"; target: Extract<Target, { kind: "delivery" }>; body: { kind: "received" | "processed"; evidenceRef: string } })
+  | (CommandCommon & { operation: "delivery.cancel"; target: Extract<Target, { kind: "delivery" }>; body: { reason: string } })
+  | (CommandCommon & { operation: "control.acquire"; target: Extract<Target, { kind: "resource" }>; body: { expectedLeaseEpoch: DecimalString; holder: "human" | "automation" } })
+  | (CommandCommon & { operation: "control.release"; target: Extract<Target, { kind: "resource" }>; body: { leaseId: string } })
+  | (CommandCommon & { operation: "terminal.detach"; target: Extract<Target, { kind: "resource" }>; body: { viewerId: string } })
+  | (CommandCommon & { operation: "question.ask"; target: Extract<Target, { kind: "run" }>; body: QuestionAskBody })
+  | (CommandCommon & { operation: "question.answer"; target: Extract<Target, { kind: "question" }>; body: QuestionAnswerBody })
+  | (CommandCommon & { operation: "question.cancel"; target: Extract<Target, { kind: "question" }>; body: { expectedRevision: DecimalString; reason: string } })
+  | (CommandCommon & { operation: "permission.request"; target: Extract<Target, { kind: "resource" }>; body: PermissionRequestBody })
+  | (CommandCommon & { operation: "permission.decide"; target: Extract<Target, { kind: "permission" }>; body: PermissionDecideBody })
   | (CommandCommon & { operation: "resource.command"; target: Extract<Target, { kind: "resource" }>; body: { command: ResourceAction } });
 export type CommandDraft = Omit<CommandCommon, "protocol" | "payloadDigest"> & {
   operation: MutationOperation;
   target: Target;
   body: unknown;
 };
+export type ReadOperation = (typeof CONTRACT.supportedReadSchemas)[number];
+export type ReadBody =
+  | Record<string, never>
+  | { selector: { kind: "id"; commandId: string } | { kind: "key"; key: string } }
+  | { after: EventCursor }
+  | { after: EventCursor; limit: DecimalString }
+  | { after: DecimalString }
+  | { after?: DecimalString };
+export interface ReadEnvelope {
+  protocol: typeof PROTOCOL;
+  operation: ReadOperation;
+  requestId: string;
+  target: Target;
+  body: ReadBody;
+}
 export interface EventCursor {
   storeLineage: string;
   scopeId: string;
@@ -168,8 +246,12 @@ function protocol(value: unknown): void {
 function target(value: unknown): Target {
   const item = record(value, "target");
   switch (item.kind) {
+    case "scope": exact(item, ["kind", "scopeId"]); identity(item.scopeId, "target.scopeId"); break;
     case "session": exact(item, ["kind", "sessionId"]); identity(item.sessionId, "target.sessionId"); break;
     case "run": exact(item, ["kind", "runId"]); identity(item.runId, "target.runId"); break;
+    case "delivery": exact(item, ["kind", "deliveryId"]); identity(item.deliveryId, "target.deliveryId"); break;
+    case "question": exact(item, ["kind", "questionId"]); identity(item.questionId, "target.questionId"); break;
+    case "permission": exact(item, ["kind", "permissionId"]); identity(item.permissionId, "target.permissionId"); break;
     case "resource": exact(item, ["kind", "podId", "resourceId"]); identity(item.podId, "target.podId"); identity(item.resourceId, "target.resourceId"); break;
     default: throw new TypeError("unknown target kind");
   }
@@ -181,8 +263,122 @@ function guard(value: unknown): Guard {
   for (const [key, entry] of Object.entries(item)) decimal(entry, "guard." + key, true);
   return item as Guard;
 }
+function contentBlocks(value: unknown): void {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64) throw new TypeError("invalid content");
+  for (const block of value) {
+    const content = record(block, "content");
+    if (content.kind === "text") {
+      exact(content, ["kind", "text"]);
+      const item = text(content.text, "content.text");
+      if (!item || encoder.encode(item).length > 64000) throw new TypeError("invalid content.text");
+    } else if (content.kind === "artifact") {
+      exact(content, ["kind", "artifactRef"]); identity(content.artifactRef, "content.artifactRef");
+    } else throw new TypeError("unknown content kind");
+  }
+}
+function identityArray(value: unknown, field: string, maximum = 64): void {
+  if (!Array.isArray(value) || value.length > maximum) throw new TypeError("invalid " + field);
+  for (const item of value) identity(item, field);
+}
+function launchBody(body: Record<string, unknown>): void {
+  exact(body, ["session", "role", "work", "profileRef", "selection", "workspace", "toolBundleRefs", "authority", "limits"], ["parentRunId"]);
+  const session = record(body.session, "session");
+  if (session.kind === "new") exact(session, ["kind"]);
+  else if (session.kind === "existing") { exact(session, ["kind", "sessionId"]); identity(session.sessionId, "session.sessionId"); }
+  else throw new TypeError("unknown session choice");
+  if (!["coordinator", "worker", "advisor"].includes(String(body.role))) throw new TypeError("unknown role");
+  const work = record(body.work, "work");
+  exact(work, ["kind", "resultContractRef"], ["input", "taskRef"]);
+  if (work.kind !== "task" && work.kind !== "service") throw new TypeError("unknown work kind");
+  identity(work.resultContractRef, "work.resultContractRef");
+  if (work.kind === "task" && work.input === undefined) throw new TypeError("task input is required");
+  if (work.input !== undefined) contentBlocks(work.input);
+  if (work.taskRef !== undefined) {
+    const task = record(work.taskRef, "work.taskRef"); exact(task, ["namespace", "id"]);
+    identity(task.namespace, "taskRef.namespace"); identity(task.id, "taskRef.id");
+  }
+  if (body.parentRunId !== undefined) identity(body.parentRunId, "parentRunId");
+  identity(body.profileRef, "profileRef");
+  const selection = record(body.selection, "selection");
+  exact(selection, ["fallback"], ["modelId", "reasoningEffort"]);
+  if (selection.fallback !== "none" && selection.fallback !== "approved") throw new TypeError("unknown fallback");
+  if (selection.modelId !== undefined) identity(selection.modelId, "selection.modelId");
+  if (selection.reasoningEffort !== undefined) identity(selection.reasoningEffort, "selection.reasoningEffort");
+  const workspace = record(body.workspace, "workspace");
+  exact(workspace, ["scopeId", "relativeCwd", "access"], ["basisRef"]);
+  identity(workspace.scopeId, "workspace.scopeId");
+  const relative = identity(workspace.relativeCwd, "workspace.relativeCwd");
+  if (relative.startsWith("/") || relative.includes("\\") || relative.includes(":") || relative.split("/").some((part) => !part || part === "..")) throw new TypeError("invalid portable workspace-relative path");
+  if (workspace.basisRef !== undefined) identity(workspace.basisRef, "workspace.basisRef");
+  if (workspace.access !== "read_only" && workspace.access !== "read_write") throw new TypeError("unknown workspace access");
+  identityArray(body.toolBundleRefs, "toolBundleRefs");
+  const authority = record(body.authority, "authority"); exact(authority, ["grantRef"]);
+  identity(authority.grantRef, "authority.grantRef");
+  const limits = record(body.limits, "limits"); exact(limits, ["wallSeconds", "maxChildren"]);
+  decimal(limits.wallSeconds, "limits.wallSeconds", true);
+  if (BigInt(decimal(limits.maxChildren, "limits.maxChildren")) > 1024n) throw new RangeError("maxChildren exceeds bound");
+}
+function questionAskBody(body: Record<string, unknown>): void {
+  exact(body, ["recipient", "title", "context", "items", "independentWorkAvailable"], ["deadlineAt"]);
+  const recipient = record(body.recipient, "recipient");
+  if (recipient.kind === "actor") { exact(recipient, ["kind", "actorId"]); identity(recipient.actorId, "recipient.actorId"); }
+  else if (recipient.kind === "superior" || recipient.kind === "human") exact(recipient, ["kind"]);
+  else throw new TypeError("unknown question recipient");
+  const title = text(body.title, "question.title"), context = text(body.context, "question.context");
+  if (!title || title.length > 256 || context.length > 64000) throw new TypeError("invalid question text");
+  if (typeof body.independentWorkAvailable !== "boolean") throw new TypeError("independentWorkAvailable must be boolean");
+  if (body.deadlineAt !== undefined) utcTimestamp(body.deadlineAt, "question.deadlineAt");
+  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 32) throw new TypeError("invalid question items");
+  for (const value of body.items) {
+    const item = record(value, "question item"); exact(item, ["itemId", "prompt", "required", "answerMode", "options"]);
+    identity(item.itemId, "item.itemId");
+    const prompt = text(item.prompt, "item.prompt");
+    if (!prompt || prompt.length > 8000 || typeof item.required !== "boolean") throw new TypeError("invalid question item");
+    if (item.answerMode !== "single_choice" && item.answerMode !== "free_text") throw new TypeError("unknown answer mode");
+    if (!Array.isArray(item.options) || item.options.length > 32 || (item.answerMode === "single_choice" && !item.options.length) || (item.answerMode === "free_text" && item.options.length !== 0)) throw new TypeError("invalid question options");
+    for (const option of item.options) { const label = text(option, "option"); if (!label || label.length > 1024) throw new TypeError("invalid option"); }
+  }
+}
+function questionAnswerBody(body: Record<string, unknown>): void {
+  exact(body, ["expectedRevision", "response"]); decimal(body.expectedRevision, "expectedRevision", true);
+  const response = record(body.response, "response");
+  if (response.kind === "submit") {
+    exact(response, ["kind", "answers"]);
+    if (!Array.isArray(response.answers) || response.answers.length < 1 || response.answers.length > 32) throw new TypeError("invalid answers");
+    for (const value of response.answers) {
+      const answer = record(value, "answer"); exact(answer, ["itemId", "value"]);
+      identity(answer.itemId, "answer.itemId");
+      const item = text(answer.value, "answer.value");
+      if (!item || item.length > 8000) throw new TypeError("invalid answer value");
+    }
+  } else if (response.kind === "decline") {
+    exact(response, ["kind", "reason"]);
+    const reason = text(response.reason, "response.reason");
+    if (!reason || reason.length > 8000) throw new TypeError("invalid decline reason");
+  } else throw new TypeError("unknown question response");
+}
+function permissionRequestBody(body: Record<string, unknown>): void {
+  exact(body, ["action", "subjectDigest", "runId", "attemptId", "requestEpoch", "grantDurationSeconds", "expiresAt"]);
+  identity(body.action, "permission.action");
+  identity(body.runId, "permission.runId"); identity(body.attemptId, "permission.attemptId");
+  if (typeof body.subjectDigest !== "string" || !/^[0-9a-f]{64}$/u.test(body.subjectDigest)) throw new TypeError("invalid subject digest");
+  decimal(body.requestEpoch, "permission.requestEpoch", true);
+  decimal(body.grantDurationSeconds, "permission.grantDurationSeconds", true);
+  utcTimestamp(body.expiresAt, "permission.expiresAt");
+}
+function permissionDecideBody(body: Record<string, unknown>): void {
+  exact(body, ["expectedRevision", "requestEpoch", "decision"]);
+  decimal(body.expectedRevision, "permission.expectedRevision", true);
+  decimal(body.requestEpoch, "permission.requestEpoch", true);
+  const decision = record(body.decision, "permission.decision");
+  if (decision.kind === "allow_scoped") { exact(decision, ["kind", "constraintRef"]); identity(decision.constraintRef, "decision.constraintRef"); }
+  else if (decision.kind === "allow_once" || decision.kind === "deny") exact(decision, ["kind"]);
+  else throw new TypeError("unknown permission decision");
+}
 function commandBody(operation: MutationOperation, value: unknown): void {
   const body = record(value, "body");
+  if (operation === "launch") { launchBody(body); return; }
+  if (operation === "session.close") { exact(body, []); return; }
   if (operation === "session.send") {
     exact(body, ["content", "policy"]);
     if (!Array.isArray(body.content) || body.content.length < 1 || body.content.length > 64) throw new TypeError("invalid body.content");
@@ -202,9 +398,47 @@ function commandBody(operation: MutationOperation, value: unknown): void {
     else throw new TypeError("unknown send policy");
     return;
   }
+  if (operation === "run.interrupt") { exact(body, ["expectedIntervalId"]); identity(body.expectedIntervalId, "expectedIntervalId"); return; }
   if (operation === "run.pause") { exact(body, ["policy"]); if (body.policy !== "drain" && body.policy !== "interrupt_current") throw new TypeError("unknown pause policy"); return; }
   if (operation === "run.resume") { exact(body, ["policy"]); if (body.policy !== "live_only" && body.policy !== "continue_saved_session") throw new TypeError("unknown resume policy"); return; }
   if (operation === "run.stop") { exact(body, ["scope"]); if (body.scope !== "self_only" && body.scope !== "subtree") throw new TypeError("unknown stop scope"); return; }
+  if (operation === "run.report") {
+    exact(body, ["summary", "artifactRefs", "evidenceRefs", "declaration"]);
+    const summary = text(body.summary, "summary");
+    if (!summary || summary.length > 64000) throw new TypeError("invalid report summary");
+    identityArray(body.artifactRefs, "artifactRefs"); identityArray(body.evidenceRefs, "evidenceRefs");
+    if (!["succeeded", "needs_follow_up", "blocked"].includes(String(body.declaration))) throw new TypeError("unknown result declaration");
+    return;
+  }
+  if (operation === "run.finish") { exact(body, ["childPolicy"]); if (body.childPolicy !== "join" && body.childPolicy !== "cancel") throw new TypeError("unknown child policy"); return; }
+  if (operation === "delivery.ack") {
+    exact(body, ["kind", "evidenceRef"]);
+    if (body.kind !== "received" && body.kind !== "processed") throw new TypeError("unknown acknowledgement kind");
+    identity(body.evidenceRef, "evidenceRef"); return;
+  }
+  if (operation === "delivery.cancel") {
+    exact(body, ["reason"]); const reason = text(body.reason, "reason");
+    if (!reason || reason.length > 8000) throw new TypeError("invalid cancellation reason");
+    return;
+  }
+  if (operation === "control.acquire") {
+    exact(body, ["expectedLeaseEpoch", "holder"]);
+    decimal(body.expectedLeaseEpoch, "expectedLeaseEpoch");
+    if (body.holder !== "human" && body.holder !== "automation") throw new TypeError("unknown lease holder");
+    return;
+  }
+  if (operation === "control.release") { exact(body, ["leaseId"]); identity(body.leaseId, "leaseId"); return; }
+  if (operation === "terminal.detach") { exact(body, ["viewerId"]); identity(body.viewerId, "viewerId"); return; }
+  if (operation === "question.ask") { questionAskBody(body); return; }
+  if (operation === "question.answer") { questionAnswerBody(body); return; }
+  if (operation === "question.cancel") {
+    exact(body, ["expectedRevision", "reason"]); decimal(body.expectedRevision, "expectedRevision", true);
+    const reason = text(body.reason, "reason");
+    if (!reason || reason.length > 8000) throw new TypeError("invalid question cancellation");
+    return;
+  }
+  if (operation === "permission.request") { permissionRequestBody(body); return; }
+  if (operation === "permission.decide") { permissionDecideBody(body); return; }
   if (operation !== "resource.command") throw new TypeError("mutation body schema is not generated");
   exact(body, ["command"]);
   const action = record(body.command, "body.command");
@@ -229,7 +463,14 @@ function validateCommand(value: unknown): CommandEnvelope {
   if (item.guard !== undefined) guard(item.guard);
   if (item.deadlineAt !== undefined) utcTimestamp(item.deadlineAt, "deadlineAt");
   if (typeof item.payloadDigest !== "string" || !/^[0-9a-f]{64}$/u.test(item.payloadDigest)) throw new TypeError("invalid payloadDigest");
-  const expectedKind = operation === "session.send" ? "session" : operation === "resource.command" ? "resource" : "run";
+  const expectedKind =
+    operation === "launch" ? "scope"
+    : operation === "session.close" || operation === "session.send" ? "session"
+    : operation === "delivery.ack" || operation === "delivery.cancel" ? "delivery"
+    : operation === "question.answer" || operation === "question.cancel" ? "question"
+    : operation === "permission.decide" ? "permission"
+    : operation === "control.acquire" || operation === "control.release" || operation === "terminal.detach" || operation === "permission.request" || operation === "resource.command" ? "resource"
+    : "run";
   if (checkedTarget.kind !== expectedKind) throw new TypeError("operation target mismatch");
   commandBody(operation, item.body);
   return item as unknown as CommandEnvelope;
@@ -293,6 +534,58 @@ export async function encodeCommand(command: CommandEnvelope): Promise<Uint8Arra
   await decodeCommand(command);
   const bytes = encoder.encode(JSON.stringify(command));
   if (bytes.length > MAX_FRAME_BYTES) throw new RangeError("command frame is too large");
+  return bytes;
+}
+function validateRead(value: unknown): ReadEnvelope {
+  const item = record(value, "read");
+  exact(item, ["protocol", "operation", "requestId", "target", "body"]);
+  protocol(item.protocol);
+  if (!CONTRACT.supportedReadSchemas.includes(item.operation as ReadOperation)) throw new TypeError("unsupported read operation");
+  identity(item.requestId, "requestId");
+  const checkedTarget = target(item.target);
+  const operation = item.operation as ReadOperation;
+  const expectedKind =
+    ["capabilities.get", "commands.get", "snapshot.get", "event.subscribe", "history.read"].includes(operation) ? "scope"
+    : operation === "run.get" ? "run"
+    : operation === "session.get" ? "session"
+    : operation === "delivery.get" ? "delivery"
+    : "resource";
+  if (checkedTarget.kind !== expectedKind) throw new TypeError("read target mismatch");
+  const body = record(item.body, "read.body");
+  if (["capabilities.get", "run.get", "session.get", "delivery.get", "snapshot.get", "terminal.snapshot"].includes(operation)) exact(body, []);
+  else if (operation === "commands.get") {
+    exact(body, ["selector"]);
+    const selector = record(body.selector, "selector");
+    if (selector.kind === "id") { exact(selector, ["kind", "commandId"]); identity(selector.commandId, "selector.commandId"); }
+    else if (selector.kind === "key") { exact(selector, ["kind", "key"]); identity(selector.key, "selector.key"); }
+    else throw new TypeError("unknown command selector");
+  } else if (operation === "event.subscribe" || operation === "history.read") {
+    exact(body, ["after", ...(operation === "history.read" ? ["limit"] : [])]);
+    const after = decodeCursor(body.after);
+    if (after.scopeId !== (checkedTarget as Extract<Target, { kind: "scope" }>).scopeId) throw new TypeError("read cursor scope mismatch");
+    if (operation === "history.read") {
+      const limit = BigInt(decimal(body.limit, "limit", true));
+      if (limit > 1024n) throw new RangeError("history limit exceeds bound");
+    }
+  } else if (operation === "terminal.attach") {
+    exact(body, [], ["after"]);
+    if (body.after !== undefined && BigInt(decimal(body.after, "terminal.after")) > MAX_I64) throw new RangeError("terminal cursor exceeds store range");
+  } else if (operation === "terminal.observe") {
+    exact(body, ["after"]);
+    if (BigInt(decimal(body.after, "terminal.after")) > MAX_I64) throw new RangeError("terminal cursor exceeds store range");
+  } else throw new TypeError("read schema is not generated");
+  return item as unknown as ReadEnvelope;
+}
+export function makeRead(draft: Omit<ReadEnvelope, "protocol">): ReadEnvelope {
+  return validateRead({ protocol: PROTOCOL, ...draft });
+}
+export function decodeRead(input: string | Uint8Array | unknown): ReadEnvelope {
+  return validateRead(parse(input));
+}
+export function encodeRead(request: ReadEnvelope): Uint8Array {
+  validateRead(request);
+  const bytes = encoder.encode(JSON.stringify(request));
+  if (bytes.length > MAX_FRAME_BYTES) throw new RangeError("read frame is too large");
   return bytes;
 }
 export function decodeCursor(input: unknown): EventCursor {
@@ -399,5 +692,12 @@ export class PodBayWireClient {
     const item = record(response, "response");
     if (Object.hasOwn(item, "error")) throw new PodBayWireError(decodeError(item));
     return decodeReceipt(item);
+  }
+  async read(request: ReadEnvelope): Promise<unknown> {
+    validateRead(request);
+    const response = parse(decodeFrame(await this.transport.exchange(encodeFrame(request))));
+    const item = record(response, "response");
+    if (Object.hasOwn(item, "error")) throw new PodBayWireError(decodeError(item));
+    return response;
   }
 }
