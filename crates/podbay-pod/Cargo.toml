@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in only for disposable native recovery crash-window fixtures.
+native-rebind-test-hook = []
+
 [dependencies]
 podbay-core = { path = "../podbay-core" }
 serde = { version = "1.0", features = ["derive"] }

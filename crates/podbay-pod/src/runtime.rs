@@ -2695,6 +2695,24 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                             if observed.checkpoint() != checkpoint {
                                 return Err(PodError::Uncertain("V2 Pending checkpoint readback differs"));
                             }
+                            // An opt-in fixture binary can stop after the first durable
+                            // PendingStore write while leaving the supervisor and child alive.
+                            // The default production binary has no such branch.
+                            #[cfg(feature = "native-rebind-test-hook")]
+                            if checkpoint.phase() == RebindPhase::PendingStore {
+                                let marker = directory.join(".podbay-test-break-after-pending-store");
+                                if fs::symlink_metadata(&marker).is_ok_and(|metadata|
+                                    metadata.is_file() && metadata.nlink() == 1
+                                        && metadata.mode() & 0o077 == 0)
+                                {
+                                    fs::remove_file(marker).map_err(|_| PodError::Uncertain(
+                                        "fixture PendingStore marker removal failed",
+                                    ))?;
+                                    return Err(PodError::Uncertain(
+                                        "fixture stopped after PendingStore fsync",
+                                    ));
+                                }
+                            }
                             Ok(observed.digest().into())
                         },
                     )?;

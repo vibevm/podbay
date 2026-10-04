@@ -1768,6 +1768,54 @@ fn rebind_second_pending_manager_process_helper() {
 }
 
 #[test]
+#[ignore = "helper for disposable B fsynced PendingStore crash fixture"]
+fn rebind_second_pending_store_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, PendingThenLostPort(port)).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let pending = host
+        .prepare_current_codex_v2_rebind(
+            &fixture.scope,
+            &fixture.pod,
+            "rebind.native.v21.pending-store",
+        )
+        .unwrap();
+    assert_eq!(pending.phase, podbay_store::DurableRebindPhase::Pending);
+    let completed = host
+        .complete_current_codex_v2_rebind(
+            &fixture.scope,
+            &fixture.pod,
+            "rebind.native.v21.pending-store",
+        )
+        .unwrap();
+    assert_eq!(completed.durable.phase, podbay_store::DurableRebindPhase::Pending);
+    assert_eq!(completed.stage, RebindCompletionStage::PendingPodUnknown);
+    let context = host.rebind_context(&fixture.scope, &fixture.pod).unwrap();
+    let checkpoint = podbay_pod::read_peer_checkpoint(&fixture.directory, context.identity())
+        .unwrap()
+        .checkpoint();
+    assert_eq!(checkpoint.phase(), RebindPhase::PendingStore);
+    assert!(checkpoint.pending_rebind().is_some());
+    fs::write(
+        fixture.directory.join("rebind.second.pending_store"),
+        b"pending_store",
+    )
+    .unwrap();
+    drop(context);
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
 #[ignore = "helper for disposable B store-Activated/pod-PendingPod fixture"]
 fn rebind_second_store_activated_manager_process_helper() {
     let fixture = Fixture::from_shared();
@@ -1839,7 +1887,12 @@ fn rebind_third_recover_manager_process_helper() {
     let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
     register_restarted_codex_profile(&mut host, &fixture);
     let proof = host.inspect_pending_codex_v2_recovery(&fixture.scope, &fixture.pod).unwrap();
-    assert_eq!(proof.pending_phase(), RebindPhase::PendingPod);
+    let expected_phase = if fixture.directory.join("rebind.second.pending_store").exists() {
+        RebindPhase::PendingStore
+    } else {
+        RebindPhase::PendingPod
+    };
+    assert_eq!(proof.pending_phase(), expected_phase);
     assert_eq!(proof.abandoned().identity.pod_id, fixture.pod);
     assert_eq!(proof.pending_process().child_process_id,
         fs::read_to_string(fixture.directory.join("rebind.first.pid")).unwrap());
@@ -2255,6 +2308,50 @@ fn disposable_v21_pending_recovery_checkpoint_keeps_same_child_across_three_mana
         assert!(state.status.success());
         if String::from_utf8_lossy(&state.stdout).trim() == "not-found" { break; }
         assert!(Instant::now() < deadline, "three-manager disposable unit remained loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and pod binary built with native-rebind-test-hook"]
+fn disposable_v21_pending_store_fsync_survives_b_crash() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).expect("A left one bound manifest");
+    let guard = DisposableUnitGuard::for_manifest(&manifest);
+    let child_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap().parse().unwrap();
+    let original_births = fs::read_to_string(fixture.directory.join("rebind.first.births"))
+        .unwrap();
+    let marker = fixture.directory.join(".podbay-test-break-after-pending-store");
+    fs::write(&marker, b"one-shot disposable fault").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    run_rebind_manager_helper(
+        "rebind_second_pending_store_manager_process_helper", &fixture, &binary,
+    );
+    assert!(!marker.exists(), "fixture pod did not consume the one-shot fault");
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.second.pending_store"))
+        .unwrap(), "pending_store");
+    assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
+    run_rebind_manager_helper("rebind_third_recover_manager_process_helper", &fixture, &binary);
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.third.inspected"))
+        .unwrap().len(), 64);
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.first.births"))
+        .unwrap(), original_births);
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2,
+        "PendingStore recovery must not resend native input");
+    assert!(Command::new("systemctl").args(["--user", "stop", &guard.0])
+        .status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=LoadState", "--value", &guard.0])
+            .output().unwrap();
+        assert!(state.status.success());
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" { break; }
+        assert!(Instant::now() < deadline, "PendingStore disposable unit remained loaded");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
