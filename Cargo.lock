@@ -352,6 +352,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "nix",
+ "podbay-adapter-codex",
  "podbay-core",
  "podbay-store",
  "podbay-wire",

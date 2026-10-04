@@ -1288,6 +1288,16 @@ impl<T: JsonlTransport> CodexResource<T> {
     }
 }
 
+impl CodexResource<crate::process_transport::ProcessJsonlTransport> {
+    /// Recheck only the owned direct child's kernel identity. This keeps the
+    /// mutable JSONL writer private while the pod verifies process liveness.
+    pub fn attest_owned_child_birth(
+        &mut self,
+    ) -> io::Result<crate::process_transport::KernelChildBirthObservation> {
+        self.io.attest_kernel_birth()
+    }
+}
+
 fn request_key(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::String(text) if !text.is_empty() => Some(format!("s:{text}")),

@@ -4,6 +4,8 @@
 #[cfg(target_os = "linux")]
 mod codex_credential;
 #[cfg(target_os = "linux")]
+mod codex_resource;
+#[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
 mod peer_checkpoint;
@@ -24,6 +26,8 @@ mod unsupported;
 pub use codex_credential::{
     CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
 };
+#[cfg(target_os = "linux")]
+pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
