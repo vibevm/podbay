@@ -1053,6 +1053,29 @@ impl HostDispatchPort for LinuxLaunchPort {
             .map_err(|_| podbay_host::HostError::StaleGuard)
     }
 
+    fn attest_abandoned_codex_v2_manager_dead(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+        abandoned: &podbay_core::AttestedPeer,
+    ) -> Result<(), podbay_host::HostError> {
+        self.config.recheck().map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| podbay_host::HostError::StaleGuard)?;
+        if current.attested_peer() != launch.manager_peer()
+            || abandoned == launch.manager_peer()
+            || abandoned.os_identity() != launch.manager_peer().os_identity()
+            || abandoned.containment_identity()
+                != launch.manager_peer().containment_identity()
+            || checked_store_file(launch.store_path(), current.uid())
+                .map_err(|_| podbay_host::HostError::StaleGuard)?
+                != launch.store_file_identity()
+        {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        attest_abandoned_manager_dead(abandoned, current.boot_id())
+            .map_err(|_| podbay_host::HostError::StaleGuard)
+    }
+
     fn inspect_pending_codex_v2_recovery(
         &self,
         launch: &ResolvedNativeCodexLaunch,

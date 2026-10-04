@@ -1014,6 +1014,7 @@ impl ResolvedNativeCodexV3Launch {
 /// trusted platform port. Constructing this DTO is not authority: the host
 /// never accepts it from a request or public prepare method, and the store
 /// independently checks current destination/target fences before Pending.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortRebindObservation {
     prior: HostObservedPriorCheckpoint,
     descriptor_digest: String,
@@ -1613,6 +1614,17 @@ pub trait HostDispatchPort {
         &self,
         _launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortRebindObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// The abandoned manager peer comes only from an exact durable B row.
+    /// The port must check that process birth is gone on the current boot;
+    /// a store row alone cannot establish liveness.
+    fn attest_abandoned_codex_v2_manager_dead(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+        _abandoned: &AttestedPeer,
+    ) -> Result<(), HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -3895,11 +3907,68 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             command_key,
             digest,
         };
+        // An already-fsynced pending-recovery Active A checkpoint is not a
+        // store-only B: its input vector has advanced to B's next epoch. Use
+        // the exact current C recovery proof first. Only if absent may the
+        // host classify a still-Active original A as an unapplied B Pending.
+        let recovered = context.store.has_current_checkpointed_recovery_for_rebind(
+            &proposal, &observed.prior,
+        )?;
+        let store_only = if recovered {
+            None
+        } else {
+            context.store.lookup_store_only_pending_rebind(&observed.prior.identity)?
+        };
+        drop(context);
+        if let Some(abandoned) = &store_only {
+            if abandoned.proposal.identity != observed.prior.identity
+                || abandoned.proposal.expected_owner_epoch != observed.prior.owner_epoch
+                || abandoned.proposal.expected_credential_epoch
+                    != observed.prior.credential_epoch
+                || abandoned.proposal.expected_input_epochs != observed.prior.input_epochs
+                || abandoned.prior.checkpoint_digest != observed.prior.checkpoint_digest
+                || abandoned.prior.supervisor_pid != observed.prior.supervisor_pid
+                || abandoned.prior.supervisor_start_ticks != observed.prior.supervisor_start_ticks
+                || abandoned.prior.boot_id != observed.prior.boot_id
+                || abandoned.prior.unit_name != observed.prior.unit_name
+                || abandoned.prior.cgroup_path != observed.prior.cgroup_path
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.host.port().attest_abandoned_codex_v2_manager_dead(
+                &reviewed, &abandoned.proposal.next_manager,
+            )?;
+            let second = self.host.port().inspect_existing_codex_v2_rebind(&reviewed)?;
+            if second != observed {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        let mut context = self.rebind_context(scope, pod)?;
+        context.recheck_current()?;
+        if context.identity() != &proposal.identity
+            || context.launch() != &reviewed.record
+            || context.store_path() != reviewed.store_path()
+            || context.store_lineage() != reviewed.store_lineage()
+            || context.owner_epoch() != proposal.next_owner_epoch.get()
+            || context.credential_epoch() != proposal.next_credential_epoch.get()
+            || context.authority_revision() != reviewed.authority_revision()
+            || context.manager_peer() != &proposal.next_manager
+            || context.resource_input_epochs() != &proposal.next_input_epochs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
         // SQLite verifies the current destination claim and exact target
         // epochs in the same IMMEDIATE transaction as the Pending insert.
-        let receipt = context
-            .store
-            .prepare_manager_rebind_from_host_observation(&proposal, &observed.prior)?;
+        let receipt = if let Some(abandoned) = &store_only {
+            context.store.prepare_manager_rebind_after_active_prior(
+                &proposal, &observed.prior, &abandoned.proposal,
+                observed.child_pid, observed.child_start_ticks,
+            )?
+        } else {
+            context.store.prepare_manager_rebind_from_host_observation(
+                &proposal, &observed.prior,
+            )?
+        };
         if receipt.phase != DurableRebindPhase::Pending {
             return Err(StoreError::Conflict("rebind is no longer Pending").into());
         }

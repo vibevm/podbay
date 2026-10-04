@@ -9,12 +9,14 @@ use podbay_core::{
     RebindProposal, RequestDigest, ResourceId, ScopeId, StoreLineageId, SupersessionLedger,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, named_params, params};
+use sha2::{Digest, Sha256};
 
 use crate::model::{HostObservedPriorCheckpoint, StoreError};
 use crate::rebind::{DurableRebindPhase, load_by_key, sqlite_counter, verify_stored};
 use crate::store::PodBayStore;
 
 const DOMAIN: &[u8] = b"podbay.rebind-supersession/1\0";
+const ACTIVE_PRIOR_DOMAIN: &[u8] = b"podbay.rebind-active-prior/1\0";
 const MAX_INTENT_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1123,6 +1125,308 @@ impl SupersessionLedger for SqliteSupersessionLedger {
             .flatten();
         latest == Some(receipt.rowid)
     }
+}
+
+fn active_prior_bytes(
+    abandoned: &RebindProposal,
+    next: &RebindProposal,
+    observed: &HostObservedPriorCheckpoint,
+    child_pid: u32,
+    child_start_ticks: u64,
+) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = ACTIVE_PRIOR_DOMAIN.to_vec();
+    for value in [abandoned, next] {
+        for text in [
+            value.identity.store_lineage.as_str(),
+            value.identity.scope_id.as_str(),
+            value.identity.pod_id.as_str(),
+            value.identity.attempt_id.as_str(),
+        ] {
+            put_text(&mut bytes, text)?;
+        }
+        bytes.extend_from_slice(&value.identity.incarnation.get().to_be_bytes());
+        for epoch in [
+            value.expected_owner_epoch.get(),
+            value.next_owner_epoch.get(),
+            value.expected_credential_epoch.get(),
+            value.next_credential_epoch.get(),
+        ] {
+            bytes.extend_from_slice(&epoch.to_be_bytes());
+        }
+        put_inputs(&mut bytes, &value.expected_input_epochs)?;
+        put_inputs(&mut bytes, &value.next_input_epochs)?;
+        for text in [
+            value.next_manager.os_identity(),
+            value.next_manager.native_process_id(),
+            value.next_manager.boot_identity(),
+            value.next_manager.birth_identity(),
+            value.next_manager.containment_identity(),
+            value.command_key.as_str(),
+            value.digest.as_str(),
+        ] {
+            put_text(&mut bytes, text)?;
+        }
+    }
+    for text in [
+        observed.checkpoint_digest.as_str(),
+        observed.boot_id.as_str(),
+        observed.unit_name.as_str(),
+        observed.cgroup_path.as_str(),
+    ] {
+        put_text(&mut bytes, text)?;
+    }
+    for value in [
+        u64::from(observed.supervisor_pid),
+        observed.supervisor_start_ticks,
+        u64::from(child_pid),
+        child_start_ticks,
+    ] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    if bytes.len() > MAX_INTENT_BYTES {
+        return Err(StoreError::InvalidInput(
+            "Active-prior intent exceeds bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Record the already-fsynced, live-inspected Active A checkpoint as a
+/// distinct historical abandonment of B. `pod_checkpointed` here refers
+/// exclusively to that pre-existing Active A file, identified by
+/// `observed_phase='active_prior'`; it never asserts a C checkpoint or input.
+/// Only the trusted host can attest B's death and the live socket.
+pub(crate) fn insert_active_prior_abandonment(
+    transaction: &Transaction<'_>,
+    abandoned_rowid: i64,
+    abandoned: &RebindProposal,
+    next: &RebindProposal,
+    observed: &HostObservedPriorCheckpoint,
+    child_pid: u32,
+    child_start_ticks: u64,
+    allow_insert: bool,
+) -> Result<i64, StoreError> {
+    let bytes = active_prior_bytes(abandoned, next, observed, child_pid, child_start_ticks)?;
+    let request_digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let identity = &next.identity;
+    let existing: Option<(i64, Vec<u8>, String, Option<String>, String)> = transaction
+        .query_row(
+            "SELECT supersession_rowid,intent_bytes,phase,recovery_checkpoint_digest,request_digest
+         FROM rebind_supersession_attempts
+         WHERE abandoned_rebind_rowid=?1 AND recovering_owner_epoch=?2",
+            params![
+                abandoned_rowid,
+                sqlite_counter(next.next_owner_epoch.get())?
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((rowid, stored_bytes, stage, checkpoint, digest)) = existing {
+        if stored_bytes != bytes
+            || stage != "pod_checkpointed"
+            || checkpoint.as_deref() != Some(observed.checkpoint_digest.as_str())
+            || digest != request_digest
+        {
+            return Err(StoreError::Conflict("Active-prior abandonment changed"));
+        }
+        verify_active_prior_row(
+            transaction,
+            rowid,
+            abandoned_rowid,
+            abandoned,
+            next,
+            observed,
+            child_pid,
+            child_start_ticks,
+        )?;
+        return Ok(rowid);
+    }
+    if !allow_insert {
+        return Err(StoreError::Conflict("Active-prior abandonment is absent"));
+    }
+    transaction.execute(
+        "INSERT INTO rebind_supersession_attempts(
+           store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+           abandoned_rebind_rowid,abandoned_request_digest,abandoned_phase,
+           abandoned_checkpoint_ref,prior_active_checkpoint_digest,observed_phase,
+           observed_checkpoint_digest,supervisor_process_id,supervisor_birth_identity,
+           child_process_id,child_birth_identity,boot_identity,unit_name,cgroup_path,
+           recovering_owner_epoch,recovering_credential_epoch,recovering_os_identity,
+           recovering_process_id,recovering_boot_identity,recovering_birth_identity,
+           recovering_containment,command_key,request_digest,intent_bytes,
+           predecessor_rowid,resource_count,phase,recovery_checkpoint_digest)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',NULL,?8,'active_prior',
+           ?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+           ?22,?23,?24,?25,NULL,?26,'pod_checkpointed',?8)",
+        params![
+            identity.store_lineage.as_str(),
+            identity.scope_id.as_str(),
+            identity.pod_id.as_str(),
+            identity.attempt_id.as_str(),
+            sqlite_counter(identity.incarnation.get())?,
+            abandoned_rowid,
+            abandoned.digest.as_str(),
+            observed.checkpoint_digest,
+            observed.supervisor_pid.to_string(),
+            observed.supervisor_start_ticks.to_string(),
+            child_pid.to_string(),
+            child_start_ticks.to_string(),
+            observed.boot_id,
+            observed.unit_name,
+            observed.cgroup_path,
+            sqlite_counter(next.next_owner_epoch.get())?,
+            sqlite_counter(next.next_credential_epoch.get())?,
+            next.next_manager.os_identity(),
+            next.next_manager.native_process_id(),
+            next.next_manager.boot_identity(),
+            next.next_manager.birth_identity(),
+            next.next_manager.containment_identity(),
+            next.command_key.as_str(),
+            request_digest,
+            bytes,
+            next.next_input_epochs.len() as i64
+        ],
+    )?;
+    let rowid = transaction.last_insert_rowid();
+    for (id, old) in &abandoned.next_input_epochs {
+        let new = next
+            .next_input_epochs
+            .get(id)
+            .ok_or(StoreError::Conflict("Active-prior Resource set differs"))?;
+        transaction.execute(
+            "INSERT INTO rebind_supersession_resources(supersession_rowid,resource_id,
+               abandoned_input_epoch,recovering_input_epoch) VALUES(?1,?2,?3,?4)",
+            params![
+                rowid,
+                id.as_str(),
+                sqlite_counter(old.get())?,
+                sqlite_counter(new.get())?
+            ],
+        )?;
+    }
+    verify_active_prior_row(
+        transaction,
+        rowid,
+        abandoned_rowid,
+        abandoned,
+        next,
+        observed,
+        child_pid,
+        child_start_ticks,
+    )?;
+    Ok(rowid)
+}
+
+fn verify_active_prior_row(
+    transaction: &Transaction<'_>,
+    rowid: i64,
+    abandoned_rowid: i64,
+    abandoned: &RebindProposal,
+    next: &RebindProposal,
+    observed: &HostObservedPriorCheckpoint,
+    child_pid: u32,
+    child_start_ticks: u64,
+) -> Result<(), StoreError> {
+    let exact: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rebind_supersession_attempts AS s
+           JOIN manager_rebinds AS b ON b.rebind_rowid=s.abandoned_rebind_rowid
+           JOIN manager_rebind_prior_observations AS p ON p.rebind_rowid=b.rebind_rowid
+         WHERE s.supersession_rowid=?1 AND s.abandoned_rebind_rowid=?2
+           AND s.store_lineage=?3 AND s.scope_id=?4 AND s.pod_id=?5
+           AND s.attempt_id=?6 AND s.pod_incarnation=?7
+           AND s.abandoned_request_digest=?8 AND s.abandoned_phase='pending'
+           AND s.abandoned_checkpoint_ref IS NULL AND b.phase='pending'
+           AND b.pod_checkpoint_ref IS NULL AND b.request_digest=?8
+           AND s.prior_active_checkpoint_digest=?9 AND p.checkpoint_digest=?9
+           AND s.observed_phase='active_prior' AND s.observed_checkpoint_digest=?9
+           AND s.supervisor_process_id=?10 AND s.supervisor_birth_identity=?11
+           AND s.child_process_id=?12 AND s.child_birth_identity=?13
+           AND s.boot_identity=?14 AND s.unit_name=?15 AND s.cgroup_path=?16
+           AND p.supervisor_pid=?17 AND p.supervisor_start_ticks=?18
+           AND p.boot_id=?14 AND p.unit_name=?15 AND p.cgroup_path=?16
+           AND s.recovering_owner_epoch=?19 AND s.recovering_credential_epoch=?20
+           AND s.recovering_os_identity=?21 AND s.recovering_process_id=?22
+           AND s.recovering_boot_identity=?23 AND s.recovering_birth_identity=?24
+           AND s.recovering_containment=?25 AND s.command_key=?26
+           AND s.resource_count=?27 AND s.predecessor_rowid IS NULL
+           AND s.phase='pod_checkpointed' AND s.recovery_checkpoint_digest=?9)",
+        params![
+            rowid,
+            abandoned_rowid,
+            next.identity.store_lineage.as_str(),
+            next.identity.scope_id.as_str(),
+            next.identity.pod_id.as_str(),
+            next.identity.attempt_id.as_str(),
+            sqlite_counter(next.identity.incarnation.get())?,
+            abandoned.digest.as_str(),
+            observed.checkpoint_digest,
+            observed.supervisor_pid.to_string(),
+            observed.supervisor_start_ticks.to_string(),
+            child_pid.to_string(),
+            child_start_ticks.to_string(),
+            observed.boot_id,
+            observed.unit_name,
+            observed.cgroup_path,
+            sqlite_counter(u64::from(observed.supervisor_pid))?,
+            sqlite_counter(observed.supervisor_start_ticks)?,
+            sqlite_counter(next.next_owner_epoch.get())?,
+            sqlite_counter(next.next_credential_epoch.get())?,
+            next.next_manager.os_identity(),
+            next.next_manager.native_process_id(),
+            next.next_manager.boot_identity(),
+            next.next_manager.birth_identity(),
+            next.next_manager.containment_identity(),
+            next.command_key.as_str(),
+            next.next_input_epochs.len() as i64
+        ],
+        |row| row.get(0),
+    )?;
+    if exact != 1 {
+        return Err(StoreError::Conflict("Active-prior scalar proof differs"));
+    }
+    let mut resources = BTreeMap::new();
+    let mut statement = transaction.prepare(
+        "SELECT resource_id,abandoned_input_epoch,recovering_input_epoch
+         FROM rebind_supersession_resources WHERE supersession_rowid=?1 ORDER BY resource_id",
+    )?;
+    for row in statement.query_map([rowid], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (id, old, next) = row?;
+        if resources.insert(id, (old, next)).is_some() {
+            return Err(StoreError::Conflict("duplicate Active-prior Resource"));
+        }
+    }
+    if resources.len() != abandoned.next_input_epochs.len() {
+        return Err(StoreError::Conflict("Active-prior Resource count differs"));
+    }
+    for (id, old) in &abandoned.next_input_epochs {
+        let next = next
+            .next_input_epochs
+            .get(id)
+            .ok_or(StoreError::Conflict("Active-prior Resource set differs"))?;
+        if resources.get(id.as_str())
+            != Some(&(sqlite_counter(old.get())?, sqlite_counter(next.get())?))
+        {
+            return Err(StoreError::Conflict("Active-prior Resource vector differs"));
+        }
+    }
+    Ok(())
 }
 
 /// The only store-side exception to an abandoned unfinished/Activated B row.

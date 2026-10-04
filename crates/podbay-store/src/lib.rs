@@ -42,6 +42,7 @@ pub use model::{
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{
     DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection,
+    StoreOnlyPendingRebind,
     SqlitePriorObservedPendingLedger, SqliteRebindLedger,
 };
 pub use supersession::{

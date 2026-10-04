@@ -1529,3 +1529,158 @@ fn prior_pending_ledger_refuses_legacy_and_missing_or_corrupt_database() {
     assert!(!corrupt.pending(&proposal));
     assert_eq!(std::fs::read(corrupt_path).unwrap(), b"not a database");
 }
+
+
+fn store_only_successor(
+    store: &mut PodBayStore,
+    abandoned: &RebindProposal,
+    owner_epoch: u64,
+    key: &str,
+) -> RebindProposal {
+    let mut next = abandoned.clone();
+    next.next_owner_epoch = owner(owner_epoch);
+    next.next_credential_epoch = credential(owner_epoch);
+    for epoch in next.next_input_epochs.values_mut() {
+        *epoch = input(owner_epoch);
+    }
+    next.next_manager = AttestedPeer::from_port(
+        "linux.uid.1000",
+        &format!("pid.{}", 900 + owner_epoch),
+        "boot.fixture",
+        &format!("birth.{}", 900 + owner_epoch),
+        "manager.unit",
+    )
+    .unwrap();
+    next.command_key = CommandKey::try_from(key).unwrap();
+    next.digest = RequestDigest::parse(&format!("{:064x}", owner_epoch)).unwrap();
+    let claim = store.current_manager_credential_claim(owner_epoch).unwrap();
+    store
+        .register_current_manager_peer(&claim, &next.next_manager)
+        .unwrap();
+    next
+}
+
+#[test]
+fn v21_active_prior_store_only_abandonment_is_atomic_exact_and_chainable() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (b, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store
+        .prepare_manager_rebind_from_host_observation(&b, &observed)
+        .unwrap();
+    assert_eq!(
+        store
+            .lookup_store_only_pending_rebind(&b.identity)
+            .unwrap()
+            .unwrap()
+            .proposal,
+        b
+    );
+    store.begin_authority_replay(4, 5).unwrap();
+    let c = store_only_successor(&mut store, &b, 5, "rebind.active-prior.c");
+    let first = store
+        .prepare_manager_rebind_after_active_prior(&c, &observed, &b, 988, 124)
+        .unwrap();
+    assert_eq!(first.phase, DurableRebindPhase::Pending);
+    assert_eq!(
+        store
+            .prepare_manager_rebind_after_active_prior(&c, &observed, &b, 988, 124,)
+            .unwrap(),
+        first
+    );
+    assert!(matches!(
+        store.prepare_manager_rebind_after_active_prior(&c, &observed, &b, 989, 124,),
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(fixture.count("manager_rebinds"), 2);
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 1);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let recorded: (String, String, String) = connection
+        .query_row(
+            "SELECT observed_phase,phase,recovery_checkpoint_digest
+         FROM rebind_supersession_attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded,
+        (
+            "active_prior".into(),
+            "pod_checkpointed".into(),
+            observed.checkpoint_digest.clone()
+        )
+    );
+    assert_eq!(
+        store
+            .lookup_store_only_pending_rebind(&b.identity)
+            .unwrap()
+            .unwrap()
+            .proposal,
+        c
+    );
+    store.begin_authority_replay(5, 6).unwrap();
+    let d = store_only_successor(&mut store, &c, 6, "rebind.active-prior.d");
+    assert_eq!(
+        store
+            .prepare_manager_rebind_after_active_prior(&d, &observed, &c, 988, 124,)
+            .unwrap()
+            .phase,
+        DurableRebindPhase::Pending
+    );
+    assert_eq!(fixture.count("manager_rebinds"), 3);
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 2);
+    assert_eq!(
+        store
+            .lookup_store_only_pending_rebind(&b.identity)
+            .unwrap()
+            .unwrap()
+            .proposal,
+        d
+    );
+}
+
+#[test]
+fn v21_active_prior_refuses_wrong_live_proof_and_rolls_back_after_side_insert() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (b, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store
+        .prepare_manager_rebind_from_host_observation(&b, &observed)
+        .unwrap();
+    store.begin_authority_replay(4, 5).unwrap();
+    let c = store_only_successor(&mut store, &b, 5, "rebind.active-prior.rollback");
+    let mut wrong = observed.clone();
+    wrong.checkpoint_digest = "e".repeat(64);
+    assert!(matches!(
+        store.prepare_manager_rebind_after_active_prior(&c, &wrong, &b, 988, 124,),
+        Err(StoreError::Conflict(_))
+    ));
+    wrong = observed.clone();
+    wrong.supervisor_start_ticks += 1;
+    assert!(matches!(
+        store.prepare_manager_rebind_after_active_prior(&c, &wrong, &b, 988, 124,),
+        Err(StoreError::Conflict(_))
+    ));
+    let mut old_manager = c.clone();
+    old_manager.next_manager = b.next_manager.clone();
+    assert!(matches!(
+        store.prepare_manager_rebind_after_active_prior(&old_manager, &observed, &b, 988, 124,),
+        Err(StoreError::Conflict(_))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_active_prior_c BEFORE INSERT ON manager_rebind_resources
+         WHEN NEW.next_input_epoch=5 BEGIN SELECT RAISE(ABORT,'fixture insert refused'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .prepare_manager_rebind_after_active_prior(&c, &observed, &b, 988, 124,)
+            .is_err()
+    );
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 0);
+    assert_eq!(fixture.count("rebind_supersession_resources"), 0);
+}
