@@ -3,7 +3,8 @@ use std::error::Error;
 use std::fmt;
 
 use podbay_core::{
-    CredentialEpoch, InputEpoch, OwnerEpoch, PodFenceIdentity, RebindPhase, ResourceId,
+    ActorId, AttemptId, CredentialEpoch, InputEpoch, OwnerEpoch, PodFenceIdentity, PodId,
+    RebindPhase, ResourceId, RunId, ScopeId, SessionId, StoreLineageId,
 };
 
 /// The caller supplies canonical request bytes; this store hashes those exact bytes.
@@ -414,6 +415,79 @@ pub struct AuthorityResourceRecord {
     pub pod_incarnation: u64,
     pub resource_epoch: u64,
     pub input_epoch: u64,
+}
+
+/// An exact structured resource selector. It is forgeable Rust data, not a
+/// grant, kernel observation, or permission to write to a native process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWriterTarget {
+    pub store_lineage: StoreLineageId,
+    pub scope_id: ScopeId,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub attempt_id: AttemptId,
+    pub pod_id: PodId,
+    pub pod_incarnation: u64,
+    pub resource_id: ResourceId,
+    pub resource_epoch: u64,
+    pub resource_input_epoch: u64,
+}
+
+/// Trusted-host proposal only. The store checks durable associations and CAS
+/// guards, but cannot authenticate its caller, OS peer, grant, or pod liveness.
+/// `expected_writer_epoch=None` means initial acquisition; `Some(epoch)` is an
+/// explicit takeover which always advances the writer epoch by one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedNativeWriterLeaseRequest {
+    pub target: NativeWriterTarget,
+    pub holder_actor_id: ActorId,
+    pub holder_credential_generation: u64,
+    pub expected_owner_epoch: u64,
+    pub expected_manager_credential_epoch: u64,
+    pub expected_authority_revision: u64,
+    pub expected_writer_epoch: Option<u64>,
+    pub ttl_seconds: u64,
+}
+
+/// A committed row at one SQLite snapshot, not an effect permit. The caller
+/// must still prove OS identity, grant, pod child and current time at effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWriterLease {
+    pub(crate) target: NativeWriterTarget,
+    pub(crate) holder_actor_id: ActorId,
+    pub(crate) holder_credential_generation: u64,
+    pub(crate) owner_epoch: u64,
+    pub(crate) manager_credential_epoch: u64,
+    pub(crate) authority_revision: u64,
+    pub(crate) writer_epoch: u64,
+    pub(crate) expires_at_unix_seconds: u64,
+}
+
+impl NativeWriterLease {
+    pub fn target(&self) -> &NativeWriterTarget {
+        &self.target
+    }
+    pub fn holder_actor_id(&self) -> &ActorId {
+        &self.holder_actor_id
+    }
+    pub fn holder_credential_generation(&self) -> u64 {
+        self.holder_credential_generation
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn manager_credential_epoch(&self) -> u64 {
+        self.manager_credential_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

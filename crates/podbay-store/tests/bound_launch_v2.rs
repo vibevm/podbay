@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
@@ -7,9 +9,10 @@ use podbay_core::{
     RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_store::{
-    BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
-    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, LaunchKeyLookupRequest,
-    LaunchLookupRequest, PodBayStore, StoreError, VerifiedPrincipal,
+    AuthorityActorRecord, AuthorityMutation, BoundLaunchAdmission, BoundLaunchFormat,
+    BoundLaunchProposal, BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
+    LaunchKeyLookupRequest, LaunchLookupRequest, NativeWriterTarget, PodBayStore, StoreError,
+    TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
     CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -748,7 +751,9 @@ fn v15_existing_v2_run_migrates_to_default_deny_budget() {
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE run_child_budgets; PRAGMA user_version=15;")
+        .execute_batch(
+            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets; PRAGMA user_version=15;",
+        )
         .unwrap();
     drop(connection);
     let mut migrated = fixture.open();
@@ -840,4 +845,278 @@ fn missing_budget_row_refuses_exact_run_inspection() {
         ),
         Err(StoreError::Conflict("Run child budget is missing"))
     ));
+}
+
+fn writer_actor(id: &str) -> AuthorityActorRecord {
+    AuthorityActorRecord {
+        scope_id: "scope.launch".into(),
+        actor_id: id.into(),
+        role: "coordinator".into(),
+        origin: "owner_cli".into(),
+        parent_actor_id: None,
+        pod_id: None,
+        pod_incarnation: None,
+        credential_generation: 1,
+        platform: "linux".into(),
+        os_identity: "linux.uid.1000".into(),
+        process_identity: "linux.pid.123".into(),
+        start_identity: 456,
+        containment_identity: "/user.slice/writer-fixture.scope".into(),
+    }
+}
+
+fn admitted_writer_target(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget, u64) {
+    let mut store = fixture.open();
+    let replay = store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            replay.revision,
+            AuthorityMutation::PutActor(writer_actor("actor.codex.fixture")),
+        )
+        .unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            revision,
+            AuthorityMutation::PutActor(writer_actor("actor.codex.other")),
+        )
+        .unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let mut request = proposal.request("key.writer.launch", b"intent.writer.launch");
+    request.proposal.as_mut().unwrap().expected_authority_revision = revision;
+    assert!(matches!(
+        store.admit_bound_root_launch_v2(request).unwrap(),
+        BoundLaunchAdmission::Committed(_)
+    ));
+    let current = store
+        .current_bound_pod_snapshot("scope.launch", "pod.launch")
+        .unwrap();
+    let resource = &current.resources()[0];
+    let target = NativeWriterTarget {
+        store_lineage: current.store_lineage().clone(),
+        scope_id: current.scope_id().clone(),
+        session_id: SessionId::try_from(current.launch().session_id.as_str()).unwrap(),
+        run_id: RunId::try_from(current.launch().run_id.as_str()).unwrap(),
+        attempt_id: current.attempt_id().clone(),
+        pod_id: current.pod_id().clone(),
+        pod_incarnation: current.pod_incarnation().get(),
+        resource_id: resource.id().clone(),
+        resource_epoch: resource.epoch().get(),
+        resource_input_epoch: resource.input_epoch().get(),
+    };
+    let manager_credential = store.current_manager_credential_claim(1).unwrap();
+    (store, target, manager_credential.credential_epoch())
+}
+
+fn writer_request(
+    store: &mut PodBayStore,
+    target: NativeWriterTarget,
+    manager_credential_epoch: u64,
+) -> TrustedNativeWriterLeaseRequest {
+    TrustedNativeWriterLeaseRequest {
+        target,
+        holder_actor_id: ActorId::try_from("actor.codex.fixture").unwrap(),
+        holder_credential_generation: 1,
+        expected_owner_epoch: 1,
+        expected_manager_credential_epoch: manager_credential_epoch,
+        expected_authority_revision: store.authority_snapshot().unwrap().revision,
+        expected_writer_epoch: None,
+        ttl_seconds: 60,
+    }
+}
+
+#[test]
+fn v17_writer_lease_acquire_is_exclusive_and_takeover_fences_old_epoch() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    assert!(matches!(
+        store.inspect_native_writer_lease(&target),
+        Err(StoreError::NotFound)
+    ));
+    let request = writer_request(&mut store, target.clone(), manager_credential);
+    let first = store
+        .acquire_native_writer_lease_from_trusted_host(&request)
+        .unwrap();
+    assert_eq!(first.writer_epoch(), 1);
+    assert!(first.expires_at_unix_seconds() > 0);
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), first);
+    let mut competing = request.clone();
+    competing.holder_actor_id = ActorId::try_from("actor.codex.other").unwrap();
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&competing),
+        Err(StoreError::Conflict("native writer already held"))
+    ));
+    competing.expected_writer_epoch = Some(1);
+    let second = store
+        .acquire_native_writer_lease_from_trusted_host(&competing)
+        .unwrap();
+    assert_eq!(second.writer_epoch(), 2);
+    assert_eq!(second.holder_actor_id().as_str(), "actor.codex.other");
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), second);
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&competing),
+        Err(StoreError::StaleEpoch)
+    ));
+    let mut foreign = target.clone();
+    foreign.scope_id = ScopeId::try_from("scope.other").unwrap();
+    assert!(matches!(
+        store.inspect_native_writer_lease(&foreign),
+        Err(StoreError::WrongScope)
+    ));
+}
+
+#[test]
+fn v17_writer_lease_rechecks_target_manager_actor_and_expiry() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let request = writer_request(&mut store, target.clone(), manager_credential);
+    for ttl in [0, 3_601] {
+        let mut invalid = request.clone();
+        invalid.ttl_seconds = ttl;
+        assert!(matches!(
+            store.acquire_native_writer_lease_from_trusted_host(&invalid),
+            Err(StoreError::InvalidInput("native writer lease bounds"))
+        ));
+    }
+    let mut stale = request.clone();
+    stale.expected_authority_revision -= 1;
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = request.clone();
+    stale.expected_manager_credential_epoch += 1;
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = request.clone();
+    stale.holder_credential_generation += 1;
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = request.clone();
+    stale.target.resource_epoch += 1;
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&stale),
+        Err(StoreError::NotFound)
+    ));
+    let first = store
+        .acquire_native_writer_lease_from_trusted_host(&request)
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute("UPDATE native_writer_leases SET expires_at_unix_seconds=1", [])
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        store.inspect_native_writer_lease(&target),
+        Err(StoreError::StaleEpoch)
+    ));
+    let mut takeover = request;
+    takeover.expected_writer_epoch = Some(first.writer_epoch());
+    assert_eq!(
+        store
+            .acquire_native_writer_lease_from_trusted_host(&takeover)
+            .unwrap()
+            .writer_epoch(),
+        2
+    );
+}
+
+#[test]
+fn v17_writer_lease_concurrent_initial_acquire_has_one_holder() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let request = writer_request(&mut store, target, manager_credential);
+    drop(store);
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = (0..2)
+        .map(|_| {
+            let path = fixture.database.clone();
+            let request = request.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut connection = PodBayStore::open(path).unwrap();
+                barrier.wait();
+                connection.acquire_native_writer_lease_from_trusted_host(&request)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::Conflict("native writer already held"))))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn v17_writer_lease_schema_is_verified_exactly() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE native_writer_leases;
+             CREATE TABLE native_writer_leases(resource_id TEXT PRIMARY KEY) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::Conflict("v17 writer lease schema differs"))
+    ));
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v17 writer lease schema differs"))
+    ));
+}
+
+#[test]
+fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let request = writer_request(&mut store, target.clone(), manager_credential);
+    let first = store
+        .acquire_native_writer_lease_from_trusted_host(&request)
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_writer_takeover AFTER UPDATE ON native_writer_leases
+             BEGIN SELECT RAISE(ABORT,'injected takeover failure'); END;",
+        )
+        .unwrap();
+    let mut takeover = request;
+    takeover.expected_writer_epoch = Some(1);
+    assert!(matches!(
+        store.acquire_native_writer_lease_from_trusted_host(&takeover),
+        Err(StoreError::Storage(_))
+    ));
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), first);
+    connection.execute_batch("DROP TRIGGER fail_writer_takeover").unwrap();
+    drop(connection);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE native_writer_leases; PRAGMA user_version=16;")
+        .unwrap();
+    drop(connection);
+    let mut migrated = fixture.open();
+    assert!(matches!(
+        migrated.inspect_native_writer_lease(&target),
+        Err(StoreError::NotFound)
+    ));
+    let read_only = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    drop(read_only);
 }

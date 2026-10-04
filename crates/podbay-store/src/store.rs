@@ -14,7 +14,7 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -50,6 +50,27 @@ const RUN_CHILD_BUDGETS_V16: &str = "CREATE TABLE run_child_budgets (
   run_id TEXT NOT NULL PRIMARY KEY REFERENCES runtime_runs(run_id) CHECK(length(run_id)>0),
   max_children INTEGER NOT NULL DEFAULT 0 CHECK(max_children>=0 AND max_children<=4294967295),
   reserved_children INTEGER NOT NULL DEFAULT 0 CHECK(reserved_children>=0 AND reserved_children<=max_children)
+) STRICT";
+// No migration invents a native writer. One row is exclusive per ResourceId;
+// any takeover increments writer_epoch, independently of PTY input_epoch.
+const NATIVE_WRITER_LEASES_V17: &str = "CREATE TABLE native_writer_leases (
+  resource_id TEXT NOT NULL PRIMARY KEY CHECK(length(resource_id)>0),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL CHECK(length(session_id)>0),
+  run_id TEXT NOT NULL CHECK(length(run_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  resource_input_epoch INTEGER NOT NULL CHECK(resource_input_epoch>=1),
+  holder_actor_id TEXT NOT NULL CHECK(length(holder_actor_id)>0),
+  holder_credential_generation INTEGER NOT NULL CHECK(holder_credential_generation>=1),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  manager_credential_epoch INTEGER NOT NULL CHECK(manager_credential_epoch>=1),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision>=1),
+  writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
+  expires_at_unix_seconds INTEGER NOT NULL CHECK(expires_at_unix_seconds>=1)
 ) STRICT";
 const LAUNCH_BINDINGS_V8: &str = "CREATE TABLE launch_bindings (
   command_rowid INTEGER PRIMARY KEY,
@@ -245,6 +266,7 @@ impl PodBayStore {
         }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
+        verify_writer_lease_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
@@ -662,8 +684,21 @@ impl PodBayStore {
                 [],
             )?;
         }
+        if version < 17 {
+            verify_runtime_schema(&transaction)?;
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='native_writer_leases'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict("v17 writer lease schema name already exists"));
+            }
+            transaction.execute_batch(&format!("{NATIVE_WRITER_LEASES_V17};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
+        verify_writer_lease_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
@@ -2318,6 +2353,20 @@ fn verify_runtime_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
         .optional()?;
     if actual.as_deref() != Some(RUN_CHILD_BUDGETS_V16) {
         return Err(StoreError::Conflict("v16 run budget schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_writer_lease_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='native_writer_leases'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(NATIVE_WRITER_LEASES_V17) {
+        return Err(StoreError::Conflict("v17 writer lease schema differs"));
     }
     Ok(())
 }

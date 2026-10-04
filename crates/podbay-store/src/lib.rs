@@ -9,6 +9,7 @@ mod model;
 mod peer_witness;
 mod rebind;
 mod store;
+mod writer_lease;
 
 pub use authority::SqliteActorVerifierWitness;
 pub use bound_launch::{
@@ -24,9 +25,9 @@ pub use model::{
     EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
     HostObservedPriorCheckpoint, LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding,
     LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
-    ObservedStage, OwnerActorRotationReceipt, QuarantinedSourceEvent, Receipt, ScopeSnapshot,
-    SourceAnomaly, SourceOrder, StoreError, StoredEffect, TrustedOwnerRotationProof,
-    VerifiedPrincipal,
+    NativeWriterLease, NativeWriterTarget, ObservedStage, OwnerActorRotationReceipt,
+    QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError,
+    StoredEffect, TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{

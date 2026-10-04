@@ -466,6 +466,8 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE native_writer_leases;
+             DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
              DROP TABLE actor_verifiers;
              DROP TABLE manager_rebind_prior_observations;
@@ -475,7 +477,6 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
              DROP TABLE manager_rebinds;
              DROP TABLE launch_resources;
              DROP TABLE launch_bindings;
-             DROP TABLE run_child_budgets;
              DROP TABLE runtime_runs;
              DROP TABLE runtime_sessions;
              DROP INDEX launch_slots_binding_identity;
@@ -543,8 +544,9 @@ fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE run_child_budgets; DROP TABLE owner_actor_rotations;
-             DROP TABLE actor_verifiers; PRAGMA user_version=13;",
+            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets;
+             DROP TABLE owner_actor_rotations; DROP TABLE actor_verifiers;
+             PRAGMA user_version=13;",
         )
         .unwrap();
     drop(connection);
@@ -573,8 +575,8 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE run_child_budgets; DROP TABLE owner_actor_rotations;
-             PRAGMA user_version=14;",
+            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets;
+             DROP TABLE owner_actor_rotations; PRAGMA user_version=14;",
         )
         .unwrap();
     drop(connection);
@@ -599,7 +601,7 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, count), (16, 0));
+    assert_eq!((version, count), (17, 0));
 }
 
 #[test]
