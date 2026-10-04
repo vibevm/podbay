@@ -246,6 +246,7 @@ pub enum RuntimeErrorCode {
     Uncertain,
     StorageFailure,
     DeadlineExceeded,
+    LimitExceeded,
     ReplayGap,
 }
 

@@ -34,6 +34,16 @@ fn resource_command() -> CommandEnvelope {
 }
 
 #[test]
+fn snapshot_limit_error_has_a_distinct_wire_code() {
+    let code = podbay_wire::RuntimeErrorCode::LimitExceeded;
+    assert_eq!(serde_json::to_value(code).unwrap(), json!("limit_exceeded"));
+    assert_eq!(
+        serde_json::from_value::<podbay_wire::RuntimeErrorCode>(json!("limit_exceeded")).unwrap(),
+        code,
+    );
+}
+
+#[test]
 fn golden_v1_command_has_stable_cross_language_digest() {
     let fixture = include_bytes!("../../../schema/v1/command-resource-write.json");
     let decoded = decode_command_json(fixture).unwrap();

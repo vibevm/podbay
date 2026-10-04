@@ -185,7 +185,7 @@ export interface CapabilityEnvelope {
   capabilities: Capability[];
   [key: string]: unknown;
 }
-export type RuntimeErrorCode = "invalid_input" | "unsupported" | "forbidden" | "conflict" | "stale_guard" | "busy" | "external_writer" | "unavailable" | "uncertain" | "storage_failure" | "deadline_exceeded" | "replay_gap";
+export type RuntimeErrorCode = "invalid_input" | "unsupported" | "forbidden" | "conflict" | "stale_guard" | "busy" | "external_writer" | "unavailable" | "uncertain" | "storage_failure" | "deadline_exceeded" | "limit_exceeded" | "replay_gap";
 export interface ErrorEnvelope {
   protocol: typeof PROTOCOL;
   requestId: string;
@@ -658,7 +658,7 @@ export function effectiveSupport(capability: Capability): "supported" | "conditi
   if (capability.support === "supported" || capability.support === "conditional" || capability.support === "unsupported") return capability.support;
   return "unverified";
 }
-const ERROR_CODES = ["invalid_input", "unsupported", "forbidden", "conflict", "stale_guard", "busy", "external_writer", "unavailable", "uncertain", "storage_failure", "deadline_exceeded", "replay_gap"] as const;
+const ERROR_CODES = ["invalid_input", "unsupported", "forbidden", "conflict", "stale_guard", "busy", "external_writer", "unavailable", "uncertain", "storage_failure", "deadline_exceeded", "limit_exceeded", "replay_gap"] as const;
 export function decodeError(input: string | Uint8Array | unknown): ErrorEnvelope {
   const item = record(parse(input), "error envelope"); exact(item, ["protocol", "requestId", "error"]);
   protocol(item.protocol); identity(item.requestId, "requestId");

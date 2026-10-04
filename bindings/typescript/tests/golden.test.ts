@@ -142,6 +142,10 @@ test("receipt, snapshot, error, frame and thin command client use golden fixture
   assert.equal(receipt.state, "persisted");
   assert.equal(snapshot.cursor.scopeId, snapshot.scopeId);
   assert.equal(error.error.code, "stale_guard");
+  assert.equal(decodeError({
+    protocol: "podbay/1", requestId: "request.limit",
+    error: { code: "limit_exceeded", message: "current snapshot limit exceeded", retry: "never" },
+  }).error.code, "limit_exceeded");
   const frame = encodeFrame(fixture("receipt-persisted.json"));
   assert.deepEqual(JSON.parse(new TextDecoder().decode(decodeFrame(frame))), fixture("receipt-persisted.json"));
   assert.throws(() => decodeFrame(new Uint8Array([...frame, 0])));

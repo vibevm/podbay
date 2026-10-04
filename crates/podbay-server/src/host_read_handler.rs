@@ -319,7 +319,7 @@ fn authority_error(error: DurableAuthorityError) -> RuntimeError {
             (RuntimeErrorCode::Forbidden, "command unavailable")
         }
         DurableAuthorityError::Store(StoreError::CurrentSnapshotLimitExceeded { .. }) => (
-            RuntimeErrorCode::Unavailable,
+            RuntimeErrorCode::LimitExceeded,
             "current scope snapshot limit exceeded; pagination is unavailable",
         ),
         DurableAuthorityError::Store(StoreError::InvalidInput(_)) => (
@@ -359,10 +359,16 @@ fn snapshot_authority_error(error: DurableAuthorityError) -> RuntimeError {
         DurableAuthorityError::Store(StoreError::NotFound) => {
             refusal(RuntimeErrorCode::Forbidden, "scope unavailable")
         }
-        DurableAuthorityError::Store(StoreError::CurrentSnapshotLimitExceeded { .. }) => refusal(
-            RuntimeErrorCode::Unavailable,
-            "current scope snapshot limit exceeded; pagination is unavailable",
-        ),
+        DurableAuthorityError::Store(StoreError::CurrentSnapshotLimitExceeded { limit }) => {
+            RuntimeError {
+                code: RuntimeErrorCode::LimitExceeded,
+                message: format!(
+                    "current scope snapshot exceeds {limit} entities; pagination is unavailable"
+                ),
+                retry: "never".into(),
+                command_id: None,
+            }
+        }
         other => authority_error(other),
     }
 }
@@ -497,5 +503,14 @@ mod tests {
             assert_eq!(response["outboxState"], "claimed_uncertain");
             assert_eq!(response["portReceiptRef"], "host.receipt.one");
         }
+    }
+
+    #[test]
+    fn current_snapshot_overflow_has_a_distinct_error_code() {
+        let error = snapshot_authority_error(DurableAuthorityError::Store(
+            StoreError::CurrentSnapshotLimitExceeded { limit: 256 },
+        ));
+        assert_eq!(error.code, RuntimeErrorCode::LimitExceeded);
+        assert!(error.message.contains("256"));
     }
 }
