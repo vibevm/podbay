@@ -9,7 +9,8 @@ mod linux {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::sync::{
@@ -70,6 +71,10 @@ mod linux {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
+        // A stale pathname must not advance the durable owner epoch. Probe it
+        // before opening the manager; the later check still catches races.
+        check_manager_socket_path(&socket_path)?;
         ensure_private_database(&config.database, &config.state_dir, self_peer.uid())?;
         // One lock and manager OS identity live for this entire serve loop.
         let mut authority = DurableAuthority::open(
@@ -80,17 +85,7 @@ mod linux {
             DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
             other => format!("durable manager open failed: {other:?}"),
         })?;
-        let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
-        match fs::symlink_metadata(&socket_path) {
-            Ok(_) => {
-                return Err(format!(
-                    "existing manager socket path {}; inspect the prior owner and reconcile it manually",
-                    socket_path.display()
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("manager socket path inspection failed: {error}")),
-        }
+        check_manager_socket_path(&socket_path)?;
         let mut listener = LinuxManagerCommandsGetListener::bind(&config.state_dir).map_err(
             |error| match error {
                 LinuxListenerError::Io(ref io_error)
@@ -188,6 +183,22 @@ mod linux {
             ));
         }
         Ok(())
+    }
+
+    fn check_manager_socket_path(path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_socket() && UnixStream::connect(path).is_ok() {
+                    return Err("manager owner busy for this database".into());
+                }
+                Err(format!(
+                    "existing manager socket path {}; inspect the prior owner and reconcile it manually",
+                    path.display()
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("manager socket path inspection failed: {error}")),
+        }
     }
 
     fn validate_database_path(database: &Path, state_dir: &Path, uid: u32) -> Result<(), String> {

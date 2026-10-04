@@ -205,6 +205,7 @@ fn exclusive_manager_stops_cleanly_restarts_and_preserves_stale_socket() {
     assert_eq!(fixture.owner_epoch(), owner + 1);
     assert!(restarted.stop_with("INT").success());
     assert!(!fixture.socket().exists());
+    let epoch_before_stale_socket = fixture.owner_epoch();
 
     let stale = UnixListener::bind(fixture.socket()).unwrap();
     let identity = fs::symlink_metadata(fixture.socket()).unwrap();
@@ -212,6 +213,7 @@ fn exclusive_manager_stops_cleanly_restarts_and_preserves_stale_socket() {
     let (failed_status, failed_error) = run_short(&fixture);
     assert!(!failed_status.success());
     assert!(failed_error.contains("existing manager socket path"));
+    assert_eq!(fixture.owner_epoch(), epoch_before_stale_socket);
     let preserved = fs::symlink_metadata(fixture.socket()).unwrap();
     assert!(preserved.file_type().is_socket());
     assert_eq!(
