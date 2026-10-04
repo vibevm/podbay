@@ -7,11 +7,14 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::{AvailableLine, JsonlTransport, MAX_FRAME_BYTES};
+use crate::{AvailableLine, AvailableWrite, JsonlTransport, MAX_FRAME_BYTES};
 
 const MAX_ARGS: usize = 64;
 const MAX_ENV: usize = 16;
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+// POSIX guarantees PIPE_BUF is at least 512 bytes. One nonblocking write at
+// or below this bound is all-or-nothing, so Pending never hides a partial RPC.
+const MAX_ATOMIC_READ_PROBE_FRAME: usize = 512;
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const ERRNO_ESRCH: i32 = 3;
@@ -537,6 +540,43 @@ impl JsonlTransport for ProcessJsonlTransport {
         }
     }
 
+    fn try_write_line(&mut self, line: &[u8]) -> io::Result<AvailableWrite> {
+        if line.is_empty()
+            || line.len() > MAX_ATOMIC_READ_PROBE_FRAME
+            || line.last() != Some(&b'\n')
+            || line[..line.len() - 1].contains(&b'\n')
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "atomic JSONL probe frame is invalid",
+            ));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = line;
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "nonblocking stdio backend unavailable",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "child stdin is closed"))?;
+            match stdin.write(line) {
+                Ok(written) if written == line.len() => Ok(AvailableWrite::Written),
+                Ok(_) => Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "atomic child pipe write was partial",
+                )),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(AvailableWrite::Pending),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
     fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -652,7 +692,11 @@ impl JsonlTransport for ProcessJsonlTransport {
                 }
                 Ok(bytes) => self.read_buffer.extend_from_slice(&chunk[..bytes]),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    return Ok(AvailableLine::Pending);
+                    return Ok(if self.read_buffer.is_empty() {
+                        AvailableLine::Pending
+                    } else {
+                        AvailableLine::IncompleteFrame
+                    });
                 }
                 Err(error) => return Err(self.abort_with(error.kind(), "child stdout read failed")),
             }
@@ -671,7 +715,7 @@ impl JsonlTransport for ProcessJsonlTransport {
                     self.abort_with(ErrorKind::InvalidData, "child JSONL frame exceeded bound")
                 );
             }
-            Ok(AvailableLine::Pending)
+            Ok(AvailableLine::IncompleteFrame)
         }
     }
 }

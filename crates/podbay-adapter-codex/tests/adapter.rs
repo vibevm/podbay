@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 use podbay_adapter_codex::{
     AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine,
-    BlockReason, BootstrapState, BootstrapTurnStage, CodecError, CodexError, CodexResource,
-    InterruptState, JsonlTransport, MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind,
-    NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity, Sandbox,
-    TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit,
-    decode, encode,
+    AvailableWrite, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, CodecError,
+    CodexError, CodexResource, InterruptState, JsonlTransport, MAX_FRAME_BYTES, NativeAnswer,
+    NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity,
+    Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage,
+    WriterPermit, decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -19,6 +19,8 @@ struct FakeTransport {
     writes: Vec<Value>,
     fail_answer_write: bool,
     answer_write_attempts: usize,
+    pending_probe_writes: usize,
+    eof_on_empty: bool,
 }
 
 impl FakeTransport {
@@ -31,6 +33,8 @@ impl FakeTransport {
             writes: Vec::new(),
             fail_answer_write: false,
             answer_write_attempts: 0,
+            pending_probe_writes: 0,
+            eof_on_empty: false,
         }
     }
 
@@ -40,6 +44,8 @@ impl FakeTransport {
             writes: Vec::new(),
             fail_answer_write: false,
             answer_write_attempts: 0,
+            pending_probe_writes: 0,
+            eof_on_empty: false,
         }
     }
 
@@ -79,9 +85,20 @@ impl JsonlTransport for FakeTransport {
     fn try_read_line(&mut self) -> io::Result<AvailableLine> {
         match self.reads.pop_front() {
             Some(frame) if frame.is_empty() => Ok(AvailableLine::Pending),
+            Some(frame) if frame == [0] => Ok(AvailableLine::IncompleteFrame),
             Some(frame) => Ok(AvailableLine::Frame(frame)),
+            None if self.eof_on_empty => Ok(AvailableLine::EndOfStream),
             None => Ok(AvailableLine::Pending),
         }
+    }
+
+    fn try_write_line(&mut self, line: &[u8]) -> io::Result<AvailableWrite> {
+        if self.pending_probe_writes > 0 {
+            self.pending_probe_writes -= 1;
+            return Ok(AvailableWrite::Pending);
+        }
+        self.write_line(line)?;
+        Ok(AvailableWrite::Written)
     }
 }
 
@@ -385,6 +402,10 @@ fn nonblocking_bootstrap_poll_distinguishes_delay_completion_and_interruption() 
         adapter.poll_available_once().unwrap();
         assert_eq!(adapter.bootstrap_state(), &expected);
         assert!(!adapter.bootstrap_ready());
+        assert_eq!(
+            adapter.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.bootstrap"),
+            Err(CodexError::Blocked(BlockReason::BootstrapUnsettled)),
+        );
     }
 }
 
@@ -498,21 +519,346 @@ fn split_bootstrap_uses_checkpointed_thread_and_one_fresh_idle_turn_start() {
 #[test]
 fn split_bootstrap_applies_completion_queued_before_turn_start_reply() {
     let mut adapter = resource([
-        initialized(), effective(2, "thread.one"), read_response(3, "idle", None),
-        completed("turn.split.bootstrap", "completed"), status("idle", &[]),
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "idle", None),
+        completed("turn.split.bootstrap", "completed"),
+        status("idle", &[]),
         work_turn_response(4, "turn.split.bootstrap"),
     ]);
     adapter.initialize().unwrap();
     let thread = adapter.start_thread_without_turn().unwrap();
-    adapter.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
-    let receipt = adapter.submit_bootstrap_after_checkpoint(
-        &writer_permit(1), &thread.thread_id, &thread.session_id,
-        "Begin work", "bootstrap:session.one",
-    ).unwrap();
-    assert_eq!(receipt.stage, BootstrapTurnStage::Submitted { turn_id: "turn.split.bootstrap".into() });
-    assert_eq!(adapter.bootstrap_state(), &BootstrapState::Completed { turn_id: "turn.split.bootstrap".into() });
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    let receipt = adapter
+        .submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            &thread.thread_id,
+            &thread.session_id,
+            "Begin work",
+            "bootstrap:session.one",
+        )
+        .unwrap();
+    assert_eq!(
+        receipt.stage,
+        BootstrapTurnStage::Submitted {
+            turn_id: "turn.split.bootstrap".into()
+        }
+    );
+    assert_eq!(
+        adapter.bootstrap_state(),
+        &BootstrapState::Completed {
+            turn_id: "turn.split.bootstrap".into()
+        }
+    );
     assert!(!adapter.poll_available_once().unwrap());
-    assert_eq!(adapter.transport().methods(), ["initialize", "initialized", "thread/start", "thread/read", "turn/start"]);
+    assert_eq!(
+        adapter.transport().methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
+}
+
+fn split_completed_with_probe_tail(
+    tail: impl IntoIterator<Item = Vec<u8>>,
+    pending_probe_writes: usize,
+    eof_on_empty: bool,
+) -> CodexResource<FakeTransport> {
+    let mut io = FakeTransport::with_reads([
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "idle", None),
+        work_turn_response(4, "turn.split.bootstrap"),
+        completed("turn.split.bootstrap", "completed"),
+        status("idle", &[]),
+    ]);
+    io.reads.extend(tail);
+    io.pending_probe_writes = pending_probe_writes;
+    io.eof_on_empty = eof_on_empty;
+    let mut adapter = CodexResource::new(io, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    let thread = adapter.start_thread_without_turn().unwrap();
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    assert_eq!(
+        adapter
+            .submit_bootstrap_after_checkpoint(
+                &writer_permit(1),
+                &thread.thread_id,
+                &thread.session_id,
+                "Begin work",
+                "bootstrap:session.one",
+            )
+            .unwrap()
+            .stage,
+        BootstrapTurnStage::Submitted {
+            turn_id: "turn.split.bootstrap".into()
+        },
+    );
+    adapter.poll_available_once().unwrap();
+    adapter.poll_available_once().unwrap();
+    assert_eq!(
+        adapter.bootstrap_state(),
+        &BootstrapState::Completed {
+            turn_id: "turn.split.bootstrap".into()
+        }
+    );
+    adapter
+}
+
+#[test]
+fn async_completion_read_waits_without_blocking_and_verifies_exact_idle_reply() {
+    let mut adapter = split_completed_with_probe_tail(
+        [
+            Vec::new(),
+            encode(&read_response(5, "idle", None)).unwrap(),
+            Vec::new(),
+        ],
+        1,
+        false,
+    );
+    let poll = |adapter: &mut CodexResource<FakeTransport>| {
+        adapter.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+    };
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Pending);
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/read")
+            .count(),
+        1
+    );
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Advanced);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Pending);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Advanced);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Verified);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Verified);
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/read")
+            .count(),
+        2
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        adapter.transport().writes.last().unwrap()["params"]["threadId"],
+        "thread.one"
+    );
+}
+
+#[test]
+fn async_completion_read_refuses_malformed_busy_pending_and_lost_reply() {
+    let mut malformed = split_completed_with_probe_tail(
+        [encode(&json!({"id":5,"result":{"thread":{"id":"thread.one"}}})).unwrap()],
+        0,
+        false,
+    );
+    malformed
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert!(matches!(
+        malformed.poll_bootstrap_read_proof_once(
+            "thread.one",
+            "thread.one",
+            "turn.split.bootstrap"
+        ),
+        Err(CodexError::Protocol(_)),
+    ));
+    assert_eq!(
+        malformed
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/read")
+            .count(),
+        2
+    );
+
+    let mut wrong_session = read_response(5, "idle", None);
+    wrong_session["result"]["thread"]["sessionId"] = json!("native.other");
+    let mut wrong = split_completed_with_probe_tail([encode(&wrong_session).unwrap()], 0, false);
+    wrong
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(
+        wrong.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap"),
+        Err(CodexError::Mismatch(
+            "completion read native Session differs"
+        )),
+    );
+
+    let mut foreign_reply = split_completed_with_probe_tail(
+        [encode(&read_response(99, "idle", None)).unwrap()],
+        0,
+        false,
+    );
+    foreign_reply
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert!(matches!(
+        foreign_reply.poll_bootstrap_read_proof_once(
+            "thread.one",
+            "thread.one",
+            "turn.split.bootstrap"
+        ),
+        Err(CodexError::Protocol(_)),
+    ));
+
+    let mut contradictory = read_response(5, "idle", None);
+    contradictory["result"]["thread"]["status"]["activeFlags"] = json!(["waitingOnApproval"]);
+    let mut waiting = split_completed_with_probe_tail([encode(&contradictory).unwrap()], 0, false);
+    waiting
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert!(matches!(
+        waiting.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap"),
+        Err(CodexError::Protocol(_)),
+    ));
+
+    let mut busy = split_completed_with_probe_tail(
+        [encode(&read_response(5, "active", None)).unwrap()],
+        0,
+        false,
+    );
+    busy.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(
+        busy.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Advanced
+    );
+    assert_ne!(
+        busy.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Verified
+    );
+
+    let mut question = split_completed_with_probe_tail(
+        [
+            encode(&command_request(70)).unwrap(),
+            encode(&read_response(5, "idle", None)).unwrap(),
+        ],
+        0,
+        false,
+    );
+    question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(question.pending_request_count(), 1);
+    assert_ne!(
+        question
+            .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Verified
+    );
+
+    let mut partial_question = split_completed_with_probe_tail(
+        [
+            encode(&read_response(5, "idle", None)).unwrap(),
+            vec![0],
+            encode(&command_request(71)).unwrap(),
+        ],
+        0,
+        false,
+    );
+    partial_question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    partial_question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(
+        partial_question
+            .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Pending,
+    );
+    assert_ne!(
+        partial_question
+            .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Verified,
+    );
+    assert_eq!(partial_question.pending_request_count(), 1);
+
+    let mut late_question = split_completed_with_probe_tail(
+        [
+            encode(&read_response(5, "idle", None)).unwrap(),
+            Vec::new(),
+            encode(&command_request(72)).unwrap(),
+        ],
+        0,
+        false,
+    );
+    late_question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    late_question
+        .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(
+        late_question
+            .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Verified
+    );
+    assert_ne!(
+        late_question
+            .poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+            .unwrap(),
+        BootstrapReadPoll::Verified
+    );
+    assert_eq!(late_question.pending_request_count(), 1);
+
+    let mut lost = split_completed_with_probe_tail([], 0, true);
+    lost.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap")
+        .unwrap();
+    assert_eq!(
+        lost.poll_bootstrap_read_proof_once("thread.one", "thread.one", "turn.split.bootstrap"),
+        Err(CodexError::TransportUncertain)
+    );
+    assert_eq!(
+        lost.transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/read")
+            .count(),
+        2
+    );
+    assert_eq!(
+        lost.transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        1
+    );
 }
 
 #[test]

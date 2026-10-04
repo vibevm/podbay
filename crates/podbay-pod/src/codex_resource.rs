@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use podbay_adapter_codex::{
-    ApprovalPolicy, BlockReason, BootstrapState, BootstrapTurnStage, ChildExitObservation, ChildLaunchSpec,
+    ApprovalPolicy, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, ChildExitObservation, ChildLaunchSpec,
     CodexError, CodexResource,
     KernelChildBirthObservation, PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity,
     Sandbox, WriterPermit,
@@ -242,9 +242,47 @@ impl PodCodexResource {
         let Some(stage) = self.journal.as_ref().map(|journal| journal.view().stage) else {
             return Ok(false);
         };
-        if !matches!(stage, CodexJournalStage::BootstrapSubmitted
-            | CodexJournalStage::BootstrapCompletionObservedPendingIdleProof)
-        {
+        if stage == CodexJournalStage::BootstrapCompletionObservedPendingIdleProof {
+            let view = self.journal.as_ref()
+                .ok_or(PodError::Uncertain("held Codex journal disappeared"))?.view();
+            let thread_id = view.native_thread_id.as_deref()
+                .ok_or(PodError::Uncertain("pending completion lacks native thread"))?;
+            let session_id = view.native_session_id.as_deref()
+                .ok_or(PodError::Uncertain("pending completion lacks native Session"))?;
+            let turn_id = view.native_turn_id.as_deref()
+                .ok_or(PodError::Uncertain("pending completion lacks native turn"))?;
+            let progress = self.resource.poll_bootstrap_read_proof_once(
+                thread_id, session_id, turn_id,
+            ).map_err(|_| PodError::Uncertain("Codex completion read outcome unknown"))?;
+            return match progress {
+                BootstrapReadPoll::Pending => Ok(false),
+                BootstrapReadPoll::Advanced => Ok(true),
+                BootstrapReadPoll::Verified => {
+                    recheck_before_journal()?;
+                    self.recheck_child()?;
+                    match self.resource.poll_bootstrap_read_proof_once(
+                        thread_id, session_id, turn_id,
+                    ).map_err(|_| PodError::Uncertain("Codex completion read changed before journal"))? {
+                        BootstrapReadPoll::Pending => return Ok(false),
+                        BootstrapReadPoll::Advanced => return Ok(true),
+                        BootstrapReadPoll::Verified => {}
+                    }
+                    let journal = self.journal.as_mut()
+                        .ok_or(PodError::Uncertain("held Codex journal disappeared"))?;
+                    journal.recheck_held_file()?;
+                    if journal.view() != view {
+                        return Err(PodError::Uncertain("completion journal changed before final proof"));
+                    }
+                    let key = view.command_key.as_deref()
+                        .ok_or(PodError::Uncertain("pending completion lacks command key"))?;
+                    let digest = view.payload_digest.as_deref()
+                        .ok_or(PodError::Uncertain("pending completion lacks request digest"))?;
+                    journal.record_bootstrap_completed(key, digest, turn_id)?;
+                    Ok(true)
+                }
+            };
+        }
+        if stage != CodexJournalStage::BootstrapSubmitted {
             return Ok(false);
         }
         let consumed = self.resource.poll_available_once()

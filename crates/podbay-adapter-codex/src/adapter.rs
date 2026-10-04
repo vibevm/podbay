@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -14,6 +15,8 @@ use crate::host_requests::{
 
 const MAX_PENDING_NOTIFICATIONS: usize = 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
+const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ATOMIC_READ_PROBE_FRAME: usize = 512;
 
 /// A pod-owned byte transport. Implementations must enforce
 /// `MAX_FRAME_BYTES` while assembling one complete JSONL frame per read;
@@ -21,8 +24,15 @@ const MAX_PENDING_REQUESTS: usize = 128;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AvailableLine {
     Pending,
+    IncompleteFrame,
     Frame(Vec<u8>),
     EndOfStream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AvailableWrite {
+    Pending,
+    Written,
 }
 
 pub trait JsonlTransport {
@@ -35,6 +45,16 @@ pub trait JsonlTransport {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "nonblocking JSONL read is unavailable",
+        ))
+    }
+
+    /// One atomic, nonblocking write of a small JSONL RPC. `Pending` proves
+    /// that no byte was written; partial or ambiguous writes must return an
+    /// error and may never be retried by the caller.
+    fn try_write_line(&mut self, _line: &[u8]) -> io::Result<AvailableWrite> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nonblocking JSONL write is unavailable",
         ))
     }
 }
@@ -237,6 +257,46 @@ pub enum BootstrapState {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapReadPoll {
+    Pending,
+    Advanced,
+    Verified,
+}
+
+enum CompletionReadState {
+    NotStarted,
+    PendingWrite {
+        id: u64,
+        frame: Vec<u8>,
+        thread_id: String,
+        session_id: String,
+        turn_id: String,
+        deadline: Instant,
+    },
+    AwaitingReply {
+        id: u64,
+        thread_id: String,
+        session_id: String,
+        turn_id: String,
+        deadline: Instant,
+    },
+    Draining {
+        thread_id: String,
+        session_id: String,
+        turn_id: String,
+        deadline: Instant,
+    },
+    Verified {
+        thread_id: String,
+        session_id: String,
+        turn_id: String,
+        deadline: Instant,
+    },
+    Inconclusive,
+    Uncertain,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartReceipt {
     pub thread: NativeThread,
@@ -355,6 +415,7 @@ pub struct CodexResource<T: JsonlTransport> {
     idle_after_completion: bool,
     external_conflict: bool,
     queued: VecDeque<Value>,
+    completion_read: CompletionReadState,
 }
 
 impl<T: JsonlTransport> CodexResource<T> {
@@ -380,6 +441,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             idle_after_completion: false,
             external_conflict: false,
             queued: VecDeque::new(),
+            completion_read: CompletionReadState::NotStarted,
         }
     }
 
@@ -1104,12 +1166,22 @@ impl<T: JsonlTransport> CodexResource<T> {
         if self.poisoned || !self.initialized {
             return Err(CodexError::InvalidState("native connection is unavailable"));
         }
+        if matches!(
+            self.completion_read,
+            CompletionReadState::PendingWrite { .. }
+                | CompletionReadState::AwaitingReply { .. }
+                | CompletionReadState::Draining { .. }
+        ) {
+            return Err(CodexError::InvalidState(
+                "completion read owns the native RPC",
+            ));
+        }
         if let Some(event) = self.queued.pop_front() {
             self.apply_event_or_poison(&event)?;
             return Ok(true);
         }
         let line = match self.io.try_read_line() {
-            Ok(AvailableLine::Pending) => return Ok(false),
+            Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => return Ok(false),
             Ok(AvailableLine::Frame(frame)) => frame,
             Ok(AvailableLine::EndOfStream) | Err(_) => {
                 self.poisoned = true;
@@ -1123,6 +1195,336 @@ impl<T: JsonlTransport> CodexResource<T> {
         }
         self.apply_event_or_poison(&value)?;
         Ok(true)
+    }
+
+    /// Progress one read-only `thread/read` RPC after the exact bootstrap
+    /// completion notification. Each tick performs at most one atomic pipe
+    /// write or one nonblocking frame read, so pod control stays responsive.
+    /// A lost or malformed response is terminally uncertain and never causes
+    /// another native write. No thread content is retained.
+    pub fn poll_bootstrap_read_proof_once(
+        &mut self,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<BootstrapReadPoll, CodexError> {
+        if self.poisoned || !self.initialized {
+            return Err(CodexError::InvalidState("native connection is unavailable"));
+        }
+        if self.thread.as_ref().is_none_or(|thread| {
+            thread.thread_id != expected_thread_id || thread.session_id != expected_session_id
+        }) || !matches!(&self.bootstrap, BootstrapState::Completed { turn_id }
+            if turn_id == expected_turn_id)
+        {
+            return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
+        }
+        if !completion_target_matches(
+            &self.completion_read,
+            expected_thread_id,
+            expected_session_id,
+            expected_turn_id,
+        ) {
+            return Err(CodexError::Mismatch("completion read target changed"));
+        }
+        let state = std::mem::replace(&mut self.completion_read, CompletionReadState::Uncertain);
+        match state {
+            CompletionReadState::NotStarted => {
+                let id = self.next_id;
+                self.next_id = id
+                    .checked_add(1)
+                    .ok_or(CodexError::InvalidState("RPC id exhausted"))?;
+                let frame = encode(&json!({
+                    "id": id, "method": "thread/read",
+                    "params": {"threadId": expected_thread_id},
+                }))
+                .map_err(CodexError::Codec)?;
+                if frame.len() > MAX_ATOMIC_READ_PROBE_FRAME {
+                    self.completion_read = CompletionReadState::Inconclusive;
+                    return Err(CodexError::Unsupported(
+                        "completion read exceeds atomic pipe bound",
+                    ));
+                }
+                self.completion_read = CompletionReadState::PendingWrite {
+                    id,
+                    frame,
+                    thread_id: expected_thread_id.into(),
+                    session_id: expected_session_id.into(),
+                    turn_id: expected_turn_id.into(),
+                    deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                };
+                self.poll_bootstrap_read_proof_once(
+                    expected_thread_id,
+                    expected_session_id,
+                    expected_turn_id,
+                )
+            }
+            CompletionReadState::PendingWrite {
+                id,
+                frame,
+                thread_id,
+                session_id,
+                turn_id,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.completion_read = CompletionReadState::Inconclusive;
+                    return Err(CodexError::TransportUncertain);
+                }
+                match self.io.try_write_line(&frame) {
+                    Ok(AvailableWrite::Pending) => {
+                        self.completion_read = CompletionReadState::PendingWrite {
+                            id,
+                            frame,
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Pending)
+                    }
+                    Ok(AvailableWrite::Written) => {
+                        self.completion_read = CompletionReadState::AwaitingReply {
+                            id,
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                        };
+                        Ok(BootstrapReadPoll::Advanced)
+                    }
+                    Err(_) => {
+                        self.poisoned = true;
+                        Err(CodexError::TransportUncertain)
+                    }
+                }
+            }
+            CompletionReadState::AwaitingReply {
+                id,
+                thread_id,
+                session_id,
+                turn_id,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.poisoned = true;
+                    return Err(CodexError::TransportUncertain);
+                }
+                if let Some(event) = self.queued.pop_front() {
+                    self.apply_event_or_poison(&event)?;
+                    self.completion_read = CompletionReadState::AwaitingReply {
+                        id,
+                        thread_id,
+                        session_id,
+                        turn_id,
+                        deadline,
+                    };
+                    return Ok(BootstrapReadPoll::Advanced);
+                }
+                let frame = match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                        self.completion_read = CompletionReadState::AwaitingReply {
+                            id,
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        return Ok(BootstrapReadPoll::Pending);
+                    }
+                    Ok(AvailableLine::Frame(frame)) => frame,
+                    Ok(AvailableLine::EndOfStream) | Err(_) => {
+                        self.poisoned = true;
+                        return Err(CodexError::TransportUncertain);
+                    }
+                };
+                let value = decode(&frame).map_err(|error| self.poison_codec(error))?;
+                if nonempty_string(value.get("method")).is_some() {
+                    self.apply_event_or_poison(&value)?;
+                    self.completion_read = CompletionReadState::AwaitingReply {
+                        id,
+                        thread_id,
+                        session_id,
+                        turn_id,
+                        deadline,
+                    };
+                    return Ok(BootstrapReadPoll::Advanced);
+                }
+                if value.get("id").and_then(Value::as_u64) != Some(id)
+                    || value.get("error").is_some()
+                {
+                    self.poisoned = true;
+                    return Err(CodexError::Protocol(
+                        "completion read reply identity differs",
+                    ));
+                }
+                let result = value.get("result").ok_or_else(|| {
+                    self.poisoned = true;
+                    CodexError::Protocol("completion read omitted result")
+                })?;
+                let thread = self
+                    .validate_read_thread(result, &thread_id)
+                    .inspect_err(|_| {
+                        self.poisoned = true;
+                    })?;
+                let waiting = waiting_flag(result.pointer("/thread/status")).inspect_err(|_| {
+                    self.poisoned = true;
+                })?;
+                if thread.status == ThreadStatus::Idle
+                    && result
+                        .pointer("/thread/status/activeFlags")
+                        .is_some_and(|flags| !flags.as_array().is_some_and(Vec::is_empty))
+                {
+                    self.poisoned = true;
+                    return Err(CodexError::Protocol(
+                        "idle completion read carries active flags",
+                    ));
+                }
+                if thread.session_id != session_id {
+                    self.poisoned = true;
+                    return Err(CodexError::Mismatch(
+                        "completion read native Session differs",
+                    ));
+                }
+                self.native_status = thread.status;
+                self.thread = Some(thread);
+                self.status_waiting = waiting;
+                self.observed_active_turn_id = None;
+                self.idle_after_completion = self.native_status == ThreadStatus::Idle;
+                self.retire_resolved_requests();
+                if !self.bootstrap_ready() || waiting {
+                    self.completion_read = CompletionReadState::Inconclusive;
+                    return Ok(BootstrapReadPoll::Advanced);
+                }
+                self.completion_read = CompletionReadState::Draining {
+                    thread_id,
+                    session_id,
+                    turn_id,
+                    deadline,
+                };
+                Ok(BootstrapReadPoll::Advanced)
+            }
+            CompletionReadState::Draining {
+                thread_id,
+                session_id,
+                turn_id,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.poisoned = true;
+                    return Err(CodexError::TransportUncertain);
+                }
+                match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending) if self.bootstrap_ready() => {
+                        self.completion_read = CompletionReadState::Verified {
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Verified)
+                    }
+                    Ok(AvailableLine::Pending) => {
+                        self.completion_read = CompletionReadState::Inconclusive;
+                        Ok(BootstrapReadPoll::Pending)
+                    }
+                    Ok(AvailableLine::IncompleteFrame) => {
+                        self.completion_read = CompletionReadState::Draining {
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Pending)
+                    }
+                    Ok(AvailableLine::Frame(frame)) => {
+                        let value = decode(&frame).map_err(|error| self.poison_codec(error))?;
+                        if nonempty_string(value.get("method")).is_none() {
+                            self.poisoned = true;
+                            return Err(CodexError::Protocol(
+                                "unsolicited completion read response",
+                            ));
+                        }
+                        self.apply_event_or_poison(&value)?;
+                        self.completion_read = if self.bootstrap_ready() {
+                            CompletionReadState::Draining {
+                                thread_id,
+                                session_id,
+                                turn_id,
+                                deadline,
+                            }
+                        } else {
+                            CompletionReadState::Inconclusive
+                        };
+                        Ok(BootstrapReadPoll::Advanced)
+                    }
+                    Ok(AvailableLine::EndOfStream) | Err(_) => {
+                        self.poisoned = true;
+                        Err(CodexError::TransportUncertain)
+                    }
+                }
+            }
+            CompletionReadState::Verified {
+                thread_id,
+                session_id,
+                turn_id,
+                deadline,
+            } => {
+                if Instant::now() >= deadline {
+                    self.poisoned = true;
+                    return Err(CodexError::TransportUncertain);
+                }
+                match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending) if self.bootstrap_ready() => {
+                        self.completion_read = CompletionReadState::Verified {
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Verified)
+                    }
+                    Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                        self.completion_read = CompletionReadState::Draining {
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Pending)
+                    }
+                    Ok(AvailableLine::Frame(frame)) => {
+                        let value = decode(&frame).map_err(|error| self.poison_codec(error))?;
+                        if nonempty_string(value.get("method")).is_none() {
+                            self.poisoned = true;
+                            return Err(CodexError::Protocol(
+                                "unsolicited completion read response",
+                            ));
+                        }
+                        self.apply_event_or_poison(&value)?;
+                        self.completion_read = if self.bootstrap_ready() {
+                            CompletionReadState::Draining {
+                                thread_id,
+                                session_id,
+                                turn_id,
+                                deadline,
+                            }
+                        } else {
+                            CompletionReadState::Inconclusive
+                        };
+                        Ok(BootstrapReadPoll::Advanced)
+                    }
+                    Ok(AvailableLine::EndOfStream) | Err(_) => {
+                        self.poisoned = true;
+                        Err(CodexError::TransportUncertain)
+                    }
+                }
+            }
+            CompletionReadState::Inconclusive => {
+                self.completion_read = CompletionReadState::Inconclusive;
+                Ok(BootstrapReadPoll::Pending)
+            }
+            CompletionReadState::Uncertain => Err(CodexError::TransportUncertain),
+        }
     }
 
     fn require_fresh_thread(&self) -> Result<(), CodexError> {
@@ -1241,6 +1643,16 @@ impl<T: JsonlTransport> CodexResource<T> {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
         if self.poisoned {
             return Err(CodexError::InvalidState("native connection is unavailable"));
+        }
+        if matches!(
+            self.completion_read,
+            CompletionReadState::PendingWrite { .. }
+                | CompletionReadState::AwaitingReply { .. }
+                | CompletionReadState::Draining { .. }
+        ) {
+            return Err(CodexError::InvalidState(
+                "completion read owns the native RPC",
+            ));
         }
         let id = self.next_id;
         self.next_id = id
@@ -1552,6 +1964,43 @@ fn nonempty_string(value: Option<&Value>) -> Option<&str> {
     value?
         .as_str()
         .filter(|text| !text.is_empty() && text.len() <= 512)
+}
+
+fn completion_target_matches(
+    state: &CompletionReadState,
+    thread: &str,
+    session: &str,
+    turn: &str,
+) -> bool {
+    match state {
+        CompletionReadState::PendingWrite {
+            thread_id,
+            session_id,
+            turn_id,
+            ..
+        }
+        | CompletionReadState::AwaitingReply {
+            thread_id,
+            session_id,
+            turn_id,
+            ..
+        }
+        | CompletionReadState::Draining {
+            thread_id,
+            session_id,
+            turn_id,
+            ..
+        }
+        | CompletionReadState::Verified {
+            thread_id,
+            session_id,
+            turn_id,
+            ..
+        } => thread_id == thread && session_id == session && turn_id == turn,
+        CompletionReadState::NotStarted
+        | CompletionReadState::Inconclusive
+        | CompletionReadState::Uncertain => true,
+    }
 }
 
 fn valid_token(value: &str) -> bool {

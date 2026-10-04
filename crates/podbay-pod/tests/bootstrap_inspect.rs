@@ -12,7 +12,8 @@ use podbay_core::{
     ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_pod::{
-    BootstrapControlStage, BootstrapSettlementStage, LinuxPeerEvidence, PodError, PodPeerBootstrap,
+    BootstrapControlStage, BootstrapSettlementStage, CodexCommandJournal, CodexJournalIdentity,
+    CodexJournalStage, LinuxBackend, LinuxPeerEvidence, PodError, PodPeerBootstrap,
     launch_bound_codex_v2,
 };
 use podbay_store::{
@@ -80,6 +81,10 @@ printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\n
 sleep 2
 printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed"}}}\n'
 printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\n'
+read -r final_read
+printf '%s\n' "$final_read" >> "$CODEX_HOME/frames.log"
+sleep 2
+printf '{"id":5,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
 sleep 30
 "##).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -467,8 +472,16 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         observed.stage,
         BootstrapControlStage::Submitted { .. }
     ));
-    // Even the later idle notification is insufficient: no fresh thread/read
-    // response has been observed, so no BootstrapCompleted is reported.
+    // The child has accepted the read-only RPC but withholds its reply for two
+    // seconds. Pod control remains responsive and completion stays pending.
+    let read_deadline = Instant::now() + Duration::from_secs(3);
+    while fs::read_to_string(&frames).unwrap().lines().count() != 6 {
+        assert!(Instant::now() < read_deadline, "asynchronous thread/read was not sent");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let control_start = Instant::now();
+    assert!(client.attested_status().unwrap().child_running);
+    assert!(control_start.elapsed() < Duration::from_secs(1), "thread/read blocked pod control");
     assert_eq!(
         client
             .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
@@ -476,14 +489,32 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
             .settlement,
         Some(BootstrapSettlementStage::CompletionObservedPendingIdleProof)
     );
-    assert!(matches!(
-        client
+    let completion_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let observed = client
             .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
-            .unwrap()
-            .stage,
-        BootstrapControlStage::Submitted { .. },
-    ));
-    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+            .unwrap();
+        if observed.settlement == Some(BootstrapSettlementStage::Completed) {
+            assert!(matches!(observed.stage, BootstrapControlStage::Submitted { .. }));
+            break;
+        }
+        assert!(Instant::now() < completion_deadline, "fresh idle thread/read was not journaled");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let journal_identity = CodexJournalIdentity::from_resource(
+        &target.store_lineage, &target.scope_id, &target.session_id, &target.run_id,
+        &target.attempt_id, &target.pod_id, Epoch::new(target.pod_incarnation).unwrap(),
+        &target.resource_id, Epoch::new(target.resource_epoch).unwrap(),
+    );
+    let reopened = CodexCommandJournal::open(
+        &LinuxBackend, &fixture.root.join("codex.commands.log"), journal_identity,
+    ).unwrap();
+    assert_eq!(reopened.view().stage, CodexJournalStage::BootstrapCompleted);
+    let methods: Vec<_> = fs::read_to_string(&frames).unwrap().lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+            .as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(methods, ["initialize", "initialized", "thread/start", "thread/read", "turn/start", "thread/read"]);
     let changed = store
         .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
             target: target.clone(),
@@ -501,6 +532,6 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         client.inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch()),
         Err(PodError::Refused(_)),
     ));
-    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 6);
     assert!(!client.stop().unwrap().child_running);
 }

@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_adapter_codex::{
-    AvailableLine, ChildLaunchSpec, CodecError, JsonlTransport, ProcessJsonlTransport,
-    TESTED_CODEX_CLI_VERSION, decode, encode,
+    AvailableLine, AvailableWrite, ChildLaunchSpec, CodecError, JsonlTransport,
+    ProcessJsonlTransport, TESTED_CODEX_CLI_VERSION, decode, encode,
 };
 use serde_json::{Value, json};
 
@@ -34,7 +34,7 @@ fn nonblocking_child_poll_keeps_partial_frame_and_returns_before_read_deadline()
     let frame = loop {
         let tick = Instant::now();
         match transport.try_read_line().unwrap() {
-            AvailableLine::Pending => saw_pending = true,
+            AvailableLine::Pending | AvailableLine::IncompleteFrame => saw_pending = true,
             AvailableLine::Frame(frame) => break frame,
             AvailableLine::EndOfStream => panic!("fake child closed before its frame"),
         }
@@ -51,6 +51,42 @@ fn nonblocking_child_poll_keeps_partial_frame_and_returns_before_read_deadline()
     assert!(saw_pending);
     assert_eq!(decode(&frame).unwrap()["result"]["ok"], true);
     assert_eq!(transport.try_read_line().unwrap(), AvailableLine::Pending);
+    transport.dispose().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn atomic_probe_write_reports_pending_without_blocking_when_child_pipe_is_full() {
+    let dirs = PrivateDirs::new();
+    let mut transport = ProcessJsonlTransport::spawn(dirs.spec(
+        "blocked",
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    ))
+    .unwrap();
+    let mut frame = vec![b'x'; 511];
+    frame.push(b'\n');
+    let mut pending = false;
+    for _ in 0..8192 {
+        let tick = Instant::now();
+        let outcome = transport.try_write_line(&frame).unwrap();
+        assert!(
+            tick.elapsed() < Duration::from_millis(250),
+            "atomic write stalled control"
+        );
+        if outcome == AvailableWrite::Pending {
+            pending = true;
+            break;
+        }
+    }
+    assert!(pending, "blocked child pipe never reported Pending");
+    assert_eq!(
+        transport
+            .try_write_line(&vec![b'x'; 513])
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput,
+    );
     transport.dispose().unwrap();
 }
 
