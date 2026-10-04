@@ -1,11 +1,13 @@
-//! One-exchange PodBay/1 router for an already authenticated local stream.
-//! No socket listener, host effect, provider, or automatic retry lives here.
+//! Authenticated PodBay/1 reads over one exchange or an owned Linux socket.
+//! No host effect, provider, or automatic retry lives here.
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 mod auth_prelude;
 #[cfg(target_os = "linux")]
 mod host_read_handler;
+#[cfg(target_os = "linux")]
+mod linux_listener;
 #[cfg(target_os = "linux")]
 mod linux_peer;
 
@@ -24,6 +26,10 @@ use serde_json::Value;
 pub use auth_prelude::{
     AUTH_PRELUDE_PROTOCOL, LinuxAuthPreludeError, LinuxAuthPreludeLimits, LinuxAuthenticatedStream,
     authenticate_accepted_linux_stream, authenticate_accepted_linux_stream_with_limits,
+};
+#[cfg(target_os = "linux")]
+pub use linux_listener::{
+    LinuxListenerError, LinuxListenerReport, LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME,
 };
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
