@@ -2,6 +2,9 @@
 //! This crate never chooses credentials, reconnects, or retries a logical command.
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod linux_auth;
+
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Write};
 
@@ -11,6 +14,13 @@ use podbay_wire::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+#[cfg(target_os = "linux")]
+pub use linux_auth::{
+    ActorChallengeOrigin, CanonicalActorChallenge, ClientAuthFailure, ClientAuthFailureKind,
+    ClientAuthStage, LinuxClientAuthLimits, authenticate_existing_linux_stream,
+    authenticate_existing_linux_stream_with_limits,
+};
 
 #[derive(Debug)]
 pub enum ClientFault {
