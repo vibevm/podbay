@@ -240,6 +240,7 @@ impl HostDispatchPort for FakePort {
             "podbay.codex-anchor.inspect/1", inspection.target().clone(),
             inspection.bootstrap_command_id().clone(), inspection.bootstrap_request_digest().into(),
             inspection.writer_epoch(), "thread.native.one".into(), "session.native.one".into(),
+            "turn.native.one".into(),
         )
     }
 
@@ -1123,12 +1124,15 @@ fn indexed_guard_readback_keeps_two_roots_isolated_and_refuses_stale_lease() {
     // writer lease is now stale. Its guard cannot be borrowed from root two.
     assert_eq!(reads[0]["ok"]["bootstrapGuard"]["available"], false);
     assert_eq!(reads[0]["ok"]["currentLaterSendGuard"]["available"], false);
+    assert_eq!(reads[0]["ok"]["currentBootstrapCompletion"]["available"], false);
     assert_eq!(
         reads[1]["ok"]["bootstrapGuard"],
         second["value"]["bootstrapGuard"]
     );
     let later = &reads[1]["ok"]["currentLaterSendGuard"];
     assert_eq!(later["available"], true);
+    assert_eq!(reads[1]["ok"]["currentBootstrapCompletion"]["available"], false,
+        "fresh writer guard without claimed completion is not readiness");
     assert_eq!(later["sessionId"], second["value"]["sessionId"]);
     assert_eq!(later["podId"], second["value"]["podId"]);
     assert_eq!(later["guard"], second["value"]["bootstrapGuard"]["guard"]);
@@ -1212,9 +1216,11 @@ fn indexed_guard_readback_keeps_two_roots_isolated_and_refuses_stale_lease() {
     assert_eq!(stale[0]["ok"]["state"], "host_accepted");
     assert_eq!(stale[0]["ok"]["bootstrapGuard"]["available"], false);
     assert_eq!(stale[0]["ok"]["currentLaterSendGuard"]["available"], false);
+    assert_eq!(stale[0]["ok"]["currentBootstrapCompletion"]["available"], false);
     assert_eq!(stale[1]["ok"]["state"], "host_accepted");
     assert_eq!(stale[1]["ok"]["bootstrapGuard"]["available"], false);
     assert_eq!(stale[1]["ok"]["currentLaterSendGuard"]["available"], true);
+    assert_eq!(stale[1]["ok"]["currentBootstrapCompletion"]["available"], false);
     assert_eq!(
         stale[1]["ok"]["currentLaterSendGuard"]["guard"]["writerEpoch"],
         "2"
@@ -1816,6 +1822,7 @@ fn claimed_later_turn_commands_get_is_read_only_and_keeps_uncertain_receipt() {
         assert_eq!(value["effectState"], "claimed_uncertain");
         assert!(value.get("bootstrapGuard").is_none());
         assert!(value.get("currentLaterSendGuard").is_none());
+        assert!(value.get("currentBootstrapCompletion").is_none());
         assert_eq!(value["nativeObservation"]["kind"], "codex_turn");
         assert_eq!(value["nativeObservation"]["stage"], "submitted");
         assert_eq!(value["nativeObservation"]["nativeTurnId"], "turn.native.two");

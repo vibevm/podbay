@@ -1493,6 +1493,11 @@ fn v3_initial_send_keeps_older_lease_after_additive_root_then_refuses_revocation
     assert_eq!(later.target(), &target);
     assert_eq!(later.policy_fence_epoch(), Some(epoch_before));
     assert_eq!(later.session_revision(), session_revision);
+    assert!(host.read_current_bootstrap_completion_for_launch(
+        &who.transport, &who.scope,
+        &CommandId::try_from(first.receipt.command_id.as_str()).unwrap(),
+        &send_policy, &later,
+    ).unwrap().is_none(), "V3 cannot borrow the V2 completion projection");
     let same_lease = host
         .acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &send_policy, 60)
         .unwrap();
@@ -1540,6 +1545,11 @@ fn v3_initial_send_keeps_older_lease_after_additive_root_then_refuses_revocation
         )
         .unwrap()
         .is_none());
+    assert!(host.read_current_bootstrap_completion_for_launch(
+        &who.transport, &who.scope,
+        &CommandId::try_from(first.receipt.command_id.as_str()).unwrap(),
+        &send_policy, &later,
+    ).unwrap().is_none(), "revoked V3 guard cannot prove completion");
     assert!(
         host.read_current_initial_bootstrap_guard_for_launch(
             &who.transport,

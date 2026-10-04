@@ -2140,6 +2140,7 @@ pub struct CurrentCodexAnchorObservation {
     writer_epoch: u64,
     native_thread_id: String,
     native_session_id: String,
+    native_turn_id: String,
 }
 
 impl CurrentCodexAnchorObservation {
@@ -2151,17 +2152,19 @@ impl CurrentCodexAnchorObservation {
         writer_epoch: u64,
         native_thread_id: String,
         native_session_id: String,
+        native_turn_id: String,
     ) -> Result<Self, HostError> {
         let native_id = |value: &str| !value.is_empty() && value.len() <= 256
             && value.bytes().all(|byte| byte.is_ascii_graphic());
         if protocol != "podbay.codex-anchor.inspect/1" || writer_epoch == 0
             || !native_id(&native_thread_id) || !native_id(&native_session_id)
+            || !native_id(&native_turn_id)
             || bootstrap_request_digest.len() != 64
             || !bootstrap_request_digest.bytes().all(|byte| byte.is_ascii_digit()
                 || (b'a'..=b'f').contains(&byte))
         { return Err(HostError::InvalidInput); }
         Ok(Self { target, bootstrap_command_id, bootstrap_request_digest,
-            writer_epoch, native_thread_id, native_session_id })
+            writer_epoch, native_thread_id, native_session_id, native_turn_id })
     }
     pub fn target(&self) -> &podbay_store::NativeWriterTarget { &self.target }
     pub fn bootstrap_command_id(&self) -> &CommandId { &self.bootstrap_command_id }
@@ -2169,6 +2172,7 @@ impl CurrentCodexAnchorObservation {
     pub fn writer_epoch(&self) -> u64 { self.writer_epoch }
     pub fn native_thread_id(&self) -> &str { &self.native_thread_id }
     pub fn native_session_id(&self) -> &str { &self.native_session_id }
+    pub fn native_turn_id(&self) -> &str { &self.native_turn_id }
 }
 
 /// Private post-claim port input. No prompt or in-memory WriterPermit crosses
@@ -6385,6 +6389,117 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 expires_at_unix_seconds: lease.expires_at_unix_seconds(),
                 policy_fence_epoch: v3_policy.map(|fence| fence.policy_fence_epoch),
             }))
+        }
+    }
+
+    /// Read-only completion proof for the original V2 root launch. A current
+    /// later-send guard proves writer authority, not bootstrap readiness; the
+    /// live pod must separately attest its held fsynced BootstrapCompleted
+    /// journal under that same current manager, Resource and writer lease.
+    pub fn read_current_bootstrap_completion_for_launch<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        launch_command_id: &CommandId,
+        policy: &TrustedBootstrapSendPolicy,
+        expected_guard: &CurrentLaterSendGuard,
+    ) -> Result<Option<CurrentCodexAnchorObservation>, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (transport, scope, launch_command_id, policy, expected_guard);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(current) = self.read_current_later_send_guard_for_launch(
+                transport, scope, launch_command_id, policy,
+            )? else { return Ok(None) };
+            if &current != expected_guard {
+                return Ok(None);
+            }
+            let actor = self.host.authenticate(transport)?.clone();
+            let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+            let Some(launch) = self.store.lookup_bound_root_codex_by_command_id(
+                &principal, scope, launch_command_id,
+            )? else { return Ok(None) };
+            // A V3 policy fence needs a distinct typed read proof. Generic
+            // roots and uncommitted launch slots cannot borrow this V2 path.
+            if launch.format != BoundLaunchFormat::CodexV2
+                || launch.session_id != current.target.session_id.as_str()
+                || launch.run_id != current.target.run_id.as_str()
+                || launch.attempt_id != current.target.attempt_id.as_str()
+                || launch.pod_id != current.target.pod_id.as_str()
+                || launch.pod_incarnation != current.target.pod_incarnation
+                || launch.resources.len() != 1
+                || launch.resources[0].id != current.target.resource_id.as_str()
+                || launch.resources[0].epoch != current.target.resource_epoch
+            {
+                return Ok(None);
+            }
+            let bootstrap = match self.store.claimed_bootstrap_lineage_for_session(
+                scope, &current.target.session_id,
+            ) {
+                Ok(value) => value,
+                Err(StoreError::NotFound) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let historical = bootstrap.native_target();
+            let target = &current.target;
+            if bootstrap.scope_id() != scope
+                || bootstrap.holder_actor_id() != &actor.actor_id
+                || historical.store_lineage != target.store_lineage
+                || historical.scope_id != target.scope_id
+                || historical.session_id != target.session_id
+                || historical.run_id != target.run_id
+                || historical.attempt_id != target.attempt_id
+                || historical.pod_id != target.pod_id
+                || historical.pod_incarnation != target.pod_incarnation
+                || historical.resource_id != target.resource_id
+                || historical.resource_epoch != target.resource_epoch
+                || historical.resource_input_epoch > target.resource_input_epoch
+            {
+                return Ok(None);
+            }
+            self.recheck_actor_resolution_manager()?;
+            let inspection = ResolvedCurrentCodexAnchorInspection {
+                target: target.clone(),
+                bootstrap_command_id: CommandId::try_from(bootstrap.receipt().command_id.as_str())
+                    .map_err(|_| HostError::StaleGuard)?,
+                bootstrap_request_digest: bootstrap.receipt().request_digest.clone(),
+                writer_epoch: current.writer_epoch,
+                owner_epoch: current.owner_epoch,
+                manager_credential_epoch: current.manager_credential_epoch,
+                authority_revision: self.recorded.revision,
+                store_path: self.canonical_database.clone(),
+                store_file_identity: self.database_identity,
+            };
+            let observed = match self.host.port.inspect_current_codex_anchor(inspection) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+            if observed.target() != target
+                || observed.bootstrap_command_id().as_str() != bootstrap.receipt().command_id
+                || observed.bootstrap_request_digest() != bootstrap.receipt().request_digest
+                || observed.writer_epoch() != current.writer_epoch
+            {
+                return Ok(None);
+            }
+            let Some(fresh_guard) = self.read_current_later_send_guard_for_launch(
+                transport, scope, launch_command_id, policy,
+            )? else { return Ok(None) };
+            if fresh_guard != current
+                || self.store.claimed_bootstrap_lineage_for_session(
+                    scope, &current.target.session_id,
+                ).ok().as_ref() != Some(&bootstrap)
+                || self.store.lookup_bound_root_codex_by_command_id(
+                    &principal, scope, launch_command_id,
+                ).ok().flatten().as_ref() != Some(&launch)
+                || durable_actor(self.host.authenticate(transport)?) != durable_actor(&actor)
+            {
+                return Ok(None);
+            }
+            self.recheck_actor_resolution_manager()?;
+            Ok(Some(observed))
         }
     }
 

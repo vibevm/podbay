@@ -1447,6 +1447,7 @@ impl PodClient {
             || response.bootstrap_request_digest != expected_bootstrap_digest
             || !native_id(&response.native_thread_id)
             || !native_id(&response.native_session_id)
+            || !native_id(&response.native_turn_id)
         { return Err(PodError::Refused("Codex anchor reply differs")); }
         Ok(response)
     }

@@ -137,6 +137,15 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   assert.ok(Array.isArray(resources) && resources.length === 1);
   assert.equal(bootstrap["resourceId"], record(resources[0])["resourceId"]);
   assert.equal(guard["resourceEpoch"], record(resources[0])["epoch"]);
+  const readLaunch = (requestId: string) => client.read(makeRead({
+    operation: "commands.get", requestId,
+    target: { kind: "scope", scopeId: "scope.zap.fake-e2e" },
+    body: { selector: { kind: "key", key: "key.fake-e2e.launch" } },
+  }));
+  const beforeSend = record(await readLaunch("request.fake-e2e.bootstrap.before-send"));
+  assert.equal(record(beforeSend["currentLaterSendGuard"])["available"], true);
+  assert.equal(record(beforeSend["currentBootstrapCompletion"])["available"], false,
+    "a current writer lease is not bootstrap completion");
 
   const send = await makeCommand({
     operation: "session.send", requestId: "request.fake-e2e.send.one",
@@ -168,6 +177,9 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   assert.equal(firstNative["source"], "pod_journal");
   assert.equal(firstNative["stage"], "submitted");
   assert.equal(firstNative["nativeTurnId"], "turn.fixture");
+  const pending = record(await readLaunch("request.fake-e2e.bootstrap.submitted"));
+  assert.equal(record(pending["currentLaterSendGuard"])["available"], true);
+  assert.equal(record(pending["currentBootstrapCompletion"])["available"], false);
 
   const retry = await makeCommand({
     operation: "session.send", requestId: "request.fake-e2e.send.retry",
@@ -289,6 +301,45 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
     "home", "codex", "frames.log"), "utf8");
   const methods = frames.trimEnd().split("\n").map((line) => (JSON.parse(line) as { method: string }).method);
   assert.deepEqual(methods, ["initialize", "initialized", "thread/start", "thread/read", "turn/start"]);
+  const codexHome = join(pods, `${manifests[0]!.slice(0, -5)}.private`, "home", "codex");
+  await writeFile(join(codexHome, "finish-bootstrap"), "go\n");
+  const idleRequestDeadline = performance.now() + 5_000;
+  while (!(await stat(join(codexHome, "completion-read-seen")).then(() => true).catch(() => false))) {
+    assert.ok(performance.now() < idleRequestDeadline, "fake completion read was not requested");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const awaitingIdle = record(await readLaunch("request.fake-e2e.bootstrap.pending-idle"));
+  assert.equal(record(awaitingIdle["currentLaterSendGuard"])["available"], true);
+  assert.equal(record(awaitingIdle["currentBootstrapCompletion"])["available"], false,
+    "turn/completed without a fresh idle reply is not completion");
+  await writeFile(join(codexHome, "release-idle"), "go\n");
+  const completedDeadline = performance.now() + 5_000;
+  let completed: Record<string, unknown>;
+  for (;;) {
+    completed = record(await readLaunch("request.fake-e2e.bootstrap.completed"));
+    if (record(completed["currentBootstrapCompletion"])["available"] === true) break;
+    assert.ok(performance.now() < completedDeadline, "fsynced bootstrap completion was not projected");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const proof = record(completed["currentBootstrapCompletion"]);
+  assert.equal(proof["source"], "pod_journal");
+  assert.equal(proof["bootstrapCommandId"], sendReceipt.commandId);
+  assert.equal(proof["requestDigest"], record(firstRead["receipt"])["requestDigest"]);
+  assert.equal(proof["scopeId"], "scope.zap.fake-e2e");
+  assert.equal(proof["sessionId"], launchValue["sessionId"]);
+  assert.equal(proof["runId"], launchValue["runId"]);
+  assert.equal(proof["attemptId"], launchValue["attemptId"]);
+  assert.equal(proof["podId"], launchValue["podId"]);
+  assert.equal(proof["resourceId"], record(resources[0])["resourceId"]);
+  assert.equal(proof["podEpoch"], guard["podEpoch"]);
+  assert.equal(proof["resourceEpoch"], guard["resourceEpoch"]);
+  assert.equal(proof["writerEpoch"], guard["writerEpoch"]);
+  assert.equal(proof["nativeThreadId"], firstNative["nativeThreadId"]);
+  assert.equal(proof["nativeSessionId"], firstNative["nativeSessionId"]);
+  assert.equal(proof["nativeTurnId"], firstNative["nativeTurnId"]);
+  const repeatedLaunch = record(await readLaunch("request.fake-e2e.bootstrap.replay"));
+  assert.deepEqual(record(repeatedLaunch["currentBootstrapCompletion"]), proof,
+    "read-only completion projection must be stable");
 });
 
 function fakeCodexScript(): string {
@@ -313,6 +364,14 @@ read -r turn
 printf '%s\\n' "$turn" >> "$CODEX_HOME/frames.log"
 printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\\n'
 printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread.fixture","delta":"private owner-only output"}}\\n'
+while [ ! -f "$CODEX_HOME/finish-bootstrap" ]; do sleep 0.05; done
+printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed","items":[]}}}\\n'
+printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\\n'
+read -r completion_read
+printf '%s\\n' "$completion_read" >> "$CODEX_HOME/frames.log"
+: > "$CODEX_HOME/completion-read-seen"
+while [ ! -f "$CODEX_HOME/release-idle" ]; do sleep 0.05; done
+printf '{"id":5,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\\n' "$(pwd)"
 sleep 30
 `;
 }

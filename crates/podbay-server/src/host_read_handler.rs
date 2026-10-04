@@ -3,9 +3,10 @@
 use podbay_core::{CommandId, ResourceId, ScopeId, SessionId};
 use podbay_host::{
     AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage,
-    CommandNativeObservation, CurrentLaterSendGuard, DurableAuthority, DurableAuthorityError,
-    HostDispatchPort, HostError, InitialBootstrapGuard, LaterTurnNativeObservation,
-    LaterTurnNativeStage, LaterTurnNativeTerminal, TrustedBootstrapSendPolicy,
+    CommandNativeObservation, CurrentCodexAnchorObservation, CurrentLaterSendGuard,
+    DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError, InitialBootstrapGuard,
+    LaterTurnNativeObservation, LaterTurnNativeStage, LaterTurnNativeTerminal,
+    TrustedBootstrapSendPolicy,
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, CurrentObservation, CurrentScopeSnapshot,
@@ -83,32 +84,50 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                     .authority
                     .lookup_command_with_any_native_observation(transport, &scope, &selector)
                     .map_err(authority_error)?;
-                let later_guard = if inspected.launch_dispatch_status.is_some() {
+                let launch_command_id = inspected
+                    .launch_dispatch_status
+                    .as_ref()
+                    .and_then(|_| CommandId::try_from(inspected.receipt.command_id.as_str()).ok());
+                let later_guard = launch_command_id.as_ref().and_then(|command_id| {
                     self.bootstrap_policy.and_then(|policy| {
-                        let command_id =
-                            CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
                         self.authority
                             .read_current_later_send_guard_for_launch(
-                                transport,
-                                &scope,
-                                &command_id,
-                                policy,
+                                transport, &scope, command_id, policy,
                             )
                             .ok()
                             .flatten()
                     })
-                } else {
-                    None
-                };
+                });
                 let bootstrap_guard = later_guard
                     .as_ref()
                     .and_then(CurrentLaterSendGuard::as_initial_bootstrap_guard);
-                Ok(inspection_json(
+                let completion = match (
+                    launch_command_id.as_ref(),
+                    later_guard.as_ref(),
+                    self.bootstrap_policy,
+                ) {
+                    (Some(command_id), Some(guard), Some(policy)) => self
+                        .authority
+                        .read_current_bootstrap_completion_for_launch(
+                            transport, &scope, command_id, policy, guard,
+                        )
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                };
+                let mut response = inspection_json(
                     inspected,
                     native.as_ref(),
                     bootstrap_guard.as_ref(),
                     later_guard.as_ref(),
-                ))
+                );
+                if launch_command_id.is_some() {
+                    response["currentBootstrapCompletion"] = completion
+                        .as_ref()
+                        .map(current_bootstrap_completion_json)
+                        .unwrap_or_else(|| json!({"available": false}));
+                }
+                Ok(response)
             }
             ReadBody::NativeEventsRead(body) => {
                 let session = SessionId::try_from(body.session_id.as_str()).map_err(|_| {
@@ -393,6 +412,29 @@ fn current_later_send_guard_json(guard: &CurrentLaterSendGuard) -> Value {
             "writerEpoch": guard.writer_epoch().to_string(),
             "targetRevision": guard.session_revision().to_string(),
         },
+    })
+}
+
+fn current_bootstrap_completion_json(proof: &CurrentCodexAnchorObservation) -> Value {
+    let target = proof.target();
+    json!({
+        "available": true,
+        "source": "pod_journal",
+        "bootstrapCommandId": proof.bootstrap_command_id().as_str(),
+        "requestDigest": proof.bootstrap_request_digest(),
+        "scopeId": target.scope_id.as_str(),
+        "sessionId": target.session_id.as_str(),
+        "runId": target.run_id.as_str(),
+        "attemptId": target.attempt_id.as_str(),
+        "podId": target.pod_id.as_str(),
+        "podEpoch": target.pod_incarnation.to_string(),
+        "resourceId": target.resource_id.as_str(),
+        "resourceEpoch": target.resource_epoch.to_string(),
+        "resourceInputEpoch": target.resource_input_epoch.to_string(),
+        "writerEpoch": proof.writer_epoch().to_string(),
+        "nativeThreadId": proof.native_thread_id(),
+        "nativeSessionId": proof.native_session_id(),
+        "nativeTurnId": proof.native_turn_id(),
     })
 }
 

@@ -1652,7 +1652,7 @@ impl HostDispatchPort for LinuxLaunchPort {
         CurrentCodexAnchorObservation::from_attested_pod(
             &response.protocol, target.clone(), inspection.bootstrap_command_id().clone(),
             response.bootstrap_request_digest, response.writer_epoch,
-            response.native_thread_id, response.native_session_id,
+            response.native_thread_id, response.native_session_id, response.native_turn_id,
         )
     }
 

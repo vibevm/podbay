@@ -3576,6 +3576,16 @@ fn rebind_v22_second_later_manager_process_helper() {
     let (target, revision) = store.current_native_writer_target_for_session(&fixture.scope, &session).unwrap();
     let owner = store.owner_epoch().unwrap();
     let manager_credential = store.current_manager_credential_claim(owner).unwrap().credential_epoch();
+    let launch_command_id = CommandId::try_from(
+        store.current_bound_pod_snapshot(fixture.scope.as_str(), fixture.pod.as_str())
+            .unwrap().launch().receipt.command_id.as_str(),
+    ).unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant, Instant::now() + Duration::from_secs(60),
+    ).unwrap();
+    assert!(host.read_current_later_send_guard_for_launch(
+        &transport, &fixture.scope, &launch_command_id, &policy,
+    ).unwrap().is_none(), "B cannot borrow A's historical writer lease");
     let prior_epoch: u64 = fs::read_to_string(
         fixture.directory.join("rebind.v22.first.writer_epoch"),
     ).unwrap().parse().unwrap();
@@ -3588,9 +3598,16 @@ fn rebind_v22_second_later_manager_process_helper() {
     }).unwrap();
     drop(store);
     assert_eq!(lease.writer_epoch(), prior_epoch + 1);
-    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
-        grant, Instant::now() + Duration::from_secs(60),
-    ).unwrap();
+    let current_guard = host.read_current_later_send_guard_for_launch(
+        &transport, &fixture.scope, &launch_command_id, &policy,
+    ).unwrap().expect("B has a current writer guard after takeover");
+    let completed_anchor = host.read_current_bootstrap_completion_for_launch(
+        &transport, &fixture.scope, &launch_command_id, &policy, &current_guard,
+    ).unwrap().expect("B reattests A's fsynced BootstrapCompleted anchor");
+    assert_eq!(completed_anchor.writer_epoch(), lease.writer_epoch());
+    assert_eq!(completed_anchor.native_thread_id(), "thread.fixture");
+    assert_eq!(completed_anchor.native_session_id(), "native.session.fixture");
+    assert_eq!(completed_anchor.native_turn_id(), "turn.fixture");
     let second = CommandEnvelope::new(
         "request.v22.rebind.second", "key.v22.rebind.second",
         WireTarget::Session { session_id: session.as_str().into() },

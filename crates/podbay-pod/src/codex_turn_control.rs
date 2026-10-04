@@ -144,6 +144,7 @@ pub struct CodexAnchorInspectReceipt {
     pub bootstrap_request_digest: String,
     pub native_thread_id: String,
     pub native_session_id: String,
+    pub native_turn_id: String,
 }
 
 impl CodexAnchorInspectReceipt {
@@ -177,6 +178,71 @@ impl CodexAnchorInspectReceipt {
             bootstrap_request_digest: digest.into(),
             native_thread_id: journal.native_thread_id.clone()?,
             native_session_id: journal.native_session_id.clone()?,
+            native_turn_id: journal.native_turn_id.clone()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::codex_journal::CodexJournalStage;
+
+    fn request() -> BootstrapControlRequest {
+        BootstrapControlRequest {
+            protocol: "podbay.codex-anchor.inspect/1".into(),
+            operation: "codex.anchor.inspect".into(),
+            token: "fixture.token".into(),
+            command_id: "command.bootstrap.fixture".into(),
+            store_lineage: "lineage.fixture".into(),
+            scope_id: "scope.fixture".into(),
+            session_id: "session.fixture".into(),
+            run_id: "run.fixture".into(),
+            attempt_id: "attempt.fixture".into(),
+            pod_id: "pod.fixture".into(),
+            pod_incarnation: 1,
+            resource_id: "resource.fixture".into(),
+            resource_epoch: 1,
+            resource_input_epoch: 2,
+            writer_epoch: 2,
+            nonce: Some("nonce.fixture".into()),
+        }
+    }
+
+    #[test]
+    fn anchor_receipt_requires_fsynced_completion_and_exact_native_turn() {
+        let request = request();
+        let digest = "a".repeat(64);
+        let mut journal = CodexJournalView {
+            stage: CodexJournalStage::BootstrapSubmitted,
+            command_key: Some(request.command_id.clone()),
+            payload_digest: Some(digest.clone()),
+            native_thread_id: Some("thread.fixture".into()),
+            native_session_id: Some("native.session.fixture".into()),
+            client_message_id: Some("message.fixture".into()),
+            native_turn_id: Some("turn.fixture".into()),
+        };
+        for stage in [
+            CodexJournalStage::BootstrapSubmitted,
+            CodexJournalStage::BootstrapCompletionObservedPendingIdleProof,
+            CodexJournalStage::BootstrapFailed,
+            CodexJournalStage::BootstrapInterrupted,
+            CodexJournalStage::StorageUncertain,
+        ] {
+            journal.stage = stage;
+            assert!(
+                CodexAnchorInspectReceipt::from_completed(&request, &digest, &journal).is_none()
+            );
+        }
+        journal.stage = CodexJournalStage::BootstrapCompleted;
+        let completed = CodexAnchorInspectReceipt::from_completed(&request, &digest, &journal)
+            .expect("completed journal has exact native IDs");
+        assert_eq!(completed.native_turn_id, "turn.fixture");
+        assert_eq!(completed.writer_epoch, 2);
+        journal.native_turn_id = None;
+        assert!(CodexAnchorInspectReceipt::from_completed(&request, &digest, &journal).is_none());
+        journal.native_turn_id = Some("turn.fixture".into());
+        journal.command_key = Some("command.other".into());
+        assert!(CodexAnchorInspectReceipt::from_completed(&request, &digest, &journal).is_none());
     }
 }
