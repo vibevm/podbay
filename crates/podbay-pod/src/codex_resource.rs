@@ -21,7 +21,8 @@ use podbay_wire::{
 };
 
 use crate::codex_credential::{
-    CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
+    CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, codex_private_slot_directory,
+    prepare_codex_home_from_systemd_credential,
 };
 use crate::codex_bootstrap::{BootstrapControlStage, BootstrapSettlementStage};
 use crate::codex_journal::{CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage, CodexJournalView};
@@ -110,8 +111,11 @@ impl PodCodexResource {
         launch
             .peer_binding
             .validate(&launch.legacy, &launch.pod_directory)?;
-        if home.isolated_home() != launch.pod_directory.join("home")
-            || home.codex_home() != launch.pod_directory.join("home/codex")
+        let private_slot = codex_private_slot_directory(
+            &launch.pod_directory, &launch.expected_unit, false,
+        )?;
+        if home.isolated_home() != private_slot.join("home")
+            || home.codex_home() != private_slot.join("home/codex")
         {
             return Err(PodError::Refused("Codex HOME belongs to another pod"));
         }
@@ -187,7 +191,7 @@ impl PodCodexResource {
         );
         let native_events = NativeEventSpool::open(
             &LinuxBackend,
-            &launch.pod_directory.join("codex.native-events.log"),
+            &private_slot.join("codex.native-events.log"),
             event_identity,
         )?;
         let config = PinnedCodexConfig::new(
@@ -238,7 +242,7 @@ impl PodCodexResource {
         Ok(Self {
             resource,
             journal: None,
-            journal_path: launch.pod_directory.join("codex.commands.log"),
+            journal_path: private_slot.join("codex.commands.log"),
             native_events,
             child_birth,
             pod_boot_id,

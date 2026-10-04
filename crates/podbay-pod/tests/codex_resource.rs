@@ -15,7 +15,7 @@ use podbay_core::{
 use podbay_pod::{
     BoundPeerManifest, CODEX_AUTH_CREDENTIAL_NAME, LaunchDescriptor, LinuxPeerEvidence,
     PodCodexResource, PodError, PodRole, ValidatedCodexResourceLaunch,
-    prepare_codex_home_from_systemd_credential,
+    codex_private_slot_directory, prepare_codex_home_from_systemd_credential,
 };
 use podbay_wire::{
     CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -415,7 +415,8 @@ fn native_systemd_fake_app_server_initializes_without_turn() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        fs::read_to_string(fixture.root.join("home/codex/frames.log"))
+        fs::read_to_string(codex_private_slot_directory(&fixture.root, &unit, false)
+            .unwrap().join("home/codex/frames.log"))
             .unwrap()
             .lines()
             .count(),

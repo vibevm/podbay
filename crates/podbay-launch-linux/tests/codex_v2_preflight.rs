@@ -33,7 +33,7 @@ use podbay_launch_linux::{
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CodexCommandJournal,
     CodexJournalIdentity, CodexJournalStage, LinuxBackend, NativeEventCursor, NativeEventKind,
-    PodClient, PodError, launch_bound_codex_v2,
+    PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
 };
 use podbay_store::{
     CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
@@ -491,6 +491,14 @@ fn slot_manifest(fixture: &Fixture) -> Option<PathBuf> {
         })
 }
 
+fn fixture_codex_slot(fixture: &Fixture) -> PathBuf {
+    let manifest = slot_manifest(fixture).expect("committed Codex manifest slot");
+    let stem = manifest.file_stem().and_then(|value| value.to_str()).unwrap();
+    codex_private_slot_directory(
+        &fixture.directory, &format!("podbay-pod-{stem}.service"), false,
+    ).unwrap()
+}
+
 fn required_real_test_path(name: &str) -> PathBuf {
     let raw = PathBuf::from(std::env::var_os(name).expect("real Codex smoke path is required"));
     assert!(raw.is_absolute(), "real Codex smoke path must be absolute");
@@ -521,7 +529,7 @@ fn reopened_bootstrap_journal(fixture: &Fixture) -> podbay_pod::CodexJournalView
     );
     CodexCommandJournal::open(
         &LinuxBackend,
-        &fixture.directory.join("codex.commands.log"),
+        &fixture_codex_slot(fixture).join("codex.commands.log"),
         identity,
     )
     .unwrap()
@@ -888,7 +896,7 @@ fn disposable_codex_v2_launch_serve_status_stop_without_model_turn() {
         duplicate.bound_status().unwrap(),
         client.bound_status().unwrap()
     );
-    let frames = fixture.directory.join("home/codex/frames.log");
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2);
     assert!(!client.stop().unwrap().child_running);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -920,7 +928,7 @@ fn disposable_codex_v2_port_admits_and_reattaches_without_duplicate_child() {
         Ok(PortDispatchOutcome::Accepted(_))
     ));
     assert_eq!(
-        fs::read_to_string(fixture.directory.join("home/codex/frames.log"))
+        fs::read_to_string(fixture_codex_slot(&fixture).join("home/codex/frames.log"))
             .unwrap()
             .lines()
             .count(),
@@ -993,7 +1001,7 @@ fn disposable_codex_v2_durable_dispatch_records_one_real_pod_launch() {
     assert_eq!(second.child_pid, first.child_pid);
     assert_eq!(second.child_start_ticks, first.child_start_ticks);
     assert_eq!(
-        fs::read_to_string(fixture.directory.join("home/codex/frames.log"))
+        fs::read_to_string(fixture_codex_slot(&fixture).join("home/codex/frames.log"))
             .unwrap()
             .lines()
             .count(),
@@ -1101,11 +1109,11 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
         submitted.port_observation,
         Some(BootstrapPortObservation::PodAccepted(_))
     ));
-    assert!(fixture.directory.join("codex.commands.log").is_file());
+    assert!(fixture_codex_slot(&fixture).join("codex.commands.log").is_file());
     let journal = reopened_bootstrap_journal(&fixture);
     assert_eq!(journal.stage, CodexJournalStage::BootstrapSubmitted);
     assert_eq!(journal.native_turn_id.as_deref(), Some("turn.fixture"));
-    let frames = fixture.directory.join("home/codex/frames.log");
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     let deadline = Instant::now() + Duration::from_secs(3);
     let methods = loop {
         let content = fs::read_to_string(&frames).unwrap_or_default();

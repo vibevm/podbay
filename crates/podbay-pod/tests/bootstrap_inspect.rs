@@ -16,7 +16,7 @@ use podbay_core::{
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CodexCommandJournal, CodexJournalIdentity,
     CodexJournalStage, LinuxBackend, LinuxPeerEvidence, NativeEventKind, NativeEventStatus,
-    PodError, PodPeerBootstrap,
+    PodError, PodPeerBootstrap, codex_private_slot_directory,
     launch_bound_codex_v2,
 };
 use podbay_store::{
@@ -387,6 +387,10 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         (credential_metadata.dev(), credential_metadata.ino()),
     )
     .unwrap();
+    let stem = client.manifest_path().unwrap().file_stem().and_then(|value| value.to_str()).unwrap();
+    let private_slot = codex_private_slot_directory(
+        &fixture.root, &format!("podbay-pod-{stem}.service"), false,
+    ).unwrap();
     store
         .record_launch_port_result(
             record.receipt.outbox_id,
@@ -471,7 +475,7 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         .env("PODBAY_NATIVE_SIBLING_MANIFEST", client.manifest_path().unwrap())
         .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
     assert!(sibling.success(), "same-UID sibling obtained native event read");
-    let frames = fixture.root.join("home/codex/frames.log");
+    let frames = private_slot.join("home/codex/frames.log");
     assert!(matches!(
         client
             .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
@@ -557,7 +561,7 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         &target.resource_id, Epoch::new(target.resource_epoch).unwrap(),
     );
     let reopened = CodexCommandJournal::open(
-        &LinuxBackend, &fixture.root.join("codex.commands.log"), journal_identity,
+        &LinuxBackend, &private_slot.join("codex.commands.log"), journal_identity,
     ).unwrap();
     assert_eq!(reopened.view().stage, CodexJournalStage::BootstrapCompleted);
     let native = client.read_codex_native_events(Some(&initial_events.next_cursor), 64).unwrap();
@@ -570,7 +574,7 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
     let public = serde_json::to_string(&native).unwrap();
     assert!(!public.contains("private fixture output"));
     assert!(!public.contains("fixture prompt"));
-    assert!(String::from_utf8_lossy(&fs::read(fixture.root.join("codex.native-events.log")).unwrap())
+    assert!(String::from_utf8_lossy(&fs::read(private_slot.join("codex.native-events.log")).unwrap())
         .contains("private fixture output"));
     let methods: Vec<_> = fs::read_to_string(&frames).unwrap().lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]

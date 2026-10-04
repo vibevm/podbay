@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_pod::{
-    CODEX_AUTH_CREDENTIAL_NAME, PodError, prepare_codex_home_from_systemd_credential,
+    CODEX_AUTH_CREDENTIAL_NAME, PodError, codex_private_slot_directory,
+    prepare_codex_home_from_systemd_credential,
 };
 
 const UNIT: &str = "podbay-pod-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.service";
@@ -57,6 +58,11 @@ impl Fixture {
         self.credentials.join(CODEX_AUTH_CREDENTIAL_NAME)
     }
 
+    fn slot(&self) -> PathBuf {
+        let stem = UNIT.strip_prefix("podbay-pod-").unwrap().strip_suffix(".service").unwrap();
+        self.pod.join(format!("{stem}.private"))
+    }
+
     fn prepare(&self) -> Result<podbay_pod::PreparedCodexHome, PodError> {
         prepare_codex_home_from_systemd_credential(UNIT, &self.pod, &self.credentials)
     }
@@ -75,11 +81,11 @@ impl Drop for Fixture {
 fn private_codex_home_links_one_dummy_credential_without_copying_bytes() {
     let fixture = Fixture::new();
     let prepared = fixture.prepare().unwrap();
-    assert_eq!(prepared.isolated_home(), fixture.pod.join("home"));
-    assert_eq!(prepared.codex_home(), fixture.pod.join("home/codex"));
+    assert_eq!(prepared.isolated_home(), fixture.slot().join("home"));
+    assert_eq!(prepared.codex_home(), fixture.slot().join("home/codex"));
     assert_eq!(
         prepared.credential_reference(),
-        fixture.pod.join("home/codex/auth.json")
+        fixture.slot().join("home/codex/auth.json")
     );
     for path in [prepared.isolated_home(), prepared.codex_home()] {
         let metadata = fs::symlink_metadata(path).unwrap();
@@ -116,6 +122,30 @@ fn private_codex_home_links_one_dummy_credential_without_copying_bytes() {
 }
 
 #[test]
+fn two_manifest_slots_have_distinct_private_home_and_log_namespaces() {
+    let fixture = Fixture::new();
+    let first = fixture.prepare().unwrap();
+    let first_slot = codex_private_slot_directory(&fixture.pod, UNIT, false).unwrap();
+    let other_unit = "podbay-pod-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.service";
+    let second_slot = codex_private_slot_directory(&fixture.pod, other_unit, true).unwrap();
+    assert_ne!(first_slot, second_slot);
+    assert!(first.isolated_home().starts_with(&first_slot));
+    for path in [&first_slot, &second_slot] {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+    }
+    fs::write(first_slot.join("codex.commands.log"), b"first").unwrap();
+    fs::write(second_slot.join("codex.commands.log"), b"second").unwrap();
+    assert_eq!(fs::read(first_slot.join("codex.commands.log")).unwrap(), b"first");
+    assert_eq!(fs::read(second_slot.join("codex.commands.log")).unwrap(), b"second");
+    fs::remove_file(second_slot.join("codex.commands.log")).unwrap();
+    fs::remove_dir(&second_slot).unwrap();
+    symlink(&first_slot, &second_slot).unwrap();
+    assert!(codex_private_slot_directory(&fixture.pod, other_unit, false).is_err());
+}
+
+#[test]
 fn missing_wrong_unit_or_noncanonical_directory_refuses_before_home_creation() {
     let fixture = Fixture::new();
     let other_unit = "podbay-pod-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.service";
@@ -138,7 +168,7 @@ fn missing_wrong_unit_or_noncanonical_directory_refuses_before_home_creation() {
         prepare_codex_home_from_systemd_credential(UNIT, &fixture.pod, &alias_parent.join(UNIT))
             .is_err()
     );
-    assert!(!fixture.pod.join("home").exists());
+    assert!(!fixture.slot().join("home").exists());
 }
 
 #[test]
@@ -152,7 +182,7 @@ fn unsafe_directory_and_credential_modes_refuse() {
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o500)).unwrap();
     fs::set_permissions(fixture.credential(), fs::Permissions::from_mode(0o600)).unwrap();
     assert!(fixture.prepare().is_err());
-    assert!(!fixture.pod.join("home").exists());
+    assert!(!fixture.slot().join("home").exists());
 }
 
 #[test]
@@ -162,7 +192,7 @@ fn symlink_extra_file_or_existing_reference_cannot_substitute_credential() {
     fs::write(fixture.credentials.join("extra"), b"dummy extra").unwrap();
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o500)).unwrap();
     assert!(fixture.prepare().is_err());
-    assert!(!fixture.pod.join("home").exists());
+    assert!(!fixture.slot().join("home").exists());
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_file(fixture.credentials.join("extra")).unwrap();
     fs::remove_file(fixture.credential()).unwrap();
@@ -171,17 +201,18 @@ fn symlink_extra_file_or_existing_reference_cannot_substitute_credential() {
     symlink(&dummy_target, fixture.credential()).unwrap();
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o500)).unwrap();
     assert!(fixture.prepare().is_err());
-    assert!(!fixture.pod.join("home").exists());
+    assert!(!fixture.slot().join("home").exists());
 
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_file(fixture.credential()).unwrap();
     fs::write(fixture.credential(), DUMMY).unwrap();
     fs::set_permissions(fixture.credential(), fs::Permissions::from_mode(0o400)).unwrap();
     fs::set_permissions(&fixture.credentials, fs::Permissions::from_mode(0o500)).unwrap();
-    let codex_home = fixture.pod.join("home/codex");
-    fs::create_dir(fixture.pod.join("home")).unwrap();
+    let slot = codex_private_slot_directory(&fixture.pod, UNIT, true).unwrap();
+    let codex_home = slot.join("home/codex");
+    fs::create_dir(slot.join("home")).unwrap();
     fs::create_dir(&codex_home).unwrap();
-    fs::set_permissions(fixture.pod.join("home"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(slot.join("home"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         codex_home.join(CODEX_AUTH_CREDENTIAL_NAME),

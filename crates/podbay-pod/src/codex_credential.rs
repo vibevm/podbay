@@ -13,6 +13,40 @@ use crate::manifest::{PodError, private_directory};
 pub const CODEX_AUTH_CREDENTIAL_NAME: &str = "auth.json";
 const MAX_CREDENTIAL_BYTES: u64 = 1_048_576;
 
+/// One private directory for the exact immutable manifest slot. The unit
+/// name is derived from that manifest's 32-hex stem, never request JSON.
+/// `create` is used only by the pod before child spawn; manager reads pass
+/// false and cannot create or change the slot directory.
+pub fn codex_private_slot_directory(
+    shared_manifest_directory: &Path,
+    expected_unit: &str,
+    create: bool,
+) -> Result<PathBuf, PodError> {
+    let stem = expected_unit.strip_prefix("podbay-pod-")
+        .and_then(|value| value.strip_suffix(".service"))
+        .filter(|_| valid_pod_unit(expected_unit))
+        .ok_or(PodError::Invalid("Codex manifest slot identity"))?;
+    private_directory(shared_manifest_directory)?;
+    let parent = fs::symlink_metadata(shared_manifest_directory)?;
+    if parent.mode() & 0o7777 != 0o700 {
+        return Err(PodError::Refused("Codex shared manifest directory mode changed"));
+    }
+    let slot = shared_manifest_directory.join(format!("{stem}.private"));
+    if create {
+        ensure_private_child(&slot)?;
+    } else {
+        private_directory(&slot)?;
+    }
+    let child = fs::symlink_metadata(&slot)?;
+    if child.mode() & 0o7777 != 0o700
+        || child.uid() != parent.uid()
+        || child.dev() != parent.dev()
+    {
+        return Err(PodError::Refused("Codex private slot directory changed"));
+    }
+    Ok(slot)
+}
+
 /// Paths for `ChildLaunchSpec` after the pod has verified a systemd credential.
 /// The reference is a symlink, not another stored copy of the credential.
 pub struct PreparedCodexHome {
@@ -102,7 +136,10 @@ pub fn prepare_codex_home_from_systemd_credential(
         ));
     }
 
-    let isolated_home = private_pod_directory.join("home");
+    let private_slot = codex_private_slot_directory(
+        private_pod_directory, expected_unit, true,
+    )?;
+    let isolated_home = private_slot.join("home");
     let codex_home = isolated_home.join("codex");
     ensure_private_child(&isolated_home)?;
     ensure_private_child(&codex_home)?;

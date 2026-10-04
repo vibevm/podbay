@@ -11,7 +11,8 @@ use podbay_host::ResolvedNativeCodexLaunch;
 use podbay_pod::{
     CODEX_V2_CAPABILITY, LinuxPeerEvidence, MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES, NativeEventCursor,
     NativeEventIdentity, NativeEventRead, PodClient, PodError, PrivateNativeEvidence,
-    decode_private_native_evidence_for_trusted_reader, manifest_path_for_identity,
+    codex_private_slot_directory, decode_private_native_evidence_for_trusted_reader,
+    manifest_path_for_identity,
 };
 
 use crate::codex_v2::{TrustedCodexCredentialSource, preflight_committed_codex_v2};
@@ -122,6 +123,11 @@ pub fn read_committed_codex_native_evidence(
             .map_err(|_| PodError::Invalid("Codex Attempt ID"))?,
         Epoch::new(wire.pod_incarnation()).map_err(|_| PodError::Invalid("Codex incarnation"))?,
     );
+    let stem = path.file_stem().and_then(|value| value.to_str())
+        .ok_or(PodError::Invalid("Codex manifest slot stem"))?;
+    let private_slot = codex_private_slot_directory(
+        &directory.path, &format!("podbay-pod-{stem}.service"), false,
+    )?;
     let client = PodClient::connect(&path)?;
     let before = client.attested_status()?;
     if !status_matches(&before, launch, &expected, resource.epoch) {
@@ -136,8 +142,7 @@ pub fn read_committed_codex_native_evidence(
     let private = if redacted.events.is_empty() {
         Vec::new()
     } else {
-        let raw =
-            read_private_log_copy(&directory.path.join("codex.native-events.log"), peer.uid())?;
+        let raw = read_private_log_copy(&private_slot.join("codex.native-events.log"), peer.uid())?;
         decode_private_native_evidence_for_trusted_reader(&raw, &expected, &redacted.events)?
     };
     let after = client.attested_status()?;

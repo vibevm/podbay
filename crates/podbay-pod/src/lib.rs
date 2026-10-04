@@ -35,7 +35,8 @@ pub use codex_bootstrap::{
 };
 #[cfg(target_os = "linux")]
 pub use codex_credential::{
-    CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
+    CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, codex_private_slot_directory,
+    prepare_codex_home_from_systemd_credential,
 };
 pub use codex_journal::{
     CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage,
