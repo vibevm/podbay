@@ -79,6 +79,16 @@ deduplicate an older key after later submissions or across process restart.
 PodBay's durable command ledger must provide caller-scoped idempotency before
 turn control is exposed to a live provider.
 
+The pod-local `CodexCommandJournal` storage slice now records a fsynced
+thread-create intent, exact native thread/session checkpoint, and separate
+bootstrap intent, uncertain, submitted and completed facts. It uses bounded,
+checksummed append frames through `DurableAppendLog`; a torn tail or unknown
+transition refuses replay, and an intent without a receipt reopens as Unknown
+without authorizing another RPC. This journal does not call Codex, authenticate
+a writer, or prove a completion by itself. The future pod command bridge must
+verify native completion and fresh idle state before recording that fact, and
+must supply durable actor/writer authority before any turn is sent.
+
 This is a codec and fake-transport slice. It does not launch Codex, make
 approval decisions, or grant native permissions on its own. A native adapter
 must reconcile a lost reply against the pod-owned process and hold a durable
