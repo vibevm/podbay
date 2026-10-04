@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::{JsonlTransport, MAX_FRAME_BYTES};
+use crate::{AvailableLine, JsonlTransport, MAX_FRAME_BYTES};
 
 const MAX_ARGS: usize = 64;
 const MAX_ENV: usize = 16;
@@ -605,6 +605,73 @@ impl JsonlTransport for ProcessJsonlTransport {
                     }
                 }
             }
+        }
+    }
+
+    fn try_read_line(&mut self) -> io::Result<AvailableLine> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "nonblocking stdio backend unavailable",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if let Some(end) = self.read_buffer.iter().position(|byte| *byte == b'\n') {
+                if end + 1 > MAX_FRAME_BYTES {
+                    return Err(
+                        self.abort_with(ErrorKind::InvalidData, "child JSONL frame exceeded bound")
+                    );
+                }
+                return Ok(AvailableLine::Frame(
+                    self.read_buffer.drain(..=end).collect(),
+                ));
+            }
+            if self.read_buffer.len() >= MAX_FRAME_BYTES {
+                return Err(
+                    self.abort_with(ErrorKind::InvalidData, "child JSONL frame exceeded bound")
+                );
+            }
+            let Some(stdout) = self.stdout.as_mut() else {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "child stdout is closed",
+                ));
+            };
+            // The child pipe was made O_NONBLOCK at spawn. One 8 KiB read is
+            // the whole work budget for this control-loop tick.
+            let mut chunk = [0u8; 8192];
+            match stdout.read(&mut chunk) {
+                Ok(0) if self.read_buffer.is_empty() => return Ok(AvailableLine::EndOfStream),
+                Ok(0) => {
+                    return Err(self.abort_with(
+                        ErrorKind::UnexpectedEof,
+                        "child closed a partial JSONL frame",
+                    ));
+                }
+                Ok(bytes) => self.read_buffer.extend_from_slice(&chunk[..bytes]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    return Ok(AvailableLine::Pending);
+                }
+                Err(error) => return Err(self.abort_with(error.kind(), "child stdout read failed")),
+            }
+            if let Some(end) = self.read_buffer.iter().position(|byte| *byte == b'\n') {
+                if end + 1 > MAX_FRAME_BYTES {
+                    return Err(
+                        self.abort_with(ErrorKind::InvalidData, "child JSONL frame exceeded bound")
+                    );
+                }
+                return Ok(AvailableLine::Frame(
+                    self.read_buffer.drain(..=end).collect(),
+                ));
+            }
+            if self.read_buffer.len() >= MAX_FRAME_BYTES {
+                return Err(
+                    self.abort_with(ErrorKind::InvalidData, "child JSONL frame exceeded bound")
+                );
+            }
+            Ok(AvailableLine::Pending)
         }
     }
 }

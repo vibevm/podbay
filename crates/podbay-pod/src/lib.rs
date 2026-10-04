@@ -2,9 +2,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
-mod codex_credential;
-#[cfg(target_os = "linux")]
 mod codex_bootstrap;
+#[cfg(target_os = "linux")]
+mod codex_credential;
 mod codex_journal;
 #[cfg(target_os = "linux")]
 mod codex_launch;
@@ -28,17 +28,17 @@ mod terminal_protocol;
 mod unsupported;
 
 #[cfg(target_os = "linux")]
+pub use codex_bootstrap::{
+    BootstrapControlReceipt, BootstrapControlStage, BootstrapSettlementStage,
+    CODEX_BOOTSTRAP_INSPECT_PROTOCOL, CODEX_BOOTSTRAP_PROTOCOL,
+};
+#[cfg(target_os = "linux")]
 pub use codex_credential::{
     CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
 };
 pub use codex_journal::{
     CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage,
     CodexJournalView,
-};
-#[cfg(target_os = "linux")]
-pub use codex_bootstrap::{
-    BootstrapControlReceipt, BootstrapControlStage, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
-    CODEX_BOOTSTRAP_PROTOCOL,
 };
 #[cfg(target_os = "linux")]
 pub use codex_launch::launch_bound_codex_v2;

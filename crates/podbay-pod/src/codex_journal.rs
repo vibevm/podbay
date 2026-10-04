@@ -87,6 +87,9 @@ pub enum CodexJournalStage {
     BootstrapUnknownAfterReopen,
     BootstrapUncertain,
     BootstrapSubmitted,
+    BootstrapCompletionObservedPendingIdleProof,
+    BootstrapFailed,
+    BootstrapInterrupted,
     BootstrapCompleted,
     StorageUncertain,
 }
@@ -119,6 +122,9 @@ enum Phase {
     BootstrapIntent,
     BootstrapUncertain,
     BootstrapSubmitted,
+    BootstrapCompletionObserved,
+    BootstrapFailed,
+    BootstrapInterrupted,
     BootstrapCompleted,
 }
 
@@ -146,6 +152,15 @@ enum JournalEvent {
     },
     BootstrapUncertain,
     BootstrapSubmitted {
+        native_turn_id: String,
+    },
+    BootstrapCompletionObserved {
+        native_turn_id: String,
+    },
+    BootstrapFailed {
+        native_turn_id: String,
+    },
+    BootstrapInterrupted {
         native_turn_id: String,
     },
     BootstrapCompleted {
@@ -217,9 +232,14 @@ impl CodexCommandJournal {
     pub fn recheck_held_file(&mut self) -> Result<(), PodError> {
         self.healthy()?;
         let identity = self.log.identity().clone();
-        let raw = self.log.read_all_bounded().inspect_err(|_| self.poisoned = true)?;
-        let (snapshot, records) = replay(&raw, &self.identity).inspect_err(|_| self.poisoned = true)?;
-        if self.log.identity() != &identity || snapshot != self.snapshot || records != self.records {
+        let raw = self
+            .log
+            .read_all_bounded()
+            .inspect_err(|_| self.poisoned = true)?;
+        let (snapshot, records) =
+            replay(&raw, &self.identity).inspect_err(|_| self.poisoned = true)?;
+        if self.log.identity() != &identity || snapshot != self.snapshot || records != self.records
+        {
             self.poisoned = true;
             return Err(PodError::Uncertain("Codex journal changed outside owner"));
         }
@@ -243,6 +263,11 @@ impl CodexCommandJournal {
                 Phase::BootstrapIntent => CodexJournalStage::BootstrapUnknownAfterReopen,
                 Phase::BootstrapUncertain => CodexJournalStage::BootstrapUncertain,
                 Phase::BootstrapSubmitted => CodexJournalStage::BootstrapSubmitted,
+                Phase::BootstrapCompletionObserved => {
+                    CodexJournalStage::BootstrapCompletionObservedPendingIdleProof
+                }
+                Phase::BootstrapFailed => CodexJournalStage::BootstrapFailed,
+                Phase::BootstrapInterrupted => CodexJournalStage::BootstrapInterrupted,
                 Phase::BootstrapCompleted => CodexJournalStage::BootstrapCompleted,
             }
         };
@@ -392,7 +417,11 @@ impl CodexCommandJournal {
             ));
         } else if !matches!(
             self.snapshot.phase,
-            Phase::BootstrapSubmitted | Phase::BootstrapCompleted
+            Phase::BootstrapSubmitted
+                | Phase::BootstrapCompletionObserved
+                | Phase::BootstrapFailed
+                | Phase::BootstrapInterrupted
+                | Phase::BootstrapCompleted
         ) || self.snapshot.native_turn_id.as_deref() != Some(native_turn_id)
         {
             return Err(PodError::Conflict("bootstrap native turn receipt changed"));
@@ -400,10 +429,10 @@ impl CodexCommandJournal {
         Ok(self.view())
     }
 
-    /// The future pod bridge must first verify a matching `turn/completed`
-    /// notification and fresh idle/no-waiting native status. The journal only
-    /// persists that observation; it cannot manufacture the evidence.
-    pub fn record_bootstrap_completed(
+    /// Persist that this exact native turn emitted `turn/completed` with a
+    /// completed status. This does not prove a fresh idle `thread/read` and
+    /// must never be reported as BootstrapCompleted by itself.
+    pub fn record_bootstrap_completion_observed(
         &mut self,
         command_key: &str,
         payload_digest: &str,
@@ -415,6 +444,97 @@ impl CodexCommandJournal {
             return Err(PodError::Conflict("bootstrap completion turn differs"));
         }
         if self.snapshot.phase == Phase::BootstrapSubmitted {
+            self.append(
+                command_key,
+                payload_digest,
+                JournalEvent::BootstrapCompletionObserved {
+                    native_turn_id: native_turn_id.into(),
+                },
+            )?;
+        } else if !matches!(
+            self.snapshot.phase,
+            Phase::BootstrapCompletionObserved | Phase::BootstrapCompleted
+        ) {
+            return Err(PodError::Conflict(
+                "bootstrap completion observation transition refused",
+            ));
+        }
+        Ok(self.view())
+    }
+
+    /// Preserve a matching native failure separately from successful
+    /// completion. A fresh idle read cannot turn this terminal fact into
+    /// BootstrapCompleted.
+    pub fn record_bootstrap_failed(
+        &mut self,
+        command_key: &str,
+        payload_digest: &str,
+        native_turn_id: &str,
+    ) -> Result<CodexJournalView, PodError> {
+        self.record_noncompletion(
+            command_key,
+            payload_digest,
+            native_turn_id,
+            JournalEvent::BootstrapFailed {
+                native_turn_id: native_turn_id.into(),
+            },
+            Phase::BootstrapFailed,
+        )
+    }
+
+    pub fn record_bootstrap_interrupted(
+        &mut self,
+        command_key: &str,
+        payload_digest: &str,
+        native_turn_id: &str,
+    ) -> Result<CodexJournalView, PodError> {
+        self.record_noncompletion(
+            command_key,
+            payload_digest,
+            native_turn_id,
+            JournalEvent::BootstrapInterrupted {
+                native_turn_id: native_turn_id.into(),
+            },
+            Phase::BootstrapInterrupted,
+        )
+    }
+
+    fn record_noncompletion(
+        &mut self,
+        command_key: &str,
+        payload_digest: &str,
+        native_turn_id: &str,
+        event: JournalEvent,
+        terminal: Phase,
+    ) -> Result<CodexJournalView, PodError> {
+        self.healthy()?;
+        self.same_command(command_key, payload_digest)?;
+        if self.snapshot.native_turn_id.as_deref() != Some(native_turn_id) {
+            return Err(PodError::Conflict("bootstrap terminal turn differs"));
+        }
+        if self.snapshot.phase == Phase::BootstrapSubmitted {
+            self.append(command_key, payload_digest, event)?;
+        } else if self.snapshot.phase != terminal {
+            return Err(PodError::Conflict("bootstrap terminal transition refused"));
+        }
+        Ok(self.view())
+    }
+
+    /// A separate bridge must verify a fresh idle/no-waiting/no-pending
+    /// `thread/read` after the journaled completion notification before this
+    /// final transition. This method is not called by the notification pump.
+    pub fn record_bootstrap_completed(
+        &mut self,
+        command_key: &str,
+        payload_digest: &str,
+        native_turn_id: &str,
+    ) -> Result<CodexJournalView, PodError> {
+        self.healthy()?;
+        self.same_command(command_key, payload_digest)?;
+        if self.snapshot.native_turn_id.as_deref() != Some(native_turn_id) {
+            return Err(PodError::Conflict("bootstrap completion turn differs"));
+        }
+        if self.snapshot.phase == Phase::BootstrapCompletionObserved {
             self.append(
                 command_key,
                 payload_digest,
@@ -569,9 +689,26 @@ fn apply_record(
             state.native_turn_id = Some(native_turn_id.clone());
             state.phase = Phase::BootstrapSubmitted;
         }
-        (Phase::BootstrapSubmitted, JournalEvent::BootstrapCompleted { native_turn_id })
+        (
+            Phase::BootstrapSubmitted,
+            JournalEvent::BootstrapCompletionObserved { native_turn_id },
+        ) if state.native_turn_id.as_deref() == Some(native_turn_id.as_str()) => {
+            state.phase = Phase::BootstrapCompletionObserved;
+        }
+        (Phase::BootstrapSubmitted, JournalEvent::BootstrapFailed { native_turn_id })
             if state.native_turn_id.as_deref() == Some(native_turn_id.as_str()) =>
         {
+            state.phase = Phase::BootstrapFailed;
+        }
+        (Phase::BootstrapSubmitted, JournalEvent::BootstrapInterrupted { native_turn_id })
+            if state.native_turn_id.as_deref() == Some(native_turn_id.as_str()) =>
+        {
+            state.phase = Phase::BootstrapInterrupted;
+        }
+        (
+            Phase::BootstrapCompletionObserved,
+            JournalEvent::BootstrapCompleted { native_turn_id },
+        ) if state.native_turn_id.as_deref() == Some(native_turn_id.as_str()) => {
             state.phase = Phase::BootstrapCompleted;
         }
         _ => return Err(PodError::Conflict("Codex journal transition refused")),
@@ -795,8 +932,14 @@ mod tests {
         journal.begin_thread_create(KEY, &digest).unwrap();
         journal.recheck_held_file().unwrap();
         files.state.lock().unwrap().bytes.push(0);
-        assert!(matches!(journal.recheck_held_file(), Err(PodError::Uncertain(_))));
-        assert!(matches!(journal.begin_thread_create(KEY, &digest), Err(PodError::Uncertain(_))));
+        assert!(matches!(
+            journal.recheck_held_file(),
+            Err(PodError::Uncertain(_))
+        ));
+        assert!(matches!(
+            journal.begin_thread_create(KEY, &digest),
+            Err(PodError::Uncertain(_))
+        ));
     }
 
     #[test]
@@ -873,6 +1016,20 @@ mod tests {
             CodexJournalStage::BootstrapSubmitted
         );
         assert_eq!(completed.view().native_turn_id.as_deref(), Some("turn.two"));
+        assert!(matches!(
+            completed.record_bootstrap_completed(KEY, &digest, "turn.two"),
+            Err(PodError::Conflict(_))
+        ));
+        completed
+            .record_bootstrap_completion_observed(KEY, &digest, "turn.two")
+            .unwrap();
+        drop(completed);
+        let mut completed =
+            CodexCommandJournal::open(&completed_files, Path::new(PATH), identity()).unwrap();
+        assert_eq!(
+            completed.view().stage,
+            CodexJournalStage::BootstrapCompletionObservedPendingIdleProof
+        );
         completed
             .record_bootstrap_completed(KEY, &digest, "turn.two")
             .unwrap();
@@ -897,6 +1054,46 @@ mod tests {
             CodexCommandJournal::open(&completed_files, Path::new(PATH), wrong),
             Err(PodError::Conflict(_))
         ));
+
+        for (interrupted, expected) in [
+            (false, CodexJournalStage::BootstrapFailed),
+            (true, CodexJournalStage::BootstrapInterrupted),
+        ] {
+            let files = MemoryFiles::new();
+            let mut journal =
+                CodexCommandJournal::open(&files, Path::new(PATH), identity()).unwrap();
+            journal.begin_thread_create(KEY, &digest).unwrap();
+            journal
+                .checkpoint_thread_created(KEY, &digest, "thread.terminal", "session.terminal")
+                .unwrap();
+            journal
+                .begin_bootstrap_intent(KEY, &digest, "message.terminal")
+                .unwrap();
+            journal
+                .record_bootstrap_submitted(KEY, &digest, "turn.terminal")
+                .unwrap();
+            assert!(matches!(
+                journal.record_bootstrap_failed(KEY, &digest, "turn.other"),
+                Err(PodError::Conflict(_))
+            ));
+            if interrupted {
+                journal
+                    .record_bootstrap_interrupted(KEY, &digest, "turn.terminal")
+                    .unwrap();
+            } else {
+                journal
+                    .record_bootstrap_failed(KEY, &digest, "turn.terminal")
+                    .unwrap();
+            }
+            drop(journal);
+            let mut reopened =
+                CodexCommandJournal::open(&files, Path::new(PATH), identity()).unwrap();
+            assert_eq!(reopened.view().stage, expected);
+            assert!(matches!(
+                reopened.record_bootstrap_completed(KEY, &digest, "turn.terminal"),
+                Err(PodError::Conflict(_))
+            ));
+        }
     }
 
     #[test]

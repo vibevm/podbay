@@ -5,14 +5,15 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
     ActorId, Attempt, AttemptId, CommandId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
     ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_pod::{
-    BootstrapControlStage, LinuxPeerEvidence, PodError, PodPeerBootstrap, launch_bound_codex_v2,
+    BootstrapControlStage, BootstrapSettlementStage, LinuxPeerEvidence, PodError, PodPeerBootstrap,
+    launch_bound_codex_v2,
 };
 use podbay_store::{
     Admission, AuthorityActorRecord, AuthorityMutation, BootstrapSendSelector,
@@ -76,6 +77,9 @@ printf '{"id":3,"result":{"thread":{"id":"thread.fixture","sessionId":"native.se
 read -r turn
 printf '%s\n' "$turn" >> "$CODEX_HOME/frames.log"
 printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\n'
+sleep 2
+printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed"}}}\n'
+printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\n'
 sleep 30
 "##).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -425,6 +429,12 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
     let _ = client
         .submit_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
         .unwrap();
+    let control_start = Instant::now();
+    assert!(client.attested_status().unwrap().child_running);
+    assert!(
+        control_start.elapsed() < Duration::from_secs(1),
+        "native wait blocked pod control"
+    );
     let recovered = client
         .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
         .unwrap();
@@ -438,6 +448,34 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
                 && native_session_id == "native.session.fixture"
                 && native_turn_id == "turn.fixture"));
     assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observed = loop {
+        let observed = client
+            .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
+            .unwrap();
+        if observed.settlement == Some(BootstrapSettlementStage::CompletionObservedPendingIdleProof)
+        {
+            break observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "matching completion notification was not journaled"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(matches!(
+        observed.stage,
+        BootstrapControlStage::Submitted { .. }
+    ));
+    // Even the later idle notification is insufficient: no fresh thread/read
+    // response has been observed, so no BootstrapCompleted is reported.
+    assert_eq!(
+        client
+            .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())
+            .unwrap()
+            .settlement,
+        Some(BootstrapSettlementStage::CompletionObservedPendingIdleProof)
+    );
     assert!(matches!(
         client
             .inspect_claimed_codex_bootstrap(&selector.command_id, &target, lease.writer_epoch())

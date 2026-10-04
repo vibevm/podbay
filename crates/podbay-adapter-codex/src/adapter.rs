@@ -18,9 +18,25 @@ const MAX_PENDING_REQUESTS: usize = 128;
 /// A pod-owned byte transport. Implementations must enforce
 /// `MAX_FRAME_BYTES` while assembling one complete JSONL frame per read;
 /// this crate supplies no process launcher or socket client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AvailableLine {
+    Pending,
+    Frame(Vec<u8>),
+    EndOfStream,
+}
+
 pub trait JsonlTransport {
     fn write_line(&mut self, line: &[u8]) -> io::Result<()>;
     fn read_line(&mut self) -> io::Result<Option<Vec<u8>>>;
+
+    /// One bounded nonblocking read step for an outer control loop. Existing
+    /// transports refuse until they implement this separate contract.
+    fn try_read_line(&mut self) -> io::Result<AvailableLine> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nonblocking JSONL read is unavailable",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +233,7 @@ pub enum BootstrapState {
     Submitted { turn_id: String },
     Completed { turn_id: String },
     Failed { turn_id: String },
+    Interrupted { turn_id: String },
     Unknown,
 }
 
@@ -632,8 +649,12 @@ impl<T: JsonlTransport> CodexResource<T> {
         client_message_id: &str,
     ) -> Result<BootstrapTurnSubmission, CodexError> {
         self.submit_bootstrap_after_checkpoint_checked(
-            permit, expected_thread_id, expected_session_id, bootstrap_text,
-            client_message_id, |_| Ok(()),
+            permit,
+            expected_thread_id,
+            expected_session_id,
+            bootstrap_text,
+            client_message_id,
+            |_| Ok(()),
         )
     }
 
@@ -1076,6 +1097,34 @@ impl<T: JsonlTransport> CodexResource<T> {
         self.apply_event_or_poison(&value)
     }
 
+    /// Consume at most one already available native notification. Pending
+    /// means the process has not produced a complete frame yet; it is neither
+    /// EOF nor a transport failure and leaves control IPC free to run.
+    pub fn poll_available_once(&mut self) -> Result<bool, CodexError> {
+        if self.poisoned || !self.initialized {
+            return Err(CodexError::InvalidState("native connection is unavailable"));
+        }
+        if let Some(event) = self.queued.pop_front() {
+            self.apply_event_or_poison(&event)?;
+            return Ok(true);
+        }
+        let line = match self.io.try_read_line() {
+            Ok(AvailableLine::Pending) => return Ok(false),
+            Ok(AvailableLine::Frame(frame)) => frame,
+            Ok(AvailableLine::EndOfStream) | Err(_) => {
+                self.poisoned = true;
+                return Err(CodexError::TransportUncertain);
+            }
+        };
+        let value = decode(&line).map_err(|error| self.poison_codec(error))?;
+        if nonempty_string(value.get("method")).is_none() {
+            self.poisoned = true;
+            return Err(CodexError::Protocol("unsolicited RPC response"));
+        }
+        self.apply_event_or_poison(&value)?;
+        Ok(true)
+    }
+
     fn require_fresh_thread(&self) -> Result<(), CodexError> {
         if !self.initialized || self.poisoned || self.thread.is_some() {
             Err(CodexError::InvalidState(
@@ -1380,13 +1429,20 @@ impl<T: JsonlTransport> CodexResource<T> {
                         .get("turn")
                         .and_then(|turn| turn.get("status"))
                         .and_then(Value::as_str);
-                    self.bootstrap = if status == Some("completed") {
-                        BootstrapState::Completed {
+                    self.bootstrap = match status {
+                        Some("completed") => BootstrapState::Completed {
                             turn_id: turn_id.to_owned(),
-                        }
-                    } else {
-                        BootstrapState::Failed {
+                        },
+                        Some("failed") => BootstrapState::Failed {
                             turn_id: turn_id.to_owned(),
+                        },
+                        Some("interrupted") => BootstrapState::Interrupted {
+                            turn_id: turn_id.to_owned(),
+                        },
+                        _ => {
+                            return Err(CodexError::Protocol(
+                                "bootstrap completion status is invalid",
+                            ));
                         }
                     };
                     self.observed_active_turn_id = None;
@@ -1645,17 +1701,28 @@ mod split_thread_tests {
             resource_epoch: Epoch::new(1).unwrap(),
         };
         let config = PinnedCodexConfig::new(
-            "gpt-6-sol", "medium", cwd, ApprovalPolicy::Never, Sandbox::DangerFullAccess,
-        ).unwrap();
+            "gpt-6-sol",
+            "medium",
+            cwd,
+            ApprovalPolicy::Never,
+            Sandbox::DangerFullAccess,
+        )
+        .unwrap();
         let mut resource = CodexResource::new(io, identity.clone(), config);
         resource.initialize().unwrap();
         resource.start_thread_without_turn().unwrap();
-        resource.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
+        resource
+            .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+            .unwrap();
         let permit = WriterPermit::from_trusted_boundary(identity, Epoch::new(1).unwrap());
         let mut called = false;
         assert!(matches!(
             resource.submit_bootstrap_after_checkpoint_checked(
-                &permit, "thread.fixture", "session.fixture", "bootstrap", "message.fixture",
+                &permit,
+                "thread.fixture",
+                "session.fixture",
+                "bootstrap",
+                "message.fixture",
                 |_| {
                     called = true;
                     Err(CodexError::Blocked(BlockReason::ObservationUnknown))
@@ -1665,9 +1732,20 @@ mod split_thread_tests {
         ));
         assert!(called);
         assert_eq!(resource.bootstrap_state(), &BootstrapState::Unknown);
-        let methods = resource.transport().writes.iter().map(|line| {
-            serde_json::from_slice::<Value>(line).unwrap()["method"].as_str().unwrap().to_owned()
-        }).collect::<Vec<_>>();
-        assert_eq!(methods, ["initialize", "initialized", "thread/start", "thread/read"]);
+        let methods = resource
+            .transport()
+            .writes
+            .iter()
+            .map(|line| {
+                serde_json::from_slice::<Value>(line).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            ["initialize", "initialized", "thread/start", "thread/read"]
+        );
     }
 }

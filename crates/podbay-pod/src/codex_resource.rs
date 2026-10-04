@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use podbay_adapter_codex::{
-    ApprovalPolicy, BlockReason, BootstrapTurnStage, ChildExitObservation, ChildLaunchSpec,
+    ApprovalPolicy, BlockReason, BootstrapState, BootstrapTurnStage, ChildExitObservation, ChildLaunchSpec,
     CodexError, CodexResource,
     KernelChildBirthObservation, PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity,
     Sandbox, WriterPermit,
@@ -23,7 +23,7 @@ use podbay_wire::{
 use crate::codex_credential::{
     CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
 };
-use crate::codex_bootstrap::BootstrapControlStage;
+use crate::codex_bootstrap::{BootstrapControlStage, BootstrapSettlementStage};
 use crate::codex_journal::{CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage, CodexJournalView};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
@@ -232,12 +232,69 @@ impl PodCodexResource {
         self.child_birth.pid
     }
 
+    /// Advance at most one already available native notification while the
+    /// pod remains able to answer control IPC. A matching completed turn is
+    /// journaled only as pending a separate fresh `thread/read` proof.
+    pub(crate) fn poll_bootstrap_notification_once(
+        &mut self,
+        mut recheck_before_journal: impl FnMut() -> Result<(), PodError>,
+    ) -> Result<bool, PodError> {
+        let Some(stage) = self.journal.as_ref().map(|journal| journal.view().stage) else {
+            return Ok(false);
+        };
+        if !matches!(stage, CodexJournalStage::BootstrapSubmitted
+            | CodexJournalStage::BootstrapCompletionObservedPendingIdleProof)
+        {
+            return Ok(false);
+        }
+        let consumed = self.resource.poll_available_once()
+            .map_err(|_| PodError::Uncertain("Codex native notification outcome unknown"))?;
+        let view = self.journal.as_ref()
+            .ok_or(PodError::Uncertain("held Codex journal disappeared"))?.view();
+        let terminal = self.resource.bootstrap_state().clone();
+        let terminal_turn = match &terminal {
+            BootstrapState::Completed { turn_id }
+            | BootstrapState::Failed { turn_id }
+            | BootstrapState::Interrupted { turn_id } => Some(turn_id.as_str()),
+            _ => None,
+        };
+        if view.stage == CodexJournalStage::BootstrapSubmitted
+            && let Some(turn_id) = terminal_turn
+            && view.native_turn_id.as_deref() == Some(turn_id)
+            && !self.resource.turn_control_state().external_conflict
+        {
+            let key = view.command_key.as_deref()
+                .ok_or(PodError::Uncertain("submitted journal lacks command key"))?;
+            let digest = view.payload_digest.as_deref()
+                .ok_or(PodError::Uncertain("submitted journal lacks request digest"))?;
+            recheck_before_journal()?;
+            self.recheck_child()?;
+            let journal = self.journal.as_mut()
+                .ok_or(PodError::Uncertain("held Codex journal disappeared"))?;
+            journal.recheck_held_file()?;
+            match terminal {
+                BootstrapState::Completed { .. } => {
+                    journal.record_bootstrap_completion_observed(key, digest, turn_id)?;
+                }
+                BootstrapState::Failed { .. } => {
+                    journal.record_bootstrap_failed(key, digest, turn_id)?;
+                }
+                BootstrapState::Interrupted { .. } => {
+                    journal.record_bootstrap_interrupted(key, digest, turn_id)?;
+                }
+                _ => unreachable!("checked terminal state"),
+            }
+            return Ok(true);
+        }
+        Ok(consumed)
+    }
+
     /// Read only the held, identity-checked journal for this exact claimed
     /// command. Absence is a distinct fact; no native adapter method is used.
     pub(crate) fn inspect_claimed_bootstrap(
         &mut self,
         proof: &BootstrapSendRecord,
-    ) -> Result<BootstrapControlStage, PodError> {
+    ) -> Result<(BootstrapControlStage, Option<BootstrapSettlementStage>), PodError> {
         let target = proof.native_target();
         let native = self.resource.identity();
         if target.session_id != native.session_id
@@ -266,7 +323,7 @@ impl PodCodexResource {
         let Some(journal) = self.journal.as_mut() else {
             return match fs::symlink_metadata(&self.journal_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(BootstrapControlStage::ClaimedUnobserved)
+                    Ok((BootstrapControlStage::ClaimedUnobserved, None))
                 }
                 _ => Err(PodError::Uncertain(
                     "Codex journal path exists without held identity",
@@ -284,7 +341,15 @@ impl PodCodexResource {
         {
             return Err(PodError::Conflict("held Codex journal belongs to another command"));
         }
-        inspect_stage_from_journal_view(&view)
+        let settlement = match view.stage {
+            CodexJournalStage::BootstrapCompletionObservedPendingIdleProof =>
+                Some(BootstrapSettlementStage::CompletionObservedPendingIdleProof),
+            CodexJournalStage::BootstrapFailed => Some(BootstrapSettlementStage::Failed),
+            CodexJournalStage::BootstrapInterrupted => Some(BootstrapSettlementStage::Interrupted),
+            CodexJournalStage::BootstrapCompleted => Some(BootstrapSettlementStage::Completed),
+            _ => None,
+        };
+        Ok((inspect_stage_from_journal_view(&view)?, settlement))
     }
 
     /// A current authority failure cannot erase an earlier fsynced native
@@ -393,7 +458,11 @@ impl PodCodexResource {
             };
         }
         match view.stage {
-            CodexJournalStage::BootstrapSubmitted | CodexJournalStage::BootstrapCompleted => {
+            CodexJournalStage::BootstrapSubmitted
+            | CodexJournalStage::BootstrapCompletionObservedPendingIdleProof
+            | CodexJournalStage::BootstrapFailed
+            | CodexJournalStage::BootstrapInterrupted
+            | CodexJournalStage::BootstrapCompleted => {
                 return submitted_from_view(&view);
             }
             CodexJournalStage::BootstrapIntentDurable
@@ -652,6 +721,9 @@ fn conservative_prior_stage(view: &CodexJournalView) -> BootstrapControlStage {
         | CodexJournalStage::BootstrapUnknownAfterReopen
         | CodexJournalStage::BootstrapUncertain
         | CodexJournalStage::BootstrapSubmitted
+        | CodexJournalStage::BootstrapCompletionObservedPendingIdleProof
+        | CodexJournalStage::BootstrapFailed
+        | CodexJournalStage::BootstrapInterrupted
         | CodexJournalStage::BootstrapCompleted => bootstrap_uncertain_from_view(view),
         _ => BootstrapControlStage::ThreadCreateUncertain,
     }
@@ -679,7 +751,11 @@ fn inspect_stage_from_journal_view(view: &CodexJournalView) -> Result<BootstrapC
             let (native_thread_id, native_session_id) = identities()?;
             Ok(BootstrapControlStage::BootstrapUncertain { native_thread_id, native_session_id })
         }
-        CodexJournalStage::BootstrapSubmitted | CodexJournalStage::BootstrapCompleted => {
+        CodexJournalStage::BootstrapSubmitted
+        | CodexJournalStage::BootstrapCompletionObservedPendingIdleProof
+        | CodexJournalStage::BootstrapFailed
+        | CodexJournalStage::BootstrapInterrupted
+        | CodexJournalStage::BootstrapCompleted => {
             let (native_thread_id, native_session_id) = identities()?;
             let native_turn_id = view.native_turn_id.clone()
                 .ok_or(PodError::Uncertain("journal lacks native turn ID"))?;

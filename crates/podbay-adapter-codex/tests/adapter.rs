@@ -3,11 +3,12 @@ use std::io;
 use std::path::PathBuf;
 
 use podbay_adapter_codex::{
-    AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason,
-    BootstrapState, BootstrapTurnStage, CodecError, CodexError, CodexResource, InterruptState,
-    JsonlTransport, MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind, NativeRequestStage,
-    NativeRpcId, PinnedCodexConfig, ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION,
-    TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit, decode, encode,
+    AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine,
+    BlockReason, BootstrapState, BootstrapTurnStage, CodecError, CodexError, CodexResource,
+    InterruptState, JsonlTransport, MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind,
+    NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity, Sandbox,
+    TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit,
+    decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -73,6 +74,14 @@ impl JsonlTransport for FakeTransport {
 
     fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.reads.pop_front())
+    }
+
+    fn try_read_line(&mut self) -> io::Result<AvailableLine> {
+        match self.reads.pop_front() {
+            Some(frame) if frame.is_empty() => Ok(AvailableLine::Pending),
+            Some(frame) => Ok(AvailableLine::Frame(frame)),
+            None => Ok(AvailableLine::Pending),
+        }
     }
 }
 
@@ -310,6 +319,115 @@ fn schema_receipt_and_exact_model_effort_are_pinned_before_bootstrap_ready() {
 }
 
 #[test]
+fn nonblocking_bootstrap_poll_distinguishes_delay_completion_and_interruption() {
+    let mut io = FakeTransport::with_reads([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+    ]);
+    io.reads.push_back(Vec::new());
+    io.reads
+        .push_back(encode(&completed("turn.bootstrap", "completed")).unwrap());
+    io.reads.push_back(encode(&status("idle", &[])).unwrap());
+    let mut adapter = CodexResource::new(io, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    assert!(!adapter.poll_available_once().unwrap());
+    assert_eq!(
+        adapter.bootstrap_state(),
+        &BootstrapState::Submitted {
+            turn_id: "turn.bootstrap".into()
+        }
+    );
+    assert!(adapter.poll_available_once().unwrap());
+    assert_eq!(
+        adapter.bootstrap_state(),
+        &BootstrapState::Completed {
+            turn_id: "turn.bootstrap".into()
+        }
+    );
+    assert!(adapter.poll_available_once().unwrap());
+    assert!(adapter.bootstrap_ready());
+    assert!(!adapter.poll_available_once().unwrap());
+    assert_eq!(
+        adapter.transport().methods(),
+        ["initialize", "initialized", "thread/start", "turn/start"]
+    );
+
+    for (wire, expected) in [
+        (
+            "failed",
+            BootstrapState::Failed {
+                turn_id: "turn.bootstrap".into(),
+            },
+        ),
+        (
+            "interrupted",
+            BootstrapState::Interrupted {
+                turn_id: "turn.bootstrap".into(),
+            },
+        ),
+    ] {
+        let mut adapter = resource([
+            initialized(),
+            effective(2, "thread.one"),
+            turn_started_response(),
+            completed("turn.bootstrap", wire),
+            status("idle", &[]),
+        ]);
+        adapter.initialize().unwrap();
+        adapter
+            .start_new("Begin work", "bootstrap:session.one")
+            .unwrap();
+        adapter.poll_available_once().unwrap();
+        adapter.poll_available_once().unwrap();
+        assert_eq!(adapter.bootstrap_state(), &expected);
+        assert!(!adapter.bootstrap_ready());
+    }
+}
+
+#[test]
+fn nonblocking_poll_never_treats_unrelated_turn_or_pending_question_as_ready() {
+    let mut unrelated = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        completed("turn.other", "completed"),
+        completed("turn.bootstrap", "completed"),
+        status("idle", &[]),
+    ]);
+    unrelated.initialize().unwrap();
+    unrelated
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    for _ in 0..3 {
+        unrelated.poll_available_once().unwrap();
+    }
+    assert!(unrelated.turn_control_state().external_conflict);
+    assert!(!unrelated.bootstrap_ready());
+
+    let mut pending = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        command_request(70),
+        completed("turn.bootstrap", "completed"),
+        status("idle", &[]),
+    ]);
+    pending.initialize().unwrap();
+    pending
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    for _ in 0..3 {
+        pending.poll_available_once().unwrap();
+    }
+    assert_eq!(pending.pending_request_count(), 1);
+    assert!(!pending.bootstrap_ready());
+}
+
+#[test]
 fn split_bootstrap_uses_checkpointed_thread_and_one_fresh_idle_turn_start() {
     let mut adapter = resource([
         initialized(),
@@ -375,6 +493,26 @@ fn split_bootstrap_uses_checkpointed_thread_and_one_fresh_idle_turn_start() {
         Err(CodexError::Blocked(BlockReason::BootstrapUnsettled))
     ));
     assert_eq!(adapter.transport().methods().len(), 5);
+}
+
+#[test]
+fn split_bootstrap_applies_completion_queued_before_turn_start_reply() {
+    let mut adapter = resource([
+        initialized(), effective(2, "thread.one"), read_response(3, "idle", None),
+        completed("turn.split.bootstrap", "completed"), status("idle", &[]),
+        work_turn_response(4, "turn.split.bootstrap"),
+    ]);
+    adapter.initialize().unwrap();
+    let thread = adapter.start_thread_without_turn().unwrap();
+    adapter.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
+    let receipt = adapter.submit_bootstrap_after_checkpoint(
+        &writer_permit(1), &thread.thread_id, &thread.session_id,
+        "Begin work", "bootstrap:session.one",
+    ).unwrap();
+    assert_eq!(receipt.stage, BootstrapTurnStage::Submitted { turn_id: "turn.split.bootstrap".into() });
+    assert_eq!(adapter.bootstrap_state(), &BootstrapState::Completed { turn_id: "turn.split.bootstrap".into() });
+    assert!(!adapter.poll_available_once().unwrap());
+    assert_eq!(adapter.transport().methods(), ["initialize", "initialized", "thread/start", "thread/read", "turn/start"]);
 }
 
 #[test]

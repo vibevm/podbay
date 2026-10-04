@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_adapter_codex::{
-    ChildLaunchSpec, CodecError, JsonlTransport, ProcessJsonlTransport, TESTED_CODEX_CLI_VERSION,
-    decode, encode,
+    AvailableLine, ChildLaunchSpec, CodecError, JsonlTransport, ProcessJsonlTransport,
+    TESTED_CODEX_CLI_VERSION, decode, encode,
 };
 use serde_json::{Value, json};
 
@@ -17,6 +17,41 @@ struct PrivateDirs {
     root: PathBuf,
     home: PathBuf,
     codex_home: PathBuf,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn nonblocking_child_poll_keeps_partial_frame_and_returns_before_read_deadline() {
+    let dirs = PrivateDirs::new();
+    let mut transport = ProcessJsonlTransport::spawn(dirs.spec(
+        "fragmented",
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    ))
+    .unwrap();
+    let start = Instant::now();
+    let mut saw_pending = false;
+    let frame = loop {
+        let tick = Instant::now();
+        match transport.try_read_line().unwrap() {
+            AvailableLine::Pending => saw_pending = true,
+            AvailableLine::Frame(frame) => break frame,
+            AvailableLine::EndOfStream => panic!("fake child closed before its frame"),
+        }
+        assert!(
+            tick.elapsed() < Duration::from_millis(250),
+            "one poll blocked control"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "fragmented frame did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(saw_pending);
+    assert_eq!(decode(&frame).unwrap()["result"]["ok"], true);
+    assert_eq!(transport.try_read_line().unwrap(), AvailableLine::Pending);
+    transport.dispose().unwrap();
 }
 
 impl PrivateDirs {

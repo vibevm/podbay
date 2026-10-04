@@ -170,6 +170,18 @@ pub enum BootstrapControlStage {
     },
 }
 
+/// Supplemental durable journal settlement. The legacy `Submitted` stage
+/// remains the native turn/start receipt; this field never upgrades it by
+/// inference. Only the pod's held journal can supply these facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapSettlementStage {
+    CompletionObservedPendingIdleProof,
+    Failed,
+    Interrupted,
+    Completed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapControlReceipt {
@@ -188,6 +200,8 @@ pub struct BootstrapControlReceipt {
     pub writer_epoch: u64,
     pub request_digest: Option<String>,
     pub stage: BootstrapControlStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<BootstrapSettlementStage>,
 }
 
 impl BootstrapControlReceipt {
@@ -212,7 +226,13 @@ impl BootstrapControlReceipt {
             writer_epoch: request.writer_epoch,
             request_digest: request_digest.map(str::to_owned),
             stage,
+            settlement: None,
         }
+    }
+
+    pub(crate) fn with_settlement(mut self, stage: Option<BootstrapSettlementStage>) -> Self {
+        self.settlement = stage;
+        self
     }
 }
 
@@ -270,6 +290,25 @@ mod tests {
             receipt
         );
         assert!(!encoded.windows(9).any(|window| window == b"completed"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&encoded)
+                .unwrap()
+                .get("settlement")
+                .is_none()
+        );
+
+        let observed = receipt.with_settlement(Some(
+            BootstrapSettlementStage::CompletionObservedPendingIdleProof,
+        ));
+        let encoded = serde_json::to_vec(&observed).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<BootstrapControlReceipt>(&encoded).unwrap(),
+            observed,
+        );
+        assert!(matches!(
+            observed.stage,
+            BootstrapControlStage::Submitted { .. }
+        ));
     }
 
     #[test]

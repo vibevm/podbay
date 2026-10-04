@@ -895,6 +895,7 @@ impl PodClient {
             || response.resource_epoch != target.resource_epoch
             || response.resource_input_epoch != target.resource_input_epoch
             || response.writer_epoch != writer_epoch
+            || response.settlement.is_some()
             || !matches!(response.stage, BootstrapControlStage::RefusedBeforeEffect)
                 && !response.request_digest.as_ref().is_some_and(|digest| {
                     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -999,6 +1000,8 @@ impl PodClient {
             || response.resource_epoch != target.resource_epoch
             || response.resource_input_epoch != target.resource_input_epoch
             || response.writer_epoch != writer_epoch
+            || (response.settlement.is_some()
+                && !matches!(response.stage, BootstrapControlStage::Submitted { .. }))
             || (!matches!(response.stage, BootstrapControlStage::RefusedBeforeEffect) && !digest_valid)
         {
             return Err(PodError::Uncertain("bootstrap inspection reply identity differs"));
@@ -1675,11 +1678,54 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let mut exit_code = None;
     let mut settled = false;
     let mut accept_failures = 0u8;
-    for incoming in listener.incoming() {
+    let codex_pump = binding.protocol == PEER_BINDING_V2_PROTOCOL;
+    if codex_pump {
+        listener.set_nonblocking(true)?;
+    }
+    let mut native_pump_available = codex_pump;
+    loop {
+        // One native frame before each accept keeps control traffic from
+        // starving completion observation. An idle tick does constant work.
+        let processed = if native_pump_available {
+            match &mut child {
+                ChildResource::Codex(resource) => {
+                    let tick = resource.poll_bootstrap_notification_once(|| {
+                        current_codex_v2_binding(binding, descriptor)?;
+                        if !manager_witness.matches_current(
+                            owner_epoch.get(), credential_epoch.get(), &manager_peer,
+                        ) {
+                            return Err(PodError::Refused(
+                                "manager claim changed before journal observation",
+                            ));
+                        }
+                        Ok(())
+                    });
+                    match tick {
+                        Ok(processed) => processed,
+                        Err(_) => {
+                            // Native or journal failure cannot erase control
+                            // access or manufacture bootstrap completion.
+                            native_pump_available = false;
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let incoming = listener.accept().map(|(stream, _)| stream);
         let mut stream = match incoming {
             Ok(stream) => {
                 accept_failures = 0;
                 stream
+            }
+            Err(error) if codex_pump && error.kind() == std::io::ErrorKind::WouldBlock => {
+                if !processed {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                continue;
             }
             Err(_error) => {
                 accept_failures = accept_failures.saturating_add(1);
@@ -1847,13 +1893,13 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     Ok((selector, proof)) => {
                         let stage = if let ChildResource::Codex(resource) = &mut child {
                             match resource.inspect_claimed_bootstrap(&proof) {
-                                Ok(stage) => stage,
+                                Ok((stage, settlement)) => (stage, settlement),
                                 Err(PodError::Refused(_) | PodError::Conflict(_) | PodError::Invalid(_)) =>
-                                    BootstrapControlStage::RefusedBeforeEffect,
-                                Err(_) => BootstrapControlStage::ThreadCreateUncertain,
+                                    (BootstrapControlStage::RefusedBeforeEffect, None),
+                                Err(_) => (BootstrapControlStage::ThreadCreateUncertain, None),
                             }
                         } else {
-                            BootstrapControlStage::RefusedBeforeEffect
+                            (BootstrapControlStage::RefusedBeforeEffect, None)
                         };
                         let fresh = (|| -> Result<(), PodError> {
                             let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
@@ -1880,8 +1926,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         })();
                         if fresh.is_ok() {
                             BootstrapControlReceipt::new(
-                                &inspect, Some(&proof.receipt().request_digest), stage,
-                            )
+                                &inspect, Some(&proof.receipt().request_digest), stage.0,
+                            ).with_settlement(stage.1)
                         } else {
                             BootstrapControlReceipt::new(
                                 &inspect, None, BootstrapControlStage::RefusedBeforeEffect,
