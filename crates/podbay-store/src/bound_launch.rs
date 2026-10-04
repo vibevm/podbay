@@ -683,6 +683,49 @@ impl PodBayStore {
         })
     }
 
+    /// Indexed historical V2 root selector for an authenticated principal.
+    /// It returns the exact immutable command binding from one read snapshot;
+    /// the host must separately prove today's Session, Run, Pod, Resource,
+    /// manager and writer lease before using it as a current guard readback.
+    pub fn lookup_bound_root_v2_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM commands
+                 WHERE command_id=?1 AND principal=?2 AND scope_id=?3 AND namespace=?4",
+                params![
+                    command_id.as_str(),
+                    principal.as_str(),
+                    scope.as_str(),
+                    NAMESPACE
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rowid) = rowid else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let record = read_bound_record(&transaction, rowid)?;
+        if record.format != BoundLaunchFormat::CodexV2
+            || record.scope_id != scope.as_str()
+            || record.receipt.command_id != command_id.as_str()
+            || record.resources.len() != 1
+            || record.resources[0].kind != "structured_provider"
+        {
+            return Err(StoreError::Conflict("indexed V2 root binding differs"));
+        }
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     /// Read an existing bound launch before a manager mints any Session, Run,
     /// Attempt, Pod, or Resource IDs. A miss permits planning; a changed
     /// canonical caller intent conflicts and must never mint another launch.

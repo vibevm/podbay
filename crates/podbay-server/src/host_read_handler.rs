@@ -1,9 +1,10 @@
 //! Narrow host-backed `commands.get` projection. No mutation reaches a port.
 
-use podbay_core::ScopeId;
+use podbay_core::{CommandId, ScopeId};
 use podbay_host::{
     AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage, DurableAuthority,
-    DurableAuthorityError, HostDispatchPort, HostError,
+    DurableAuthorityError, HostDispatchPort, HostError, InitialBootstrapGuard,
+    TrustedBootstrapSendPolicy,
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, EffectState, LaunchDispatchStage, ObservedStage,
@@ -15,15 +16,29 @@ use podbay_wire::{
 };
 use serde_json::{Value, json};
 
-use crate::Handler;
+use crate::{Handler, host_launch_handler::bootstrap_guard_json};
 
 pub(crate) struct HostReadHandler<'a, P: HostDispatchPort> {
     authority: &'a mut DurableAuthority<P>,
+    bootstrap_policy: Option<&'a TrustedBootstrapSendPolicy>,
 }
 
 impl<'a, P: HostDispatchPort> HostReadHandler<'a, P> {
     pub(crate) fn new(authority: &'a mut DurableAuthority<P>) -> Self {
-        Self { authority }
+        Self {
+            authority,
+            bootstrap_policy: None,
+        }
+    }
+
+    pub(crate) fn with_bootstrap_policy(
+        authority: &'a mut DurableAuthority<P>,
+        policy: &'a TrustedBootstrapSendPolicy,
+    ) -> Self {
+        Self {
+            authority,
+            bootstrap_policy: Some(policy),
+        }
     }
 }
 
@@ -66,13 +81,30 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
             .authority
             .lookup_command_with_native_observation(transport, &scope, &selector)
             .map_err(authority_error)?;
-        Ok(inspection_json(inspected, native.as_ref()))
+        let guard = if inspected.launch_dispatch_status.is_some() {
+            self.bootstrap_policy.and_then(|policy| {
+                let command_id = CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
+                self.authority
+                    .read_current_initial_bootstrap_guard_for_launch(
+                        transport,
+                        &scope,
+                        &command_id,
+                        policy,
+                    )
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        Ok(inspection_json(inspected, native.as_ref(), guard.as_ref()))
     }
 }
 
 fn inspection_json(
     inspected: CommandInspection,
     native: Option<&BootstrapNativeObservation>,
+    guard: Option<&InitialBootstrapGuard>,
 ) -> Value {
     // These are the facts established by the store. A claimed effect remains
     // uncertain; host acceptance does not imply provider consumption.
@@ -140,10 +172,9 @@ fn inspection_json(
     if let Some(stage) = launch_stage {
         response["launchStage"] = json!(stage);
         response["outboxState"] = json!(outbox_state);
-        // An indexed CommandId→current writer lease lookup is not available
-        // in this store API. Never reconstruct a guard by scanning pods or
-        // replaying a prior launch receipt on a generic read.
-        response["bootstrapGuard"] = json!({"available": false});
+        response["bootstrapGuard"] = guard
+            .map(bootstrap_guard_json)
+            .unwrap_or_else(|| json!({"available": false}));
         if let Some(reference) = launch.and_then(|status| status.receipt_ref.as_deref()) {
             response["portReceiptRef"] = json!(reference);
         }
@@ -264,12 +295,14 @@ mod tests {
 
     #[test]
     fn uncertain_and_host_accepted_are_never_projected_as_settled() {
-        let uncertain = inspection_json(inspection(EffectState::ClaimedUncertain, None), None);
+        let uncertain =
+            inspection_json(inspection(EffectState::ClaimedUncertain, None), None, None);
         assert_eq!(uncertain["state"], "uncertain");
         assert_eq!(uncertain["effectState"], "claimed_uncertain");
         assert_eq!(uncertain["receipt"]["eventSequence"], "7");
         let accepted = inspection_json(
             inspection(EffectState::Observed, Some(ObservedStage::HostAccepted)),
+            None,
             None,
         );
         assert_eq!(accepted["state"], "host_accepted");
@@ -289,7 +322,7 @@ mod tests {
                 stage,
                 receipt_ref: Some("host.receipt.one".into()),
             });
-            let response = inspection_json(fact, None);
+            let response = inspection_json(fact, None, None);
             assert_eq!(response["state"], "host_accepted");
             assert_eq!(response["effectState"], label);
             assert_eq!(response["launchStage"], label);

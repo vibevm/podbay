@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
 use podbay_client::{LinuxClientAuthLimits, authenticate_existing_linux_stream_with_limits};
-use podbay_core::{ActorId, ResourceKind, ScopeId, SessionId};
+use podbay_core::{ActorId, CommandId, ResourceKind, ScopeId, SessionId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
@@ -34,7 +34,7 @@ use podbay_server::{
 };
 use podbay_store::{
     AuthorityMutation, BoundLaunchFormat, CommandLookupSelector, PodBayStore,
-    TrustedNativeWriterLeaseRequest,
+    TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
     CommandEnvelope, Guard, MutationOperation, ReadEnvelope, ReadOperation, ResourceDriver,
@@ -422,6 +422,18 @@ fn read_by_key(request_id: &str, key: &str) -> ReadEnvelope {
     .unwrap()
 }
 
+fn read_by_id(request_id: &str, command_id: &str) -> ReadEnvelope {
+    ReadEnvelope::new_json(
+        request_id,
+        WireTarget::Scope {
+            scope_id: "scope.server.launch".into(),
+        },
+        ReadOperation::CommandsGet,
+        json!({"selector":{"kind":"id","commandId":command_id}}),
+    )
+    .unwrap()
+}
+
 fn authenticate(socket: UnixStream, actor: &str) -> impl Read + Write {
     let signer = KeyPair::from_seed(Seed::new([7; 32]));
     authenticate_existing_linux_stream_with_limits(
@@ -670,7 +682,7 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
     assert_eq!(launched[1]["ok"]["value"]["portCalled"], false);
     assert_eq!(launched[1]["ok"]["value"]["bootstrapGuard"], *first_guard);
     assert_eq!(launched[2]["ok"]["state"], "host_accepted");
-    assert_eq!(launched[2]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(launched[2]["ok"]["bootstrapGuard"], *first_guard);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let session_id =
         SessionId::try_from(launched[0]["ok"]["value"]["sessionId"].as_str().unwrap()).unwrap();
@@ -913,6 +925,263 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
             .unwrap(),
         before
     );
+    listener.shutdown().unwrap();
+}
+
+#[test]
+fn indexed_guard_readback_keeps_two_roots_isolated_and_refuses_stale_lease() {
+    let fixture = Fixture::new();
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::Accepted);
+    let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+    let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+        grant,
+        Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    let send_template =
+        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30))
+            .unwrap()
+            .with_initial_writer_lease_seconds(120)
+            .unwrap();
+    let launched = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            launch_request("request.root.one", "key.root.one", grant, "gpt-6-sol")
+                .encode_json()
+                .unwrap(),
+            launch_request("request.root.two", "key.root.two", grant, "gpt-6-sol")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let first = &launched[0]["ok"];
+    let second = &launched[1]["ok"];
+    assert_eq!(first["state"], "host_accepted");
+    assert_eq!(second["state"], "host_accepted");
+    assert_ne!(first["commandId"], second["commandId"]);
+    assert_ne!(first["value"]["sessionId"], second["value"]["sessionId"]);
+    assert_ne!(first["value"]["podId"], second["value"]["podId"]);
+    assert_eq!(first["value"]["bootstrapGuard"]["available"], true);
+    assert_eq!(second["value"]["bootstrapGuard"]["available"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let scope = ScopeId::try_from("scope.server.launch").unwrap();
+    let principal = VerifiedPrincipal::from_authenticated_boundary(actor.as_str()).unwrap();
+    let first_id = CommandId::try_from(first["commandId"].as_str().unwrap()).unwrap();
+    let second_id = CommandId::try_from(second["commandId"].as_str().unwrap()).unwrap();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let first_record = store
+        .lookup_bound_root_v2_by_command_id(&principal, &scope, &first_id)
+        .unwrap()
+        .unwrap();
+    let second_record = store
+        .lookup_bound_root_v2_by_command_id(&principal, &scope, &second_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_record.session_id, first["value"]["sessionId"]);
+    assert_eq!(second_record.session_id, second["value"]["sessionId"]);
+    assert!(
+        store
+            .lookup_bound_root_v2_by_command_id(
+                &VerifiedPrincipal::from_authenticated_boundary("actor.foreign").unwrap(),
+                &scope,
+                &first_id,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .lookup_bound_root_v2_by_command_id(
+                &principal,
+                &ScopeId::try_from("scope.foreign").unwrap(),
+                &first_id,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let durable_before_reads = store.scope_snapshot(scope.as_str()).unwrap();
+    drop(store);
+
+    let reads = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.root.one.read", "key.root.one")
+                .encode_json()
+                .unwrap(),
+            read_by_id("request.root.two.read", second_id.as_str())
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(reads[0]["ok"]["state"], "host_accepted");
+    assert_eq!(reads[1]["ok"]["state"], "host_accepted");
+    assert_eq!(reads[0]["ok"]["receipt"]["commandId"], first["commandId"]);
+    assert_eq!(reads[1]["ok"]["receipt"]["commandId"], second["commandId"]);
+    // The second root advanced global authority revision; the first root's
+    // writer lease is now stale. Its guard cannot be borrowed from root two.
+    assert_eq!(reads[0]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(
+        reads[1]["ok"]["bootstrapGuard"],
+        second["value"]["bootstrapGuard"]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let wrong_process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000,
+        99_992,
+        444_555,
+        "/user.slice/foreign.scope",
+    )
+    .unwrap();
+    let wrong_actor = ReplayTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        wrong_process,
+        CredentialGeneration::new(1).unwrap(),
+    ));
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(matches!(
+        authority.read_current_initial_bootstrap_guard_for_launch(
+            &wrong_actor,
+            &scope,
+            &first_id,
+            &policy,
+        ),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (target, _) = store
+        .current_native_writer_target_for_session(
+            &scope,
+            &SessionId::try_from(second_record.session_id.as_str()).unwrap(),
+        )
+        .unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    let claim = store
+        .current_manager_credential_claim(snapshot.owner_epoch)
+        .unwrap();
+    store
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target,
+            holder_actor_id: actor.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: snapshot.owner_epoch,
+            expected_manager_credential_epoch: claim.credential_epoch(),
+            expected_authority_revision: snapshot.revision,
+            expected_writer_epoch: Some(1),
+            ttl_seconds: 120,
+        })
+        .unwrap();
+    drop(store);
+    let stale = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.root.one.stale", "key.root.one")
+                .encode_json()
+                .unwrap(),
+            read_by_key("request.root.two.stale", "key.root.two")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(stale[0]["ok"]["state"], "host_accepted");
+    assert_eq!(stale[0]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(stale[1]["ok"]["state"], "host_accepted");
+    assert_eq!(stale[1]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .scope_snapshot(scope.as_str())
+            .unwrap(),
+        durable_before_reads
+    );
+    listener.shutdown().unwrap();
+}
+
+#[test]
+fn authority_revision_change_keeps_launch_receipt_but_hides_old_guard() {
+    let fixture = Fixture::new();
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::Accepted);
+    let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+    let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+        grant,
+        Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    let send_template =
+        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30))
+            .unwrap()
+            .with_initial_writer_lease_seconds(120)
+            .unwrap();
+    let first = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            launch_request(
+                "request.revision.launch",
+                "key.revision.launch",
+                grant,
+                "gpt-6-sol",
+            )
+            .encode_json()
+            .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let original = first[0]["ok"]["commandId"].clone();
+    assert_eq!(first[0]["ok"]["value"]["bootstrapGuard"]["available"], true);
+    let scope = ScopeId::try_from("scope.server.launch").unwrap();
+    authority
+        .install_grant_from_trusted_policy(
+            &actor,
+            GrantSpec {
+                scope_id: scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([Right::new(
+                    Operation::SendSession,
+                    HostTarget::Scope(scope),
+                )]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let read = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.revision.read", "key.revision.launch")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(read[0]["ok"]["receipt"]["commandId"], original);
+    assert_eq!(read[0]["ok"]["state"], "host_accepted");
+    assert_eq!(read[0]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     listener.shutdown().unwrap();
 }
 

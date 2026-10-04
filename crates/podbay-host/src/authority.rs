@@ -3307,6 +3307,148 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
     }
 
+    /// Read back an existing initial writer guard for one exact authenticated
+    /// V2 launch CommandId. Every lookup is indexed by CommandId/principal and
+    /// then verified against today's Session→Run→Pod→Resource and lease. This
+    /// method never mints, renews or takes over a writer lease.
+    pub fn read_current_initial_bootstrap_guard_for_launch<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        command_id: &CommandId,
+        policy: &TrustedBootstrapSendPolicy,
+    ) -> Result<Option<InitialBootstrapGuard>, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (transport, scope, command_id, policy);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let inspected = self.lookup_command(
+                transport,
+                scope,
+                &CommandLookupSelector::Id {
+                    command_id: command_id.as_str().into(),
+                },
+            )?;
+            self.recheck_actor_resolution_manager()?;
+            let actor = self.host.authenticate(transport)?.clone();
+            if actor.scope_id != *scope {
+                return Err(StoreError::NotFound.into());
+            }
+            self.host.check_grant(
+                &actor,
+                policy.grant_id,
+                scope,
+                &Right::new(Operation::SendSession, Target::Scope(scope.clone())),
+            )?;
+            if policy.deadline <= Instant::now() {
+                return Ok(None);
+            }
+            let principal =
+                VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+            let Some(record) = self
+                .store
+                .lookup_bound_root_v2_by_command_id(&principal, scope, command_id)?
+            else {
+                return Ok(None);
+            };
+            if record.receipt != inspected.receipt {
+                return Ok(None);
+            }
+            let status = self.store.launch_dispatch_status(
+                record.receipt.outbox_id,
+                scope.as_str(),
+                &record.pod_id,
+            )?;
+            if !matches!(
+                status.stage,
+                LaunchDispatchStage::HostAccepted | LaunchDispatchStage::PortSettled
+            ) {
+                return Ok(None);
+            }
+            let current = match self
+                .store
+                .current_bound_pod_snapshot(scope.as_str(), &record.pod_id)
+            {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+            if current.launch() != &record
+                || current.owner_epoch().get() != self.manager_claim.owner_epoch()
+                || current.authority_revision() != self.recorded.revision
+                || current.resources().len() != 1
+                || current.resources()[0].id().as_str() != record.resources[0].id
+                || current.resources()[0].epoch().get() != record.resources[0].epoch
+            {
+                return Ok(None);
+            }
+            let session = SessionId::try_from(record.session_id.as_str())
+                .map_err(|_| DurableAuthorityError::Corrupt("bound Session ID is invalid"))?;
+            let (target, session_revision) = match self
+                .store
+                .current_native_writer_target_for_session(scope, &session)
+            {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+            if target.scope_id != *scope
+                || target.session_id.as_str() != record.session_id
+                || target.run_id.as_str() != record.run_id
+                || target.attempt_id.as_str() != record.attempt_id
+                || target.pod_id.as_str() != record.pod_id
+                || target.pod_incarnation != record.pod_incarnation
+                || target.resource_id.as_str() != record.resources[0].id
+                || target.resource_epoch != record.resources[0].epoch
+                || target.resource_input_epoch != current.resources()[0].input_epoch().get()
+            {
+                return Ok(None);
+            }
+            let lease = match self.store.inspect_native_writer_lease(&target) {
+                Ok(value) => value,
+                Err(_) => return Ok(None),
+            };
+            if lease.target() != &target
+                || lease.holder_actor_id() != &actor.actor_id
+                || lease.holder_credential_generation() != actor.credential_generation.get()
+                || lease.owner_epoch() != self.manager_claim.owner_epoch()
+                || lease.manager_credential_epoch() != self.manager_claim.credential_epoch()
+                || lease.authority_revision() != self.recorded.revision
+                || lease.writer_epoch() != 1
+            {
+                return Ok(None);
+            }
+            self.recheck_actor_resolution_manager()?;
+            let fresh_actor = self.host.authenticate(transport)?;
+            if durable_actor(fresh_actor) != durable_actor(&actor)
+                || !self
+                    .store
+                    .current_bound_pod_snapshot(scope.as_str(), &record.pod_id)
+                    .is_ok_and(|snapshot| snapshot.launch() == &record)
+                || self
+                    .store
+                    .inspect_native_writer_lease(&target)
+                    .ok()
+                    .as_ref()
+                    != Some(&lease)
+            {
+                return Ok(None);
+            }
+            self.recheck_actor_resolution_manager()?;
+            if policy.deadline <= Instant::now() {
+                return Ok(None);
+            }
+            Ok(Some(InitialBootstrapGuard {
+                target,
+                owner_epoch: lease.owner_epoch(),
+                session_revision,
+                writer_epoch: lease.writer_epoch(),
+                expires_at_unix_seconds: lease.expires_at_unix_seconds(),
+            }))
+        }
+    }
+
     /// Keep the durable `commands.get` receipt authoritative and optionally
     /// attach a fresh pod-journal observation for this actor's claimed first
     /// send. A stale lease, missing pod, malformed reply or port refusal drops

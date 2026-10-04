@@ -137,7 +137,11 @@ where
         transport: &T,
         request: ReadEnvelope,
     ) -> Result<Value, RuntimeError> {
-        HostReadHandler::new(self.authority).read(transport, request)
+        match self.bootstrap_send_policy {
+            Some(policy) => HostReadHandler::with_bootstrap_policy(self.authority, policy)
+                .read(transport, request),
+            None => HostReadHandler::new(self.authority).read(transport, request),
+        }
     }
 }
 
@@ -351,7 +355,7 @@ fn project_launch_receipt<P: HostDispatchPort>(
     Ok(receipt)
 }
 
-fn bootstrap_guard_json(guard: &InitialBootstrapGuard) -> Value {
+pub(crate) fn bootstrap_guard_json(guard: &InitialBootstrapGuard) -> Value {
     let target = guard.target();
     json!({
         "available": true,
