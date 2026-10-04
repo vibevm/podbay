@@ -1296,6 +1296,22 @@ impl CodexResource<crate::process_transport::ProcessJsonlTransport> {
     ) -> io::Result<crate::process_transport::KernelChildBirthObservation> {
         self.io.attest_kernel_birth()
     }
+
+    /// Observe only the owned direct child's exit. A returned observation is
+    /// from the retained Child handle; None means it was still running then.
+    pub fn observe_owned_child_exit(
+        &mut self,
+    ) -> io::Result<Option<crate::process_transport::ChildExitObservation>> {
+        self.io.observe_exit()
+    }
+
+    /// Request bounded direct-child termination and return only an observed
+    /// reap. Errors do not prove exit; no raw JSONL writer is exposed.
+    pub fn dispose_owned_child(
+        &mut self,
+    ) -> io::Result<crate::process_transport::ChildExitObservation> {
+        self.io.dispose()
+    }
 }
 
 fn request_key(value: Option<&Value>) -> Option<String> {

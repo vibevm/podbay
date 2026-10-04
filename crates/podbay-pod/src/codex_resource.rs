@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use podbay_adapter_codex::{
-    ApprovalPolicy, ChildLaunchSpec, CodexResource, KernelChildBirthObservation, PinnedCodexConfig,
-    ProcessJsonlTransport, ResourceIdentity, Sandbox,
+    ApprovalPolicy, ChildExitObservation, ChildLaunchSpec, CodexResource,
+    KernelChildBirthObservation, PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity,
+    Sandbox,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use podbay_wire::{
@@ -76,8 +77,8 @@ impl ValidatedCodexResourceLaunch {
     }
 }
 
-/// Owns the structured adapter and its direct child. Only observational
-/// methods are exposed by this slice; it cannot submit a model turn.
+/// Owns the structured adapter and its direct child. Exposes lifecycle
+/// observation and bounded disposal, but cannot submit a model turn.
 pub struct PodCodexResource {
     resource: CodexResource<ProcessJsonlTransport>,
     child_birth: KernelChildBirthObservation,
@@ -216,6 +217,55 @@ impl PodCodexResource {
 
     pub fn child_birth(&self) -> &KernelChildBirthObservation {
         &self.child_birth
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child_birth.pid
+    }
+
+    /// Observe the retained direct-child handle. The outer None means the
+    /// child was running at observation; an inner None means it exited by
+    /// signal, which must not be reported as exit code zero.
+    pub fn try_wait(&mut self) -> Result<Option<Option<i32>>, PodError> {
+        if let Some(exit) = self.resource.observe_owned_child_exit()? {
+            return self.checked_exit_code(exit).map(Some);
+        }
+        let live = self.recheck_child();
+        if let Some(exit) = self.resource.observe_owned_child_exit()? {
+            return self.checked_exit_code(exit).map(Some);
+        }
+        live?;
+        Ok(None)
+    }
+
+    /// Stop only the exact observed direct child after checking its birth and
+    /// pod cgroup. Success means the retained child handle observed a reap;
+    /// the pod unit remains responsible for any descendant processes.
+    pub fn stop(&mut self) -> Result<(), PodError> {
+        if let Some(exit) = self.resource.observe_owned_child_exit()? {
+            self.checked_exit_code(exit)?;
+            return Ok(());
+        }
+        if let Err(live_error) = self.recheck_child() {
+            if let Some(exit) = self.resource.observe_owned_child_exit()? {
+                self.checked_exit_code(exit)?;
+                return Ok(());
+            }
+            return Err(live_error);
+        }
+        let exit = self
+            .resource
+            .dispose_owned_child()
+            .map_err(|_| PodError::Uncertain("Codex direct-child reap was not observed"))?;
+        self.checked_exit_code(exit)?;
+        Ok(())
+    }
+
+    fn checked_exit_code(&self, exit: ChildExitObservation) -> Result<Option<i32>, PodError> {
+        if exit.pid != self.child_birth.pid {
+            return Err(PodError::Refused("Codex child exit belongs to another PID"));
+        }
+        Ok(exit.status.code())
     }
 
     /// Recheck the same live direct child and exact pod boot/cgroup. A future

@@ -321,6 +321,8 @@ fn native_systemd_child_helper() {
     let mut resource = PodCodexResource::spawn_initialized(reviewed, home).unwrap();
     let birth = resource.recheck_child().unwrap();
     assert_eq!(&birth, resource.child_birth());
+    assert_eq!(resource.pid(), birth.pid);
+    assert_eq!(resource.try_wait().unwrap(), None);
     assert!(birth.pid > 0 && birth.start_ticks > 0);
     assert_eq!(
         birth.cgroup_path.rsplit('/').next(),
@@ -349,6 +351,10 @@ fn native_systemd_child_helper() {
     assert!(lines[0].contains("\"method\":\"initialize\""));
     assert!(lines[1].contains("\"method\":\"initialized\""));
     assert!(!frames.contains("turn/start"));
+    resource.stop().unwrap();
+    assert_eq!(resource.try_wait().unwrap(), Some(None));
+    assert!(resource.recheck_child().is_err());
+    resource.stop().unwrap();
 }
 
 /// Optional native proof: no Codex executable, account, model input or turn.
