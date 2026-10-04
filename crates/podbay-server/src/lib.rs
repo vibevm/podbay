@@ -1,6 +1,6 @@
 //! Authenticated PodBay/1 exchanges over an owned Linux socket. The default
 //! listener is read-only; explicit trusted policies enable root launch and
-//! the first claimed Codex session send. No automatic retry lives here.
+//! claimed Codex session sends. No automatic retry lives here.
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]

@@ -14,15 +14,18 @@ use podbay_core::{
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
+    CurrentCodexAnchorObservation,
     PortDispatchOutcome, PortPendingRecoveryObservation, PortRebindObservation,
     PortRecoveredActiveObservation,
     PortReceiptRef, PreparedCodexV2Rebind, PreparedPendingRecovery,
     ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection,
+    ResolvedClaimedLaterTurn, ResolvedCurrentCodexAnchorInspection,
     ResolvedClaimedCodexV3Bootstrap, ResolvedNativeCodexLaunch, ResolvedNativeCodexV3Launch,
     ResolvedNativeLaunch,
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
+    LaterTurnControlStage,
     CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY, LinuxPeerEvidence, PodClient, PodError,
     PodManifest, PodPeerBootstrap, PodStatus, RebindInspection,
     peer_checkpoint_observation_digest,
@@ -1175,6 +1178,116 @@ impl HostDispatchPort for LinuxLaunchPort {
     ) -> Result<BootstrapNativeObservation, BootstrapObservationError> {
         self.inspect_claimed_bootstrap(inspection)
     }
+
+    fn inspect_current_codex_anchor(
+        &self,
+        inspection: ResolvedCurrentCodexAnchorInspection,
+    ) -> Result<CurrentCodexAnchorObservation, podbay_host::HostError> {
+        use podbay_host::HostError;
+        let target = inspection.target();
+        let mut context = current_turn_context(
+            &self.config, target, inspection.store_path(), inspection.store_file_identity(),
+            inspection.owner_epoch(), inspection.manager_credential_epoch(),
+            inspection.authority_revision(),
+        ).map_err(|_| HostError::StaleGuard)?;
+        let bootstrap = context.store.claimed_bootstrap_lineage_for_session(
+            &target.scope_id, &target.session_id,
+        ).map_err(|_| HostError::StaleGuard)?;
+        if bootstrap.receipt().command_id != inspection.bootstrap_command_id().as_str()
+            || bootstrap.receipt().request_digest != inspection.bootstrap_request_digest()
+            || bootstrap.holder_actor_id() != context.lease.holder_actor_id()
+            || context.lease.writer_epoch() != inspection.writer_epoch()
+        { return Err(HostError::StaleGuard); }
+        let response = context.client.inspect_current_codex_anchor(
+            inspection.bootstrap_command_id(), target, inspection.writer_epoch(),
+            inspection.bootstrap_request_digest(),
+        ).map_err(|_| HostError::StaleGuard)?;
+        let after = context.client.attested_status().map_err(|_| HostError::StaleGuard)?;
+        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest)
+            || after.supervisor_pid != context.before.supervisor_pid
+            || after.supervisor_start_ticks != context.before.supervisor_start_ticks
+            || after.child_pid != context.before.child_pid
+            || after.child_start_ticks != context.before.child_start_ticks
+            || after.boot_id != context.before.boot_id
+            || after.cgroup_path != context.before.cgroup_path
+            || checked_store_file(inspection.store_path(), context.manager.uid())
+                .map_err(|_| HostError::StaleGuard)? != inspection.store_file_identity()
+            || fs::symlink_metadata(&context.manifest_path).ok()
+                .map(|meta| (meta.dev(), meta.ino())) != Some(context.manifest_identity)
+            || context.store.inspect_native_writer_lease(target).ok().as_ref()
+                != Some(&context.lease)
+            || context.store.claimed_bootstrap_lineage_for_session(
+                &target.scope_id, &target.session_id,
+            ).ok().as_ref() != Some(&bootstrap)
+        { return Err(HostError::StaleGuard); }
+        CurrentCodexAnchorObservation::from_attested_pod(
+            &response.protocol, target.clone(), inspection.bootstrap_command_id().clone(),
+            response.bootstrap_request_digest, response.writer_epoch,
+            response.native_thread_id, response.native_session_id,
+        )
+    }
+
+    fn accepts_claimed_codex_turn(&self) -> bool { self.config.recheck().is_ok() }
+
+    fn send_claimed_codex_turn(
+        &mut self,
+        claimed: ResolvedClaimedLaterTurn,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        fn refused<E>(_: E) -> PortDispatchError { PortDispatchError::RefusedBeforeEffect }
+        let selector = claimed.selector();
+        let target = &selector.native_target;
+        let receipt = PortReceiptRef::from_port(&format!(
+            "podbay.turn.{}", selector.command_id.as_str(),
+        )).map_err(refused)?;
+        let uncertain = || PortDispatchError::UncertainAfterPossibleEffect {
+            receipt_ref: Some(receipt.clone()),
+        };
+        let mut context = current_turn_context(
+            &self.config, target, claimed.store_path(), claimed.store_file_identity(),
+            claimed.owner_epoch(), claimed.manager_credential_epoch(),
+            claimed.authority_revision(),
+        ).map_err(refused)?;
+        let proof = context.store.inspect_claimed_later_codex_send(selector).map_err(refused)?;
+        if proof.receipt().request_digest != claimed.expected_request_digest()
+            || proof.native_thread_id() != claimed.native_thread_id()
+            || proof.writer_epoch() != claimed.writer_epoch()
+            || proof.owner_epoch() != claimed.owner_epoch()
+            || proof.manager_credential_epoch() != claimed.manager_credential_epoch()
+            || proof.authority_revision() != claimed.authority_revision()
+            || context.lease.writer_epoch() != proof.writer_epoch()
+            || context.lease.holder_actor_id() != proof.holder_actor_id()
+            || context.lease.holder_credential_generation() != proof.holder_credential_generation()
+            || context.lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+        { return Err(PortDispatchError::RefusedBeforeEffect); }
+        self.config.recheck().map_err(refused)?;
+        if checked_store_file(claimed.store_path(), context.manager.uid()).map_err(refused)?
+            != claimed.store_file_identity()
+        { return Err(PortDispatchError::RefusedBeforeEffect); }
+        let response = context.client.submit_claimed_codex_turn(
+            selector, claimed.writer_epoch(), claimed.expected_request_digest(),
+            claimed.native_thread_id(),
+        ).map_err(|_| uncertain())?;
+        let after = context.client.attested_status().map_err(|_| uncertain())?;
+        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest)
+            || after.supervisor_pid != context.before.supervisor_pid
+            || after.supervisor_start_ticks != context.before.supervisor_start_ticks
+            || after.child_pid != context.before.child_pid
+            || after.child_start_ticks != context.before.child_start_ticks
+            || after.boot_id != context.before.boot_id
+            || after.cgroup_path != context.before.cgroup_path
+            || self.config.recheck().is_err()
+            || checked_store_file(claimed.store_path(), context.manager.uid()).map_err(|_| uncertain())?
+                != claimed.store_file_identity()
+            || fs::symlink_metadata(&context.manifest_path).ok()
+                .map(|meta| (meta.dev(), meta.ino())) != Some(context.manifest_identity)
+            || context.store.inspect_claimed_later_codex_send(selector).ok().as_ref() != Some(&proof)
+        { return Err(uncertain()); }
+        match response.stage {
+            LaterTurnControlStage::Submitted { .. } => Ok(PortDispatchOutcome::Accepted(receipt)),
+            LaterTurnControlStage::Settled { .. } => Ok(PortDispatchOutcome::Settled(receipt)),
+            _ => Err(uncertain()),
+        }
+    }
 }
 
 fn check_inspection_store(
@@ -1600,6 +1713,131 @@ fn bootstrap_status_matches(
         && bound.store_lineage == target.store_lineage.as_str()
         && bound.owner_epoch == claimed.owner_epoch()
         && bound.credential_epoch == claimed.manager_credential_epoch()
+}
+
+fn current_codex_turn_status_matches(
+    status: &PodStatus,
+    target: &NativeWriterTarget,
+    binding: &BoundPeerManifest,
+    manifest: &PodManifest,
+) -> bool {
+    let Some(bound) = status.bound.as_ref() else { return false; };
+    status.child_running
+        && status.pod_id == target.pod_id.as_str()
+        && status.attempt_id == target.attempt_id.as_str()
+        && status.incarnation == target.pod_incarnation
+        && status.manifest_digest == manifest.digest
+        && bound.capability == binding.capability
+        && matches!(bound.capability.as_str(), CODEX_V2_CAPABILITY | CODEX_V3_CAPABILITY)
+        && bound.scope_id == target.scope_id.as_str()
+        && bound.resource_id == target.resource_id.as_str()
+        && bound.resource_epoch == target.resource_epoch
+        && bound.store_lineage == target.store_lineage.as_str()
+        && bound.owner_epoch == binding.owner_epoch
+        && bound.credential_epoch == binding.credential_epoch
+        && bound.policy_fence == binding.policy_fence
+}
+
+struct CurrentTurnContext {
+    manager: LinuxPeerEvidence,
+    manifest_path: PathBuf,
+    manifest_identity: (u64, u64),
+    manifest: PodManifest,
+    binding: BoundPeerManifest,
+    client: PodClient,
+    store: PodBayStore,
+    lease: podbay_store::NativeWriterLease,
+    before: PodStatus,
+}
+
+fn current_turn_context(
+    config: &TrustedLinuxLaunchConfig,
+    target: &NativeWriterTarget,
+    store_path: &Path,
+    store_identity: (u64, u64),
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    authority_revision: u64,
+) -> Result<CurrentTurnContext, ()> {
+    config.recheck().map_err(|_| ())?;
+    let manager = LinuxPeerEvidence::for_current_process().map_err(|_| ())?;
+    if checked_store_file(store_path, manager.uid()).map_err(|_| ())? != store_identity {
+        return Err(());
+    }
+    let incarnation = Epoch::new(target.pod_incarnation).map_err(|_| ())?;
+    let manifest_path = podbay_pod::manifest_path_for_identity(
+        &config.directory, &target.pod_id, &target.attempt_id, incarnation,
+    );
+    let meta = fs::symlink_metadata(&manifest_path).map_err(|_| ())?;
+    if !meta.is_file() || meta.nlink() != 1 || meta.uid() != manager.uid()
+        || meta.mode() & 0o077 != 0 || meta.len() == 0 || meta.len() > 1_048_576
+        || fs::canonicalize(&manifest_path).map_err(|_| ())? != manifest_path
+    { return Err(()); }
+    let manifest: PodManifest = serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| ())?)
+        .map_err(|_| ())?;
+    let binding = podbay_pod::current_bound_peer_binding(&manifest_path).map_err(|_| ())?;
+    if !matches!(binding.capability.as_str(), CODEX_V2_CAPABILITY | CODEX_V3_CAPABILITY)
+        || binding.store_path != store_path
+        || binding.store_lineage != target.store_lineage.as_str()
+        || binding.owner_epoch != owner_epoch
+        || binding.credential_epoch != manager_credential_epoch
+        || binding.resource_epoch != target.resource_epoch
+        || binding.resource_input_epochs.len() != 1
+        || binding.resource_input_epochs.get(target.resource_id.as_str())
+            != Some(&target.resource_input_epoch)
+        || manifest.descriptor.scope_id != target.scope_id.as_str()
+        || manifest.descriptor.session_id != target.session_id.as_str()
+        || manifest.descriptor.run_id != target.run_id.as_str()
+        || manifest.descriptor.attempt_id != target.attempt_id.as_str()
+        || manifest.descriptor.pod_id != target.pod_id.as_str()
+        || manifest.descriptor.incarnation != target.pod_incarnation
+        || manifest.descriptor.resource_id != target.resource_id.as_str()
+        || manifest.descriptor.pty.is_some()
+        || binding.manager_os_identity != manager.attested_peer().os_identity()
+        || binding.manager_process_id != manager.attested_peer().native_process_id()
+        || binding.manager_boot_identity != manager.attested_peer().boot_identity()
+        || binding.manager_birth_identity != manager.attested_peer().birth_identity()
+        || binding.manager_containment != manager.attested_peer().containment_identity()
+    { return Err(()); }
+    let mut store = PodBayStore::open_existing_read_only(store_path).map_err(|_| ())?;
+    let (current_target, _) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).map_err(|_| ())?;
+    let lease = store.inspect_native_writer_lease(target).map_err(|_| ())?;
+    let bound = store.current_bound_pod_snapshot(
+        target.scope_id.as_str(), target.pod_id.as_str(),
+    ).map_err(|_| ())?;
+    let claim = store.current_manager_credential_claim(owner_epoch).map_err(|_| ())?;
+    if current_target != *target
+        || lease.target() != target
+        || lease.owner_epoch() != owner_epoch
+        || lease.manager_credential_epoch() != manager_credential_epoch
+        || lease.authority_revision() > authority_revision
+        || bound.store_lineage() != &target.store_lineage
+        || bound.owner_epoch().get() != owner_epoch
+        || bound.authority_revision() != authority_revision
+        || bound.launch().descriptor != binding.wire_descriptor
+        || bound.launch().effective_spec != binding.effective_spec
+        || claim.store_lineage() != target.store_lineage.as_str()
+        || claim.credential_epoch() != manager_credential_epoch
+        || !store.current_manager_peer_matches(&claim, manager.attested_peer()).map_err(|_| ())?
+        || (binding.capability == CODEX_V3_CAPABILITY
+            && bound.current_policy_fence().is_none_or(|fence| {
+                binding.policy_fence.as_ref().is_none_or(|expected| {
+                    fence.policy_fence_epoch != expected.policy_fence_epoch
+                        || fence.admission_authority_revision != expected.admission_authority_revision
+                })
+            }))
+    { return Err(()); }
+    let client = PodClient::connect(&manifest_path).map_err(|_| ())?;
+    let before = client.attested_status().map_err(|_| ())?;
+    if !current_codex_turn_status_matches(&before, target, &binding, &manifest) {
+        return Err(());
+    }
+    Ok(CurrentTurnContext {
+        manager, manifest_path, manifest_identity: (meta.dev(), meta.ino()),
+        manifest, binding, client, store, lease, before,
+    })
 }
 
 fn bootstrap_status_matches_v3(

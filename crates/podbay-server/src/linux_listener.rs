@@ -247,7 +247,7 @@ impl LinuxManagerCommandsGetListener {
         })
     }
 
-    /// Opt in to root launch and one first `session.send` on the same socket.
+    /// Opt in to root launch and claimed Codex `session.send` on the same socket.
     /// An exchange is dispatched once; duplicate reconciliation belongs to
     /// the durable authority and the pod journal, never this listener loop.
     pub fn serve_until_with_launch_and_first_send<P: HostDispatchPort>(

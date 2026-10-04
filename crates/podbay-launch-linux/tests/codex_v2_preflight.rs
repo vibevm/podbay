@@ -38,11 +38,11 @@ use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY,
     CodexCommandJournal,
     CodexJournalIdentity, CodexJournalStage, LinuxBackend, NativeEventCursor, NativeEventKind,
-    PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
+    LaterTurnControlStage, PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
     manifest_path_for_identity,
 };
 use podbay_store::{
-    CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore, StoreError,
+    CommandLookupSelector, EffectClaim, LaterCodexSendSelector, LaunchDispatchStage, PodBayStore, StoreError,
     TrustedNativeWriterLeaseRequest,
 };
 use podbay_wire::{
@@ -3244,6 +3244,328 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
     assert!(native.is_none());
     assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
     assert!(!client.stop().unwrap().child_running);
+}
+
+fn install_fake_completed_then_second_turn(fixture: &Fixture, lost_reply: bool) {
+    let original = fs::read_to_string(&fixture.executable).unwrap();
+    let replacement = r#"sleep 1
+printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed","items":[]}}}\n'
+printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\n'
+read -r completion_read
+printf '%s\n' "$completion_read" >> "$CODEX_HOME/frames.log"
+printf '{"id":5,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
+read -r later_read
+printf '%s\n' "$later_read" >> "$CODEX_HOME/frames.log"
+printf '{"id":6,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
+read -r later_turn
+printf '%s\n' "$later_turn" >> "$CODEX_HOME/frames.log"
+__LATER_TURN_REPLY__
+sleep __WAIT_AFTER_TURN__
+"#;
+    let response = if lost_reply { "" } else {
+        "printf '{\"id\":7,\"result\":{\"turn\":{\"id\":\"turn.later.fixture\",\"status\":\"inProgress\",\"items\":[]}}}\\n'"
+    };
+    let replacement = replacement.replace("__LATER_TURN_REPLY__", response)
+        .replace("__WAIT_AFTER_TURN__", if lost_reply { "40" } else { "30" });
+    let updated = original.replacen("sleep 30\n", &replacement, 1);
+    assert_ne!(updated, original);
+    fs::write(&fixture.executable, updated).unwrap();
+}
+
+fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    install_fake_completed_then_second_turn(&fixture, lost_reply);
+    let mut port = port_for(&fixture, &binary);
+    let reference = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone()).unwrap(),
+    ).unwrap();
+    let (fixture, mut host, _, _, transport, launch_request) = setup_with_port(
+        Role::Coordinator, fixture, port, Duration::from_secs(45), 90,
+    );
+    let accepted = host.dispatch_prepared_bound_root_codex_v2(
+        &transport, launch_request.clone(),
+    ).unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);
+    let client = PodClient::connect(&manifest).unwrap();
+    assert!(client.attested_status().unwrap().child_running);
+    let session = SessionId::try_from("session.codex.preflight").unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        launch_request.host_request.grant_id, Instant::now() + Duration::from_secs(75),
+    ).unwrap();
+    let lease = host.acquire_initial_bootstrap_writer_lease(&transport, &session, &policy, 90).unwrap();
+    let (target, revision) = PodBayStore::open(&fixture.database).unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session).unwrap();
+    let guard = Some(Guard {
+        manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+        pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+        resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+        writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+        lease_epoch: None, target_revision: Some(DecimalString::new(revision)),
+    });
+    let first = CommandEnvelope::new(
+        "request.v22.first", "key.v22.first",
+        WireTarget::Session { session_id: session.as_str().into() }, guard.clone(), None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "fixture first turn".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let first_receipt = host.send_codex_session_from_wire(&transport, first, &policy).unwrap();
+    assert!(matches!(first_receipt.port_observation, Some(BootstrapPortObservation::PodAccepted(_))));
+    let begin_status = Instant::now();
+    assert!(client.attested_status().unwrap().child_running);
+    assert!(begin_status.elapsed() < Duration::from_secs(2));
+    let first_id = CommandId::try_from(first_receipt.receipt.command_id.as_str()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let observed = client.inspect_claimed_codex_bootstrap(&first_id, &target, lease.writer_epoch()).unwrap();
+        if observed.settlement == Some(BootstrapSettlementStage::Completed) { break; }
+        assert!(Instant::now() < deadline, "bootstrap did not durably complete");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(reopened_bootstrap_journal(&fixture).stage, CodexJournalStage::BootstrapCompleted);
+    let second = CommandEnvelope::new(
+        "request.v22.second", "key.v22.second",
+        WireTarget::Session { session_id: session.as_str().into() }, guard.clone(), None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "fixture second turn".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let second_receipt = host.send_codex_session_from_wire(&transport, second.clone(), &policy).unwrap();
+    if lost_reply {
+        assert!(matches!(second_receipt.port_observation,
+            Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
+    } else {
+        assert!(matches!(second_receipt.port_observation,
+            Some(BootstrapPortObservation::PodAccepted(_))));
+    }
+    let second_id = CommandId::try_from(second_receipt.receipt.command_id.as_str()).unwrap();
+    let selector = LaterCodexSendSelector {
+        scope_id: fixture.scope.clone(), command_id: second_id,
+        native_target: target.clone(),
+    };
+    let observed = client.inspect_claimed_codex_turn(
+        &selector, lease.writer_epoch(), &second_receipt.receipt.request_digest, "thread.fixture",
+    ).unwrap_or_else(|error| {
+        let status = client.attested_status();
+        let mut store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+        let lease_state = store.inspect_native_writer_lease(&target);
+        panic!("later-turn inspection failed: {error:?}; status={status:?}; lease={lease_state:?}");
+    });
+    if lost_reply {
+        assert!(matches!(observed.stage, LaterTurnControlStage::SubmissionUncertain));
+    } else {
+        assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { ref native_turn_id }
+            if native_turn_id == "turn.later.fixture"));
+    }
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    let methods = fs::read_to_string(&frames).unwrap().lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+            .as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!(methods.iter().filter(|method| method.as_str() == "turn/start").count(), 2);
+    let mut retry = second;
+    retry.request_id = "request.v22.second.retry".into();
+    let duplicate = host.send_codex_session_from_wire(&transport, retry, &policy).unwrap();
+    assert!(duplicate.duplicate && !duplicate.port_called);
+    assert_eq!(duplicate.receipt, second_receipt.receipt);
+    let after = fs::read_to_string(&frames).unwrap();
+    assert_eq!(after.lines().count(), methods.len());
+    let final_status = client.attested_status().unwrap();
+    if !lost_reply { assert!(final_status.child_running); }
+    assert!(!client.stop().unwrap().child_running);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_second_turn_claims_once_and_reconciles_without_resend() {
+    run_disposable_codex_v22_second_turn(false);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_lost_second_reply_is_uncertain_and_never_resends() {
+    run_disposable_codex_v22_second_turn(true);
+}
+
+#[test]
+#[ignore = "helper for disposable v22 completed-bootstrap A process"]
+fn rebind_v22_first_completed_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone()).unwrap(),
+    ).unwrap();
+    let (fixture, mut host, _, _, transport, request) = setup_with_port(
+        Role::Coordinator, fixture, port, Duration::from_secs(45), 90,
+    );
+    let accepted = host.dispatch_prepared_bound_root_codex_v2(&transport, request.clone()).unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let client = PodClient::connect(&manifest).unwrap();
+    let status = client.attested_status().unwrap();
+    assert!(status.child_running);
+    fs::write(fixture.directory.join("rebind.v22.first.pid"), status.child_pid.to_string()).unwrap();
+    let session = SessionId::try_from("session.codex.preflight").unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        request.host_request.grant_id, Instant::now() + Duration::from_secs(60),
+    ).unwrap();
+    let lease = host.acquire_initial_bootstrap_writer_lease(&transport, &session, &policy, 90).unwrap();
+    fs::write(fixture.directory.join("rebind.v22.first.writer_epoch"),
+        lease.writer_epoch().to_string()).unwrap();
+    let (target, revision) = PodBayStore::open(&fixture.database).unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session).unwrap();
+    let send = CommandEnvelope::new(
+        "request.v22.rebind.first", "key.v22.rebind.first",
+        WireTarget::Session { session_id: session.as_str().into() },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+            lease_epoch: None, target_revision: Some(DecimalString::new(revision)),
+        }), None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "fixture first turn".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let first = host.send_codex_session_from_wire(&transport, send, &policy).unwrap();
+    assert!(matches!(first.port_observation, Some(BootstrapPortObservation::PodAccepted(_))));
+    let id = CommandId::try_from(first.receipt.command_id.as_str()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let observed = client.inspect_claimed_codex_bootstrap(&id, &target, lease.writer_epoch()).unwrap();
+        if observed.settlement == Some(BootstrapSettlementStage::Completed) { break; }
+        assert!(Instant::now() < deadline, "A bootstrap did not complete before rebind");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    fs::write(fixture.directory.join("rebind.v22.first.done"), first.receipt.command_id).unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
+#[ignore = "helper for disposable v22 later turn after A to B rebind"]
+fn rebind_v22_second_later_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone()).unwrap(),
+    ).unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let actor = ActorId::try_from("actor.codex.preflight").unwrap();
+    let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000, 4242, 777, "/user.slice/preflight.scope",
+    ).unwrap();
+    let transport = Transport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        process.clone(), CredentialGeneration::new(1).unwrap(),
+    ));
+    host.reattest_actor_from_trusted_replay(&transport,
+        ActorRegistration::owner_cli_from_trusted_policy(
+            actor.clone(), fixture.scope.clone(), process, CredentialGeneration::new(1).unwrap(),
+        ),
+    ).unwrap();
+    let recorded_id = host.recorded_snapshot().grants[0].grant_id;
+    let grant = host.activate_recorded_grant_for_actor_from_trusted_replay(
+        &actor, &fixture.scope, recorded_id,
+    ).unwrap();
+    let key = "rebind.native.v22.second";
+    assert_eq!(host.prepare_current_codex_v2_rebind(&fixture.scope, &fixture.pod, key)
+        .unwrap().phase, podbay_store::DurableRebindPhase::Pending);
+    let completed = host.complete_current_codex_v2_rebind(&fixture.scope, &fixture.pod, key).unwrap();
+    assert_eq!(completed.stage, RebindCompletionStage::PodActive);
+    let session = SessionId::try_from("session.codex.preflight").unwrap();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (target, revision) = store.current_native_writer_target_for_session(&fixture.scope, &session).unwrap();
+    let owner = store.owner_epoch().unwrap();
+    let manager_credential = store.current_manager_credential_claim(owner).unwrap().credential_epoch();
+    let prior_epoch: u64 = fs::read_to_string(
+        fixture.directory.join("rebind.v22.first.writer_epoch"),
+    ).unwrap().parse().unwrap();
+    let lease = store.acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+        target: target.clone(), holder_actor_id: actor.clone(), holder_credential_generation: 1,
+        expected_owner_epoch: owner,
+        expected_manager_credential_epoch: manager_credential,
+        expected_authority_revision: host.recorded_snapshot().revision,
+        expected_writer_epoch: Some(prior_epoch), ttl_seconds: 90,
+    }).unwrap();
+    drop(store);
+    assert_eq!(lease.writer_epoch(), prior_epoch + 1);
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant, Instant::now() + Duration::from_secs(60),
+    ).unwrap();
+    let second = CommandEnvelope::new(
+        "request.v22.rebind.second", "key.v22.rebind.second",
+        WireTarget::Session { session_id: session.as_str().into() },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(owner)),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+            lease_epoch: None, target_revision: Some(DecimalString::new(revision)),
+        }), None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "fixture second turn".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let submitted = host.send_codex_session_from_wire(&transport, second.clone(), &policy).unwrap();
+    assert!(matches!(submitted.port_observation, Some(BootstrapPortObservation::PodAccepted(_))),
+        "B second-turn observation: {:?}", submitted.port_observation);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let client = PodClient::connect(&manifest).unwrap();
+    let status = client.attested_status().unwrap();
+    assert_eq!(status.child_pid.to_string(), fs::read_to_string(
+        fixture.directory.join("rebind.v22.first.pid")).unwrap());
+    let selector = LaterCodexSendSelector {
+        scope_id: fixture.scope.clone(),
+        command_id: CommandId::try_from(submitted.receipt.command_id.as_str()).unwrap(),
+        native_target: target,
+    };
+    let observed = client.inspect_claimed_codex_turn(&selector, lease.writer_epoch(),
+        &submitted.receipt.request_digest, "thread.fixture").unwrap();
+    assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { .. }));
+    let mut retry = second;
+    retry.request_id = "request.v22.rebind.second.retry".into();
+    let duplicate = host.send_codex_session_from_wire(&transport, retry, &policy).unwrap();
+    assert!(duplicate.duplicate && !duplicate.port_called);
+    assert_eq!(duplicate.receipt, submitted.receipt);
+    let frames = fs::read_to_string(fixture_codex_slot(&fixture).join("home/codex/frames.log")).unwrap();
+    assert_eq!(frames.lines().filter(|line| line.contains("\"method\":\"turn/start\"")).count(), 2);
+    assert!(!client.stop().unwrap().child_running);
+    fs::write(fixture.directory.join("rebind.v22.second.done"), b"one_second_turn").unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_second_turn_after_a_to_b_rebind_uses_current_anchor() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    install_fake_completed_then_second_turn(&fixture, false);
+    run_rebind_manager_helper("rebind_v22_first_completed_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);
+    assert!(fixture.directory.join("rebind.v22.first.done").is_file());
+    run_rebind_manager_helper("rebind_v22_second_later_manager_process_helper", &fixture, &binary);
+    assert!(fixture.directory.join("rebind.v22.second.done").is_file());
 }
 
 #[test]
