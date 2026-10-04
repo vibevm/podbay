@@ -320,6 +320,7 @@ name = "podbay-host"
 version = "0.1.0"
 dependencies = [
  "ed25519-compact",
+ "getrandom",
  "libc",
  "podbay-core",
  "podbay-store",
