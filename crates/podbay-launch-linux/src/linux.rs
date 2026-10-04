@@ -396,6 +396,9 @@ impl LinuxLaunchPort {
         let manager = LinuxPeerEvidence::for_current_process().map_err(refused)?;
         let database_identity =
             checked_store_file(claimed.store_path(), manager.uid()).map_err(refused)?;
+        if database_identity != claimed.store_file_identity() {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
         let incarnation = Epoch::new(target.pod_incarnation).map_err(refused)?;
         let manifest_path = podbay_pod::manifest_path_for_identity(
             &self.config.directory,
@@ -495,7 +498,7 @@ impl LinuxLaunchPort {
         }
         self.config.recheck().map_err(refused)?;
         if checked_store_file(claimed.store_path(), manager.uid()).map_err(refused)?
-            != database_identity
+            != claimed.store_file_identity()
             || fs::symlink_metadata(&manifest_path).map_err(refused)?.ino() != manifest_meta.ino()
         {
             return Err(PortDispatchError::RefusedBeforeEffect);
@@ -522,7 +525,7 @@ impl LinuxLaunchPort {
                 .map(|metadata| (metadata.dev(), metadata.ino()))
                 != Some((manifest_meta.dev(), manifest_meta.ino()))
             || checked_store_file(claimed.store_path(), manager.uid()).map_err(|_| uncertain())?
-                != database_identity
+                != claimed.store_file_identity()
             || response
                 .request_digest
                 .as_deref()
