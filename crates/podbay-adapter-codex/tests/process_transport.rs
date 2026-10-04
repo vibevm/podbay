@@ -266,6 +266,186 @@ fn isolated_real_app_server_handshake() {
     assert!(transport.observe_exit().unwrap().is_some());
 }
 
+/// Opt-in native shape probe. This creates a thread in an empty private home
+/// but never submits `turn/start`, invokes a model, or uses account credentials.
+/// PODBAY_CODEX_APP_SERVER_EXE=/absolute/path/to/codex cargo test \
+///   -p podbay-adapter-codex --test process_transport \
+///   isolated_real_app_server_thread_start_without_turn -- --ignored
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires an explicit reviewed Codex 0.159.3 executable"]
+fn isolated_real_app_server_thread_start_without_turn() {
+    let executable = PathBuf::from(
+        std::env::var_os("PODBAY_CODEX_APP_SERVER_EXE")
+            .expect("PODBAY_CODEX_APP_SERVER_EXE must name a reviewed executable"),
+    );
+    assert!(
+        executable.is_absolute(),
+        "Codex executable must be absolute"
+    );
+    let dirs = PrivateDirs::new();
+    let version_spec = ChildLaunchSpec::new(
+        executable.clone(),
+        vec!["--version".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut version_child = ProcessJsonlTransport::spawn(version_spec).unwrap();
+    let version = version_child
+        .read_line()
+        .unwrap()
+        .expect("Codex version closed early");
+    let version_exit = version_child.dispose().unwrap();
+    assert_eq!(version_exit.pid, version_child.birth().pid);
+    assert_eq!(
+        String::from_utf8_lossy(&version).trim(),
+        format!("codex-cli {TESTED_CODEX_CLI_VERSION}"),
+        "Codex CLI version differs from the pinned schema receipt"
+    );
+
+    let spec = ChildLaunchSpec::new(
+        executable,
+        vec!["app-server".into(), "--listen".into(), "stdio://".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut transport = ProcessJsonlTransport::spawn(spec).unwrap();
+    let pid = transport.birth().pid;
+    let result = probe_thread_start_without_turn(&mut transport, &dirs);
+    let exit = transport
+        .dispose()
+        .expect("real app-server direct child was not reaped");
+    assert_eq!(exit.pid, pid);
+    assert!(transport.observe_exit().unwrap().is_some());
+    if let Err(detail) = result {
+        panic!("isolated thread/start probe failed: {detail}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn probe_thread_start_without_turn(
+    transport: &mut ProcessJsonlTransport,
+    dirs: &PrivateDirs,
+) -> Result<(), String> {
+    let initialize = raw_real_rpc(
+        transport,
+        1,
+        "initialize",
+        json!({"clientInfo":{"name":"podbay-thread-shape","version":"0.1.0"}}),
+    )?;
+    let home = initialize
+        .get("codexHome")
+        .and_then(Value::as_str)
+        .ok_or("initialize omitted codexHome")?;
+    if fs::canonicalize(home).map_err(|error| error.to_string())?
+        != fs::canonicalize(&dirs.codex_home).map_err(|error| error.to_string())?
+    {
+        return Err("app-server used a different CODEX_HOME".into());
+    }
+    transport
+        .write_line(
+            &encode(&json!({"method":"initialized","params":{}}))
+                .map_err(|error| format!("initialized encode: {error:?}"))?,
+        )
+        .map_err(|error| format!("initialized write: {error}"))?;
+
+    let start = raw_real_rpc(
+        transport,
+        2,
+        "thread/start",
+        json!({
+            "model":"gpt-6-sol",
+            "cwd":dirs.root,
+            "approvalPolicy":"never",
+            "sandbox":"danger-full-access",
+            "ephemeral":false,
+            "serviceName":"podbay-thread-shape",
+            "config":{"model_reasoning_effort":"medium"}
+        }),
+    )?;
+    let thread = start.get("thread").ok_or("thread/start omitted thread")?;
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("thread/start omitted thread id")?;
+    if thread.get("sessionId").and_then(Value::as_str).is_none()
+        || thread
+            .get("turns")
+            .and_then(Value::as_array)
+            .is_none_or(|turns| !turns.is_empty())
+        || thread.pointer("/status/type").and_then(Value::as_str) != Some("idle")
+        || start.get("model").and_then(Value::as_str) != Some("gpt-6-sol")
+        || start.get("reasoningEffort").and_then(Value::as_str) != Some("medium")
+        || start.get("approvalPolicy").and_then(Value::as_str) != Some("never")
+        || start.pointer("/sandbox/type").and_then(Value::as_str) != Some("dangerFullAccess")
+        || start.get("cwd").and_then(Value::as_str) != dirs.root.to_str()
+    {
+        return Err("thread/start effective response differed or a turn was created".into());
+    }
+    // The 0.159.3 app-server may refuse thread/read's list_turns path even
+    // though thread/start returned a complete idle thread with no turns.
+    let _ = thread_id;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn raw_real_rpc(
+    transport: &mut ProcessJsonlTransport,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let frame = encode(&json!({"id":id,"method":method,"params":params}))
+        .map_err(|error| format!("{method} encode: {error:?}"))?;
+    transport
+        .write_line(&frame)
+        .map_err(|error| format!("{method} write: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for _ in 0..64 {
+        if Instant::now() >= deadline {
+            return Err(format!("{method} response deadline elapsed"));
+        }
+        let frame = transport
+            .read_line()
+            .map_err(|error| format!("{method} read: {error}"))?
+            .ok_or_else(|| format!("{method} closed before response"))?;
+        let value = decode(&frame).map_err(|error| format!("{method} decode: {error:?}"))?;
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            if let Some(error) = value.get("error") {
+                let code = error.get("code").and_then(Value::as_i64);
+                let message: String = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("native RPC error without message")
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(256)
+                    .collect();
+                return Err(format!(
+                    "{method} RPC error code={code:?} message={message}"
+                ));
+            }
+            return value
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("{method} omitted result"));
+        }
+        if value.get("method").and_then(Value::as_str).is_none() {
+            return Err(format!("{method} observed unrelated RPC response"));
+        }
+    }
+    Err(format!("{method} notification limit exceeded"))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_real_result(transport: &mut ProcessJsonlTransport, expected_id: u64) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);

@@ -98,6 +98,20 @@ reap. On 2026-10-04 it passed locally (one test, exit 0) with no credentials and
 no thread or turn. Run it explicitly with
 `PODBAY_CODEX_APP_SERVER_EXE=/absolute/path/to/codex cargo test -p podbay-adapter-codex --test process_transport isolated_real_app_server_handshake -- --ignored`.
 
+The separate ignored `isolated_real_app_server_thread_start_without_turn`
+fixture uses the same isolated, credential-free launch and checks only
+`initialize` → `initialized` → `thread/start`. It requests `gpt-6-sol`,
+`medium`, `never` approval and `danger-full-access` in a disposable empty
+workspace, then verifies the returned thread ID/session, idle status, empty
+turn list, cwd and effective selection. It sends **no** `turn/start` or model
+input. Its first local run on 2026-10-04 passed every `thread/start` check but
+then failed at an optional `thread/read` with RPC `-32601` and message
+`list_turns is not supported yet`. The fixture no longer treats that
+unsupported read as part of its thread-start gate. This does not establish
+provider entitlement, a durable native writer, pod ownership, or turn success.
+The focused rerun passed (one ignored test selected, exit 0), and the direct
+child was reaped by the fixture's bounded disposal path.
+
 ## Pod-side stdio transport boundary
 
 The explicit child launcher takes a reviewed absolute executable, exact argv
@@ -111,8 +125,10 @@ a successful kill it waits up to three seconds for reap and reports an error
 if reap is unobserved. Only a successful exit observation proves direct-child
 reap; escaped-descendant containment is not established.
 
-The current transport discards child stderr, limiting diagnostics. Its child
-birth timestamp is the parent's observation after spawn, not an OS process
-start identity or ownership attestation. Fake child fixtures and the isolated
-real Codex handshake have exercised this launcher; provider accounts, session
-and turn lifecycle, and pod ownership remain uncertified.
+The current transport discards child stderr, limiting diagnostics. Its basic
+birth timestamp is the parent's observation after spawn; a separate Linux
+method rechecks PID/start ticks, boot ID and cgroup against `/proc` before
+returning a point-in-time direct-child receipt. Neither value proves pod
+membership or descendant containment. Fake child fixtures and isolated real
+Codex probes have exercised this launcher; provider accounts, turn lifecycle
+and pod ownership remain uncertified.
