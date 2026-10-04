@@ -1,5 +1,10 @@
 # PodBay
 
+**Future maintainers:** before expanding PodBay beyond the local Linux MVP,
+read [POST-MVP-CAMPAIGN.md](POST-MVP-CAMPAIGN.md) in full. It records the
+owner-deferred phases, dependencies, acceptance gates, and the boundary that
+lets Zap and VibeVM proceed without waiting for remote or cross-platform work.
+
 PodBay is an independent Rust project for supervising arbitrary processes and their resources. Its design includes a distributed supervisor: a local pod owns process and PTY lifetime, while a future multi-host control plane routes guarded commands and observations across computers within PodBay itself. Agent providers such as Codex are adapters on that process foundation. Zap consumes PodBay's public contract and does not own the supervised processes. Coordinator, worker, and advisor are roles in one session/run/attempt/pod model.
 
 Preproduction `0.1.0` has a versioned Rust wire contract, generated TypeScript binding, authenticated local Unix-socket transport, a durable command/event/outbox store, host authority, and Linux user-systemd pods. A private trusted manager policy and one-use setup socket enroll the exact launcher process and its process-owned Ed25519 key before enabling authenticated root Coordinator/Service launch and first `session.send`. The manager returns committed PodBay IDs and a current writer guard; `commands.get` reads the original command, current guard, and pod-journal evidence without repeating native input. `snapshot.get` reads a bounded current-scope projection with one event watermark rather than replaying historical commands. A fresh store is created directly at schema v23; an older schema is refused without migration.
