@@ -10,10 +10,10 @@ use std::time::Duration;
 use podbay_adapter_codex::{
     ApprovalPolicy, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, ChildExitObservation, ChildLaunchSpec,
     CodexError, CodexResource,
-    KernelChildBirthObservation, PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity,
-    Sandbox, WriterPermit,
+    KernelChildBirthObservation, NativeObservationKind, NativeObservationStatus,
+    PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity, Sandbox, WriterPermit,
 };
-use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
+use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId};
 use podbay_store::BootstrapSendRecord;
 use podbay_wire::{
     EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, ResourceDriver,
@@ -26,11 +26,16 @@ use crate::codex_credential::{
 use crate::codex_bootstrap::{BootstrapControlStage, BootstrapSettlementStage};
 use crate::codex_journal::{CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage, CodexJournalView};
 use crate::linux_peer::LinuxPeerEvidence;
+use crate::native_events::{
+    NativeEventAppend, NativeEventCursor, NativeEventIdentity, NativeEventKind, NativeEventRead,
+    NativeEventSpool, NativeEventStatus,
+};
 use crate::manifest::{
     BoundPeerManifest, CODEX_V2_CAPABILITY, LaunchDescriptor, PEER_BINDING_V2_PROTOCOL, PodError,
     manifest_path, private_directory, unit_name,
 };
 use crate::ports::DurableFiles;
+use crate::runtime::LinuxBackend;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ARGV: [&str; 3] = ["app-server", "--listen", "stdio://"];
@@ -88,6 +93,7 @@ pub struct PodCodexResource {
     resource: CodexResource<ProcessJsonlTransport>,
     journal: Option<CodexCommandJournal>,
     journal_path: PathBuf,
+    native_events: NativeEventSpool,
     child_birth: KernelChildBirthObservation,
     pod_boot_id: String,
     pod_cgroup: String,
@@ -165,6 +171,25 @@ impl PodCodexResource {
             resource_epoch: Epoch::new(resource.epoch)
                 .map_err(|_| PodError::Invalid("Codex resource epoch"))?,
         };
+        let event_identity = NativeEventIdentity::from_resource(
+            &StoreLineageId::try_from(launch.peer_binding.store_lineage.as_str())
+                .map_err(|_| PodError::Invalid("Codex event store lineage"))?,
+            &ScopeId::try_from(descriptor.scope_id())
+                .map_err(|_| PodError::Invalid("Codex event scope"))?,
+            &identity.session_id,
+            &identity.run_id,
+            &identity.attempt_id,
+            &identity.pod_id,
+            Epoch::new(launch.legacy.incarnation)
+                .map_err(|_| PodError::Invalid("Codex event Pod incarnation"))?,
+            &identity.resource_id,
+            identity.resource_epoch,
+        );
+        let native_events = NativeEventSpool::open(
+            &LinuxBackend,
+            &launch.pod_directory.join("codex.native-events.log"),
+            event_identity,
+        )?;
         let config = PinnedCodexConfig::new(
             descriptor.model_id(),
             descriptor.reasoning_effort(),
@@ -214,6 +239,7 @@ impl PodCodexResource {
             resource,
             journal: None,
             journal_path: launch.pod_directory.join("codex.commands.log"),
+            native_events,
             child_birth,
             pod_boot_id,
             pod_cgroup,
@@ -232,6 +258,56 @@ impl PodCodexResource {
         self.child_birth.pid
     }
 
+    /// This private source is current only after all state-applied native
+    /// facts have crossed a held fsynced append. A failed append stops native
+    /// publication and leaves the pod's control channel available.
+    fn flush_native_events(&mut self) -> Result<(), PodError> {
+        while let Some(observed) = self.resource.take_applied_native_notification() {
+            let kind = match observed.kind() {
+                NativeObservationKind::Status => NativeEventKind::Status,
+                NativeObservationKind::Output => NativeEventKind::Output,
+                NativeObservationKind::Question => NativeEventKind::Question,
+                NativeObservationKind::Permission => NativeEventKind::Permission,
+                NativeObservationKind::Opaque => NativeEventKind::Opaque,
+            };
+            let status = observed.status().map(|status| match status {
+                NativeObservationStatus::Idle => NativeEventStatus::Idle,
+                NativeObservationStatus::Active => NativeEventStatus::Active,
+                NativeObservationStatus::Waiting => NativeEventStatus::Waiting,
+                NativeObservationStatus::Completed => NativeEventStatus::Completed,
+                NativeObservationStatus::Failed => NativeEventStatus::Failed,
+                NativeObservationStatus::Interrupted => NativeEventStatus::Interrupted,
+                NativeObservationStatus::SystemError => NativeEventStatus::SystemError,
+            });
+            let sequence = self.native_events.next_source_sequence()?;
+            if !matches!(
+                self.native_events.append_applied(
+                    sequence, observed.private_jsonl(), kind, status,
+                    observed.external_conflict(),
+                )?,
+                NativeEventAppend::Committed(_)
+            ) {
+                return Err(PodError::Conflict("native event source sequence repeated"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_native_events_unknown(&mut self) {
+        let _ = self.native_events.mark_continuity_unknown();
+    }
+
+    pub(crate) fn read_native_events(
+        &mut self,
+        cursor: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<NativeEventRead, PodError> {
+        if self.resource.has_unspooled_native_notifications() {
+            return Err(PodError::Uncertain("native event source awaits durable append"));
+        }
+        self.native_events.read_after(cursor, limit)
+    }
+
     /// Advance at most one already available native notification while the
     /// pod remains able to answer control IPC. A matching completed turn is
     /// journaled only as pending a separate fresh `thread/read` proof.
@@ -239,9 +315,14 @@ impl PodCodexResource {
         &mut self,
         mut recheck_before_journal: impl FnMut() -> Result<(), PodError>,
     ) -> Result<bool, PodError> {
-        let Some(stage) = self.journal.as_ref().map(|journal| journal.view().stage) else {
-            return Ok(false);
-        };
+        let stage = self.journal.as_ref().map(|journal| journal.view().stage);
+        if stage.is_none() {
+            let consumed = self.resource.poll_available_once()
+                .map_err(|_| PodError::Uncertain("Codex native notification outcome unknown"))?;
+            self.flush_native_events()?;
+            return Ok(consumed);
+        }
+        let stage = stage.expect("checked journal stage");
         if stage == CodexJournalStage::BootstrapCompletionObservedPendingIdleProof {
             let view = self.journal.as_ref()
                 .ok_or(PodError::Uncertain("held Codex journal disappeared"))?.view();
@@ -254,6 +335,7 @@ impl PodCodexResource {
             let progress = self.resource.poll_bootstrap_read_proof_once(
                 thread_id, session_id, turn_id,
             ).map_err(|_| PodError::Uncertain("Codex completion read outcome unknown"))?;
+            self.flush_native_events()?;
             return match progress {
                 BootstrapReadPoll::Pending => Ok(false),
                 BootstrapReadPoll::Advanced => Ok(true),
@@ -267,6 +349,7 @@ impl PodCodexResource {
                         BootstrapReadPoll::Advanced => return Ok(true),
                         BootstrapReadPoll::Verified => {}
                     }
+                    self.flush_native_events()?;
                     let journal = self.journal.as_mut()
                         .ok_or(PodError::Uncertain("held Codex journal disappeared"))?;
                     journal.recheck_held_file()?;
@@ -283,10 +366,14 @@ impl PodCodexResource {
             };
         }
         if stage != CodexJournalStage::BootstrapSubmitted {
-            return Ok(false);
+            let consumed = self.resource.poll_available_once()
+                .map_err(|_| PodError::Uncertain("Codex native notification outcome unknown"))?;
+            self.flush_native_events()?;
+            return Ok(consumed);
         }
         let consumed = self.resource.poll_available_once()
             .map_err(|_| PodError::Uncertain("Codex native notification outcome unknown"))?;
+        self.flush_native_events()?;
         let view = self.journal.as_ref()
             .ok_or(PodError::Uncertain("held Codex journal disappeared"))?.view();
         let terminal = self.resource.bootstrap_state().clone();
@@ -334,7 +421,7 @@ impl PodCodexResource {
         proof: &BootstrapSendRecord,
     ) -> Result<(BootstrapControlStage, Option<BootstrapSettlementStage>), PodError> {
         let target = proof.native_target();
-        let native = self.resource.identity();
+        let native = self.resource.identity().clone();
         if target.session_id != native.session_id
             || target.run_id != native.run_id
             || target.attempt_id != native.attempt_id
@@ -345,6 +432,9 @@ impl PodCodexResource {
             || proof.writer_epoch() == 0
         {
             return Err(PodError::Refused("bootstrap journal target differs"));
+        }
+        if self.resource.has_unspooled_native_notifications() {
+            return Err(PodError::Uncertain("native observations await durable append"));
         }
         let identity = CodexJournalIdentity::from_resource(
             &target.store_lineage,
@@ -482,6 +572,9 @@ impl PodCodexResource {
         let key = proof.receipt().command_id.as_str();
         let digest = proof.receipt().request_digest.as_str();
         let before = journal.view();
+        if self.flush_native_events().is_err() {
+            return conservative_prior_stage(&before);
+        }
         if journal.recheck_held_file().is_err() {
             return conservative_prior_stage(&before);
         }
@@ -526,6 +619,9 @@ impl PodCodexResource {
                 Ok(thread) => thread,
                 Err(_) => return BootstrapControlStage::ThreadCreateUncertain,
             };
+            if self.flush_native_events().is_err() {
+                return BootstrapControlStage::ThreadCreateUncertain;
+            }
             if journal.checkpoint_thread_created(key, digest, &thread.thread_id, &thread.session_id).is_err() {
                 return BootstrapControlStage::ThreadCreateUncertain;
             }
@@ -609,6 +705,12 @@ impl PodCodexResource {
                             native_session_id: session_id,
                         };
                     }
+                    if self.flush_native_events().is_err() {
+                        return BootstrapControlStage::BootstrapUncertain {
+                            native_thread_id: thread_id,
+                            native_session_id: session_id,
+                        };
+                    }
                     BootstrapControlStage::Submitted {
                         native_thread_id: thread_id,
                         native_session_id: session_id,
@@ -617,6 +719,7 @@ impl PodCodexResource {
                 }
                 BootstrapTurnStage::Uncertain => {
                     let _ = journal.record_bootstrap_uncertain(key, digest);
+                    let _ = self.flush_native_events();
                     BootstrapControlStage::BootstrapUncertain {
                         native_thread_id: thread_id,
                         native_session_id: session_id,
@@ -625,6 +728,7 @@ impl PodCodexResource {
             },
             Err(_) => {
                 let _ = journal.record_bootstrap_uncertain(key, digest);
+                let _ = self.flush_native_events();
                 BootstrapControlStage::BootstrapUncertain {
                     native_thread_id: thread_id,
                     native_session_id: session_id,

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
 
-use crate::codec::{CodecError, decode, encode};
+use crate::codec::{CodecError, MAX_FRAME_BYTES, decode, encode};
 use crate::host_requests::{
     NativeAnswer, NativeAnswerError, NativeRequestParseError, NativeRequestStage, NativeRpcId,
     PendingNativeRequest, answer_value, parse_pending_request,
@@ -15,6 +15,8 @@ use crate::host_requests::{
 
 const MAX_PENDING_NOTIFICATIONS: usize = 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_APPLIED_NOTIFICATIONS: usize = 1024;
+const MAX_APPLIED_NOTIFICATION_BYTES: usize = 4 * 1_048_576;
 const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ATOMIC_READ_PROBE_FRAME: usize = 512;
 
@@ -33,6 +35,62 @@ pub enum AvailableLine {
 pub enum AvailableWrite {
     Pending,
     Written,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeObservationKind {
+    Status,
+    Output,
+    Question,
+    Permission,
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeObservationStatus {
+    Idle,
+    Active,
+    Waiting,
+    Completed,
+    Failed,
+    Interrupted,
+    SystemError,
+}
+
+/// Full native JSONL stays private to the pod-owned log. Debug and the public
+/// summary omit the bytes, question text, command, path, and answer payload.
+pub struct AppliedNativeNotification {
+    private_jsonl: Vec<u8>,
+    kind: NativeObservationKind,
+    status: Option<NativeObservationStatus>,
+    external_conflict: bool,
+}
+
+impl Debug for AppliedNativeNotification {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppliedNativeNotification")
+            .field("private_bytes", &self.private_jsonl.len())
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("external_conflict", &self.external_conflict)
+            .finish()
+    }
+}
+
+impl AppliedNativeNotification {
+    pub fn private_jsonl(&self) -> &[u8] {
+        &self.private_jsonl
+    }
+    pub fn kind(&self) -> NativeObservationKind {
+        self.kind
+    }
+    pub fn status(&self) -> Option<NativeObservationStatus> {
+        self.status
+    }
+    pub fn external_conflict(&self) -> bool {
+        self.external_conflict
+    }
 }
 
 pub trait JsonlTransport {
@@ -394,6 +452,11 @@ pub enum CodexError {
 
 /// Only one RPC is outstanding at a time. Notifications arriving before its
 /// response are retained in wire order and applied once the turn is known.
+struct QueuedNotification {
+    value: Value,
+    raw_jsonl: Vec<u8>,
+}
+
 pub struct CodexResource<T: JsonlTransport> {
     io: T,
     identity: ResourceIdentity,
@@ -414,7 +477,9 @@ pub struct CodexResource<T: JsonlTransport> {
     status_waiting: bool,
     idle_after_completion: bool,
     external_conflict: bool,
-    queued: VecDeque<Value>,
+    queued: VecDeque<QueuedNotification>,
+    applied_notifications: VecDeque<AppliedNativeNotification>,
+    applied_notification_bytes: usize,
     completion_read: CompletionReadState,
 }
 
@@ -441,6 +506,8 @@ impl<T: JsonlTransport> CodexResource<T> {
             idle_after_completion: false,
             external_conflict: false,
             queued: VecDeque::new(),
+            applied_notifications: VecDeque::new(),
+            applied_notification_bytes: 0,
             completion_read: CompletionReadState::NotStarted,
         }
     }
@@ -497,6 +564,18 @@ impl<T: JsonlTransport> CodexResource<T> {
 
     pub fn pending_native_requests(&self) -> Vec<PendingNativeRequest> {
         self.pending_requests.values().cloned().collect()
+    }
+
+    /// Drain one state-applied native frame for the pod's private durable
+    /// event source. It must be appended before a manager read can publish it.
+    pub fn take_applied_native_notification(&mut self) -> Option<AppliedNativeNotification> {
+        let observed = self.applied_notifications.pop_front()?;
+        self.applied_notification_bytes -= observed.private_jsonl.len();
+        Some(observed)
+    }
+
+    pub fn has_unspooled_native_notifications(&self) -> bool {
+        !self.applied_notifications.is_empty()
     }
 
     /// Records a monotonically advancing fence asserted by the authenticated
@@ -1148,7 +1227,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             return Err(CodexError::InvalidState("native connection is unavailable"));
         }
         if let Some(event) = self.queued.pop_front() {
-            return self.apply_event_or_poison(&event);
+            return self.apply_event_or_poison(&event.value, &event.raw_jsonl);
         }
         let line = self.read_frame()?;
         let value = decode(&line).map_err(|error| self.poison_codec(error))?;
@@ -1156,7 +1235,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             self.poisoned = true;
             return Err(CodexError::Protocol("unsolicited RPC response"));
         }
-        self.apply_event_or_poison(&value)
+        self.apply_event_or_poison(&value, &line)
     }
 
     /// Consume at most one already available native notification. Pending
@@ -1177,7 +1256,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             ));
         }
         if let Some(event) = self.queued.pop_front() {
-            self.apply_event_or_poison(&event)?;
+            self.apply_event_or_poison(&event.value, &event.raw_jsonl)?;
             return Ok(true);
         }
         let line = match self.io.try_read_line() {
@@ -1193,7 +1272,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             self.poisoned = true;
             return Err(CodexError::Protocol("unsolicited RPC response"));
         }
-        self.apply_event_or_poison(&value)?;
+        self.apply_event_or_poison(&value, &line)?;
         Ok(true)
     }
 
@@ -1310,7 +1389,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                     return Err(CodexError::TransportUncertain);
                 }
                 if let Some(event) = self.queued.pop_front() {
-                    self.apply_event_or_poison(&event)?;
+                    self.apply_event_or_poison(&event.value, &event.raw_jsonl)?;
                     self.completion_read = CompletionReadState::AwaitingReply {
                         id,
                         thread_id,
@@ -1339,7 +1418,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                 };
                 let value = decode(&frame).map_err(|error| self.poison_codec(error))?;
                 if nonempty_string(value.get("method")).is_some() {
-                    self.apply_event_or_poison(&value)?;
+                    self.apply_event_or_poison(&value, &frame)?;
                     self.completion_read = CompletionReadState::AwaitingReply {
                         id,
                         thread_id,
@@ -1444,7 +1523,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                                 "unsolicited completion read response",
                             ));
                         }
-                        self.apply_event_or_poison(&value)?;
+                        self.apply_event_or_poison(&value, &frame)?;
                         self.completion_read = if self.bootstrap_ready() {
                             CompletionReadState::Draining {
                                 thread_id,
@@ -1500,7 +1579,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                                 "unsolicited completion read response",
                             ));
                         }
-                        self.apply_event_or_poison(&value)?;
+                        self.apply_event_or_poison(&value, &frame)?;
                         self.completion_read = if self.bootstrap_ready() {
                             CompletionReadState::Draining {
                                 thread_id,
@@ -1672,7 +1751,10 @@ impl<T: JsonlTransport> CodexResource<T> {
                     self.poisoned = true;
                     return Err(CodexError::Protocol("notification backlog exceeded"));
                 }
-                self.queued.push_back(value);
+                self.queued.push_back(QueuedNotification {
+                    value,
+                    raw_jsonl: line,
+                });
                 continue;
             }
             if value.get("id").and_then(Value::as_u64) != Some(id) {
@@ -1714,7 +1796,7 @@ impl<T: JsonlTransport> CodexResource<T> {
 
     fn apply_queued(&mut self) -> Result<(), CodexError> {
         while let Some(event) = self.queued.pop_front() {
-            self.apply_event_or_poison(&event)?;
+            self.apply_event_or_poison(&event.value, &event.raw_jsonl)?;
         }
         Ok(())
     }
@@ -1740,12 +1822,50 @@ impl<T: JsonlTransport> CodexResource<T> {
         }
     }
 
-    fn apply_event_or_poison(&mut self, event: &Value) -> Result<(), CodexError> {
-        let result = self.apply_event(event);
-        if result.is_err() {
+    fn apply_event_or_poison(&mut self, event: &Value, raw_jsonl: &[u8]) -> Result<(), CodexError> {
+        let exact_bound_thread = self.thread.as_ref().is_some_and(|thread| {
+            event.pointer("/params/threadId").and_then(Value::as_str)
+                == Some(thread.thread_id.as_str())
+        });
+        if let Err(error) = self.apply_event(event) {
             self.poisoned = true;
+            return Err(error);
         }
-        result
+        if self.applied_notifications.len() >= MAX_APPLIED_NOTIFICATIONS {
+            self.poisoned = true;
+            return Err(CodexError::Protocol("native observation backlog exceeded"));
+        }
+        if raw_jsonl.is_empty() || raw_jsonl.len() > MAX_FRAME_BYTES {
+            self.poisoned = true;
+            return Err(CodexError::Protocol(
+                "native observation raw frame is unbounded",
+            ));
+        }
+        let private_jsonl = raw_jsonl.to_vec();
+        let next_bytes = self
+            .applied_notification_bytes
+            .checked_add(private_jsonl.len())
+            .filter(|value| *value <= MAX_APPLIED_NOTIFICATION_BYTES);
+        let Some(next_bytes) = next_bytes else {
+            self.poisoned = true;
+            return Err(CodexError::Protocol(
+                "native observation byte backlog exceeded",
+            ));
+        };
+        let (mut kind, mut status) = classify_native_observation(event);
+        if !exact_bound_thread || self.external_conflict {
+            kind = NativeObservationKind::Opaque;
+            status = None;
+        }
+        self.applied_notifications
+            .push_back(AppliedNativeNotification {
+                private_jsonl,
+                kind,
+                status,
+                external_conflict: self.external_conflict,
+            });
+        self.applied_notification_bytes = next_bytes;
+        Ok(())
     }
 
     fn apply_event(&mut self, event: &Value) -> Result<(), CodexError> {
@@ -1958,6 +2078,54 @@ fn waiting_flag(status: Option<&Value>) -> Result<bool, CodexError> {
         Some("notLoaded" | "idle" | "systemError") => Ok(false),
         _ => Err(CodexError::Protocol("native status type is invalid")),
     }
+}
+
+fn classify_native_observation(
+    event: &Value,
+) -> (NativeObservationKind, Option<NativeObservationStatus>) {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    let status = match method {
+        "thread/status/changed" => {
+            match event.pointer("/params/status/type").and_then(Value::as_str) {
+                Some("idle") => Some(NativeObservationStatus::Idle),
+                Some("active") => Some(
+                    if event
+                        .pointer("/params/status/activeFlags")
+                        .and_then(Value::as_array)
+                        .is_some_and(|flags| !flags.is_empty())
+                    {
+                        NativeObservationStatus::Waiting
+                    } else {
+                        NativeObservationStatus::Active
+                    },
+                ),
+                Some("systemError") => Some(NativeObservationStatus::SystemError),
+                _ => None,
+            }
+        }
+        "turn/started" => Some(NativeObservationStatus::Active),
+        "turn/completed" => match event.pointer("/params/turn/status").and_then(Value::as_str) {
+            Some("completed") => Some(NativeObservationStatus::Completed),
+            Some("failed") => Some(NativeObservationStatus::Failed),
+            Some("interrupted") => Some(NativeObservationStatus::Interrupted),
+            _ => None,
+        },
+        _ => None,
+    };
+    let kind = match method {
+        "item/tool/requestUserInput" => NativeObservationKind::Question,
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => NativeObservationKind::Permission,
+        "thread/status/changed" | "turn/started" | "turn/completed" | "serverRequest/resolved" => {
+            NativeObservationKind::Status
+        }
+        method if method.starts_with("item/") && event.get("id").is_none() => {
+            NativeObservationKind::Output
+        }
+        _ => NativeObservationKind::Opaque,
+    };
+    (kind, status)
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {

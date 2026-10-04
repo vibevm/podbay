@@ -6,9 +6,9 @@ use podbay_adapter_codex::{
     AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine,
     AvailableWrite, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, CodecError,
     CodexError, CodexResource, InterruptState, JsonlTransport, MAX_FRAME_BYTES, NativeAnswer,
-    NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity,
-    Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage,
-    WriterPermit, decode, encode,
+    NativeObservationKind, NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig,
+    ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode,
+    TurnSubmissionStage, WriterPermit, decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -255,6 +255,110 @@ fn user_input_request(id: i64) -> Value {
         "isBlocking":true,"questions":[{"id":"question.one","header":"Choice",
         "question":"Which action?","options":[{"label":"A","description":"Option A"}]}]
     }})
+}
+
+#[test]
+fn applied_native_fact_preserves_private_question_but_redacts_public_debug() {
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        user_input_request(70),
+        turn_started_response(),
+    ]);
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    let observed = adapter
+        .take_applied_native_notification()
+        .expect("queued request fact");
+    assert_eq!(observed.kind(), NativeObservationKind::Question);
+    assert!(String::from_utf8_lossy(observed.private_jsonl()).contains("Which action?"));
+    let redacted = format!("{observed:?}");
+    assert!(!redacted.contains("Which action?"));
+    assert!(!redacted.contains("Option A"));
+    assert!(adapter.take_applied_native_notification().is_none());
+    assert_eq!(adapter.pending_request_count(), 1);
+
+    let raw = b"{ \"method\" : \"item/agentMessage/delta\", \"params\": {\"threadId\":\"thread.one\",\"delta\":\"private output\"} }\n".to_vec();
+    let mut io = FakeTransport::with_reads([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+    ]);
+    io.reads.push_back(raw.clone());
+    let mut adapter = CodexResource::new(io, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter.poll_available_once().unwrap();
+    let observed = adapter.take_applied_native_notification().unwrap();
+    assert_eq!(observed.kind(), NativeObservationKind::Output);
+    assert_eq!(observed.private_jsonl(), raw);
+    assert!(!format!("{observed:?}").contains("private output"));
+}
+
+#[test]
+fn foreign_turn_completion_is_opaque_conflict_not_public_completed_status() {
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        completed("turn.other", "completed"),
+    ]);
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter.poll_available_once().unwrap();
+    let observed = adapter.take_applied_native_notification().unwrap();
+    assert_eq!(observed.kind(), NativeObservationKind::Opaque);
+    assert_eq!(observed.status(), None);
+    assert!(observed.external_conflict());
+    assert!(!adapter.bootstrap_ready());
+
+    let mut foreign_status = status("idle", &[]);
+    foreign_status["params"]["threadId"] = json!("thread.other");
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        foreign_status,
+    ]);
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter.poll_available_once().unwrap();
+    let observed = adapter.take_applied_native_notification().unwrap();
+    assert_eq!(observed.kind(), NativeObservationKind::Opaque);
+    assert_eq!(observed.status(), None);
+}
+
+#[test]
+fn applied_native_fact_queue_has_a_byte_bound_before_publication() {
+    let huge = json!({"method":"item/agentMessage/delta","params":{
+        "threadId":"thread.one","delta":"x".repeat(4 * 1_048_576),
+    }});
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        huge,
+    ]);
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    assert_eq!(
+        adapter.poll_available_once(),
+        Err(CodexError::Protocol(
+            "native observation byte backlog exceeded"
+        )),
+    );
+    assert!(adapter.take_applied_native_notification().is_none());
+    assert!(!adapter.bootstrap_ready());
 }
 
 fn pending_bootstrap_reads(request: Value, extra: impl IntoIterator<Item = Value>) -> Vec<Value> {

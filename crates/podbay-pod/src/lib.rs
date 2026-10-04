@@ -13,6 +13,7 @@ mod codex_resource;
 #[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
+mod native_events;
 mod peer_checkpoint;
 mod ports;
 #[cfg(all(target_os = "linux", test))]
@@ -53,6 +54,11 @@ pub use manifest::{
 };
 pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
+};
+pub use native_events::{
+    CODEX_NATIVE_EVENTS_READ_PROTOCOL,
+    NativeEventCursor, NativeEventFidelity, NativeEventGap, NativeEventIdentity, NativeEventKind,
+    NativeEventRead, NativeEventSnapshot, NativeEventSpool, NativeEventStatus, PublicNativeEvent,
 };
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
 #[cfg(target_os = "linux")]

@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +15,8 @@ use podbay_core::{
 };
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CodexCommandJournal, CodexJournalIdentity,
-    CodexJournalStage, LinuxBackend, LinuxPeerEvidence, PodError, PodPeerBootstrap,
+    CodexJournalStage, LinuxBackend, LinuxPeerEvidence, NativeEventKind, NativeEventStatus,
+    PodError, PodPeerBootstrap,
     launch_bound_codex_v2,
 };
 use podbay_store::{
@@ -31,6 +34,44 @@ use podbay_wire::{
 use sha2::{Digest, Sha256};
 
 const ARGUMENTS: [&str; 3] = ["app-server", "--listen", "stdio://"];
+
+#[test]
+fn native_events_same_uid_sibling_is_refused() {
+    let Some(path) = std::env::var_os("PODBAY_NATIVE_SIBLING_MANIFEST") else {
+        return;
+    };
+    let manifest: podbay_pod::PodManifest = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let binding = manifest.peer_binding.as_ref().unwrap();
+    let launch = &manifest.descriptor;
+    let identity = serde_json::json!({
+        "store_lineage": binding.store_lineage,
+        "scope_id": launch.scope_id,
+        "session_id": launch.session_id,
+        "run_id": launch.run_id,
+        "attempt_id": launch.attempt_id,
+        "pod_id": launch.pod_id,
+        "pod_incarnation": launch.incarnation,
+        "resource_id": launch.resource_id,
+        "resource_epoch": binding.resource_epoch,
+    });
+    let request = serde_json::json!({
+        "protocol": "podbay.codex-events.read/1",
+        "operation": "codex.events.read",
+        "token": manifest.token,
+        "identity": identity,
+        "cursor": null,
+        "limit": 16,
+    });
+    let mut socket = UnixStream::connect(manifest.socket_path).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    socket.write_all(&serde_json::to_vec(&request).unwrap()).unwrap();
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = Vec::new();
+    socket.read_to_end(&mut reply).unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(reply["refused"], true);
+    assert!(reply["read"].is_null());
+}
 
 struct Fixture {
     root: PathBuf,
@@ -78,6 +119,7 @@ printf '{"id":3,"result":{"thread":{"id":"thread.fixture","sessionId":"native.se
 read -r turn
 printf '%s\n' "$turn" >> "$CODEX_HOME/frames.log"
 printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\n'
+printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread.fixture","delta":"private fixture output"}}\n'
 sleep 2
 printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed"}}}\n'
 printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\n'
@@ -421,6 +463,14 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         store.claim_bootstrap_send(&selector).unwrap(),
         EffectClaim::NewClaim
     );
+    let initial_events = client.read_codex_native_events(None, 16).unwrap();
+    assert_eq!(initial_events.snapshot.watermark, 0);
+    assert!(initial_events.events.is_empty());
+    let sibling = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "native_events_same_uid_sibling_is_refused"])
+        .env("PODBAY_NATIVE_SIBLING_MANIFEST", client.manifest_path().unwrap())
+        .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+    assert!(sibling.success(), "same-UID sibling obtained native event read");
     let frames = fixture.root.join("home/codex/frames.log");
     assert!(matches!(
         client
@@ -510,6 +560,18 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
         &LinuxBackend, &fixture.root.join("codex.commands.log"), journal_identity,
     ).unwrap();
     assert_eq!(reopened.view().stage, CodexJournalStage::BootstrapCompleted);
+    let native = client.read_codex_native_events(Some(&initial_events.next_cursor), 64).unwrap();
+    assert!(native.snapshot.watermark >= 3);
+    assert!(native.gap.is_none());
+    assert!(native.events.iter().any(|event| event.kind == NativeEventKind::Output));
+    assert!(native.events.iter().any(|event| event.status == Some(NativeEventStatus::Completed)));
+    assert!(native.events.iter().any(|event| event.status == Some(NativeEventStatus::Idle)));
+    assert_eq!(native.next_cursor.sequence, native.snapshot.watermark);
+    let public = serde_json::to_string(&native).unwrap();
+    assert!(!public.contains("private fixture output"));
+    assert!(!public.contains("fixture prompt"));
+    assert!(String::from_utf8_lossy(&fs::read(fixture.root.join("codex.native-events.log")).unwrap())
+        .contains("private fixture output"));
     let methods: Vec<_> = fs::read_to_string(&frames).unwrap().lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
             .as_str().unwrap().to_owned())

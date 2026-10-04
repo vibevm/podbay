@@ -11,11 +11,12 @@ mod host_requests;
 mod process_transport;
 
 pub use adapter::{
-    AnswerWriteOutcome, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine, AvailableWrite,
-    BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, BootstrapTurnSubmission,
-    CodexError, CodexResource, InterruptState, JsonlTransport, NativeThread, PinnedCodexConfig,
-    ResourceIdentity, Sandbox, StartReceipt, ThreadStatus, TurnControlState, TurnMode,
-    TurnSubmission, TurnSubmissionStage, WriterPermit,
+    AnswerWriteOutcome, AppliedNativeNotification, ApprovalPolicy, AuthorizedAnswerPermit,
+    AvailableLine, AvailableWrite, BlockReason, BootstrapReadPoll, BootstrapState,
+    BootstrapTurnStage, BootstrapTurnSubmission, CodexError, CodexResource, InterruptState,
+    JsonlTransport, NativeObservationKind, NativeObservationStatus, NativeThread,
+    PinnedCodexConfig, ResourceIdentity, Sandbox, StartReceipt, ThreadStatus, TurnControlState,
+    TurnMode, TurnSubmission, TurnSubmissionStage, WriterPermit,
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, decode, encode};
 pub use host_requests::{

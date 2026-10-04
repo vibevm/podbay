@@ -32,6 +32,10 @@ use crate::manifest::{
     PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
     private_directory, read_manifest, unit_name, write_manifest,
 };
+use crate::native_events::{
+    CODEX_NATIVE_EVENTS_READ_PROTOCOL, NativeEventCursor, NativeEventRead,
+    NativeEventsReadReply, NativeEventsReadRequest, identity_from_manifest,
+};
 use crate::peer_checkpoint::{
     PeerCheckpointError, read_peer_checkpoint, read_peer_checkpoint_observation,
     write_peer_checkpoint,
@@ -1029,6 +1033,120 @@ impl PodClient {
         Ok(response)
     }
 
+    /// One manager-only redacted snapshot and bounded events-after read. The
+    /// cursor binds exact lineage/scope/Resource; no native input or replay
+    /// of private JSONL occurs on this control path.
+    pub fn read_codex_native_events(
+        &self,
+        cursor: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<NativeEventRead, PodError> {
+        let binding = self.manifest.peer_binding.as_ref()
+            .ok_or(PodError::Unsupported("Codex event binding is unavailable"))?;
+        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY
+            || !(1..=64).contains(&limit)
+        {
+            return Err(PodError::Unsupported("Codex event read requires bounded V2"));
+        }
+        let identity = identity_from_manifest(&self.manifest)?;
+        if cursor.is_some_and(|cursor| cursor.identity != identity) {
+            return Err(PodError::Refused("Codex event cursor belongs to another Resource"));
+        }
+        let request = NativeEventsReadRequest {
+            protocol: CODEX_NATIVE_EVENTS_READ_PROTOCOL.into(),
+            operation: "codex.events.read".into(),
+            token: self.manifest.token.clone(),
+            identity: identity.clone(),
+            cursor: cursor.cloned(),
+            limit,
+        };
+        let bytes = serde_json::to_vec(&request)?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("Codex event read request exceeds bound"));
+        }
+        let mut socket = UnixStream::connect(&self.manifest.socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let observed = LinuxPeerEvidence::from_connected(&socket)
+            .map_err(|_| PodError::Refused("Codex event server OS identity unavailable"))?;
+        socket.write_all(&bytes).map_err(|_| PodError::Uncertain("Codex event request may have reached pod"))?;
+        socket.shutdown(std::net::Shutdown::Write)
+            .map_err(|_| PodError::Uncertain("Codex event request completion unknown"))?;
+        let mut reply = Vec::new();
+        (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)
+            .map_err(|_| PodError::Uncertain("Codex event reply lost"))?;
+        if reply.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("Codex event reply exceeds bound"));
+        }
+        observed.recheck_connected(&socket)
+            .map_err(|_| PodError::Uncertain("Codex event server changed"))?;
+        let fresh = read_manifest(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("Codex event manifest changed"))?;
+        let metadata = fs::symlink_metadata(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("Codex event manifest unavailable"))?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Uncertain("Codex event client identity unavailable"))?;
+        if serde_json::to_vec(&fresh)? != serde_json::to_vec(&self.manifest)?
+            || observed.uid() != metadata.uid()
+            || observed.uid() != current.uid()
+            || !unit_cgroup_exact(observed.cgroup(), &self.manifest.unit_name)
+        {
+            return Err(PodError::Refused("Codex event server identity differs"));
+        }
+        let response: NativeEventsReadReply = serde_json::from_slice(&reply)
+            .map_err(|_| PodError::Invalid("Codex event reply is malformed"))?;
+        if response.protocol != CODEX_NATIVE_EVENTS_READ_PROTOCOL || response.refused {
+            return Err(PodError::Refused("Codex event read refused"));
+        }
+        let read = response.read.ok_or(PodError::Invalid("Codex event read omitted result"))?;
+        if read.snapshot.identity != identity
+            || read.next_cursor.identity != identity
+            || read.next_cursor.sequence > read.snapshot.watermark
+            || read.snapshot.earliest_retained > read.snapshot.watermark.saturating_add(1)
+            || read.events.len() > limit
+            || read.events.iter().any(|event| event.identity != identity
+                || event.source_sequence > read.snapshot.watermark
+                || event.committed_cursor != event.source_sequence
+                || event.schema_version != 1
+                || event.provenance != "codex.app-server.pod-observed/1"
+                || event.event_id.len() != 71
+                || !event.event_id.starts_with("native.")
+                || !event.event_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(PodError::Invalid("Codex event read identity differs"));
+        }
+        let after = cursor.map(|cursor| cursor.sequence).unwrap_or(read.snapshot.watermark);
+        if cursor.is_none() && (!read.events.is_empty() || read.gap.is_some()
+            || read.next_cursor.sequence != read.snapshot.watermark)
+        {
+            return Err(PodError::Invalid("Codex snapshot read crossed its watermark"));
+        }
+        let mut expected = after.saturating_add(1);
+        let mut saw_gap = false;
+        for event in &read.events {
+            if event.source_sequence > expected {
+                if saw_gap || read.gap.as_ref().is_none_or(|gap|
+                    gap.missing_from != expected
+                        || gap.missing_through != event.source_sequence - 1
+                        || gap.earliest_available != event.source_sequence)
+                {
+                    return Err(PodError::Invalid("Codex event sequence gap differs"));
+                }
+                saw_gap = true;
+            } else if event.source_sequence != expected {
+                return Err(PodError::Invalid("Codex event sequence is not monotonic"));
+            }
+            expected = event.source_sequence.saturating_add(1);
+        }
+        if saw_gap != read.gap.is_some()
+            || read.next_cursor.sequence != read.events.last()
+                .map(|event| event.source_sequence).unwrap_or(after)
+        {
+            return Err(PodError::Invalid("Codex event cursor or gap differs"));
+        }
+        Ok(read)
+    }
+
     pub fn bound_status(&self) -> Result<BoundPodStatus, PodError> {
         self.request("status")?
             .bound
@@ -1705,6 +1823,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         Err(_) => {
                             // Native or journal failure cannot erase control
                             // access or manufacture bootstrap completion.
+                            resource.mark_native_events_unknown();
                             native_pump_available = false;
                             false
                         }
@@ -1845,6 +1964,59 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         },
                     )?;
                     return Ok(false);
+                }
+                stream.write_all(&encoded)?;
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(read) = serde_json::from_slice::<NativeEventsReadRequest>(&bytes)
+                && read.protocol == CODEX_NATIVE_EVENTS_READ_PROTOCOL
+            {
+                let result = (|| -> Result<NativeEventRead, PodError> {
+                    if read.operation != "codex.events.read"
+                        || binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                        || !constant_time_equal(read.token.as_bytes(), manifest.token.as_bytes())
+                        || !(1..=64).contains(&read.limit)
+                        || read.identity != identity_from_manifest(&manifest)?
+                    {
+                        return Err(PodError::Refused("Codex event read capability differs"));
+                    }
+                    let observed = peer_evidence.as_ref()
+                        .map_err(|_| PodError::Refused("Codex event manager OS peer unavailable"))?;
+                    if observed.attested_peer() != &manager_peer
+                        || observed.recheck_before_effect(&stream, &manager_peer).is_err()
+                        || !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer)
+                    {
+                        return Err(PodError::Refused("Codex event manager peer is stale"));
+                    }
+                    current_codex_v2_binding(binding, descriptor)?;
+                    let result = if let ChildResource::Codex(resource) = &mut child {
+                        resource.read_native_events(read.cursor.as_ref(), read.limit)?
+                    } else {
+                        return Err(PodError::Refused("Codex event Resource is unavailable"));
+                    };
+                    observed.recheck_before_effect(&stream, &manager_peer)
+                        .map_err(|_| PodError::Refused("Codex event manager peer changed"))?;
+                    if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
+                        return Err(PodError::Refused("Codex event manager claim changed"));
+                    }
+                    current_codex_v2_binding(binding, descriptor)?;
+                    Ok(result)
+                })();
+                let reply = match result {
+                    Ok(read) => NativeEventsReadReply {
+                        protocol: CODEX_NATIVE_EVENTS_READ_PROTOCOL.into(),
+                        read: Some(read), refused: false,
+                    },
+                    Err(_) => NativeEventsReadReply {
+                        protocol: CODEX_NATIVE_EVENTS_READ_PROTOCOL.into(),
+                        read: None, refused: true,
+                    },
+                };
+                let encoded = serde_json::to_vec(&reply)?;
+                if encoded.len() as u64 > FRAME_LIMIT {
+                    return Err(PodError::Invalid("Codex event reply exceeds frame bound"));
                 }
                 stream.write_all(&encoded)?;
                 return Ok(false);
