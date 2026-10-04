@@ -840,6 +840,15 @@ impl ImmutableLaunchDescriptorV2 {
     pub fn scope_id(&self) -> &str {
         &self.body.base.scope_id
     }
+    pub fn actor_id(&self) -> &str {
+        &self.body.base.actor_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.body.base.session_id
+    }
+    pub fn run_id(&self) -> &str {
+        &self.body.base.run_id
+    }
     pub fn parent_run_id(&self) -> Option<&str> {
         self.body.base.parent_run_id.as_deref()
     }
@@ -848,6 +857,24 @@ impl ImmutableLaunchDescriptorV2 {
     }
     pub fn work_kind(&self) -> NativeWorkKind {
         self.body.base.work_kind
+    }
+    pub fn attempt_id(&self) -> &str {
+        &self.body.base.attempt_id
+    }
+    pub fn attempt_ordinal(&self) -> u64 {
+        self.body.base.attempt_ordinal.get()
+    }
+    pub fn attempt_epoch(&self) -> u64 {
+        self.body.base.attempt_epoch.get()
+    }
+    pub fn pod_incarnation(&self) -> u64 {
+        self.body.base.pod_incarnation.get()
+    }
+    pub fn target_os(&self) -> TargetOs {
+        self.body.base.target_os
+    }
+    pub fn host_id(&self) -> &str {
+        &self.body.base.host_id
     }
     pub fn profile_ref(&self) -> &str {
         &self.body.base.profile_ref
