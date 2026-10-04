@@ -27,3 +27,34 @@ PodBay's read surface before deciding what to do next.
 Run the local transport fixtures with Node.js 24:
 
     node --test bindings/typescript/tests/unix-socket.test.ts
+
+## Authenticated Node Unix-socket transport
+
+`src/authenticated-unix-socket.ts` implements the Linux `podbay.auth/1`
+prelude on each new connection, then one PodBay/1 exchange. Construct
+`AuthenticatedUnixSocketWireTransport` with an absolute, trusted `socketPath`,
+an exact `expected` actor challenge (actor ID, store lineage, scope, credential
+generation, UID/PID/start/cgroup process binding, and owner or pod origin), and
+a `validateAndSign` callback. The transport strictly decodes the canonical TLV
+challenge and compares every expected field before calling that callback.
+Counters use `bigint` so u64 identities are never rounded.
+
+The callback must validate the host endpoint through trusted information
+outside the challenge and refuse any unwanted transcript before returning a
+64-byte signature over `challenge.bytes`. A socket path or server-supplied
+challenge is not by itself host authentication. Do not expose the callback as
+an arbitrary-message signer. The transport does not discover an endpoint,
+enroll an actor, store a private key, or retry a failed exchange.
+
+The handshake has one absolute deadline from connection attempt through the
+exact auth ACK. The following request/reply has a separate absolute deadline.
+A successful exchange requires one bounded response frame followed by peer EOF;
+extra bytes or a connection kept open past the deadline fail closed.
+`AuthenticatedSocketTransportError.stage` is `before_request_write` until the
+PodBay/1 request write is attempted and `possible_effect` afterward. On a
+`possible_effect` failure, retain the original command key and reconcile it
+through PodBay reads before deciding on a new operation.
+
+Run its disposable local-socket fixtures with Node.js 24:
+
+    node --test bindings/typescript/tests/authenticated-unix-socket.test.ts
