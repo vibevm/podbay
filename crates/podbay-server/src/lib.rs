@@ -1,6 +1,6 @@
 //! Authenticated PodBay/1 exchanges over an owned Linux socket. The default
-//! listener is read-only; an explicit trusted policy enables root launch.
-//! No provider turn or automatic retry lives here.
+//! listener is read-only; explicit trusted policies enable root launch and
+//! the first claimed Codex session send. No automatic retry lives here.
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
@@ -33,7 +33,7 @@ pub use auth_prelude::{
 #[cfg(target_os = "linux")]
 pub use linux_listener::{
     LinuxListenerError, LinuxListenerReport, LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME,
-    TrustedWireRootLaunchTemplate,
+    TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
 };
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
@@ -83,6 +83,30 @@ where
     let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
         .map_err(LinuxServeOneFault::Authentication)?;
     let mut handler = host_launch_handler::HostLaunchHandler::new(authority, policy);
+    serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
+}
+
+/// Opt in to root launch and the first Codex bootstrap send on one authenticated
+/// manager socket. The send policy maps to a preinstalled scope grant; the
+/// request cannot install one or supply native input directly to the pod.
+#[cfg(target_os = "linux")]
+pub fn serve_authenticated_linux_launch_and_first_send_one<P>(
+    socket: std::os::unix::net::UnixStream,
+    authority: &mut podbay_host::DurableAuthority<P>,
+    launch_policy: &podbay_host::TrustedWireRootLaunchPolicy,
+    send_policy: &podbay_host::TrustedBootstrapSendPolicy,
+) -> Result<(), LinuxServeOneFault>
+where
+    P: podbay_host::HostDispatchPort,
+    P::Receipt: podbay_host::StablePortReceipt,
+{
+    let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
+        .map_err(LinuxServeOneFault::Authentication)?;
+    let mut handler = host_launch_handler::HostLaunchHandler::with_first_send(
+        authority,
+        launch_policy,
+        send_policy,
+    );
     serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
 }
 

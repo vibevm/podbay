@@ -16,23 +16,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
-use podbay_core::{ActorId, ResourceKind, ScopeId};
+use podbay_core::{ActorId, ResourceKind, ScopeId, SessionId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedTransport, AuthorisedBoundLaunch,
     AuthorisedDispatch, CredentialGeneration, CredentialRef, DurableAuthority, ExecutionMode,
     GrantMode, GrantSpec, HostDispatchPort, HostError, Operation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right,
-    Target as HostTarget, TrustedDriverTemplate, TrustedLaunchProfileInput,
-    TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
+    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedClaimedBootstrap,
+    ResolvedNativeCodexLaunch, Right, Target as HostTarget, TrustedBootstrapSendPolicy,
+    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
+    TrustedWireRootLaunchPolicy,
 };
 use podbay_server::{
     LinuxAcceptedPeerEvidence, LinuxManagerCommandsGetListener, LinuxServeOneFault, ServerFault,
-    TrustedWireRootLaunchTemplate, serve_authenticated_linux_launch_one,
+    TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
+    serve_authenticated_linux_launch_one,
 };
 use podbay_store::{AuthorityMutation, BoundLaunchFormat, PodBayStore};
 use podbay_wire::{
-    CommandEnvelope, MutationOperation, ReadEnvelope, ReadOperation, ResourceDriver,
-    Target as WireTarget,
+    CommandEnvelope, DecimalString, Guard, MutationOperation, ReadEnvelope, ReadOperation,
+    ResourceDriver, Target as WireTarget,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -123,6 +125,24 @@ impl HostDispatchPort for FakePort {
             }),
         }
     }
+
+    fn accepts_claimed_codex_bootstrap(&self) -> bool {
+        true
+    }
+
+    fn send_claimed_codex_bootstrap(
+        &mut self,
+        _: ResolvedClaimedBootstrap,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let receipt = PortReceiptRef::from_port("receipt.fake.bootstrap").unwrap();
+        match self.mode {
+            PortMode::Accepted => Ok(PortDispatchOutcome::Accepted(receipt)),
+            PortMode::LostReply => Err(PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt),
+            }),
+        }
+    }
 }
 
 struct ReplayTransport(AuthenticatedPeer);
@@ -140,6 +160,7 @@ fn prepared_authority(
     ActorId,
     podbay_host::GrantId,
     Arc<AtomicUsize>,
+    ReplayTransport,
 ) {
     let (server, _client) = UnixStream::pair().unwrap();
     let process = LinuxAcceptedPeerEvidence::from_accepted(&server)
@@ -267,14 +288,15 @@ fn prepared_authority(
                 scope_id: scope.clone(),
                 mode: GrantMode::Controller,
                 rights: BTreeSet::from([
-                    Right::new(Operation::LaunchPod, HostTarget::Scope(scope)),
+                    Right::new(Operation::LaunchPod, HostTarget::Scope(scope.clone())),
                     Right::new(Operation::UseCredential, HostTarget::Credential(credential)),
+                    Right::new(Operation::SendSession, HostTarget::Scope(scope.clone())),
                 ]),
                 remaining_delegation_depth: 0,
             },
         )
         .unwrap();
-    (authority, actor, grant, calls)
+    (authority, actor, grant, calls, transport)
 }
 
 fn launch_request(
@@ -360,6 +382,7 @@ fn serve_batch(
     actor: &ActorId,
     requests: Vec<Vec<u8>>,
     template: Option<&TrustedWireRootLaunchTemplate>,
+    send_template: Option<&TrustedBootstrapSendTemplate>,
 ) -> Vec<Value> {
     let path = listener.path().to_path_buf();
     let actor_name = actor.as_str().to_owned();
@@ -375,7 +398,11 @@ fn serve_batch(
             })
             .collect::<Vec<_>>()
     });
-    let report = if let Some(template) = template {
+    let report = if let (Some(template), Some(send_template)) = (template, send_template) {
+        listener
+            .serve_until_with_launch_and_first_send(authority, &stop, template, send_template)
+            .unwrap()
+    } else if let Some(template) = template {
         listener
             .serve_until_with_launch(authority, &stop, template)
             .unwrap()
@@ -392,7 +419,7 @@ fn serve_batch(
 #[test]
 fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
     let fixture = Fixture::new();
-    let (mut authority, actor, grant, calls) = prepared_authority(&fixture, PortMode::Accepted);
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::Accepted);
     let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
     let launch = launch_request("request.first", "key.server.launch", grant, "gpt-6-sol");
     let read_only = serve_batch(
@@ -400,6 +427,7 @@ fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
         &mut authority,
         &actor,
         vec![launch.encode_json().unwrap()],
+        None,
         None,
     );
     assert_eq!(read_only[0]["error"]["code"], "unsupported");
@@ -429,6 +457,7 @@ fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
                 .unwrap(),
         ],
         Some(&template),
+        None,
     );
     let first = &responses[0]["ok"];
     assert_eq!(first["state"], "host_accepted");
@@ -496,9 +525,122 @@ fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
 }
 
 #[test]
+fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
+    let fixture = Fixture::new();
+    let (mut authority, actor, grant, calls, transport) =
+        prepared_authority(&fixture, PortMode::Accepted);
+    let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+    let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+        grant,
+        Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    let send_template =
+        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30)).unwrap();
+    let launched = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            launch_request(
+                "request.bootstrap.launch",
+                "key.bootstrap.launch",
+                grant,
+                "gpt-6-sol",
+            )
+            .encode_json()
+            .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(launched[0]["ok"]["state"], "host_accepted");
+    let session_id =
+        SessionId::try_from(launched[0]["ok"]["value"]["sessionId"].as_str().unwrap()).unwrap();
+    let scope = ScopeId::try_from("scope.server.launch").unwrap();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (target, revision) = store
+        .current_native_writer_target_for_session(&scope, &session_id)
+        .unwrap();
+    drop(store);
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let lease = authority
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 120)
+        .unwrap();
+    let guard = Guard {
+        manager_epoch: Some(DecimalString::new(authority.owner_epoch().get())),
+        pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+        resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+        writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+        target_revision: Some(DecimalString::new(revision)),
+        ..Guard::default()
+    };
+    let send = |request_id: &str, text: &str| {
+        CommandEnvelope::new_json(
+            request_id,
+            "key.bootstrap.send",
+            WireTarget::Session {
+                session_id: session_id.as_str().into(),
+            },
+            Some(guard.clone()),
+            None,
+            MutationOperation::SessionSend,
+            json!({"content":[{"kind":"text","text":text}], "policy":{"kind":"when_idle"}}),
+        )
+        .unwrap()
+    };
+    let responses = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            send("request.bootstrap.send", "hello bootstrap")
+                .encode_json()
+                .unwrap(),
+            send("request.bootstrap.replay", "hello bootstrap")
+                .encode_json()
+                .unwrap(),
+            read_by_key("request.bootstrap.read", "key.bootstrap.send")
+                .encode_json()
+                .unwrap(),
+            send("request.bootstrap.changed", "different text")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let first = &responses[0]["ok"];
+    assert_eq!(first["state"], "uncertain");
+    assert_eq!(first["value"]["effectState"], "claimed_uncertain");
+    assert_eq!(first["value"]["portObservation"]["kind"], "pod_accepted");
+    assert_eq!(
+        first["value"]["portObservation"]["durability"],
+        "pod_journal_only"
+    );
+    assert_eq!(first["cursor"]["scopeId"], "scope.server.launch");
+    assert_eq!(responses[1]["ok"]["commandId"], first["commandId"]);
+    assert_eq!(responses[1]["ok"]["value"]["duplicate"], true);
+    assert_eq!(responses[1]["ok"]["value"]["portCalled"], false);
+    assert_eq!(
+        responses[2]["ok"]["receipt"]["commandId"],
+        first["commandId"]
+    );
+    assert_eq!(responses[2]["ok"]["state"], "uncertain");
+    assert_eq!(responses[3]["error"]["code"], "conflict");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    listener.shutdown().unwrap();
+}
+
+#[test]
 fn authenticated_refusal_uncertainty_and_lost_reply_preserve_one_command() {
     let fixture = Fixture::new();
-    let (mut authority, actor, grant, calls) = prepared_authority(&fixture, PortMode::LostReply);
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::LostReply);
     let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
     let template = TrustedWireRootLaunchTemplate::from_trusted_policy(
         grant,
@@ -563,6 +705,7 @@ fn authenticated_refusal_uncertainty_and_lost_reply_preserve_one_command() {
             .unwrap(),
         ],
         Some(&template),
+        None,
     );
     assert_eq!(responses[0]["error"]["code"], "unsupported");
     assert_eq!(responses[1]["error"]["code"], "forbidden");
@@ -581,7 +724,7 @@ fn authenticated_refusal_uncertainty_and_lost_reply_preserve_one_command() {
     // A disconnected reply does not cause a second host effect. The server
     // retains the original key and CommandId in ResponseLost for reconciliation.
     let fixture = Fixture::new();
-    let (mut authority, actor, grant, calls) = prepared_authority(&fixture, PortMode::Accepted);
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::Accepted);
     let path = fixture.root.join("lost.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let policy = TrustedWireRootLaunchPolicy::from_trusted_policy(
@@ -625,7 +768,7 @@ fn authenticated_refusal_uncertainty_and_lost_reply_preserve_one_command() {
 #[test]
 fn external_authority_revision_drift_refuses_before_port_effect() {
     let fixture = Fixture::new();
-    let (mut authority, actor, grant, calls) = prepared_authority(&fixture, PortMode::Accepted);
+    let (mut authority, actor, grant, calls, _) = prepared_authority(&fixture, PortMode::Accepted);
     let path = fixture.root.join("drift.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let policy = TrustedWireRootLaunchPolicy::from_trusted_policy(

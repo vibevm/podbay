@@ -2,10 +2,11 @@
 //! This slice admits only the host planner's no-input Coordinator/Service root.
 
 use podbay_host::{
-    AuthenticatedTransport, DurableAuthority, HostDispatchPort, HostError, LaunchPodError,
-    LaunchPodReceipt, StablePortReceipt, TrustedWireRootLaunchPolicy,
+    AuthenticatedTransport, BootstrapPortObservation, BootstrapSendError, BootstrapSendReceipt,
+    DurableAuthority, HostDispatchPort, HostError, LaunchPodError, LaunchPodReceipt,
+    StablePortReceipt, TrustedBootstrapSendPolicy, TrustedWireRootLaunchPolicy,
 };
-use podbay_store::{BoundLaunchRecord, LaunchDispatchStage, StoreError};
+use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, StoreError};
 use podbay_wire::{
     CommandBody, CommandEnvelope, CommandStage, DecimalString, EventCursor, ProtocolVersion,
     ReadEnvelope, Receipt, RuntimeError, RuntimeErrorCode, Target,
@@ -17,6 +18,7 @@ use crate::{Handler, host_read_handler::HostReadHandler};
 pub(crate) struct HostLaunchHandler<'a, P: HostDispatchPort> {
     authority: &'a mut DurableAuthority<P>,
     policy: &'a TrustedWireRootLaunchPolicy,
+    bootstrap_send_policy: Option<&'a TrustedBootstrapSendPolicy>,
 }
 
 impl<'a, P: HostDispatchPort> HostLaunchHandler<'a, P> {
@@ -24,7 +26,23 @@ impl<'a, P: HostDispatchPort> HostLaunchHandler<'a, P> {
         authority: &'a mut DurableAuthority<P>,
         policy: &'a TrustedWireRootLaunchPolicy,
     ) -> Self {
-        Self { authority, policy }
+        Self {
+            authority,
+            policy,
+            bootstrap_send_policy: None,
+        }
+    }
+
+    pub(crate) fn with_first_send(
+        authority: &'a mut DurableAuthority<P>,
+        policy: &'a TrustedWireRootLaunchPolicy,
+        bootstrap_send_policy: &'a TrustedBootstrapSendPolicy,
+    ) -> Self {
+        Self {
+            authority,
+            policy,
+            bootstrap_send_policy: Some(bootstrap_send_policy),
+        }
     }
 }
 
@@ -37,6 +55,19 @@ where
         transport: &T,
         request: CommandEnvelope,
     ) -> Result<Receipt<Value>, RuntimeError> {
+        if matches!(&request.body, CommandBody::SessionSend(_)) {
+            let policy = self.bootstrap_send_policy.ok_or_else(|| {
+                refusal(
+                    RuntimeErrorCode::Unsupported,
+                    "session.send is unavailable on this manager endpoint",
+                )
+            })?;
+            let outcome = self
+                .authority
+                .send_first_codex_bootstrap_from_wire(transport, request, policy)
+                .map_err(bootstrap_error)?;
+            return project_bootstrap_send_receipt(self.authority, outcome);
+        }
         if !matches!(&request.body, CommandBody::Launch(_)) {
             return Err(refusal(
                 RuntimeErrorCode::Unsupported,
@@ -77,6 +108,142 @@ where
         request: ReadEnvelope,
     ) -> Result<Value, RuntimeError> {
         HostReadHandler::new(self.authority).read(transport, request)
+    }
+}
+
+fn project_bootstrap_send_receipt<P: HostDispatchPort>(
+    authority: &DurableAuthority<P>,
+    outcome: BootstrapSendReceipt,
+) -> Result<Receipt<Value>, RuntimeError> {
+    let scope_id = outcome.scope_id.as_str().to_owned();
+    let original = outcome.receipt;
+    let command_id = original.command_id;
+    let event_sequence = u64::try_from(original.event_sequence)
+        .ok()
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(|| committed_projection_error(&command_id))?;
+    let outbox_id = u64::try_from(original.outbox_id)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| committed_projection_error(&command_id))?;
+    let (state, effect_state) = match outcome.effect_state {
+        EffectState::Prepared => (CommandStage::Persisted, "prepared"),
+        EffectState::ClaimedUncertain => (CommandStage::Uncertain, "claimed_uncertain"),
+        EffectState::Observed => (CommandStage::Uncertain, "observed_unclassified"),
+    };
+    let port_observation = match outcome.port_observation {
+        None => Value::Null,
+        Some(BootstrapPortObservation::PodAccepted(reference)) => json!({
+            "kind": "pod_accepted", "receiptRef": reference,
+            "durability": "pod_journal_only"
+        }),
+        Some(BootstrapPortObservation::RefusedBeforeEffect) => json!({
+            "kind": "refused_before_effect"
+        }),
+        Some(BootstrapPortObservation::UncertainAfterPossibleEffect(reference)) => json!({
+            "kind": "uncertain_after_possible_effect", "receiptRef": reference
+        }),
+    };
+    let position = DecimalString::new(event_sequence);
+    let receipt = Receipt {
+        protocol: ProtocolVersion::V1,
+        command_id: command_id.clone(),
+        state,
+        value: json!({
+            "revisionKind": "admission_event_sequence",
+            "effectState": effect_state,
+            "eventSequence": event_sequence.to_string(),
+            "outboxId": outbox_id.to_string(),
+            "digestVersion": original.digest_version,
+            "requestDigest": original.request_digest,
+            "duplicate": outcome.duplicate,
+            "portCalled": outcome.port_called,
+            "portObservation": port_observation,
+        }),
+        revision: position,
+        cursor: EventCursor {
+            store_lineage: authority.store_lineage_for_receipt().to_owned(),
+            scope_id,
+            sequence: position,
+        },
+    };
+    receipt
+        .validate()
+        .map_err(|_| committed_projection_error(&command_id))?;
+    Ok(receipt)
+}
+
+fn bootstrap_error(error: BootstrapSendError) -> RuntimeError {
+    match error {
+        BootstrapSendError::PostAdmission { receipt, .. } => RuntimeError {
+            code: RuntimeErrorCode::Uncertain,
+            message: "session.send admission committed; query the original command".into(),
+            retry: "query_command".into(),
+            command_id: Some(receipt.command_id),
+        },
+        BootstrapSendError::Host(host) => match host {
+            HostError::Unauthenticated | HostError::Unauthorised => refusal(
+                RuntimeErrorCode::Forbidden,
+                "session.send authority unavailable",
+            ),
+            HostError::InvalidInput => refusal(
+                RuntimeErrorCode::InvalidInput,
+                "session.send input is invalid",
+            ),
+            HostError::StaleGuard => refusal(
+                RuntimeErrorCode::StaleGuard,
+                "session.send authority changed",
+            ),
+            HostError::DeadlineExpired => refusal(
+                RuntimeErrorCode::DeadlineExceeded,
+                "session.send deadline elapsed",
+            ),
+            HostError::Unsupported | HostError::NativeResolutionUnverified => refusal(
+                RuntimeErrorCode::Unsupported,
+                "session.send capability is unavailable",
+            ),
+            HostError::AuthorityStoreUnavailable => refusal(
+                RuntimeErrorCode::StorageFailure,
+                "session.send store unavailable",
+            ),
+            HostError::UncertainAfterPossibleEffect { .. } => RuntimeError {
+                code: RuntimeErrorCode::Uncertain,
+                message: "session.send effect is uncertain; query the original key".into(),
+                retry: "query_command".into(),
+                command_id: None,
+            },
+            HostError::RefusedBeforeEffect => refusal(
+                RuntimeErrorCode::Unavailable,
+                "session.send refused before effect",
+            ),
+            _ => refusal(RuntimeErrorCode::Unavailable, "session.send unavailable"),
+        },
+        BootstrapSendError::Store(store) => match store {
+            StoreError::NotFound | StoreError::WrongScope => refusal(
+                RuntimeErrorCode::Forbidden,
+                "session.send target unavailable",
+            ),
+            StoreError::Conflict(_) => refusal(
+                RuntimeErrorCode::Conflict,
+                "session.send key or state conflicts",
+            ),
+            StoreError::InvalidInput(_) => refusal(
+                RuntimeErrorCode::InvalidInput,
+                "session.send input is invalid",
+            ),
+            StoreError::StaleEpoch => refusal(
+                RuntimeErrorCode::StaleGuard,
+                "session.send owner or target changed",
+            ),
+            _ => refusal(
+                RuntimeErrorCode::StorageFailure,
+                "session.send store unavailable",
+            ),
+        },
+        BootstrapSendError::Authority(_) => refusal(
+            RuntimeErrorCode::StorageFailure,
+            "session.send authority unavailable",
+        ),
     }
 }
 

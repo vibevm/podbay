@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use podbay_host::{
     DurableAuthority, GrantId, HostDispatchPort, HostError, StablePortReceipt,
-    TrustedWireRootLaunchPolicy,
+    TrustedBootstrapSendPolicy, TrustedWireRootLaunchPolicy,
 };
 use podbay_pod::LinuxPeerEvidence;
 
 use crate::{
     LinuxServeOneFault, serve_authenticated_linux_commands_get_one,
-    serve_authenticated_linux_launch_one,
+    serve_authenticated_linux_launch_and_first_send_one, serve_authenticated_linux_launch_one,
 };
 
 pub const MANAGER_SOCKET_NAME: &str = "manager.sock";
@@ -95,6 +95,38 @@ impl TrustedWireRootLaunchTemplate {
             deadline,
             &self.result_contract_ref,
         )
+    }
+}
+
+/// Trusted scope SendSession grant and a fresh budget for each accepted
+/// exchange. This does not itself create a writer lease or permit native input.
+pub struct TrustedBootstrapSendTemplate {
+    grant_id: GrantId,
+    exchange_budget: Duration,
+}
+
+impl TrustedBootstrapSendTemplate {
+    pub fn from_trusted_policy(
+        grant_id: GrantId,
+        exchange_budget: Duration,
+    ) -> Result<Self, HostError> {
+        if exchange_budget.is_zero() || exchange_budget > Duration::from_secs(300) {
+            return Err(HostError::InvalidInput);
+        }
+        Instant::now()
+            .checked_add(exchange_budget)
+            .ok_or(HostError::InvalidInput)?;
+        Ok(Self {
+            grant_id,
+            exchange_budget,
+        })
+    }
+
+    fn fresh(&self) -> Result<TrustedBootstrapSendPolicy, HostError> {
+        let deadline = Instant::now()
+            .checked_add(self.exchange_budget)
+            .ok_or(HostError::InvalidInput)?;
+        TrustedBootstrapSendPolicy::from_trusted_policy(self.grant_id, deadline)
     }
 }
 
@@ -196,6 +228,35 @@ impl LinuxManagerCommandsGetListener {
                 .map_err(LinuxListenerError::Configuration)?;
             Ok(serve_authenticated_linux_launch_one(
                 stream, authority, &policy,
+            ))
+        })
+    }
+
+    /// Opt in to root launch and one first `session.send` on the same socket.
+    /// An exchange is dispatched once; duplicate reconciliation belongs to
+    /// the durable authority and the pod journal, never this listener loop.
+    pub fn serve_until_with_launch_and_first_send<P: HostDispatchPort>(
+        &mut self,
+        authority: &mut DurableAuthority<P>,
+        stop: &AtomicBool,
+        launch_template: &TrustedWireRootLaunchTemplate,
+        send_template: &TrustedBootstrapSendTemplate,
+    ) -> Result<LinuxListenerReport, LinuxListenerError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.serve_serial(authority, stop, |stream, authority| {
+            let launch_policy = launch_template
+                .fresh()
+                .map_err(LinuxListenerError::Configuration)?;
+            let send_policy = send_template
+                .fresh()
+                .map_err(LinuxListenerError::Configuration)?;
+            Ok(serve_authenticated_linux_launch_and_first_send_one(
+                stream,
+                authority,
+                &launch_policy,
+                &send_policy,
             ))
         })
     }
