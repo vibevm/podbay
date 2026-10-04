@@ -6,6 +6,7 @@ use podbay_adapter_codex::{
     AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine,
     AvailableWrite, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, CodecError,
     CodexError, CodexResource, InterruptState, JsonlTransport, LaterTurnCompletionObservation,
+    LaterTurnStartPoll,
     LaterTurnTerminalStatus, MAX_FRAME_BYTES, NativeAnswer, NativeObservationKind,
     NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity,
     Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage,
@@ -21,6 +22,7 @@ struct FakeTransport {
     fail_answer_write: bool,
     answer_write_attempts: usize,
     pending_probe_writes: usize,
+    fail_partial_probe_write: bool,
     eof_on_empty: bool,
 }
 
@@ -35,6 +37,7 @@ impl FakeTransport {
             fail_answer_write: false,
             answer_write_attempts: 0,
             pending_probe_writes: 0,
+            fail_partial_probe_write: false,
             eof_on_empty: false,
         }
     }
@@ -46,6 +49,7 @@ impl FakeTransport {
             fail_answer_write: false,
             answer_write_attempts: 0,
             pending_probe_writes: 0,
+            fail_partial_probe_write: false,
             eof_on_empty: false,
         }
     }
@@ -97,6 +101,14 @@ impl JsonlTransport for FakeTransport {
         if self.pending_probe_writes > 0 {
             self.pending_probe_writes -= 1;
             return Ok(AvailableWrite::Pending);
+        }
+        if self.fail_partial_probe_write
+            && decode(line).ok().and_then(|value| value.get("method")?.as_str().map(str::to_owned))
+                .as_deref() == Some("turn/start")
+        {
+            self.fail_partial_probe_write = false;
+            self.writes.push(decode(line).unwrap());
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "ambiguous partial pipe write"));
         }
         self.write_line(line)?;
         Ok(AvailableWrite::Written)
@@ -225,6 +237,51 @@ fn bootstrapped(extra: impl IntoIterator<Item = Value>) -> CodexResource<FakeTra
     adapter
         .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
         .unwrap();
+    adapter
+}
+
+fn bootstrapped_nonblocking(
+    extra: impl IntoIterator<Item = Value>,
+    pending_writes: usize,
+    partial_start: bool,
+    eof_on_empty: bool,
+) -> CodexResource<FakeTransport> {
+    let mut reads = vec![
+        initialized(), effective(2, "thread.one"), turn_started_response(),
+        completed("turn.bootstrap", "completed"), status("idle", &[]),
+    ];
+    reads.extend(extra);
+    let mut io = FakeTransport::with_reads(reads);
+    io.pending_probe_writes = pending_writes;
+    io.fail_partial_probe_write = partial_start;
+    io.eof_on_empty = eof_on_empty;
+    let mut adapter = CodexResource::new(io, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    adapter.start_new("Begin work", "bootstrap:session.one").unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert!(adapter.bootstrap_ready());
+    adapter.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
+    adapter
+}
+
+fn bootstrapped_with_native_id(thread_id: &str) -> CodexResource<FakeTransport> {
+    let mut adapter = resource([
+        initialized(), effective(2, thread_id), turn_started_response(),
+        json!({"method":"turn/completed","params":{
+            "threadId":thread_id,
+            "turn":{"id":"turn.bootstrap","status":"completed","items":[]}
+        }}),
+        json!({"method":"thread/status/changed","params":{
+            "threadId":thread_id,"status":{"type":"idle"}
+        }}),
+    ]);
+    adapter.initialize().unwrap();
+    adapter.start_new("Begin work", "bootstrap:session.one").unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert!(adapter.bootstrap_ready());
+    adapter.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
     adapter
 }
 
@@ -1675,6 +1732,117 @@ fn checked_later_turn_lost_reply_or_changed_thread_never_resends() {
             .count(),
         1
     );
+}
+
+#[test]
+fn nonblocking_later_turn_checks_full_atomic_frame_and_pending_writes_zero_bytes() {
+    let mut adapter = bootstrapped_nonblocking([
+        read_response(4, "idle", None), work_turn_response(5, "turn.async"),
+        completed("turn.async", "completed"), status("idle", &[]),
+        read_response(6, "idle", None), work_turn_response(7, "turn.next"),
+    ], 1, false, false);
+    let permit = writer_permit(1);
+    let before = adapter.transport().writes.len();
+    assert!(matches!(adapter.prepare_nonblocking_later_turn(
+        &permit, "thread.one", "thread.one", &"x".repeat(450), "message.async",
+    ), Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound"))));
+    assert_eq!(adapter.transport().writes.len(), before);
+    let prepared = adapter.prepare_nonblocking_later_turn(
+        &permit, "thread.one", "thread.one", "Short", "message.async",
+    ).unwrap();
+    adapter.begin_nonblocking_later_turn_after_intent(prepared).unwrap();
+    assert!(adapter.has_pending_nonblocking_later_turn());
+    assert_eq!(adapter.poll_nonblocking_later_turn_once(|_| Ok(())).unwrap(),
+        LaterTurnStartPoll::Pending);
+    assert_eq!(adapter.transport().writes.len(), before,
+        "Pending must certify zero bytes written");
+    let mut submitted = None;
+    let mut checked = 0;
+    for _ in 0..12 {
+        match adapter.poll_nonblocking_later_turn_once(|_| { checked += 1; Ok(()) }).unwrap() {
+            LaterTurnStartPoll::Submitted { turn_id } => { submitted = Some(turn_id); break; }
+            LaterTurnStartPoll::Pending | LaterTurnStartPoll::Advanced => {}
+            LaterTurnStartPoll::Uncertain => panic!("fake native receipt became uncertain"),
+        }
+    }
+    assert_eq!(submitted.as_deref(), Some("turn.async"));
+    assert!(checked >= 2);
+    assert_eq!(adapter.transport().methods().iter().filter(|method| **method == "turn/start").count(), 2);
+    assert!(adapter.transport().writes.iter()
+        .filter(|value| value.get("method").and_then(Value::as_str) == Some("turn/start"))
+        .last().is_some_and(|value| encode(value).unwrap().len() <= 512));
+    assert!(matches!(adapter.prepare_nonblocking_later_turn(
+        &permit, "thread.one", "thread.one", "Short", "message.async",
+    ), Err(CodexError::Blocked(BlockReason::DuplicateMessageKey))));
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    assert!(adapter.bootstrap_ready());
+    let next = adapter.prepare_nonblocking_later_turn(
+        &permit, "thread.one", "thread.one", "Next", "message.next",
+    ).unwrap();
+    adapter.begin_nonblocking_later_turn_after_intent(next).unwrap();
+    let mut second = None;
+    for _ in 0..12 {
+        match adapter.poll_nonblocking_later_turn_once(|_| Ok(())).unwrap() {
+            LaterTurnStartPoll::Submitted { turn_id } => { second = Some(turn_id); break; }
+            LaterTurnStartPoll::Pending | LaterTurnStartPoll::Advanced => {}
+            LaterTurnStartPoll::Uncertain => panic!("second later turn became uncertain"),
+        }
+    }
+    assert_eq!(second.as_deref(), Some("turn.next"));
+    assert_eq!(adapter.transport().methods().iter()
+        .filter(|method| **method == "turn/start").count(), 3);
+}
+
+#[test]
+fn nonblocking_later_turn_lost_or_partial_reply_never_restarts() {
+    for partial in [false, true] {
+        let mut adapter = bootstrapped_nonblocking([read_response(4, "idle", None)],
+            0, partial, !partial);
+        let permit = writer_permit(1);
+        let prepared = adapter.prepare_nonblocking_later_turn(
+            &permit, "thread.one", "thread.one", "Short", "message.uncertain",
+        ).unwrap();
+        adapter.begin_nonblocking_later_turn_after_intent(prepared).unwrap();
+        let mut uncertain = false;
+        for _ in 0..12 {
+            match adapter.poll_nonblocking_later_turn_once(|_| Ok(())).unwrap() {
+                LaterTurnStartPoll::Uncertain => { uncertain = true; break; }
+                LaterTurnStartPoll::Pending | LaterTurnStartPoll::Advanced => {}
+                LaterTurnStartPoll::Submitted { .. } => panic!("lost reply was accepted"),
+            }
+        }
+        assert!(uncertain);
+        assert_eq!(adapter.transport().methods().iter()
+            .filter(|method| **method == "turn/start").count(), 2,
+            "one bootstrap plus exactly one uncertain later start");
+        assert!(adapter.prepare_nonblocking_later_turn(
+            &permit, "thread.one", "thread.one", "Short", "message.uncertain",
+        ).is_err());
+        assert_eq!(adapter.transport().methods().iter()
+            .filter(|method| **method == "turn/start").count(), 2);
+    }
+}
+
+#[test]
+fn nonblocking_later_turn_refuses_long_realistic_ids_before_intent() {
+    let message_id = format!("command.pb04.{}", "a".repeat(64));
+    let prompt = "x".repeat(60);
+    let thread_uuid_shape = "a".repeat(36);
+    let mut ordinary = bootstrapped_with_native_id(&thread_uuid_shape);
+    let ordinary_frame = ordinary.prepare_nonblocking_later_turn(
+        &writer_permit(1), &thread_uuid_shape, &thread_uuid_shape, &prompt, &message_id,
+    ).unwrap();
+    eprintln!("uuid36 later-turn frame bytes={}", ordinary_frame.encoded_start_frame_bytes());
+    assert!(ordinary_frame.encoded_start_frame_bytes() <= 512);
+    let long_thread = "b".repeat(256);
+    let mut long = bootstrapped_with_native_id(&long_thread);
+    let before = long.transport().writes.len();
+    assert!(matches!(long.prepare_nonblocking_later_turn(
+        &writer_permit(1), &long_thread, &long_thread, &prompt, &message_id,
+    ), Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound"))));
+    assert_eq!(long.transport().writes.len(), before,
+        "oversize frame must refuse before any native later-turn write");
 }
 
 #[test]

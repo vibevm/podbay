@@ -3203,7 +3203,7 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
     assert!(!client.stop().unwrap().child_running);
 }
 
-fn install_fake_completed_then_second_turn(fixture: &Fixture, lost_reply: bool) {
+fn install_fake_completed_then_second_turn(fixture: &Fixture, lost_reply: bool, delay_seconds: u64) {
     let original = fs::read_to_string(&fixture.executable).unwrap();
     let replacement = r#"sleep 1
 printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.fixture","status":"completed","items":[]}}}\n'
@@ -3216,13 +3216,17 @@ printf '%s\n' "$later_read" >> "$CODEX_HOME/frames.log"
 printf '{"id":6,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
 read -r later_turn
 printf '%s\n' "$later_turn" >> "$CODEX_HOME/frames.log"
+__LATER_TURN_DELAY__
 __LATER_TURN_REPLY__
 sleep __WAIT_AFTER_TURN__
 "#;
     let response = if lost_reply { "" } else {
         "printf '{\"id\":7,\"result\":{\"turn\":{\"id\":\"turn.later.fixture\",\"status\":\"inProgress\",\"items\":[]}}}\\n'"
     };
-    let replacement = replacement.replace("__LATER_TURN_REPLY__", response)
+    let delay = if delay_seconds == 0 { String::new() }
+        else { format!("sleep {delay_seconds}") };
+    let replacement = replacement.replace("__LATER_TURN_DELAY__", &delay)
+        .replace("__LATER_TURN_REPLY__", response)
         .replace("__WAIT_AFTER_TURN__", if lost_reply { "40" } else { "30" });
     let updated = original.replacen("sleep 30\n", &replacement, 1);
     assert_ne!(updated, original);
@@ -3232,7 +3236,8 @@ sleep __WAIT_AFTER_TURN__
 fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let fixture = Fixture::new();
-    install_fake_completed_then_second_turn(&fixture, lost_reply);
+    install_fake_completed_then_second_turn(&fixture, lost_reply,
+        if lost_reply { 0 } else { 6 });
     let mut port = port_for(&fixture, &binary);
     let reference = CredentialRef::from_trusted_vault(
         fixture.scope.clone(), "vault.codex.preflight",
@@ -3295,33 +3300,50 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
             policy: SendPolicy::WhenIdle,
         }),
     ).unwrap();
+    let begin_send = Instant::now();
     let second_receipt = host.send_codex_session_from_wire(&transport, second.clone(), &policy).unwrap();
-    if lost_reply {
-        assert!(matches!(second_receipt.port_observation,
-            Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
-    } else {
-        assert!(matches!(second_receipt.port_observation,
-            Some(BootstrapPortObservation::PodAccepted(_))));
-    }
+    assert!(begin_send.elapsed() < Duration::from_secs(3),
+        "second-turn IPC blocked on a native RPC: elapsed={:?}, observation={:?}",
+        begin_send.elapsed(), second_receipt.port_observation);
+    assert!(matches!(second_receipt.port_observation,
+        Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
     let second_id = CommandId::try_from(second_receipt.receipt.command_id.as_str()).unwrap();
     let selector = LaterCodexSendSelector {
         scope_id: fixture.scope.clone(), command_id: second_id,
         native_target: target.clone(),
     };
-    let observed = client.inspect_claimed_codex_turn(
-        &selector, lease.writer_epoch(), &second_receipt.receipt.request_digest, "thread.fixture",
-    ).unwrap_or_else(|error| {
-        let status = client.attested_status();
-        let mut store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
-        let lease_state = store.inspect_native_writer_lease(&target);
-        panic!("later-turn inspection failed: {error:?}; status={status:?}; lease={lease_state:?}");
-    });
-    if lost_reply {
-        assert!(matches!(observed.stage, LaterTurnControlStage::SubmissionUncertain));
-    } else {
-        assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { ref native_turn_id }
-            if native_turn_id == "turn.later.fixture"));
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    let deadline = Instant::now() + Duration::from_secs(if lost_reply { 40 } else { 15 });
+    let mut status_during_native_reply = None;
+    loop {
+        let observed = client.inspect_claimed_codex_turn(
+            &selector, lease.writer_epoch(), &second_receipt.receipt.request_digest,
+            "thread.fixture",
+        ).unwrap();
+        let starts = fs::read_to_string(&frames).unwrap_or_default().lines()
+            .filter(|line| line.contains("\"method\":\"turn/start\"")).count();
+        if starts == 2 && status_during_native_reply.is_none() {
+            let before_status = Instant::now();
+            let status = client.attested_status().unwrap();
+            let latency = before_status.elapsed();
+            assert!(status.protocol == "podbay-pod/1");
+            assert!(latency < Duration::from_millis(500),
+                "status blocked during native reply: {latency:?}");
+            eprintln!("later-turn delayed-reply status latency={latency:?}");
+            status_during_native_reply = Some(latency);
+        }
+        let done = if lost_reply {
+            matches!(observed.stage, LaterTurnControlStage::SubmissionUncertain)
+        } else {
+            matches!(observed.stage, LaterTurnControlStage::Submitted { ref native_turn_id }
+                if native_turn_id == "turn.later.fixture")
+        };
+        if done { break; }
+        assert!(Instant::now() < deadline,
+            "later turn did not settle its native reply uncertainty: {:?}", observed.stage);
+        std::thread::sleep(Duration::from_millis(25));
     }
+    assert!(status_during_native_reply.is_some());
     let command_selector = CommandLookupSelector::Key { key: "key.v22.second".into() };
     for _ in 0..2 {
         let (durable, native) = host.lookup_command_with_any_native_observation(
@@ -3339,7 +3361,6 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
             _ => panic!("later command was projected as bootstrap"),
         }
     }
-    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     let methods = fs::read_to_string(&frames).unwrap().lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
             .as_str().unwrap().to_owned()).collect::<Vec<_>>();
@@ -3536,7 +3557,7 @@ fn rebind_v22_second_later_manager_process_helper() {
         }),
     ).unwrap();
     let submitted = host.send_codex_session_from_wire(&transport, second.clone(), &policy).unwrap();
-    assert!(matches!(submitted.port_observation, Some(BootstrapPortObservation::PodAccepted(_))),
+    assert!(matches!(submitted.port_observation, Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))),
         "B second-turn observation: {:?}", submitted.port_observation);
     let manifest = slot_manifest(&fixture).unwrap();
     let client = PodClient::connect(&manifest).unwrap();
@@ -3548,9 +3569,14 @@ fn rebind_v22_second_later_manager_process_helper() {
         command_id: CommandId::try_from(submitted.receipt.command_id.as_str()).unwrap(),
         native_target: target,
     };
-    let observed = client.inspect_claimed_codex_turn(&selector, lease.writer_epoch(),
-        &submitted.receipt.request_digest, "thread.fixture").unwrap();
-    assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { .. }));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let observed = client.inspect_claimed_codex_turn(&selector, lease.writer_epoch(),
+            &submitted.receipt.request_digest, "thread.fixture").unwrap();
+        if matches!(observed.stage, LaterTurnControlStage::Submitted { .. }) { break; }
+        assert!(Instant::now() < deadline, "rebound later-turn native reply stayed unknown");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     for _ in 0..2 {
         let (durable, native) = host.lookup_command_with_any_native_observation(
             &transport, &fixture.scope,
@@ -3579,7 +3605,7 @@ fn rebind_v22_second_later_manager_process_helper() {
 fn disposable_codex_v22_second_turn_after_a_to_b_rebind_uses_current_anchor() {
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let fixture = Fixture::new();
-    install_fake_completed_then_second_turn(&fixture, false);
+    install_fake_completed_then_second_turn(&fixture, false, 0);
     run_rebind_manager_helper("rebind_v22_first_completed_manager_process_helper", &fixture, &binary);
     let manifest = slot_manifest(&fixture).unwrap();
     let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);

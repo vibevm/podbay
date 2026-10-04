@@ -104,6 +104,7 @@ pub struct PodCodexResource {
     later_journal: Option<CodexLaterTurnJournal>,
     later_journal_path: PathBuf,
     later_identity: Option<CodexJournalIdentity>,
+    pending_later_proof: Option<LaterCodexSendRecord>,
     native_events: CodexNativeEventSource,
     child_birth: KernelChildBirthObservation,
     pod_boot_id: String,
@@ -319,6 +320,7 @@ impl PodCodexResource {
             later_journal: None,
             later_journal_path: private_slot.join("codex.turns.log"),
             later_identity: None,
+            pending_later_proof: None,
             native_events,
             child_birth,
             pod_boot_id,
@@ -393,8 +395,17 @@ impl PodCodexResource {
                 recheck()
             },
         );
+        if result.as_ref().is_ok_and(|view| view.stage == LaterTurnStage::IntentDurable)
+            && self.resource.has_pending_nonblocking_later_turn()
+        {
+            self.pending_later_proof = Some(proof.clone());
+        }
         self.flush_native_events()?;
         result
+    }
+
+    pub(crate) fn pending_later_proof(&self) -> Option<&LaterCodexSendRecord> {
+        self.pending_later_proof.as_ref()
     }
 
     pub(crate) fn inspect_claimed_later_turn(
@@ -453,14 +464,18 @@ impl PodCodexResource {
         let expected_child = self.child_birth.clone();
         let expected_boot = self.pod_boot_id.clone();
         let expected_cgroup = self.pod_cgroup.clone();
-        codex_later_turn::poll_once(
+        let result = codex_later_turn::poll_once(
             &mut self.resource, bootstrap, later, identity,
             &mut |native| {
                 recheck_native_child(native, &expected_child, &expected_boot, &expected_cgroup)?;
                 recheck_before_journal()
             },
             &mut |native| flush_native_events_from(native, &mut self.native_events),
-        )
+        );
+        if later.active_view().is_none_or(|view| view.stage != LaterTurnStage::IntentDurable) {
+            self.pending_later_proof = None;
+        }
+        result
     }
 
     pub(crate) fn mark_native_events_unknown(&mut self) {

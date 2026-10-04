@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1302,8 +1302,20 @@ impl PodClient {
         socket.shutdown(std::net::Shutdown::Write)
             .map_err(|_| PodError::Uncertain("later-turn request completion unknown"))?;
         let mut reply = Vec::new();
-        (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)
-            .map_err(|_| PodError::Uncertain("later-turn reply lost after possible effect"))?;
+        if inspection {
+            (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)
+                .map_err(|_| PodError::Uncertain("later-turn reply lost after possible effect"))?;
+        } else {
+            // The pod retains an attested clone of this accepted socket until
+            // native effect fencing ends. An EOF read would wait on that clone.
+            // One newline-terminated bounded reply is sufficient and exact.
+            let mut reader = BufReader::new((&mut socket).take(FRAME_LIMIT + 1));
+            reader.read_until(b'\n', &mut reply)
+                .map_err(|_| PodError::Uncertain("later-turn reply lost after possible effect"))?;
+            if reply.pop() != Some(b'\n') {
+                return Err(PodError::Uncertain("later-turn reply frame is incomplete"));
+            }
+        }
         if reply.len() as u64 > FRAME_LIMIT {
             return Err(PodError::Uncertain("later-turn reply exceeds frame bound"));
         }
@@ -2570,6 +2582,10 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         listener.set_nonblocking(true)?;
     }
     let mut native_pump_available = codex_pump;
+    // Retain the kernel-attested initiating socket while a later native RPC
+    // progresses by nonblocking ticks. The client may have read the immediate
+    // intent receipt; its process birth still has to be current at effect.
+    let mut pending_later_manager: Option<(UnixStream, LinuxPeerEvidence, (u64, u64))> = None;
     let mut prior_rebind_observation: Option<HostObservedPriorCheckpoint> = None;
     let mut completed_recovery: Option<(PendingRebindSupersession, String)> = None;
     loop {
@@ -2578,6 +2594,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         let processed = if native_pump_available {
             match &mut child {
                 ChildResource::Codex(resource) => {
+                    let pending = resource.pending_later_proof().cloned();
                     let tick = resource.poll_native_notification_once(|| {
                         let live = active_codex_binding(&manifest)?;
                         current_codex_binding(&live, descriptor)?;
@@ -2588,8 +2605,42 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                                 "manager claim changed before journal observation",
                             ));
                         }
+                        if let Some(proof) = pending.as_ref() {
+                            let (socket, observed, store_identity) = pending_later_manager.as_ref()
+                                .ok_or(PodError::Refused("later-turn manager socket was lost"))?;
+                            observed.recheck_before_effect(socket, &manager_peer)
+                                .map_err(|_| PodError::Refused("later-turn manager birth changed"))?;
+                            let metadata = fs::symlink_metadata(&live.store_path)
+                                .map_err(|_| PodError::Refused("later-turn store disappeared"))?;
+                            if (metadata.dev(), metadata.ino()) != *store_identity {
+                                return Err(PodError::Refused("later-turn store file changed"));
+                            }
+                            let target = proof.native_target();
+                            let selector = LaterCodexSendSelector {
+                                scope_id: target.scope_id.clone(),
+                                command_id: CommandId::try_from(proof.receipt().command_id.as_str())
+                                    .map_err(|_| PodError::Invalid("later-turn CommandId"))?,
+                                native_target: target.clone(),
+                            };
+                            let mut store = PodBayStore::open_existing_read_only(&live.store_path)
+                                .map_err(|_| PodError::Refused("later-turn store is unavailable"))?;
+                            let current = store.inspect_claimed_later_codex_send(&selector)
+                                .map_err(|_| PodError::Refused("later-turn claimed effect changed"))?;
+                            let lease = store.inspect_native_writer_lease(target)
+                                .map_err(|_| PodError::Refused("later-turn writer lease changed"))?;
+                            if &current != proof || lease.writer_epoch() != proof.writer_epoch()
+                                || lease.holder_actor_id() != proof.holder_actor_id()
+                                || lease.holder_credential_generation()
+                                    != proof.holder_credential_generation()
+                                || lease.expires_at_unix_seconds()
+                                    != proof.lease_expires_at_unix_seconds()
+                            { return Err(PodError::Refused("later-turn effect proof changed")); }
+                        }
                         Ok(())
                     });
+                    if resource.pending_later_proof().is_none() {
+                        pending_later_manager = None;
+                    }
                     match tick {
                         Ok(processed) => processed,
                         Err(_) => {
@@ -3412,11 +3463,23 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                             Ok(())
                         };
                         if let ChildResource::Codex(resource) = &mut child {
+                            let held_peer = if inspection { None } else {
+                                let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                                    "later-turn manager OS peer unavailable"))?;
+                                let metadata = fs::symlink_metadata(&binding.store_path)?;
+                                Some((stream.try_clone()?, observed.clone(),
+                                    (metadata.dev(), metadata.ino())))
+                            };
                             let result = if inspection {
                                 resource.inspect_claimed_later_turn(&proof)
                             } else {
                                 resource.submit_claimed_later_turn(&proof, fresh).map(Some)
                             };
+                            if resource.pending_later_proof().is_some()
+                                && pending_later_manager.is_none()
+                            {
+                                pending_later_manager = held_peer;
+                            }
                             let failed = result.is_err();
                             let view = match result {
                                 Ok(view) => view,
@@ -3448,6 +3511,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     return Err(PodError::Uncertain("later-turn reply exceeds frame bound"));
                 }
                 stream.write_all(&encoded)?;
+                if !inspection {
+                    stream.write_all(b"\n")?;
+                }
                 return Ok(false);
             }
             if bytes.len() as u64 <= FRAME_LIMIT

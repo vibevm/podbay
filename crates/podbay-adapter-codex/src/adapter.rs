@@ -370,6 +370,43 @@ enum CompletionReadState {
     Uncertain,
 }
 
+/// Prepared in memory only. The pod must fsync its command journal Intent
+/// before passing this value to `begin_nonblocking_later_turn_after_intent`.
+/// Private prompt text exists only inside the bounded native frame.
+pub struct PreparedNonblockingLaterTurn {
+    permit: WriterPermit,
+    expected_thread_id: String,
+    expected_session_id: String,
+    client_message_id: String,
+    read_id: u64,
+    read_frame: Vec<u8>,
+    start_id: u64,
+    start_frame: Vec<u8>,
+}
+
+impl PreparedNonblockingLaterTurn {
+    /// Exact serde_json frame bytes including newline; never exposes text.
+    pub fn encoded_start_frame_bytes(&self) -> usize { self.start_frame.len() }
+}
+
+enum LaterSubmissionState {
+    Idle,
+    ReadPendingWrite { prepared: PreparedNonblockingLaterTurn, deadline: Instant },
+    ReadAwaitingReply { prepared: PreparedNonblockingLaterTurn, deadline: Instant },
+    StartPendingWrite { prepared: PreparedNonblockingLaterTurn, deadline: Instant },
+    StartAwaitingReply { prepared: PreparedNonblockingLaterTurn, deadline: Instant },
+    Submitted,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaterTurnStartPoll {
+    Pending,
+    Advanced,
+    Submitted { turn_id: String },
+    Uncertain,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartReceipt {
     pub thread: NativeThread,
@@ -497,6 +534,7 @@ pub struct CodexResource<T: JsonlTransport> {
     applied_notification_bytes: usize,
     completion_read: CompletionReadState,
     last_later_turn_completion: Option<LaterTurnCompletionObservation>,
+    later_submission: LaterSubmissionState,
 }
 
 impl<T: JsonlTransport> CodexResource<T> {
@@ -526,6 +564,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             applied_notification_bytes: 0,
             completion_read: CompletionReadState::NotStarted,
             last_later_turn_completion: None,
+            later_submission: LaterSubmissionState::Idle,
         }
     }
 
@@ -1262,6 +1301,250 @@ impl<T: JsonlTransport> CodexResource<T> {
             self.poisoned = true;
         }
         Ok(accepted)
+    }
+
+    /// Pure preflight for the atomic nonblocking pipe path. The complete
+    /// encoded `turn/start` frame must fit PIPE_BUF before the pod fsyncs an
+    /// intent; larger prompts require a distinct chunked transport contract.
+    pub fn prepare_nonblocking_later_turn(
+        &mut self,
+        permit: &WriterPermit,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> Result<PreparedNonblockingLaterTurn, CodexError> {
+        self.check_permit(permit)?;
+        if text.is_empty() || text.len() > 1_000_000 || !valid_token(client_message_id)
+            || !valid_native_id(expected_thread_id) || !valid_native_id(expected_session_id)
+        { return Err(CodexError::InvalidInput("later turn text or identity is invalid")); }
+        if !matches!(self.bootstrap, BootstrapState::Completed { .. }) {
+            return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
+        }
+        if !matches!(self.later_submission, LaterSubmissionState::Idle | LaterSubmissionState::Submitted)
+            || self.last_submission.as_ref().is_some_and(|prior|
+                prior.client_message_id == client_message_id)
+        { return Err(CodexError::Blocked(BlockReason::DuplicateMessageKey)); }
+        self.check_native_blockers()?;
+        if !self.bootstrap_ready() {
+            return Err(CodexError::Blocked(BlockReason::NativeBusy));
+        }
+        let native = self.thread.as_ref().ok_or(CodexError::Blocked(BlockReason::ObservationUnknown))?;
+        if native.thread_id != expected_thread_id || native.session_id != expected_session_id {
+            return Err(CodexError::Mismatch("later-turn native anchor differs"));
+        }
+        let read_id = self.next_id;
+        let start_id = read_id.checked_add(1).ok_or(CodexError::InvalidState("RPC id exhausted"))?;
+        let read_frame = encode(&json!({"id":read_id,"method":"thread/read",
+            "params":{"threadId":expected_thread_id}})).map_err(CodexError::Codec)?;
+        let start_frame = encode(&json!({"id":start_id,"method":"turn/start",
+            "params":{"threadId":expected_thread_id,
+                "input":[{"type":"text","text":text}],
+                "clientUserMessageId":client_message_id,
+                "model":self.config.model,"effort":self.config.effort}}))
+            .map_err(CodexError::Codec)?;
+        if read_frame.len() > MAX_ATOMIC_READ_PROBE_FRAME
+            || start_frame.len() > MAX_ATOMIC_READ_PROBE_FRAME
+        { return Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound")); }
+        Ok(PreparedNonblockingLaterTurn {
+            permit: permit.clone(), expected_thread_id: expected_thread_id.into(),
+            expected_session_id: expected_session_id.into(),
+            client_message_id: client_message_id.into(), read_id, read_frame,
+            start_id, start_frame,
+        })
+    }
+
+    /// Called only after the pod fsyncs its exact later-turn journal Intent.
+    /// This schedules no write; the outer control loop advances it by ticks.
+    pub fn begin_nonblocking_later_turn_after_intent(
+        &mut self,
+        prepared: PreparedNonblockingLaterTurn,
+    ) -> Result<(), CodexError> {
+        self.check_permit(&prepared.permit)?;
+        if self.next_id != prepared.read_id
+            || !matches!(self.later_submission, LaterSubmissionState::Idle | LaterSubmissionState::Submitted)
+        { return Err(CodexError::Blocked(BlockReason::ObservationUnknown)); }
+        self.next_id = prepared.start_id.checked_add(1)
+            .ok_or(CodexError::InvalidState("RPC id exhausted"))?;
+        self.last_submission = Some(TurnSubmission {
+            client_message_id: prepared.client_message_id.clone(),
+            mode: TurnMode::Start, stage: TurnSubmissionStage::Uncertain,
+        });
+        self.later_submission = LaterSubmissionState::ReadPendingWrite {
+            prepared, deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+        };
+        Ok(())
+    }
+
+    pub fn has_pending_nonblocking_later_turn(&self) -> bool {
+        matches!(self.later_submission,
+            LaterSubmissionState::ReadPendingWrite { .. }
+            | LaterSubmissionState::ReadAwaitingReply { .. }
+            | LaterSubmissionState::StartPendingWrite { .. }
+            | LaterSubmissionState::StartAwaitingReply { .. })
+    }
+
+    fn later_submission_uncertain(&mut self) -> LaterTurnStartPoll {
+        self.later_submission = LaterSubmissionState::Uncertain;
+        self.poisoned = true;
+        LaterTurnStartPoll::Uncertain
+    }
+
+    /// One atomic pipe write or one nonblocking frame read. `Pending` from
+    /// try_write_line certifies zero bytes; a partial write is an error and
+    /// never triggers a second `turn/start`. Notifications are applied before
+    /// the matching response is interpreted.
+    pub fn poll_nonblocking_later_turn_once(
+        &mut self,
+        mut before_turn_start: impl FnMut(&mut Self) -> Result<(), CodexError>,
+    ) -> Result<LaterTurnStartPoll, CodexError> {
+        let state = std::mem::replace(&mut self.later_submission, LaterSubmissionState::Uncertain);
+        match state {
+            LaterSubmissionState::Idle => Err(CodexError::InvalidState("later turn was not scheduled")),
+            LaterSubmissionState::Submitted => {
+                self.later_submission = LaterSubmissionState::Submitted;
+                Err(CodexError::InvalidState("later turn was already submitted"))
+            }
+            LaterSubmissionState::Uncertain => Ok(LaterTurnStartPoll::Uncertain),
+            LaterSubmissionState::ReadPendingWrite { prepared, deadline } => {
+                if Instant::now() >= deadline { return Ok(self.later_submission_uncertain()); }
+                match self.io.try_write_line(&prepared.read_frame) {
+                    Ok(AvailableWrite::Pending) => {
+                        self.later_submission = LaterSubmissionState::ReadPendingWrite { prepared, deadline };
+                        Ok(LaterTurnStartPoll::Pending)
+                    }
+                    Ok(AvailableWrite::Written) => {
+                        self.later_submission = LaterSubmissionState::ReadAwaitingReply { prepared, deadline };
+                        Ok(LaterTurnStartPoll::Advanced)
+                    }
+                    Err(_) => Ok(self.later_submission_uncertain()),
+                }
+            }
+            LaterSubmissionState::ReadAwaitingReply { prepared, deadline } => {
+                if Instant::now() >= deadline { return Ok(self.later_submission_uncertain()); }
+                let frame = match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                        self.later_submission = LaterSubmissionState::ReadAwaitingReply { prepared, deadline };
+                        return Ok(LaterTurnStartPoll::Pending);
+                    }
+                    Ok(AvailableLine::Frame(frame)) => frame,
+                    Ok(AvailableLine::EndOfStream) | Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                let value = match decode(&frame) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                if nonempty_string(value.get("method")).is_some() {
+                    if self.apply_event_or_poison(&value, &frame).is_err() {
+                        return Ok(self.later_submission_uncertain());
+                    }
+                    self.later_submission = LaterSubmissionState::ReadAwaitingReply { prepared, deadline };
+                    return Ok(LaterTurnStartPoll::Advanced);
+                }
+                if value.get("id").and_then(Value::as_u64) != Some(prepared.read_id) {
+                    return Ok(self.later_submission_uncertain());
+                }
+                let result = match value.get("result") {
+                    Some(result) => result,
+                    None => return Ok(self.later_submission_uncertain()),
+                };
+                let thread = match self.validate_read_thread(result, &prepared.expected_thread_id) {
+                    Ok(thread) => thread,
+                    Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                let waiting = match waiting_flag(result.pointer("/thread/status")) {
+                    Ok(waiting) => waiting,
+                    Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                self.thread = Some(thread.clone());
+                self.native_status = thread.status;
+                self.observed_active_turn_id = None;
+                self.status_waiting = waiting;
+                self.retire_resolved_requests();
+                if thread.session_id != prepared.expected_session_id
+                    || thread.status != ThreadStatus::Idle
+                    || self.apply_queued().is_err()
+                    || self.check_native_blockers().is_err()
+                    || !self.bootstrap_ready()
+                { return Ok(self.later_submission_uncertain()); }
+                if before_turn_start(self).is_err() {
+                    return Ok(self.later_submission_uncertain());
+                }
+                self.later_submission = LaterSubmissionState::StartPendingWrite {
+                    prepared, deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                };
+                Ok(LaterTurnStartPoll::Advanced)
+            }
+            LaterSubmissionState::StartPendingWrite { prepared, deadline } => {
+                if Instant::now() >= deadline || before_turn_start(self).is_err()
+                    || self.check_permit(&prepared.permit).is_err()
+                    || self.check_native_blockers().is_err() || !self.bootstrap_ready()
+                    || self.thread.as_ref().is_none_or(|thread|
+                        thread.thread_id != prepared.expected_thread_id
+                            || thread.session_id != prepared.expected_session_id)
+                { return Ok(self.later_submission_uncertain()); }
+                match self.io.try_write_line(&prepared.start_frame) {
+                    Ok(AvailableWrite::Pending) => {
+                        self.later_submission = LaterSubmissionState::StartPendingWrite { prepared, deadline };
+                        Ok(LaterTurnStartPoll::Pending)
+                    }
+                    Ok(AvailableWrite::Written) => {
+                        self.later_submission = LaterSubmissionState::StartAwaitingReply {
+                            prepared, deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                        };
+                        Ok(LaterTurnStartPoll::Advanced)
+                    }
+                    Err(_) => Ok(self.later_submission_uncertain()),
+                }
+            }
+            LaterSubmissionState::StartAwaitingReply { prepared, deadline } => {
+                if Instant::now() >= deadline { return Ok(self.later_submission_uncertain()); }
+                let frame = match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                        self.later_submission = LaterSubmissionState::StartAwaitingReply { prepared, deadline };
+                        return Ok(LaterTurnStartPoll::Pending);
+                    }
+                    Ok(AvailableLine::Frame(frame)) => frame,
+                    Ok(AvailableLine::EndOfStream) | Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                let value = match decode(&frame) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(self.later_submission_uncertain()),
+                };
+                if nonempty_string(value.get("method")).is_some() {
+                    if self.apply_event_or_poison(&value, &frame).is_err() {
+                        return Ok(self.later_submission_uncertain());
+                    }
+                    self.later_submission = LaterSubmissionState::StartAwaitingReply { prepared, deadline };
+                    return Ok(LaterTurnStartPoll::Advanced);
+                }
+                if value.get("id").and_then(Value::as_u64) != Some(prepared.start_id) {
+                    return Ok(self.later_submission_uncertain());
+                }
+                let turn = value.pointer("/result/turn");
+                let Some(turn_id) = nonempty_string(turn.and_then(|turn| turn.get("id"))) else {
+                    return Ok(self.later_submission_uncertain());
+                };
+                if turn.and_then(|turn| turn.get("status")).and_then(Value::as_str)
+                    != Some("inProgress")
+                { return Ok(self.later_submission_uncertain()); }
+                let turn_id = turn_id.to_owned();
+                self.owned_active_turn_id = Some(turn_id.clone());
+                self.last_later_turn_completion = None;
+                self.completion_read = CompletionReadState::NotStarted;
+                self.observed_active_turn_id = Some(turn_id.clone());
+                self.native_status = ThreadStatus::Active;
+                self.idle_after_completion = false;
+                self.last_submission = Some(TurnSubmission {
+                    client_message_id: prepared.client_message_id,
+                    mode: TurnMode::Start,
+                    stage: TurnSubmissionStage::Accepted { turn_id: turn_id.clone() },
+                });
+                self.later_submission = LaterSubmissionState::Submitted;
+                if self.apply_queued().is_err() { self.poisoned = true; }
+                Ok(LaterTurnStartPoll::Submitted { turn_id })
+            }
+        }
     }
 
     /// RPC success is only an interrupt request receipt. A matching native

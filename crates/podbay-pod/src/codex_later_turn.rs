@@ -3,8 +3,10 @@
 
 use podbay_adapter_codex::{
     BlockReason, BootstrapReadPoll, CodexError, CodexResource, JsonlTransport,
-    LaterTurnCompletionObservation, LaterTurnTerminalStatus, TurnSubmissionStage, WriterPermit,
+    LaterTurnCompletionObservation, LaterTurnStartPoll, LaterTurnTerminalStatus, WriterPermit,
 };
+#[cfg(test)]
+use podbay_adapter_codex::TurnSubmissionStage;
 use podbay_core::Epoch;
 use podbay_store::{EffectState, LaterCodexSendRecord};
 
@@ -79,7 +81,59 @@ pub(crate) fn submit_store_claimed<T: JsonlTransport>(
             resource_id: target.resource_id.clone(), resource_epoch,
         },
     };
-    submit_claimed(resource, bootstrap, later, &proof, recheck)
+    submit_claimed_nonblocking(resource, bootstrap, later, &proof, recheck)
+}
+
+fn submit_claimed_nonblocking<T: JsonlTransport, P: ClaimedLaterTurn>(
+    resource: &mut CodexResource<T>,
+    bootstrap: &mut CodexCommandJournal,
+    later: &mut CodexLaterTurnJournal,
+    proof: &P,
+    recheck: &mut impl FnMut(&mut CodexResource<T>) -> Result<(), PodError>,
+) -> Result<LaterTurnView, PodError> {
+    if resource.identity() != proof.resource_identity() {
+        return Err(PodError::Refused("later-turn pod Resource differs"));
+    }
+    current_anchor(resource, bootstrap, later, proof.journal_identity())?;
+    let key = proof.command_key();
+    let digest = proof.request_digest();
+    if later.view(key).is_some() {
+        return match later.begin_turn(key, digest, proof.client_message_id(), proof.writer_epoch())? {
+            LaterTurnIntentResult::Duplicate(view) => Ok(view),
+            LaterTurnIntentResult::NewlyDurable(_) => unreachable!("existing command"),
+        };
+    }
+    recheck(resource)?;
+    let epoch = Epoch::new(proof.writer_epoch())
+        .map_err(|_| PodError::Refused("later-turn writer epoch is invalid"))?;
+    resource.install_writer_epoch_from_trusted_boundary(epoch)
+        .map_err(|_| PodError::Refused("later-turn writer epoch differs"))?;
+    let permit = WriterPermit::from_trusted_boundary(resource.identity().clone(), epoch);
+    let anchor = bootstrap.view();
+    let thread_id = anchor.native_thread_id.as_deref()
+        .ok_or(PodError::Refused("later-turn native thread anchor is absent"))?;
+    let session_id = anchor.native_session_id.as_deref()
+        .ok_or(PodError::Refused("later-turn native Session anchor is absent"))?;
+    // The complete turn/start frame is encoded and checked against PIPE_BUF
+    // before any journal Intent or native write. No text is truncated.
+    let prepared = resource.prepare_nonblocking_later_turn(
+        &permit,
+        thread_id,
+        session_id,
+        proof.text(),
+        proof.client_message_id(),
+    ).map_err(|_| PodError::Refused("later turn exceeds or fails atomic native preflight"))?;
+    let view = match later.begin_turn(key, digest, proof.client_message_id(), proof.writer_epoch())? {
+        LaterTurnIntentResult::Duplicate(view) => return Ok(view),
+        LaterTurnIntentResult::NewlyDurable(view) => view,
+    };
+    if recheck(resource).is_err()
+        || current_anchor(resource, bootstrap, later, proof.journal_identity()).is_err()
+    { return uncertain_view(later, key, digest); }
+    if resource.begin_nonblocking_later_turn_after_intent(prepared).is_err() {
+        return uncertain_view(later, key, digest);
+    }
+    Ok(view)
 }
 
 fn current_anchor<T: JsonlTransport>(
@@ -118,9 +172,9 @@ fn uncertain_view(
         .map_err(|_| PodError::Uncertain("later-turn native outcome lacks durable receipt"))
 }
 
-/// Fsync one intent and attempt at most one native `turn/start`. `recheck`
-/// is the current OS child and writer-lease boundary. A store record alone
-/// never authenticates the connected manager or authorizes native input.
+/// Historical synchronous fixture controller. Production uses the bounded
+/// nonblocking path above; this stays only to exercise journal transitions.
+#[cfg(test)]
 fn submit_claimed<T: JsonlTransport, P: ClaimedLaterTurn>(
     resource: &mut CodexResource<T>,
     bootstrap: &mut CodexCommandJournal,
@@ -203,6 +257,48 @@ pub(crate) fn poll_once<T: JsonlTransport>(
     flush_native: &mut impl FnMut(&mut CodexResource<T>) -> Result<(), PodError>,
 ) -> Result<bool, PodError> {
     let view = later.active_view();
+    if let Some(view) = view.as_ref()
+        && view.stage == LaterTurnStage::IntentDurable
+    {
+        if !resource.has_pending_nonblocking_later_turn() {
+            uncertain_view(later, &view.command_key, &view.payload_digest)?;
+            return Ok(true);
+        }
+        let progress = resource.poll_nonblocking_later_turn_once(|native| {
+            current_anchor(native, bootstrap, later, journal_identity)
+                .map_err(|_| CodexError::Blocked(BlockReason::ObservationUnknown))?;
+            recheck(native).map_err(|_| CodexError::Blocked(BlockReason::ObservationUnknown))
+        });
+        if flush_native(resource).is_err() {
+            uncertain_view(later, &view.command_key, &view.payload_digest)?;
+            return Err(PodError::Uncertain("later-turn native event append failed"));
+        }
+        return match progress {
+            Ok(LaterTurnStartPoll::Pending) => Ok(false),
+            Ok(LaterTurnStartPoll::Advanced) => Ok(true),
+            Ok(LaterTurnStartPoll::Submitted { turn_id }) => {
+                if recheck(resource).is_err()
+                    || current_anchor(resource, bootstrap, later, journal_identity).is_err()
+                {
+                    uncertain_view(later, &view.command_key, &view.payload_digest)?;
+                    return Ok(true);
+                }
+                later.record_submitted(&view.command_key, &view.payload_digest, &turn_id)?;
+                Ok(true)
+            }
+            Ok(LaterTurnStartPoll::Uncertain) | Err(_) => {
+                uncertain_view(later, &view.command_key, &view.payload_digest)?;
+                Ok(true)
+            }
+        };
+    }
+    if let Some(view) = view.as_ref()
+        && view.stage == LaterTurnStage::IntentUnknownAfterReopen
+    {
+        // The process lost whether its old intent reached the native pipe.
+        // Never restart or consume a response as a new turn.
+        return Ok(false);
+    }
     if let Some(view) = view.as_ref()
         && let LaterTurnStage::CompletionObservedPendingIdleProof(expected_status) = view.stage
     {

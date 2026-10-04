@@ -86,25 +86,34 @@ deduplicate an older key after later submissions or across process restart.
 PodBay's durable command ledger must provide caller-scoped idempotency before
 turn control is exposed to a live provider.
 
-`send_turn_after_checkpoint_checked` is an idle-only later-turn primitive. It
-requires a local writer permit, the exact checkpointed native thread and
-native Session IDs, a fresh metadata-only idle read, and a trusted read-only
-preflight immediately before one `turn/start`. It returns the exact in-progress
-turn ID or an uncertain attempted submission; an ambiguous reply poisons this
-adapter instance. The separate pod-local `CodexLaterTurnJournal` anchors to a
-fsynced BootstrapCompleted record and records multiple command keys, intents,
-turn receipts, reported terminal notifications and fresh-idle settlement as
-distinct facts. Neither primitive grants manager admission. A later store
-version and authenticated pod control bridge are required before exposing
-subsequent `session.send` to clients.
+`send_turn_after_checkpoint_checked` is the historical synchronous, idle-only
+primitive. The v22 pod route now uses `prepare_nonblocking_later_turn` before
+fsyncing journal Intent. It encodes the **whole** `turn/start` JSONL frame and
+refuses if it exceeds 512 bytes, the atomic pipe-write bound. After Intent,
+`begin_nonblocking_later_turn_after_intent` schedules no write; one outer-loop
+tick writes or reads at most one nonblocking native frame. `Pending` certifies
+zero bytes written and may retry only that same frame in the same process.
+A partial write, timeout, lost/malformed reply, or crash after Intent remains
+uncertain and never resends `turn/start`. Only a valid native reply fsyncs the
+exact turn ID. This is a bounded capability, not 64 KiB prompt support; larger
+encoded frames fail closed without truncation. A 36-byte UUID-shaped thread ID,
+77-byte PodBay CommandId, 60-byte text and gpt-6-sol/medium encoded to 328
+bytes in the focused fixture. A real disposable Codex smoke observed native
+thread and Session ID lengths of 36 bytes each (metadata only).
+
+The pod-local `CodexLaterTurnJournal` anchors to fsynced BootstrapCompleted
+and records multiple command keys, intents, exact turn receipts, reported
+terminal notifications and fresh-idle settlement as distinct facts. The v22
+store claim and authenticated selector-only pod route supply manager authority;
+neither an in-memory WriterPermit nor a journal record grants it alone.
 
 After a matching state-applied later `turn/completed`, the adapter retains the
 exact native thread, Session, turn and terminal status. Its existing bounded
 nonblocking `thread/read` bridge can then require fresh idle, no waiting and
 no pending host request before a pod journal records settlement. An unrelated
-turn or a lost/malformed read remains uncertain. This bridge is exercised by
-a sealed fixture-only controller; the normal Pod binary still has no later
-`session.send` mutation route.
+turn or a lost/malformed read remains uncertain. The normal Pod binary now
+uses this bridge for claimed later turns and keeps control/status available
+while a delayed native reply is pending.
 
 The pod-local `CodexCommandJournal` storage slice now records a fsynced
 thread-create intent, exact native thread/session checkpoint, and separate
