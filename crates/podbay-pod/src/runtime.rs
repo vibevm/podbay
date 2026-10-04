@@ -2348,6 +2348,49 @@ fn renew_and_authorize_manager_pod_control(
 /// public terminal stream. The pod continues draining after the bound so a
 /// chatty child cannot block on its pipe. This file is evidence for the local
 /// process fixture, not a durable event cursor or provider acknowledgement.
+fn operator_user_runtime_directory() -> Result<PathBuf, PodError> {
+    let peer = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| PodError::Refused("operator Pod process identity unavailable"))?;
+    let path = expected_operator_user_runtime_directory(peer.uid());
+    validate_operator_user_runtime_directory(&path, peer.uid())?;
+    Ok(path)
+}
+
+fn expected_operator_user_runtime_directory(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/run/user/{uid}"))
+}
+
+fn validate_operator_user_runtime_directory(path: &Path, uid: u32) -> Result<(), PodError> {
+    if path != expected_operator_user_runtime_directory(uid) {
+        return Err(PodError::Refused("operator user runtime path differs"));
+    }
+    validate_operator_runtime_directory_metadata(path, uid)
+}
+
+fn validate_operator_runtime_directory_metadata(path: &Path, uid: u32) -> Result<(), PodError> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_dir()
+        || before.uid() != uid
+        || before.mode() & 0o7777 != 0o700
+        || fs::canonicalize(path)? != path
+    {
+        return Err(PodError::Refused("operator user runtime directory is not private"));
+    }
+    let pinned = OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let opened = pinned.metadata()?;
+    let after = fs::symlink_metadata(path)?;
+    if (opened.dev(), opened.ino(), opened.uid(), opened.mode() & 0o7777)
+        != (before.dev(), before.ino(), uid, 0o700)
+        || (after.dev(), after.ino(), after.uid(), after.mode() & 0o7777)
+            != (before.dev(), before.ino(), uid, 0o700)
+    {
+        return Err(PodError::Refused("operator user runtime directory changed"));
+    }
+    Ok(())
+}
+
 fn spawn_operator_process(
     descriptor: &LaunchDescriptor,
     manifest_path: &Path,
@@ -2380,10 +2423,12 @@ fn spawn_operator_process(
     }
     let stdout_file = private_output(&manifest_path.with_extension("process-output"))?;
     let stderr_file = private_output(&manifest_path.with_extension("process-error"))?;
+    let user_runtime = operator_user_runtime_directory()?;
     let mut child = Command::new(&descriptor.executable)
         .args(&descriptor.args)
         .current_dir(&descriptor.cwd)
         .env_clear()
+        .env("XDG_RUNTIME_DIR", user_runtime)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4083,6 +4128,24 @@ mod tests {
     use crate::manifest::PodRole;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn operator_user_runtime_environment_is_exact_and_refuses_wrong_uid_or_path() {
+        let peer = LinuxPeerEvidence::for_current_process().unwrap();
+        let expected = expected_operator_user_runtime_directory(peer.uid());
+        assert_eq!(expected, PathBuf::from(format!("/run/user/{}", peer.uid())));
+        if expected.exists() {
+            assert_eq!(operator_user_runtime_directory().unwrap(), expected);
+        }
+        assert!(validate_operator_user_runtime_directory(Path::new("/tmp"), peer.uid()).is_err());
+        let wrong_owner = std::env::temp_dir().join(format!(
+            "podbay-runtime-owner-{}-{}", std::process::id(), peer.start_ticks(),
+        ));
+        fs::create_dir(&wrong_owner).unwrap();
+        fs::set_permissions(&wrong_owner, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_operator_runtime_directory_metadata(&wrong_owner, peer.uid() + 1).is_err());
+        fs::remove_dir(&wrong_owner).unwrap();
+    }
 
     struct PendingFixtureLedger(RebindProposal);
     impl RebindLedger for PendingFixtureLedger {
