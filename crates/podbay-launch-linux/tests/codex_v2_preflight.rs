@@ -1211,6 +1211,29 @@ fn rebind_second_manager_process_helper() {
     assert_eq!(client.attested_status().unwrap().child_pid, before_pid);
     let events = client.read_codex_native_events(None, 16).unwrap();
     assert_eq!(events.snapshot.identity.pod_id, fixture.pod.as_str());
+    let rebound_proof = host
+        .inspect_committed_root_codex_v2(&fixture.scope, &fixture.pod)
+        .unwrap();
+    let read_source = TrustedCodexCredentialSource::from_trusted_policy(
+        CredentialRef::from_trusted_vault(
+            fixture.scope.clone(),
+            "vault.codex.preflight",
+        )
+        .unwrap(),
+        fixture.source.clone(),
+    )
+    .unwrap();
+    let trusted_directory =
+        TrustedNativeEventDirectory::from_trusted_policy(fixture.directory.clone()).unwrap();
+    let manager_events = read_committed_codex_native_evidence(
+        &rebound_proof,
+        &read_source,
+        &trusted_directory,
+        None,
+        16,
+    )
+    .unwrap();
+    assert_eq!(manager_events.redacted().snapshot.identity.pod_id, fixture.pod.as_str());
     assert!(!client.stop().unwrap().child_running);
     fs::write(
         fixture.directory.join("rebind.second.done"),
