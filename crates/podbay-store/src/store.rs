@@ -338,13 +338,39 @@ impl PodBayStore {
         }
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
-        )?;
+        let before_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // A v19 pod may still be running against this file. Delay WAL mode
+        // changes until after the v19 launch-state gate has passed under the
+        // same IMMEDIATE transaction as migration.
+        if before_version == 19 {
+            connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        } else {
+            connection.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+            )?;
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedSchema(version));
+        }
+        if version == 19 {
+            verify_runtime_schema(&transaction)?;
+            let occupied: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM launch_bindings LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM launch_slots LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM authority_pods LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM runtime_sessions LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM runtime_runs LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM manager_rebinds LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v19 launch state requires attested quiescence before v20 migration",
+                ));
+            }
         }
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (
@@ -864,6 +890,9 @@ impl PodBayStore {
         verify_policy_fence_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
+        if before_version == 19 {
+            connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+        }
         let store_lineage: String = connection.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],

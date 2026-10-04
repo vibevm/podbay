@@ -2001,7 +2001,7 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
 }
 
 #[test]
-fn v19_to_v20_keeps_historical_v2_binding_without_inventing_policy_fence() {
+fn v19_with_historical_v2_refuses_default_migration_without_changing_database() {
     let fixture = Fixture::new();
     let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
     let before = store
@@ -2018,39 +2018,52 @@ fn v19_to_v20_keeps_historical_v2_binding_without_inventing_policy_fence() {
         )
         .unwrap();
     drop(connection);
-    let mut reopened = fixture.open();
-    assert_eq!(reopened.policy_fence_epoch().unwrap(), revision.max(1));
-    assert_eq!(
-        reopened
-            .inspect_native_writer_lease(&target)
-            .unwrap()
-            .writer_epoch(),
-        writer_epoch
-    );
-    assert_eq!(
-        reopened
-            .current_manager_credential_claim(1)
-            .unwrap()
-            .credential_epoch(),
-        manager_credential
-    );
-    assert_eq!(
-        reopened
-            .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str(),)
-            .unwrap()
-            .launch(),
-        before.launch()
-    );
-    let count: i64 = rusqlite::Connection::open(&fixture.database)
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM launch_policy_fences", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        count, 0,
-        "migration may not invent V3 policy evidence for a V2 launch"
-    );
+    let original_database = std::fs::read(&fixture.database).unwrap();
+    let wal_path = fixture.database.with_extension("sqlite-wal");
+    let original_wal = std::fs::read(&wal_path).ok();
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict(
+            "v19 launch state requires attested quiescence before v20 migration"
+        ))
+    ));
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), original_database);
+    assert_eq!(std::fs::read(&wal_path).ok(), original_wal);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let descriptor: Vec<u8> = connection.query_row(
+        "SELECT descriptor FROM launch_bindings LIMIT 1", [], |row| row.get(0),
+    ).unwrap();
+    let lease: i64 = connection.query_row(
+        "SELECT writer_epoch FROM native_writer_leases LIMIT 1", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(version, 19);
+    assert_eq!(descriptor, before.launch().descriptor);
+    assert_eq!(lease as u64, writer_epoch);
+    assert!(revision > 0 && manager_credential > 0);
+    assert_eq!(target.pod_id.as_str(), before.pod_id().as_str());
+}
+
+#[test]
+fn v19_without_launch_state_upgrades_to_v20_with_empty_policy_rows() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "DROP TABLE launch_policy_fences;
+         DELETE FROM metadata WHERE key='policy_fence_epoch';
+         PRAGMA user_version=19;",
+    ).unwrap();
+    drop(connection);
+    let reopened = fixture.open();
+    assert_eq!(reopened.policy_fence_epoch().unwrap(), 1);
+    drop(reopened);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM launch_policy_fences", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!((version, rows), (20, 0));
 }
 
 #[test]

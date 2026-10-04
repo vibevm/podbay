@@ -40,7 +40,7 @@ use podbay_pod::{
     manifest_path_for_identity,
 };
 use podbay_store::{
-    CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
+    CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore, StoreError,
     TrustedNativeWriterLeaseRequest,
 };
 use podbay_wire::{
@@ -1281,6 +1281,81 @@ fn disposable_codex_v3_two_roots_hold_policy_until_revocation() {
             assert!(Instant::now() < deadline, "V3 disposable unit remained loaded: {unit}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and V19 fixture/pod binaries"]
+fn disposable_live_v19_v2_unit_blocks_v20_migration_without_touching_database() {
+    let helper = fs::canonicalize(
+        std::env::var_os("PODBAY_TEST_V19_FIXTURE_BINARY").unwrap(),
+    ).unwrap();
+    let pod_binary = fs::canonicalize(
+        std::env::var_os("PODBAY_TEST_V19_POD_BINARY").unwrap(),
+    ).unwrap();
+    let fixture = Fixture::new();
+    let started = Command::new(&helper)
+        .args(["--ignored", "--exact", "rebind_first_manager_process_helper", "--nocapture"])
+        .env("PODBAY_REBIND_FIXTURE_DIR", &fixture.directory)
+        .env("PODBAY_REBIND_FIXTURE_POD", fixture.pod.as_str())
+        .env("PODBAY_TEST_POD_BINARY", &pod_binary)
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "v19 helper failed: {}",
+        String::from_utf8_lossy(&started.stderr));
+    let manifest = slot_manifest(&fixture).expect("v19 helper launched one V2 pod");
+    let guard = DisposableUnitGuard::for_manifest(&manifest);
+    let show = || Command::new("systemctl")
+        .args(["--user", "show", "--property=ActiveState", "--property=MainPID", &guard.0])
+        .output().unwrap();
+    let active = show();
+    assert!(active.status.success());
+    let active_text = String::from_utf8_lossy(&active.stdout);
+    assert!(active_text.lines().any(|line| line == "ActiveState=active"));
+    let supervisor_pid: u32 = active_text.lines()
+        .find_map(|line| line.strip_prefix("MainPID="))
+        .unwrap().parse().unwrap();
+    assert!(supervisor_pid > 0);
+    let child_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap().parse().unwrap();
+    assert!(Path::new(&format!("/proc/{child_pid}")).exists());
+    assert!(matches!(
+        PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::UnsupportedSchema(19))
+    ));
+    let db_before = fs::read(&fixture.database).unwrap();
+    let wal = fixture.database.with_extension("sqlite-wal");
+    let wal_before = fs::read(&wal).ok();
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict(
+            "v19 launch state requires attested quiescence before v20 migration"
+        ))
+    ));
+    assert!(matches!(
+        PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::UnsupportedSchema(19))
+    ));
+    assert_eq!(fs::read(&fixture.database).unwrap(), db_before);
+    assert_eq!(fs::read(&wal).ok(), wal_before);
+    let after = show();
+    assert!(after.status.success());
+    let after_text = String::from_utf8_lossy(&after.stdout);
+    assert!(after_text.lines().any(|line| line == "ActiveState=active"));
+    assert!(after_text.lines().any(|line| line == format!("MainPID={supervisor_pid}")));
+    assert!(Path::new(&format!("/proc/{child_pid}")).exists());
+
+    assert!(Command::new("systemctl").args(["--user", "stop", &guard.0])
+        .status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=LoadState", "--value", &guard.0])
+            .output().unwrap();
+        assert!(state.status.success());
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" { break; }
+        assert!(Instant::now() < deadline, "v19 disposable unit remained loaded");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
