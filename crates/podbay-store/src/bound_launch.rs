@@ -15,7 +15,8 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeMap;
 
 use crate::model::{
-    CommandRequest, DIGEST_VERSION, LaunchLookupRequest, Receipt, StoreError, VerifiedPrincipal,
+    CommandRequest, DIGEST_VERSION, LaunchKeyLookupRequest, LaunchLookupRequest, Receipt,
+    StoreError, VerifiedPrincipal,
 };
 use crate::store::{
     PodBayStore, digest_request, integer, sha256_hex, stable_command_id, valid_id, validate_request,
@@ -235,6 +236,49 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
+    /// Read an existing bound launch before a manager mints any Session, Run,
+    /// Attempt, Pod, or Resource IDs. A miss permits planning; a changed
+    /// canonical caller intent conflicts and must never mint another launch.
+    /// This does not authorize dispatch or prove that the pod is current.
+    pub fn lookup_bound_launch_by_key(
+        &mut self,
+        request: &LaunchKeyLookupRequest,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        valid_id(&request.command_key)?;
+        valid_id(&request.scope_id)?;
+        if request.canonical_intent.is_empty() || request.canonical_intent.len() > 1_048_576 {
+            return Err(StoreError::InvalidInput(
+                "canonical caller intent size is invalid",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let row: Option<(i64, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT command_rowid,scope_id,canonical_request FROM commands
+                 WHERE principal=?1 AND namespace=?2 AND command_key=?3",
+                params![request.principal.as_str(), NAMESPACE, request.command_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((rowid, scope, canonical)) = row else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if scope != request.scope_id {
+            return Err(StoreError::NotFound);
+        }
+        if canonical != request.canonical_intent {
+            return Err(StoreError::Conflict(
+                "command key changed canonical caller intent",
+            ));
+        }
+        let record = read_bound_record(&transaction, rowid)?;
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     /// Current bound Pod and resource context from one DEFERRED SQLite
     /// snapshot. Caller supplies only scope/PodId; historical command keys,
     /// principals and caller bytes cannot select or revive a stale launch.

@@ -92,6 +92,17 @@ pub struct LaunchLookupRequest {
     pub canonical_intent: Vec<u8>,
 }
 
+/// Pre-mint lookup for a high-level launch request that does not yet have a
+/// PodId. The manager supplies an authenticated principal and canonical
+/// caller intent; the store returns only an already committed binding.
+#[derive(Clone, Debug)]
+pub struct LaunchKeyLookupRequest {
+    pub principal: VerifiedPrincipal,
+    pub command_key: String,
+    pub scope_id: String,
+    pub canonical_intent: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchIntentBinding {
     /// An old row or a generic schema-v8 admission has no reviewed binding.

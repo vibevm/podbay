@@ -8,8 +8,8 @@ use podbay_core::{
 };
 use podbay_store::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
-    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, LaunchLookupRequest, PodBayStore,
-    StoreError, VerifiedPrincipal,
+    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, LaunchKeyLookupRequest,
+    LaunchLookupRequest, PodBayStore, StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{
     CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -248,6 +248,15 @@ fn lookup(key: &str, intent: &[u8]) -> LaunchLookupRequest {
     }
 }
 
+fn lookup_by_key(key: &str, intent: &[u8]) -> LaunchKeyLookupRequest {
+    LaunchKeyLookupRequest {
+        principal: principal(),
+        command_key: key.into(),
+        scope_id: "scope.launch".into(),
+        canonical_intent: intent.to_vec(),
+    }
+}
+
 #[test]
 fn codex_v2_root_coordinator_and_root_worker_commit_with_exact_snapshot_and_duplicate() {
     // Both variants create a new Session and its first root Run. The Worker
@@ -289,6 +298,35 @@ fn codex_v2_root_coordinator_and_root_worker_commit_with_exact_snapshot_and_dupl
                 .lookup_bound_launch(&lookup("key.codex.v2", b"intent.codex.v2"))
                 .unwrap(),
             Some(record.clone())
+        );
+        assert_eq!(
+            store
+                .lookup_bound_launch_by_key(&lookup_by_key("key.codex.v2", b"intent.codex.v2"))
+                .unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            store
+                .lookup_bound_launch_by_key(&lookup_by_key("key.new", b"intent.new"))
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.lookup_bound_launch_by_key(&lookup_by_key("key.codex.v2", b"intent.changed")),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut foreign_scope = lookup_by_key("key.codex.v2", b"intent.codex.v2");
+        foreign_scope.scope_id = "scope.other".into();
+        assert!(matches!(
+            store.lookup_bound_launch_by_key(&foreign_scope),
+            Err(StoreError::NotFound)
+        ));
+        let mut foreign_actor = lookup_by_key("key.codex.v2", b"intent.codex.v2");
+        foreign_actor.principal =
+            VerifiedPrincipal::from_authenticated_boundary("principal.other").unwrap();
+        assert_eq!(
+            store.lookup_bound_launch_by_key(&foreign_actor).unwrap(),
+            None
         );
         assert_eq!(
             store
