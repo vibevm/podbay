@@ -479,6 +479,96 @@ fn codex_v2_root_coordinator_and_root_worker_commit_with_exact_snapshot_and_dupl
 }
 
 #[test]
+fn delegating_parent_preflight_requires_current_coordinator_and_rechecks_revision() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    store
+        .admit_bound_root_launch_v2(proposal.request("key.parent.preflight", b"intent.parent"))
+        .unwrap();
+    let scope = ScopeId::try_from("scope.launch").unwrap();
+    let run = RunId::try_from("run.codex.fixture").unwrap();
+    let pod = PodId::try_from("pod.launch").unwrap();
+    let witness = store
+        .preflight_delegating_parent(&scope, &run, &pod)
+        .unwrap();
+    assert_eq!(witness.parent_run_id(), &run);
+    assert_eq!(
+        witness.parent_session_id().as_str(),
+        "session.codex.fixture"
+    );
+    assert_eq!(witness.current_pod().pod_id(), &pod);
+    assert_eq!(
+        (
+            witness.budget().max_children(),
+            witness.budget().reserved_children()
+        ),
+        (2, 0)
+    );
+    store.recheck_delegating_parent(&witness).unwrap();
+    assert!(matches!(
+        store.preflight_delegating_parent(&ScopeId::try_from("scope.other").unwrap(), &run, &pod,),
+        Err(StoreError::WrongScope | StoreError::NotFound)
+    ));
+    assert!(matches!(
+        store.preflight_delegating_parent(&scope, &RunId::try_from("run.other").unwrap(), &pod,),
+        Err(StoreError::WrongScope)
+    ));
+    drop(store);
+    let mut reopened = fixture.open();
+    reopened.recheck_delegating_parent(&witness).unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE runtime_runs SET revision=revision+1 WHERE run_id=?1",
+            [run.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.recheck_delegating_parent(&witness),
+        Err(StoreError::StaleEpoch)
+    ));
+}
+
+#[test]
+fn delegating_parent_preflight_refuses_root_worker_and_zero_lifetime_budget() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let worker = ProposalFixture::new(Role::Worker, WorkKind::Task);
+    store
+        .admit_bound_root_launch_v2(worker.request("key.parent.worker", b"intent.worker"))
+        .unwrap();
+    let scope = ScopeId::try_from("scope.launch").unwrap();
+    let run = RunId::try_from("run.codex.fixture").unwrap();
+    let pod = PodId::try_from("pod.launch").unwrap();
+    assert!(matches!(
+        store.preflight_delegating_parent(&scope, &run, &pod),
+        Err(StoreError::Conflict(_))
+    ));
+
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let coordinator = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    store
+        .admit_bound_root_launch_v2(coordinator.request("key.parent.zero", b"intent.zero"))
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE run_child_budgets SET max_children=0 WHERE run_id=?1",
+            [run.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.preflight_delegating_parent(&scope, &run, &pod),
+        Err(StoreError::Conflict("parent child budget is exhausted"))
+    ));
+}
+
+#[test]
 fn changed_key_intent_and_v1_v2_cross_format_replay_refuse() {
     let fixture = Fixture::new();
     let mut store = fixture.open();

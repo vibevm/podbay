@@ -3,8 +3,8 @@
 use podbay_core::{
     AdmissionState, Attempt, AttemptId, CommandAdmission, CommandId, DesiredMode, Epoch,
     ExecutionState, InputEpoch, LaunchBinding, OwnerEpoch, PlannedRootBinding, PodId, ResourceId,
-    ResourceKind, Revision, Role, Run, RunCommandKind, RunId, ScopeId, Session, SessionState,
-    StoreLineageId, WorkKind,
+    ResourceKind, Revision, Role, Run, RunCommandKind, RunId, ScopeId, Session, SessionId,
+    SessionState, StoreLineageId, WorkKind,
 };
 use podbay_wire::{
     EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract,
@@ -272,6 +272,44 @@ pub struct CurrentBoundResource {
     input_epoch: InputEpoch,
 }
 
+/// Store-issued parent snapshot for a proposed first child. Its private
+/// fields cannot be supplied as caller JSON. It proves current SQLite links
+/// and budget only; the host must separately attest the live parent pod and
+/// authenticated delegating actor before any child admission or OS effect.
+pub struct CurrentDelegatingParentSnapshot {
+    current: CurrentBoundPodSnapshot,
+    parent_run_id: RunId,
+    parent_session_id: SessionId,
+    parent_session_actor_id: podbay_core::ActorId,
+    session_revision: Revision,
+    run_revision: Revision,
+    budget: RunChildBudget,
+}
+
+impl CurrentDelegatingParentSnapshot {
+    pub fn current_pod(&self) -> &CurrentBoundPodSnapshot {
+        &self.current
+    }
+    pub fn parent_run_id(&self) -> &RunId {
+        &self.parent_run_id
+    }
+    pub fn parent_session_id(&self) -> &SessionId {
+        &self.parent_session_id
+    }
+    pub fn parent_session_actor_id(&self) -> &podbay_core::ActorId {
+        &self.parent_session_actor_id
+    }
+    pub fn session_revision(&self) -> Revision {
+        self.session_revision
+    }
+    pub fn run_revision(&self) -> Revision {
+        self.run_revision
+    }
+    pub fn budget(&self) -> &RunChildBudget {
+        &self.budget
+    }
+}
+
 impl CurrentBoundPodSnapshot {
     pub fn store_lineage(&self) -> &StoreLineageId {
         &self.store_lineage
@@ -323,6 +361,228 @@ impl CurrentBoundResource {
     }
 }
 
+fn read_current_delegating_parent(
+    transaction: &Transaction<'_>,
+    current: &CurrentBoundPodSnapshot,
+) -> Result<(podbay_core::ActorId, Revision, Revision, RunChildBudget), StoreError> {
+    let launch = current.launch();
+    let metadata: (String, i64, i64) = transaction.query_row(
+        "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),
+                (SELECT value FROM metadata WHERE key='owner_epoch'),
+                (SELECT value FROM metadata WHERE key='authority_revision')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if metadata
+        != (
+            current.store_lineage.as_str().to_owned(),
+            integer(current.owner_epoch.get())?,
+            integer(current.authority_revision)?,
+        )
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    let session: Option<(String, String, String, Option<String>, i64)> = transaction
+        .query_row(
+            "SELECT scope_id,actor_id,state,current_run_id,revision
+             FROM runtime_sessions WHERE session_id=?1",
+            [&launch.session_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((session_scope, session_actor, state, current_run, session_revision)) = session else {
+        return Err(StoreError::Conflict("delegating parent Session is missing"));
+    };
+    if session_scope != launch.scope_id
+        || state != "open"
+        || current_run.as_deref() != Some(launch.run_id.as_str())
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    let run: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+    )> = transaction
+        .query_row(
+            "SELECT session_id,scope_id,role,work_kind,parent_run_id,revision,
+                    admission_state,desired_mode,execution_state,current_attempt_id,
+                    last_attempt_ordinal FROM runtime_runs WHERE run_id=?1",
+            [&launch.run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        run_session,
+        run_scope,
+        role,
+        work,
+        parent_run,
+        run_revision,
+        admission,
+        desired,
+        execution,
+        attempt,
+        ordinal,
+    )) = run
+    else {
+        return Err(StoreError::Conflict("delegating parent Run is missing"));
+    };
+    if run_session != launch.session_id
+        || run_scope != launch.scope_id
+        || role != "coordinator"
+        || work != "service"
+        || parent_run.is_some()
+        || admission != "admitted"
+        || desired != "run"
+        || !matches!(execution.as_str(), "starting" | "running")
+        || attempt.as_deref() != Some(launch.attempt_id.as_str())
+        || ordinal != 1
+    {
+        return Err(StoreError::Conflict(
+            "delegating parent is not an active Coordinator/Service",
+        ));
+    }
+    let pod: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT scope_id,incarnation FROM authority_pods WHERE pod_id=?1",
+            [&launch.pod_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let target: Option<i64> = transaction
+        .query_row(
+            "SELECT epoch FROM target_epochs WHERE scope_id=?1 AND target_id=?2",
+            params![launch.scope_id, launch.pod_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let binding: Option<(String, String, i64, i64)> = transaction
+        .query_row(
+            "SELECT run_id,attempt_id,pod_incarnation,command_rowid FROM launch_bindings
+             WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+            params![
+                launch.scope_id,
+                launch.pod_id,
+                integer(launch.pod_incarnation)?
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if pod != Some((launch.scope_id.clone(), integer(launch.pod_incarnation)?))
+        || target != Some(integer(launch.pod_incarnation)?)
+        || !binding
+            .as_ref()
+            .is_some_and(|(run, attempt, incarnation, _)| {
+                run == &launch.run_id
+                    && attempt == &launch.attempt_id
+                    && *incarnation == launch.pod_incarnation as i64
+            })
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    let (_, _, _, command_rowid) = binding.expect("binding checked above");
+    if read_bound_record(transaction, command_rowid)? != *launch {
+        return Err(StoreError::StaleEpoch);
+    }
+    for resource in &current.resources {
+        let authority: Option<(String, String, i64, i64, i64)> = transaction
+            .query_row(
+                "SELECT scope_id,pod_id,pod_incarnation,resource_epoch,input_epoch
+                 FROM authority_resources WHERE resource_id=?1",
+                [resource.id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if authority
+            != Some((
+                launch.scope_id.clone(),
+                launch.pod_id.clone(),
+                integer(launch.pod_incarnation)?,
+                integer(resource.epoch.get())?,
+                integer(resource.input_epoch.get())?,
+            ))
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+    }
+    let budget: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT max_children,reserved_children FROM run_child_budgets WHERE run_id=?1",
+            [&launch.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (maximum, reserved) =
+        budget.ok_or(StoreError::Conflict("parent child budget is missing"))?;
+    let maximum = u32::try_from(maximum)
+        .map_err(|_| StoreError::Conflict("parent child budget is invalid"))?;
+    let reserved = u32::try_from(reserved)
+        .map_err(|_| StoreError::Conflict("parent child reservation is invalid"))?;
+    if reserved >= maximum {
+        return Err(StoreError::Conflict("parent child budget is exhausted"));
+    }
+    Ok((
+        podbay_core::ActorId::try_from(session_actor.as_str())
+            .map_err(|_| StoreError::Conflict("parent Session actor ID is invalid"))?,
+        Revision::new(positive_stored_epoch(
+            session_revision,
+            "parent Session revision is invalid",
+        )?)
+        .map_err(|_| StoreError::Conflict("parent Session revision is invalid"))?,
+        Revision::new(positive_stored_epoch(
+            run_revision,
+            "parent Run revision is invalid",
+        )?)
+        .map_err(|_| StoreError::Conflict("parent Run revision is invalid"))?,
+        RunChildBudget {
+            scope_id: current.scope_id.clone(),
+            run_id: RunId::try_from(launch.run_id.as_str())
+                .map_err(|_| StoreError::Conflict("parent Run ID is invalid"))?,
+            max_children: maximum,
+            reserved_children: reserved,
+        },
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BoundLaunchAdmission {
     Committed(BoundLaunchRecord),
@@ -330,6 +590,61 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
+    /// Read the exact current parent Run/Pod in a validated store snapshot,
+    /// then pin its mutable rows under an IMMEDIATE transaction. This is not
+    /// process liveness, an actor grant or a child reservation.
+    pub fn preflight_delegating_parent(
+        &mut self,
+        scope_id: &ScopeId,
+        parent_run_id: &RunId,
+        parent_pod_id: &PodId,
+    ) -> Result<CurrentDelegatingParentSnapshot, StoreError> {
+        let current = self.current_bound_pod_snapshot(scope_id.as_str(), parent_pod_id.as_str())?;
+        if current.launch().run_id != parent_run_id.as_str() {
+            return Err(StoreError::WrongScope);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (parent_session_actor_id, session_revision, run_revision, budget) =
+            read_current_delegating_parent(&transaction, &current)?;
+        transaction.commit()?;
+        Ok(CurrentDelegatingParentSnapshot {
+            parent_run_id: parent_run_id.clone(),
+            parent_session_id: SessionId::try_from(current.launch().session_id.as_str())
+                .map_err(|_| StoreError::Conflict("parent Session ID is invalid"))?,
+            parent_session_actor_id,
+            current,
+            session_revision,
+            run_revision,
+            budget,
+        })
+    }
+
+    /// Re-read the parent, owner, authority and budget rows under the same
+    /// writer-lock kind that a future child admission must use. This separate
+    /// read transaction does not reserve capacity; future admission must call
+    /// the private recheck inside its own mutation transaction.
+    pub fn recheck_delegating_parent(
+        &mut self,
+        witness: &CurrentDelegatingParentSnapshot,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (session_actor, session_revision, run_revision, budget) =
+            read_current_delegating_parent(&transaction, &witness.current)?;
+        if session_actor != witness.parent_session_actor_id
+            || session_revision != witness.session_revision
+            || run_revision != witness.run_revision
+            || budget != witness.budget
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Inspect a Run's committed budget only through its exact scope. A
     /// missing budget row is corruption, not permission to infer capacity.
     pub fn inspect_run_child_budget(

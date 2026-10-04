@@ -16,6 +16,7 @@ pub enum LaunchBindingError {
     SessionUnavailable,
     RunNotAdmitted,
     RunNotQueued,
+    WrongChildShape,
     WrongPhase,
     WrongSessionRun,
     MissingCurrentAttempt,
@@ -35,6 +36,9 @@ impl Display for LaunchBindingError {
             Self::SessionUnavailable => "session is closed or has no current run",
             Self::RunNotAdmitted => "run has no admitted launch state",
             Self::RunNotQueued => "planned root run is not queued and unadmitted",
+            Self::WrongChildShape => {
+                "planned child must be a Worker/Task with one distinct parent Run"
+            }
             Self::WrongPhase => "planned and admitted launch binding phases differ",
             Self::WrongSessionRun => "run differs from the session actor, scope or current writer",
             Self::MissingCurrentAttempt => "run has no current attempt",
@@ -100,6 +104,93 @@ enum BindingPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedRootBinding {
     identity: LaunchBinding,
+}
+
+/// Identity-only first child plan. The exact parent Run is retained, but this
+/// value proves neither parent liveness nor command admission or delegation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedChildBinding {
+    identity: LaunchBinding,
+}
+
+impl PlannedChildBinding {
+    pub fn identity(&self) -> &LaunchBinding {
+        &self.identity
+    }
+
+    pub fn from_queued_snapshot(
+        session: &Session,
+        run: &Run,
+        identity: &LaunchBinding,
+    ) -> Result<Self, LaunchBindingError> {
+        require_queued_child(run)?;
+        if identity.phase != BindingPhase::Planned {
+            return Err(LaunchBindingError::WrongPhase);
+        }
+        if session.state() != SessionState::Open || session.current_run_id() != Some(run.id()) {
+            return Err(LaunchBindingError::SessionUnavailable);
+        }
+        if identity.session_id() != session.id()
+            || identity.actor_id() != session.actor_id()
+            || identity.scope_id() != session.scope_id()
+            || identity.run_id() != run.id()
+            || run.session_id() != session.id()
+            || run.actor_id() != session.actor_id()
+            || run.scope_id() != session.scope_id()
+            || identity.role() != Role::Worker
+            || identity.work_kind() != WorkKind::Task
+            || identity.parent_run_id() != run.parent_run_id()
+            || identity.attempt_ordinal() != 1
+        {
+            return Err(LaunchBindingError::WrongSessionRun);
+        }
+        Ok(Self {
+            identity: identity.clone(),
+        })
+    }
+
+    /// Rebuild only after the store has inserted the exact child command row.
+    pub fn confirm_after_admission(
+        &self,
+        session: &Session,
+        run: &Run,
+    ) -> Result<LaunchBinding, LaunchBindingError> {
+        let identity = &self.identity;
+        let mut attempt = Attempt::new(
+            identity.attempt_id.clone(),
+            identity.run_id.clone(),
+            identity.attempt_ordinal,
+            identity.attempt_epoch,
+        )
+        .map_err(|_| LaunchBindingError::WrongRunAttempt)?;
+        let mut pod = Pod::new(
+            identity.pod_id.clone(),
+            identity.attempt_id.clone(),
+            identity.pod_incarnation,
+        );
+        attempt
+            .attach_pod(attempt.revision(), &pod)
+            .map_err(|_| LaunchBindingError::WrongAttemptPod)?;
+        let mut resources = Vec::with_capacity(identity.resources.len());
+        for bound in &identity.resources {
+            let resource = Resource::new(
+                bound.id.clone(),
+                identity.pod_id.clone(),
+                bound.kind,
+                bound.epoch,
+            );
+            pod.attach_resource(pod.revision(), &resource)
+                .map_err(|_| LaunchBindingError::ResourceSetMismatch)?;
+            resources.push(resource);
+        }
+        let strict = LaunchBinding::from_aggregates(session, run, &attempt, &pod, &resources)?;
+        let mut expected = identity.clone();
+        expected.phase = BindingPhase::Admitted;
+        if strict != expected {
+            return Err(LaunchBindingError::WrongPhase);
+        }
+        Ok(strict)
+    }
 }
 
 impl PlannedRootBinding {
@@ -201,6 +292,24 @@ fn require_queued_root(run: &Run) -> Result<(), LaunchBindingError> {
     Ok(())
 }
 
+fn require_queued_child(run: &Run) -> Result<(), LaunchBindingError> {
+    if run.role() != Role::Worker
+        || run.work_kind() != WorkKind::Task
+        || run.parent_run_id().is_none_or(|parent| parent == run.id())
+    {
+        return Err(LaunchBindingError::WrongChildShape);
+    }
+    if run.admission() != AdmissionState::Queued
+        || run.execution() != ExecutionState::Queued
+        || run.desired() != DesiredMode::Run
+        || run.current_attempt_id().is_some()
+        || run.last_attempt_ordinal() != 0
+    {
+        return Err(LaunchBindingError::RunNotQueued);
+    }
+    Ok(())
+}
+
 impl LaunchBinding {
     /// Produces a copy of existing aggregate identities. No IDs, epochs,
     /// process handles, provider settings or launch paths are allocated here.
@@ -262,6 +371,24 @@ impl LaunchBinding {
         let identity =
             Self::copy_associations(session, run, attempt, pod, resources, BindingPhase::Planned)?;
         Ok(PlannedRootBinding { identity })
+    }
+
+    /// Capture a new child Session's queued Worker/Task identity with its
+    /// exact parent Run. Only the store may admit it under parent proof.
+    pub fn plan_first_child(
+        session: &Session,
+        run: &Run,
+        attempt: &Attempt,
+        pod: &Pod,
+        resources: &[Resource],
+    ) -> Result<PlannedChildBinding, LaunchBindingError> {
+        require_queued_child(run)?;
+        if attempt.run_id() != run.id() || attempt.ordinal() != 1 {
+            return Err(LaunchBindingError::WrongRunAttempt);
+        }
+        let identity =
+            Self::copy_associations(session, run, attempt, pod, resources, BindingPhase::Planned)?;
+        Ok(PlannedChildBinding { identity })
     }
 
     fn copy_associations(
@@ -632,5 +759,101 @@ mod tests {
             Err(LaunchBindingError::WrongResourcePod)
         );
         assert!(Epoch::new(0).is_err());
+    }
+
+    #[test]
+    fn first_child_plan_keeps_exact_parent_and_cannot_claim_admission() {
+        let mut session = Session::new(
+            SessionId::try_from("session.child.fixture").unwrap(),
+            ActorId::try_from("actor.parent.fixture").unwrap(),
+            ScopeId::try_from("scope.child.fixture").unwrap(),
+        );
+        let parent_id = RunId::try_from("run.parent.fixture").unwrap();
+        let mut run = Run::new(
+            RunId::try_from("run.child.fixture").unwrap(),
+            &session,
+            Role::Worker,
+            WorkKind::Task,
+            Some(parent_id.clone()),
+        );
+        session.bind_run(session.revision(), &run).unwrap();
+        let mut attempt = Attempt::new(
+            AttemptId::try_from("attempt.child.fixture").unwrap(),
+            run.id().clone(),
+            1,
+            Epoch::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut pod = Pod::new(
+            PodId::try_from("pod.child.fixture").unwrap(),
+            attempt.id().clone(),
+            Epoch::new(1).unwrap(),
+        );
+        attempt.attach_pod(attempt.revision(), &pod).unwrap();
+        let resources = vec![Resource::new(
+            ResourceId::try_from("resource.child.fixture").unwrap(),
+            pod.id().clone(),
+            ResourceKind::StructuredProvider,
+            Epoch::new(1).unwrap(),
+        )];
+        pod.attach_resource(pod.revision(), &resources[0]).unwrap();
+        let planned =
+            LaunchBinding::plan_first_child(&session, &run, &attempt, &pod, &resources).unwrap();
+        assert!(planned.identity().is_planned());
+        assert!(!planned.identity().is_admitted());
+        assert_eq!(planned.identity().parent_run_id(), Some(&parent_id));
+        assert_eq!(
+            PlannedChildBinding::from_queued_snapshot(&session, &run, planned.identity()).unwrap(),
+            planned
+        );
+        assert_eq!(
+            PlannedRootBinding::from_queued_snapshot(&session, &run, planned.identity()),
+            Err(LaunchBindingError::RunNotQueued)
+        );
+        let command = CommandId::try_from("command.child.fixture").unwrap();
+        run.admit(run.revision(), &command, &Admitted).unwrap();
+        run.start_attempt(run.revision(), &attempt).unwrap();
+        let admitted = planned.confirm_after_admission(&session, &run).unwrap();
+        assert!(admitted.is_admitted());
+        assert_eq!(admitted.parent_run_id(), Some(&parent_id));
+    }
+
+    #[test]
+    fn first_child_plan_refuses_root_self_parent_and_non_worker_role() {
+        let run_id = RunId::try_from("run.child.refusal").unwrap();
+        for (role, work, parent) in [
+            (Role::Worker, WorkKind::Task, None),
+            (Role::Worker, WorkKind::Task, Some(run_id.clone())),
+            (
+                Role::Coordinator,
+                WorkKind::Service,
+                Some(RunId::try_from("run.parent.refusal").unwrap()),
+            ),
+        ] {
+            let mut session = Session::new(
+                SessionId::try_from("session.child.refusal").unwrap(),
+                ActorId::try_from("actor.child.refusal").unwrap(),
+                ScopeId::try_from("scope.child.refusal").unwrap(),
+            );
+            let run = Run::new(run_id.clone(), &session, role, work, parent);
+            session.bind_run(session.revision(), &run).unwrap();
+            let mut attempt = Attempt::new(
+                AttemptId::try_from("attempt.child.refusal").unwrap(),
+                run.id().clone(),
+                1,
+                Epoch::new(1).unwrap(),
+            )
+            .unwrap();
+            let pod = Pod::new(
+                PodId::try_from("pod.child.refusal").unwrap(),
+                attempt.id().clone(),
+                Epoch::new(1).unwrap(),
+            );
+            attempt.attach_pod(attempt.revision(), &pod).unwrap();
+            assert_eq!(
+                LaunchBinding::plan_first_child(&session, &run, &attempt, &pod, &[]),
+                Err(LaunchBindingError::WrongChildShape)
+            );
+        }
     }
 }

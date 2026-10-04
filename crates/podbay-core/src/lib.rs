@@ -12,7 +12,9 @@ pub use ids::{
     IdError, InputEpoch, OwnerEpoch, PeerGrantId, PodId, ReportId, ResourceId, Revision, RunId,
     ScopeId, SessionId, SourceId, StoreLineageId, WorkIntervalId,
 };
-pub use launch_binding::{BoundResource, LaunchBinding, LaunchBindingError, PlannedRootBinding};
+pub use launch_binding::{
+    BoundResource, LaunchBinding, LaunchBindingError, PlannedChildBinding, PlannedRootBinding,
+};
 pub use model::{
     Attempt, CommandAdmission, Delivery, DeliveryEvidenceLookup, ForegroundEvidence,
     ObservationEvidence, Pod, PodObservationEvidence, ProcessEvidence, Resource,

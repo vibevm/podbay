@@ -19,7 +19,7 @@ pub use bootstrap_send::{
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
-    CurrentBoundPodSnapshot, CurrentBoundResource, RunChildBudget,
+    CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot, RunChildBudget,
 };
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
