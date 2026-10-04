@@ -216,7 +216,7 @@ fn valid_actor_id(actor: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
-fn parse_challenge<'a>(
+pub(crate) fn parse_challenge<'a>(
     bytes: &'a [u8],
     selected_actor: &str,
 ) -> Option<CanonicalActorChallenge<'a>> {

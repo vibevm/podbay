@@ -2,6 +2,7 @@
 //! This crate never chooses credentials, reconnects, or retries a logical command.
 #![forbid(unsafe_code)]
 
+mod actor_key;
 #[cfg(target_os = "linux")]
 mod linux_auth;
 
@@ -15,6 +16,9 @@ use podbay_wire::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+#[cfg(target_os = "linux")]
+pub use actor_key::ExpectedLinuxActorChallenge;
+pub use actor_key::{ActorCredentialKey, ActorKeyError};
 #[cfg(target_os = "linux")]
 pub use linux_auth::{
     ActorChallengeOrigin, CanonicalActorChallenge, ClientAuthFailure, ClientAuthFailureKind,
