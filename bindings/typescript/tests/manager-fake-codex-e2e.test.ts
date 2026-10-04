@@ -10,7 +10,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { AuthenticatedUnixSocketWireTransport } from "../src/authenticated-unix-socket.ts";
-import { decimal, makeCommand, makeRead, PodBayWireClient } from "../src/generated.ts";
+import { decimal, makeCommand, makeRead, PodBayWireClient, type NativeEventCursor } from "../src/generated.ts";
 import { INITIAL_OWNER_RIGHTS_DIGEST, InitialOwnerSetupClient } from "../src/owner-setup.ts";
 
 const exec = promisify(execFile);
@@ -80,11 +80,14 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   const ownerEpoch = BigInt((db.prepare("SELECT value FROM metadata WHERE key='owner_epoch'").get() as { value: number }).value);
   const authorityRevision = BigInt((db.prepare("SELECT value FROM metadata WHERE key='authority_revision'").get() as { value: number }).value);
   db.close();
+  const ownerProcess = selfProcess();
+  const custodyPath = join(state, "owner-key-custody.json");
   const owner = new InitialOwnerSetupClient({
     setupSocketPath: setupSocket, managerSocketPath: managerSocket,
     actorId: "actor.zap.fake-e2e", scopeId: "scope.zap.fake-e2e",
     credentialRef: "vault.zap.fake-e2e", storeLineage: lineage,
-    ownerEpoch, authorityRevision, ...selfProcess(),
+    ownerEpoch, authorityRevision, ...ownerProcess,
+    ownerKeyCustodyPath: custodyPath,
     rightsDigest: INITIAL_OWNER_RIGHTS_DIGEST,
     validateHostEndpoint: async (phase) => {
       if (manager.exitCode !== null || manager.signalCode !== null) return false;
@@ -179,7 +182,111 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   assert.equal(secondNative["nativeTurnId"], firstNative["nativeTurnId"]);
   assert.equal(secondNative["stage"], firstNative["stage"]);
 
-  const frames = await readFile(join(pods, "home", "codex", "frames.log"), "utf8");
+  const nativeRead = (requestId: string, after?: NativeEventCursor) => client.read(makeRead({
+    operation: "native.events.read", requestId,
+    target: { kind: "scope", scopeId: "scope.zap.fake-e2e" },
+    body: {
+      sessionId: string(launchValue["sessionId"]),
+      resourceId: string(record(resources[0])["resourceId"]),
+      limit: decimal("2"),
+      ...(after === undefined ? {} : { after }),
+    },
+  }));
+  const nativeDeadline = performance.now() + 5_000;
+  let nativePage: Record<string, unknown>;
+  for (;;) {
+    nativePage = record(await nativeRead("request.fake-e2e.native.initial"));
+    const events = nativePage["events"];
+    assert.ok(Array.isArray(events));
+    if (events.length > 0) break;
+    assert.ok(performance.now() < nativeDeadline, "fake native output did not reach manager read");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(nativePage["kind"], "native_events_page");
+  const firstEvent = record((nativePage["events"] as unknown[])[0]);
+  assert.equal(firstEvent["kind"], "output");
+  assert.equal(firstEvent["sourceSequence"], "1");
+  const rawJsonl = string(firstEvent["rawJsonl"]);
+  assert.match(rawJsonl, /private owner-only output/u);
+  assert.equal(createHash("sha256").update(Buffer.from(rawJsonl, "utf8")).digest("hex"),
+    firstEvent["contentDigest"]);
+  const cursor = record(nativePage["nextCursor"]);
+  assert.equal(cursor["sourceSequence"], "1");
+  const source = record(cursor["identity"]);
+  assert.equal(source["storeLineage"], lineage);
+  assert.equal(source["scopeId"], "scope.zap.fake-e2e");
+  assert.equal(source["sessionId"], launchValue["sessionId"]);
+  assert.equal(source["runId"], launchValue["runId"]);
+  assert.equal(source["attemptId"], launchValue["attemptId"]);
+  assert.equal(source["podId"], launchValue["podId"]);
+  assert.equal(source["resourceId"], record(resources[0])["resourceId"]);
+  assert.equal(source["resourceEpoch"], record(resources[0])["epoch"]);
+  assert.equal(record(nativePage["snapshot"])["fidelity"], "exact");
+  assert.equal(nativePage["gap"], null);
+  const replay = record(await nativeRead("request.fake-e2e.native.replay"));
+  assert.deepEqual(replay, nativePage, "same initial selector must replay durable exact output");
+  const evidenceDb = new DatabaseSync(database, { readOnly: true });
+  const evidenceCount = evidenceDb.prepare(
+    "SELECT COUNT(*) AS count FROM codex_native_evidence WHERE resource_id=?",
+  ).get(string(record(resources[0])["resourceId"])) as { count: number };
+  evidenceDb.close();
+  assert.equal(evidenceCount.count, 1, "replay must not insert a second native event");
+  const advanced = record(await nativeRead("request.fake-e2e.native.after", cursor as unknown as NativeEventCursor));
+  assert.deepEqual(advanced["events"], []);
+  assert.equal(record(advanced["nextCursor"])["sourceSequence"], "1");
+
+  // A separate same-UID process can read this fixture's private dummy key,
+  // but its kernel PID/birth differ from the enrolled owner. The auth prelude
+  // must refuse it before any native output can be returned.
+  const siblingExpected = {
+    actorId: "actor.zap.fake-e2e", storeLineage: lineage,
+    scopeId: "scope.zap.fake-e2e", credentialGeneration: "1",
+    osIdentity: ownerProcess.osIdentity, processIdentity: ownerProcess.processIdentity,
+    startIdentity: ownerProcess.startIdentity.toString(),
+    containmentIdentity: ownerProcess.containmentIdentity,
+    origin: { kind: "owner-cli" },
+  };
+  const siblingScript = `
+    import { readFileSync } from "node:fs";
+    import { createPrivateKey, sign } from "node:crypto";
+    const { AuthenticatedUnixSocketWireTransport } = await import(process.argv[1]);
+    const { PodBayWireClient, makeRead } = await import(process.argv[2]);
+    const custody = JSON.parse(readFileSync(process.argv[3], "utf8"));
+    const key = createPrivateKey({key: Buffer.from(custody.privateKeyPkcs8,"base64"),format:"der",type:"pkcs8"});
+    const expected = JSON.parse(process.argv[4]);
+    expected.credentialGeneration = BigInt(expected.credentialGeneration);
+    expected.startIdentity = BigInt(expected.startIdentity);
+    const channel = new AuthenticatedUnixSocketWireTransport({
+      socketPath: process.argv[5], expected,
+      validateAndSign: (challenge) => new Uint8Array(sign(null, Buffer.from(challenge.bytes), key)),
+      handshakeTimeoutMs: 3000, exchangeTimeoutMs: 3000,
+    });
+    const client = new PodBayWireClient(channel);
+    const request = makeRead(JSON.parse(process.argv[6]));
+    try {
+      const page = await client.read(request);
+      if (JSON.stringify(page).includes("private owner-only output")) process.exit(3);
+      process.exit(2);
+    } catch (error) { process.stdout.write("REFUSED:" + String(error?.code ?? error?.name) + "\\n"); }
+  `;
+  const siblingRequest = {
+    operation: "native.events.read", requestId: "request.fake-e2e.native.sibling",
+    target: { kind: "scope", scopeId: "scope.zap.fake-e2e" },
+    body: { sessionId: string(launchValue["sessionId"]),
+      resourceId: string(record(resources[0])["resourceId"]), limit: decimal("2") },
+  };
+  const sibling = await exec(process.execPath, ["--input-type=module", "-e", siblingScript,
+    new URL("../src/authenticated-unix-socket.ts", import.meta.url).href,
+    new URL("../src/generated.ts", import.meta.url).href,
+    custodyPath, JSON.stringify(siblingExpected), managerSocket, JSON.stringify(siblingRequest)],
+    { timeout: 5_000 });
+  assert.equal(sibling.stdout, "REFUSED:auth_lost\n");
+  assert.equal(manager.exitCode, null, "manager must remain live after sibling refusal");
+
+  const manifests = (await readdir(pods)).filter((name) => /^[0-9a-f]{32}\.json$/u.test(name));
+  assert.equal(manifests.length, 1, "exactly one disposable Pod manifest");
+  const frames = await readFile(join(pods, `${manifests[0]!.slice(0, -5)}.private`,
+    "home", "codex", "frames.log"), "utf8");
   const methods = frames.trimEnd().split("\n").map((line) => (JSON.parse(line) as { method: string }).method);
   assert.deepEqual(methods, ["initialize", "initialized", "thread/start", "thread/read", "turn/start"]);
 });
@@ -205,6 +312,7 @@ printf '{"id":3,"result":{"thread":{"id":"thread.fixture","sessionId":"native.se
 read -r turn
 printf '%s\\n' "$turn" >> "$CODEX_HOME/frames.log"
 printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\\n'
+printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread.fixture","delta":"private owner-only output"}}\\n'
 sleep 30
 `;
 }
