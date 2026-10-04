@@ -3,6 +3,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+mod manager_policy;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
     use std::env;
@@ -18,6 +21,7 @@ mod linux {
         atomic::{AtomicBool, Ordering},
     };
 
+    use crate::manager_policy::PreparedManagerPolicy;
     use podbay_core::{ActorId, ScopeId};
     use podbay_host::{
         CredentialRef, DurableAuthority, DurableAuthorityError, TrustedInitialOwnerPolicy,
@@ -27,13 +31,14 @@ mod linux {
     use podbay_server::{
         InitialOwnerSetupError, LinuxInitialOwnerSetupListener, LinuxListenerError,
         LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME,
+        TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
     };
     use signal_hook::{
         consts::signal::{SIGINT, SIGTERM},
         flag,
     };
 
-    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh initial owner setup uses DIR/owner-setup.sock before authenticated reads at DIR/manager.sock. Mutation routes remain disabled.";
+    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--trusted-policy FILE | --initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh initial owner setup uses DIR/owner-setup.sock before DIR/manager.sock. A trusted policy file explicitly enables one V2 root launch and first send.";
 
     struct InitialOwnerConfig {
         actor_id: String,
@@ -48,6 +53,7 @@ mod linux {
         pod_binary: PathBuf,
         pod_sha256: String,
         initial_owner: Option<InitialOwnerConfig>,
+        trusted_policy: Option<PathBuf>,
     }
 
     pub fn main() -> ExitCode {
@@ -62,7 +68,7 @@ mod linux {
 
     fn run() -> Result<(), String> {
         let config = parse_args(env::args_os())?;
-        let parent = if config.initial_owner.is_some() {
+        let parent = if config.initial_owner.is_some() || config.trusted_policy.is_some() {
             Some(
                 LinuxPeerEvidence::for_launcher_parent()
                     .map_err(|error| format!("launcher parent evidence unavailable: {error}"))?,
@@ -80,12 +86,45 @@ mod linux {
         validate_private_directory(&config.state_dir, self_peer.uid())?;
         validate_private_directory(&config.pod_dir, self_peer.uid())?;
         validate_database_path(&config.database, &config.state_dir, self_peer.uid())?;
+        let mut prepared = config
+            .trusted_policy
+            .as_ref()
+            .map(|path| PreparedManagerPolicy::load(path, &config.state_dir, self_peer.uid()))
+            .transpose()?;
+        let owner_policy = if let Some(ref policy) = prepared {
+            Some(policy.owner.clone())
+        } else if let Some(ref initial) = config.initial_owner {
+            let actor_id = ActorId::try_from(initial.actor_id.as_str())
+                .map_err(|_| "initial owner actor ID is invalid".to_owned())?;
+            let scope_id = ScopeId::try_from(initial.scope_id.as_str())
+                .map_err(|_| "initial owner scope ID is invalid".to_owned())?;
+            let credential =
+                CredentialRef::from_trusted_vault(scope_id.clone(), &initial.credential_ref)
+                    .map_err(|_| "initial owner credential reference is invalid".to_owned())?;
+            Some(
+                TrustedInitialOwnerPolicy::from_trusted_manager_policy(
+                    actor_id, scope_id, credential,
+                )
+                .map_err(|_| "initial owner policy is invalid".to_owned())?,
+            )
+        } else {
+            None
+        };
         let port_config = TrustedLinuxLaunchConfig::from_trusted_policy(
             config.pod_binary,
             config.pod_sha256,
             config.pod_dir,
         )
         .map_err(|error| format!("trusted pod configuration refused: {error}"))?;
+        let mut port = LinuxLaunchPort::new(port_config);
+        if let Some(ref mut policy) = prepared {
+            let source = policy
+                .credential_source
+                .take()
+                .ok_or_else(|| "trusted credential source is missing".to_owned())?;
+            port.register_codex_credential_source_from_trusted_policy(source)
+                .map_err(|error| format!("trusted credential registration refused: {error}"))?;
+        }
 
         // Register before exposing the socket. A signal handler only sets a
         // flag; unlink and SQLite teardown run on the normal thread.
@@ -102,33 +141,20 @@ mod linux {
         // A stale pathname must not advance the durable owner epoch. Probe it
         // before opening the manager; the later check still catches races.
         check_manager_socket_path(&socket_path)?;
-        if config.initial_owner.is_some() {
+        if owner_policy.is_some() {
             check_owner_setup_socket_path(&setup_path)?;
         }
         ensure_private_database(&config.database, &config.state_dir, self_peer.uid())?;
         // One lock and manager OS identity live for this entire serve loop.
-        let mut authority = DurableAuthority::open(
-            &config.database,
-            LinuxLaunchPort::new(port_config),
-        )
-        .map_err(|error| match error {
-            DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
-            other => format!("durable manager open failed: {other:?}"),
-        })?;
+        let mut authority =
+            DurableAuthority::open(&config.database, port).map_err(|error| match error {
+                DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
+                other => format!("durable manager open failed: {other:?}"),
+            })?;
         check_manager_socket_path(&socket_path)?;
-        if let Some(initial) = config.initial_owner {
+        let mut enrolled_grant = None;
+        if let Some(policy) = owner_policy {
             check_owner_setup_socket_path(&setup_path)?;
-            let actor_id = ActorId::try_from(initial.actor_id.as_str())
-                .map_err(|_| "initial owner actor ID is invalid".to_owned())?;
-            let scope_id = ScopeId::try_from(initial.scope_id.as_str())
-                .map_err(|_| "initial owner scope ID is invalid".to_owned())?;
-            let credential =
-                CredentialRef::from_trusted_vault(scope_id.clone(), &initial.credential_ref)
-                    .map_err(|_| "initial owner credential reference is invalid".to_owned())?;
-            let policy = TrustedInitialOwnerPolicy::from_trusted_manager_policy(
-                actor_id, scope_id, credential,
-            )
-            .map_err(|_| "initial owner policy is invalid".to_owned())?;
             let mut setup = LinuxInitialOwnerSetupListener::bind(
                 &config.state_dir,
                 parent.expect("setup requires captured launcher parent"),
@@ -138,13 +164,16 @@ mod linux {
             let enrolled = setup.serve(&mut authority, policy, &stop);
             let cleanup = setup.shutdown();
             match (enrolled, cleanup) {
-                (Ok(receipt), Ok(())) => eprintln!(
-                    "podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
-                    receipt.actor_id.as_str(),
-                    receipt.scope_id.as_str(),
-                    receipt.grant_id.get(),
-                    receipt.owner_epoch,
-                ),
+                (Ok(receipt), Ok(())) => {
+                    eprintln!(
+                        "podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                        receipt.actor_id.as_str(),
+                        receipt.scope_id.as_str(),
+                        receipt.grant_id.get(),
+                        receipt.owner_epoch,
+                    );
+                    enrolled_grant = Some(receipt.grant_id);
+                }
                 (Err(InitialOwnerSetupError::Stopped), Ok(())) => return Ok(()),
                 (Err(error), Ok(())) => return Err(format!("owner setup failed: {error}")),
                 (Ok(_), Err(error)) => return Err(format!("owner setup cleanup failed: {error}")),
@@ -155,6 +184,31 @@ mod linux {
                 }
             }
         }
+        let templates = if let Some(policy) = prepared {
+            let grant = enrolled_grant
+                .ok_or_else(|| "trusted policy lacks an enrolled owner grant".to_owned())?;
+            authority
+                .register_native_host_from_trusted_policy(policy.native_host)
+                .map_err(|error| format!("trusted native host registration refused: {error:?}"))?;
+            authority
+                .register_launch_profile_from_trusted_policy(policy.profile)
+                .map_err(|error| {
+                    format!("trusted launch profile registration refused: {error:?}")
+                })?;
+            let launch = TrustedWireRootLaunchTemplate::from_trusted_policy(
+                grant,
+                policy.launch_deadline,
+                &policy.result_contract_ref,
+            )
+            .map_err(|error| format!("trusted launch template refused: {error:?}"))?;
+            let send =
+                TrustedBootstrapSendTemplate::from_trusted_policy(grant, policy.send_deadline)
+                    .map_err(|error| format!("trusted send template refused: {error:?}"))?;
+            let _writer_lease_seconds = policy.writer_lease_seconds;
+            Some((launch, send))
+        } else {
+            None
+        };
         let mut listener = LinuxManagerCommandsGetListener::bind(&config.state_dir).map_err(
             |error| match error {
                 LinuxListenerError::Io(ref io_error)
@@ -169,10 +223,19 @@ mod linux {
             },
         )?;
         eprintln!(
-            "podbay manager read-only socket: {}",
-            listener.path().display()
+            "podbay manager socket: {} mode={}",
+            listener.path().display(),
+            if templates.is_some() {
+                "trusted-v2-root"
+            } else {
+                "read-only"
+            }
         );
-        let served = listener.serve_until(&mut authority, &stop);
+        let served = if let Some((launch, send)) = templates.as_ref() {
+            listener.serve_until_with_launch_and_first_send(&mut authority, &stop, launch, send)
+        } else {
+            listener.serve_until(&mut authority, &stop)
+        };
         let shutdown = listener.shutdown();
         match (served, shutdown) {
             (Ok(report), Ok(())) => {
@@ -217,6 +280,7 @@ mod linux {
                     | "--initial-owner-actor"
                     | "--initial-owner-scope"
                     | "--initial-owner-credential"
+                    | "--trusted-policy"
             ) {
                 return Err(format!("unknown flag {flag}; {USAGE}"));
             }
@@ -230,6 +294,11 @@ mod linux {
         let actor = flags.remove("--initial-owner-actor");
         let scope = flags.remove("--initial-owner-scope");
         let credential = flags.remove("--initial-owner-credential");
+        let trusted_policy = flags.remove("--trusted-policy").map(PathBuf::from);
+        if trusted_policy.is_some() && (actor.is_some() || scope.is_some() || credential.is_some())
+        {
+            return Err("--trusted-policy and individual initial-owner flags are exclusive".into());
+        }
         let initial_owner = match (actor, scope, credential) {
             (None, None, None) => None,
             (Some(actor), Some(scope), Some(credential)) => Some(InitialOwnerConfig {
@@ -263,6 +332,7 @@ mod linux {
                 .into_string()
                 .map_err(|_| "pod SHA-256 must be ASCII hex".to_owned())?,
             initial_owner,
+            trusted_policy,
         })
     }
 

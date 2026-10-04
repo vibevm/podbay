@@ -314,6 +314,7 @@ dependencies = [
  "podbay-server",
  "podbay-store",
  "podbay-wire",
+ "serde",
  "serde_json",
  "sha2",
  "signal-hook",

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
 use podbay_store::PodBayStore;
-use podbay_wire::{ReadEnvelope, ReadOperation, Target};
+use podbay_wire::{CommandEnvelope, MutationOperation, ReadEnvelope, ReadOperation, Target};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -88,6 +88,53 @@ impl Fixture {
             .arg("scope.zap.test")
             .arg("--initial-owner-credential")
             .arg("vault.zap.test");
+        command
+    }
+
+    fn trusted_policy_file(&self) -> PathBuf {
+        let credentials = self.root.join("credentials");
+        fs::create_dir(&credentials).unwrap();
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = credentials.join("dummy-auth.json");
+        fs::write(&source, b"dummy credential fixture").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let workspace = self.root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let path = self.state.join("trusted-policy.json");
+        let value = json!({
+            "schema": "podbay.trusted-manager-policy/1",
+            "actorId": "actor.zap.test",
+            "scopeId": "scope.zap.test",
+            "credentialRef": "vault.zap.test",
+            "credentialSource": source,
+            "profileRef": "profile.codex.test",
+            "profileGeneration": 1,
+            "executable": self.binary,
+            "executableSha256": self.digest,
+            "workspaceRoot": workspace,
+            "workspaceBasisRef": "basis.test",
+            "hostId": "host.test",
+            "driverRef": "driver.codex.test",
+            "protocolRef": "protocol.codex.test",
+            "modelId": "gpt-6-sol",
+            "reasoningEffort": "medium",
+            "approvalPolicy": "never",
+            "sandbox": "danger_full_access",
+            "wallSeconds": 60,
+            "maxChildren": 2,
+            "resultContractRef": "result.none",
+            "launchDeadlineSeconds": 30,
+            "sendDeadlineSeconds": 30,
+            "writerLeaseSeconds": 120,
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    fn policy_command(&self, path: &PathBuf) -> Command {
+        let mut command = self.command();
+        command.arg("--trusted-policy").arg(path);
         command
     }
 
@@ -213,6 +260,22 @@ fn spawn_setup(fixture: &Fixture) -> Running {
     )
 }
 
+fn spawn_policy(fixture: &Fixture, path: &PathBuf) -> Running {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fixture.root.join("manager.log"))
+        .unwrap();
+    Running(
+        fixture
+            .policy_command(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    )
+}
+
 fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
     stream
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -288,10 +351,9 @@ impl Drop for Running {
     }
 }
 
-fn run_short(fixture: &Fixture) -> (ExitStatus, String) {
+fn run_short_command(mut command: Command) -> (ExitStatus, String) {
     let mut child = Running(
-        fixture
-            .command()
+        command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -316,6 +378,46 @@ fn run_short(fixture: &Fixture) -> (ExitStatus, String) {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn run_short(fixture: &Fixture) -> (ExitStatus, String) {
+    run_short_command(fixture.command())
+}
+
+fn authenticated_wrong_model_launch(fixture: &Fixture, signer: &KeyPair) -> Value {
+    let socket = UnixStream::connect(fixture.socket()).unwrap();
+    let mut stream = authenticate_existing_linux_stream(socket, "actor.zap.test", |challenge| {
+        let signature = signer.sk.sign(challenge.bytes, None);
+        let mut bytes = [0_u8; 64];
+        bytes.copy_from_slice(signature.as_ref());
+        Some(bytes)
+    })
+    .unwrap();
+    let request = CommandEnvelope::new_json(
+        "request.policy.launch",
+        "key.policy.launch",
+        Target::Scope {
+            scope_id: "scope.zap.test".into(),
+        },
+        None,
+        None,
+        MutationOperation::Launch,
+        json!({
+            "session":{"kind":"new"},
+            "role":"coordinator",
+            "work":{"kind":"service","resultContractRef":"result.none"},
+            "profileRef":"profile.codex.test",
+            "selection":{"modelId":"model.other","reasoningEffort":"medium","fallback":"none"},
+            "workspace":{"scopeId":"scope.zap.test","relativeCwd":".",
+                "basisRef":"basis.test","access":"read_write"},
+            "toolBundleRefs":[],
+            "authority":{"grantRef":"grant.1"},
+            "limits":{"wallSeconds":"30","maxChildren":"1"}
+        }),
+    )
+    .unwrap();
+    write_frame(&mut stream, &request.encode_json().unwrap());
+    serde_json::from_slice(&read_frame(&mut stream)).unwrap()
 }
 
 #[test]
@@ -514,4 +616,49 @@ fn stale_owner_setup_path_is_preserved_and_never_adopted() {
     );
     assert!(!fixture.database.exists());
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn private_trusted_policy_enables_reviewed_route_after_parent_enrollment() {
+    let fixture = Fixture::new();
+    let policy = fixture.trusted_policy_file();
+    let mut manager = spawn_policy(&fixture, &policy);
+    manager.wait_setup_ready(&fixture);
+    let signer = KeyPair::from_seed(Seed::new([11; 32]));
+    let receipt = setup_attempt(&fixture, &signer, &signer, true).unwrap();
+    assert_eq!(receipt["grantRef"], "grant.1");
+    manager.wait_ready(&fixture);
+    let reply = authenticated_wrong_model_launch(&fixture, &signer);
+    assert_eq!(reply["requestId"], "request.policy.launch");
+    assert_ne!(reply["error"]["code"], "unsupported");
+    assert_eq!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .scope_snapshot("scope.zap.test")
+            .unwrap()
+            .receipts
+            .len(),
+        0
+    );
+    assert!(manager.stop_with("TERM").success());
+}
+
+#[test]
+fn policy_file_must_be_private_canonical_and_fixed() {
+    let fixture = Fixture::new();
+    let policy = fixture.trusted_policy_file();
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap();
+    let (status, error) = run_short_command(fixture.policy_command(&policy));
+    assert!(!status.success());
+    assert!(error.contains("canonical owned 0600"));
+    assert!(!fixture.database.exists());
+
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut value: Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    value["approvalPolicy"] = json!("ask");
+    fs::write(&policy, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (status, error) = run_short_command(fixture.policy_command(&policy));
+    assert!(!status.success());
+    assert!(error.contains("fixed Codex fields"));
+    assert!(!fixture.database.exists());
 }
