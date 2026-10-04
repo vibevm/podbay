@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 mod manager_policy;
 #[cfg(target_os = "linux")]
+mod owner_process;
+#[cfg(target_os = "linux")]
 mod socket_reconcile;
 
 #[cfg(target_os = "linux")]
@@ -23,6 +25,7 @@ mod linux {
     };
 
     use crate::manager_policy::PreparedManagerPolicy;
+    use crate::owner_process::{OwnerProcessSelector, OwnerProcessWatch};
     use crate::socket_reconcile::reconcile_abandoned_sockets;
     use podbay_core::{ActorId, ScopeId};
     use podbay_host::RebindCompletionStage;
@@ -43,7 +46,7 @@ mod linux {
         flag,
     };
 
-    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--trusted-policy FILE | --initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh owner uses DIR/owner-setup.sock; a recorded owner uses DIR/owner-recovery.sock. Both precede DIR/manager.sock. A trusted policy file enables one V2 root launch and first send.";
+    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--trusted-policy FILE | --initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF] [--owner-process-pid PID --owner-process-start-ticks TICKS --owner-process-uid UID]\nA fresh owner uses DIR/owner-setup.sock; a recorded owner uses DIR/owner-recovery.sock. Both precede DIR/manager.sock. A trusted policy file enables one V2 root launch and first send. The owner-process flags opt in to exact direct-launcher death supervision.";
 
     struct InitialOwnerConfig {
         actor_id: String,
@@ -59,6 +62,7 @@ mod linux {
         pod_sha256: String,
         initial_owner: Option<InitialOwnerConfig>,
         trusted_policy: Option<PathBuf>,
+        owner_process: Option<OwnerProcessSelector>,
     }
 
     pub fn main() -> ExitCode {
@@ -73,7 +77,10 @@ mod linux {
 
     fn run() -> Result<(), String> {
         let config = parse_args(env::args_os())?;
-        let parent = if config.initial_owner.is_some() || config.trusted_policy.is_some() {
+        let parent = if config.initial_owner.is_some()
+            || config.trusted_policy.is_some()
+            || config.owner_process.is_some()
+        {
             Some(
                 LinuxPeerEvidence::for_launcher_parent()
                     .map_err(|error| format!("launcher parent evidence unavailable: {error}"))?,
@@ -88,6 +95,33 @@ mod linux {
         }) {
             return Err("launcher parent effective UID/GID differs from manager".into());
         }
+        // Arm before any durable open, socket bind or policy registration. A
+        // parent that exited before pidfd_open is refused, not adopted by PID.
+        let stop = Arc::new(AtomicBool::new(false));
+        flag::register(SIGINT, stop.clone())
+            .map_err(|error| format!("cannot register SIGINT handler: {error}"))?;
+        flag::register(SIGTERM, stop.clone())
+            .map_err(|error| format!("cannot register SIGTERM handler: {error}"))?;
+        let owner_watch = config
+            .owner_process
+            .map(|selector| {
+                OwnerProcessWatch::arm(
+                    selector,
+                    parent
+                        .as_ref()
+                        .expect("opt-in requires captured parent")
+                        .clone(),
+                    &self_peer,
+                    stop.clone(),
+                )
+            })
+            .transpose()?;
+        let check_owner = || -> Result<(), String> {
+            owner_watch
+                .as_ref()
+                .map_or(Ok(()), OwnerProcessWatch::check_alive)
+        };
+        check_owner()?;
         validate_private_directory(&config.state_dir, self_peer.uid())?;
         validate_private_directory(&config.pod_dir, self_peer.uid())?;
         validate_database_path(&config.database, &config.state_dir, self_peer.uid())?;
@@ -131,16 +165,12 @@ mod linux {
                 .map_err(|error| format!("trusted credential registration refused: {error}"))?;
         }
 
-        // Register before exposing the socket. A signal handler only sets a
-        // flag; unlink and SQLite teardown run on the normal thread.
-        let stop = Arc::new(AtomicBool::new(false));
-        flag::register(SIGINT, stop.clone())
-            .map_err(|error| format!("cannot register SIGINT handler: {error}"))?;
-        flag::register(SIGTERM, stop.clone())
-            .map_err(|error| format!("cannot register SIGTERM handler: {error}"))?;
+        // A signal handler and the owner watcher only set a flag; unlink and
+        // SQLite teardown run on this thread.
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        check_owner()?;
         let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
         let setup_path = config.state_dir.join(OWNER_SETUP_SOCKET_NAME);
         let recovery_path = config.state_dir.join(OWNER_RECOVERY_SOCKET_NAME);
@@ -168,6 +198,7 @@ mod linux {
             DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
             other => format!("durable manager open failed: {other:?}"),
         })?;
+        check_owner()?;
         check_manager_socket_path(&socket_path)?;
         let mut enrolled_grant = None;
         if let Some(policy) = owner_policy {
@@ -178,6 +209,7 @@ mod linux {
                     && actor.scope_id == policy.scope_id().as_str()
             });
             if recorded_owner {
+                check_owner()?;
                 check_owner_recovery_socket_path(&recovery_path)?;
                 let mut recovery = LinuxOwnerRecoveryListener::bind(&config.state_dir, parent)
                     .map_err(|error| format!("owner recovery bind failed: {error}"))?;
@@ -209,6 +241,7 @@ mod linux {
                     }
                 }
             } else {
+                check_owner()?;
                 check_owner_setup_socket_path(&setup_path)?;
                 let mut setup = LinuxInitialOwnerSetupListener::bind(&config.state_dir, parent)
                     .map_err(|error| format!("owner setup bind failed: {error}"))?;
@@ -242,6 +275,7 @@ mod linux {
         let first_v2_page = authority
             .current_codex_v2_rebind_page(None)
             .map_err(|error| format!("current V2 Pod inventory unavailable: {error:?}"))?;
+        check_owner()?;
         if !first_v2_page.candidates().is_empty() && prepared.is_none() {
             return Err("current V2 Pods require the original trusted policy for recovery".into());
         }
@@ -262,6 +296,7 @@ mod linux {
             loop {
                 let next = page.next_cursor().cloned();
                 for (scope, pod) in page.candidates() {
+                    check_owner()?;
                     let key = auto_rebind_key(
                         authority.owner_epoch().get(),
                         scope.as_str(),
@@ -281,6 +316,7 @@ mod linux {
                         .map_err(|error| format!(
                             "current V2 Pod {pod} in {scope} rebind failed after {settled} settled Pods on page {page_number}; manager not ready: {error:?}"
                         ))?;
+                    check_owner()?;
                     if completed.stage != RebindCompletionStage::PodActive {
                         return Err(format!(
                             "current V2 Pod {pod} in {scope} rebind remains {:?} after {settled} settled Pods on page {page_number}; manager not ready",
@@ -292,6 +328,7 @@ mod linux {
                     ).map_err(|error| format!(
                         "current V2 Pod {pod} in {scope} writer takeover unavailable after {settled} settled Pods on page {page_number}; manager not ready: {error:?}"
                     ))?;
+                    check_owner()?;
                     eprintln!(
                         "podbay V2 rebind active: pod={} scope={} key={} writerEpoch={}",
                         pod,
@@ -329,6 +366,7 @@ mod linux {
         } else {
             None
         };
+        check_owner()?;
         let mut listener = LinuxManagerCommandsGetListener::bind(&config.state_dir).map_err(
             |error| match error {
                 LinuxListenerError::Io(ref io_error)
@@ -351,10 +389,24 @@ mod linux {
                 "read-only"
             }
         );
+        if let Err(error) = check_owner() {
+            let cleanup = listener.shutdown();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; manager socket shutdown failed: {cleanup}"),
+            });
+        }
+        let mut owner_check = || check_owner().map_err(|_| LinuxListenerError::OwnerProcessChanged);
         let served = if let Some((launch, send)) = templates.as_ref() {
-            listener.serve_until_with_launch_and_first_send(&mut authority, &stop, launch, send)
+            listener.serve_until_with_launch_and_first_send_checked(
+                &mut authority,
+                &stop,
+                launch,
+                send,
+                &mut owner_check,
+            )
         } else {
-            listener.serve_until(&mut authority, &stop)
+            listener.serve_until_checked(&mut authority, &stop, &mut owner_check)
         };
         let shutdown = listener.shutdown();
         match (served, shutdown) {
@@ -401,6 +453,9 @@ mod linux {
                     | "--initial-owner-scope"
                     | "--initial-owner-credential"
                     | "--trusted-policy"
+                    | "--owner-process-pid"
+                    | "--owner-process-start-ticks"
+                    | "--owner-process-uid"
             ) {
                 return Err(format!("unknown flag {flag}; {USAGE}"));
             }
@@ -415,6 +470,21 @@ mod linux {
         let scope = flags.remove("--initial-owner-scope");
         let credential = flags.remove("--initial-owner-credential");
         let trusted_policy = flags.remove("--trusted-policy").map(PathBuf::from);
+        let owner_process = match (
+            flags.remove("--owner-process-pid"),
+            flags.remove("--owner-process-start-ticks"),
+            flags.remove("--owner-process-uid"),
+        ) {
+            (None, None, None) => None,
+            (Some(pid), Some(start_ticks), Some(uid)) => Some(OwnerProcessSelector::parse(
+                pid.to_str().ok_or("owner process PID is not UTF-8")?,
+                start_ticks
+                    .to_str()
+                    .ok_or("owner process birth ticks are not UTF-8")?,
+                uid.to_str().ok_or("owner process UID is not UTF-8")?,
+            )?),
+            _ => return Err("all three owner-process flags are required".into()),
+        };
         if trusted_policy.is_some() && (actor.is_some() || scope.is_some() || credential.is_some())
         {
             return Err("--trusted-policy and individual initial-owner flags are exclusive".into());
@@ -453,6 +523,7 @@ mod linux {
                 .map_err(|_| "pod SHA-256 must be ASCII hex".to_owned())?,
             initial_owner,
             trusted_policy,
+            owner_process,
         })
     }
 

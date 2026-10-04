@@ -33,6 +33,7 @@ pub enum LinuxListenerError {
     Configuration(HostError),
     PrivateDirectoryRequired,
     SocketIdentityChanged,
+    OwnerProcessChanged,
 }
 
 impl Display for LinuxListenerError {
@@ -47,6 +48,9 @@ impl Display for LinuxListenerError {
             }
             Self::SocketIdentityChanged => {
                 formatter.write_str("manager socket path or directory changed")
+            }
+            Self::OwnerProcessChanged => {
+                formatter.write_str("manager launcher process changed or exited")
             }
         }
     }
@@ -218,7 +222,19 @@ impl LinuxManagerCommandsGetListener {
         authority: &mut DurableAuthority<P>,
         stop: &AtomicBool,
     ) -> Result<LinuxListenerReport, LinuxListenerError> {
-        self.serve_serial(authority, stop, |stream, authority| {
+        self.serve_until_checked(authority, stop, || Ok(()))
+    }
+
+    /// An opt-in launcher process fence, checked on the accepted connection
+    /// before dispatch. A separate pidfd watcher sets `stop` while idle. It
+    /// grants no actor or command authority.
+    pub fn serve_until_checked<P: HostDispatchPort>(
+        &mut self,
+        authority: &mut DurableAuthority<P>,
+        stop: &AtomicBool,
+        owner_check: impl FnMut() -> Result<(), LinuxListenerError>,
+    ) -> Result<LinuxListenerReport, LinuxListenerError> {
+        self.serve_serial(authority, stop, owner_check, |stream, authority| {
             Ok(serve_authenticated_linux_commands_get_one(
                 stream, authority,
             ))
@@ -237,14 +253,19 @@ impl LinuxManagerCommandsGetListener {
     where
         P::Receipt: StablePortReceipt,
     {
-        self.serve_serial(authority, stop, |stream, authority| {
-            let policy = template
-                .fresh()
-                .map_err(LinuxListenerError::Configuration)?;
-            Ok(serve_authenticated_linux_launch_one(
-                stream, authority, &policy,
-            ))
-        })
+        self.serve_serial(
+            authority,
+            stop,
+            || Ok(()),
+            |stream, authority| {
+                let policy = template
+                    .fresh()
+                    .map_err(LinuxListenerError::Configuration)?;
+                Ok(serve_authenticated_linux_launch_one(
+                    stream, authority, &policy,
+                ))
+            },
+        )
     }
 
     /// Opt in to root launch and claimed Codex `session.send` on the same socket.
@@ -260,6 +281,26 @@ impl LinuxManagerCommandsGetListener {
     where
         P::Receipt: StablePortReceipt,
     {
+        self.serve_until_with_launch_and_first_send_checked(
+            authority,
+            stop,
+            launch_template,
+            send_template,
+            || Ok(()),
+        )
+    }
+
+    pub fn serve_until_with_launch_and_first_send_checked<P: HostDispatchPort>(
+        &mut self,
+        authority: &mut DurableAuthority<P>,
+        stop: &AtomicBool,
+        launch_template: &TrustedWireRootLaunchTemplate,
+        send_template: &TrustedBootstrapSendTemplate,
+        owner_check: impl FnMut() -> Result<(), LinuxListenerError>,
+    ) -> Result<LinuxListenerReport, LinuxListenerError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
         // Pod bootstrap can wait up to 75s on its attested socket. The
         // authenticated manager exchange stays bounded but must outlive that
         // call. This limit is created from trusted templates, never wire JSON.
@@ -270,7 +311,7 @@ impl LinuxManagerCommandsGetListener {
             .min(Duration::from_secs(300));
         let limits = LinuxAuthPreludeLimits::new(Duration::from_secs(5), exchange)
             .map_err(|_| LinuxListenerError::Configuration(HostError::InvalidInput))?;
-        self.serve_serial(authority, stop, |stream, authority| {
+        self.serve_serial(authority, stop, owner_check, |stream, authority| {
             let launch_policy = launch_template
                 .fresh()
                 .map_err(LinuxListenerError::Configuration)?;
@@ -293,6 +334,7 @@ impl LinuxManagerCommandsGetListener {
         &mut self,
         authority: &mut DurableAuthority<P>,
         stop: &AtomicBool,
+        mut owner_check: impl FnMut() -> Result<(), LinuxListenerError>,
         mut serve: impl FnMut(
             UnixStream,
             &mut DurableAuthority<P>,
@@ -310,6 +352,10 @@ impl LinuxManagerCommandsGetListener {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             };
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            owner_check()?;
             self.recheck_owned_socket()?;
             report.accepted = report.accepted.saturating_add(1);
             match serve(stream, authority)? {

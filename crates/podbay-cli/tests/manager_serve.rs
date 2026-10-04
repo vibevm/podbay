@@ -11,8 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
+use podbay_pod::LinuxPeerEvidence;
 use podbay_store::PodBayStore;
 use podbay_wire::{CommandEnvelope, MutationOperation, ReadEnvelope, ReadOperation, Target};
+use rustix::fd::OwnedFd;
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -825,4 +828,171 @@ fn policy_file_must_be_private_canonical_and_fixed() {
     assert!(!status.success());
     assert!(error.contains("fixed Codex fields"));
     assert!(!fixture.database.exists());
+}
+
+// This test is entered only by the separate test-harness process below. The
+// manager's *actual* direct parent is this process, so killing the launcher
+// exercises the pidfd fence rather than a forged argv selector.
+#[test]
+fn owner_death_launcher_helper() {
+    let Ok(root) = std::env::var("PODBAY_OWNER_DEATH_FIXTURE_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let peer = LinuxPeerEvidence::for_current_process().unwrap();
+    let binary = root.join("pod-binary");
+    let digest: String = Sha256::digest(fs::read(&binary).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("manager.log"))
+        .unwrap();
+    let mut manager = Running(
+        Command::new(env!("CARGO_BIN_EXE_podbay"))
+            .args(["manager", "serve", "--state-dir"])
+            .arg(root.join("state"))
+            .arg("--database")
+            .arg(root.join("state/podbay.sqlite"))
+            .arg("--pod-dir")
+            .arg(root.join("pods"))
+            .arg("--pod-binary")
+            .arg(binary)
+            .arg("--pod-sha256")
+            .arg(digest)
+            .arg("--owner-process-pid")
+            .arg(peer.pid().to_string())
+            .arg("--owner-process-start-ticks")
+            .arg(peer.start_ticks().to_string())
+            .arg("--owner-process-uid")
+            .arg(peer.uid().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let socket = root.join("state/manager.sock");
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            manager.0.try_wait().unwrap().is_none(),
+            "manager exited before ready"
+        );
+        if socket.exists() && UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "supervised manager did not become ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(root.join("launcher-ready"), manager.0.id().to_string()).unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+struct ExactManagerCleanup(OwnedFd);
+
+impl Drop for ExactManagerCleanup {
+    fn drop(&mut self) {
+        // A pidfd cannot retarget to a reused numeric PID on a failed test.
+        let _ = pidfd_send_signal(&self.0, Signal::KILL);
+    }
+}
+
+#[test]
+fn owner_process_flags_refuse_wrong_birth_uid_and_partial_selector_before_store_open() {
+    let fixture = Fixture::new();
+    let self_peer = LinuxPeerEvidence::for_current_process().unwrap();
+    for (pid, birth, uid) in [
+        (
+            self_peer.pid(),
+            self_peer.start_ticks() + 1,
+            self_peer.uid(),
+        ),
+        (
+            self_peer.pid(),
+            self_peer.start_ticks(),
+            self_peer.uid() + 1,
+        ),
+        (
+            self_peer.pid() + 1,
+            self_peer.start_ticks(),
+            self_peer.uid(),
+        ),
+    ] {
+        let mut command = fixture.command();
+        command
+            .arg("--owner-process-pid")
+            .arg(pid.to_string())
+            .arg("--owner-process-start-ticks")
+            .arg(birth.to_string())
+            .arg("--owner-process-uid")
+            .arg(uid.to_string());
+        let (status, error) = run_short_command(command);
+        assert!(!status.success());
+        assert!(error.contains("selector differs"), "{error}");
+        assert!(!fixture.database.exists());
+    }
+    let mut partial = fixture.command();
+    partial
+        .arg("--owner-process-pid")
+        .arg(self_peer.pid().to_string());
+    let (status, error) = run_short_command(partial);
+    assert!(!status.success());
+    assert!(error.contains("all three owner-process flags"));
+    assert!(!fixture.database.exists());
+}
+
+#[test]
+fn killed_direct_launcher_releases_manager_socket_and_lifetime_lock() {
+    let fixture = Fixture::new();
+    let mut launcher = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "owner_death_launcher_helper", "--nocapture"])
+        .env("PODBAY_OWNER_DEATH_FIXTURE_ROOT", &fixture.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = fixture.root.join("launcher-ready");
+    let until = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            launcher.try_wait().unwrap().is_none(),
+            "launcher exited early"
+        );
+        assert!(Instant::now() < until, "launcher did not start manager");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let manager_pid: u32 = fs::read_to_string(ready).unwrap().parse().unwrap();
+    let manager_pid = Pid::from_raw(manager_pid as i32).unwrap();
+    let _cleanup = ExactManagerCleanup(pidfd_open(manager_pid, PidfdFlags::empty()).unwrap());
+    assert!(fixture.socket().exists());
+    assert_eq!(fixture.owner_epoch(), 1);
+    launcher.kill().unwrap();
+    assert!(!launcher.wait().unwrap().success());
+
+    let until = Instant::now() + Duration::from_secs(5);
+    while fixture.socket().exists() {
+        assert!(
+            Instant::now() < until,
+            "manager did not remove its socket after owner SIGKILL"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let log = fs::read_to_string(fixture.root.join("manager.log")).unwrap();
+    assert!(log.contains("podbay manager stopped"), "{log}");
+    // The old manager may be a briefly unreaped orphan; a fresh durable owner
+    // is the stronger proof that its lifetime lock was released.
+    let mut replacement = Running::spawn(&fixture);
+    replacement.wait_ready(&fixture);
+    assert_eq!(fixture.owner_epoch(), 2);
+    assert!(replacement.stop_with("TERM").success());
+    assert!(!fixture.socket().exists());
 }
