@@ -619,6 +619,50 @@ impl PodPeerFence {
         Ok(())
     }
 
+    /// Refresh only the current manager process's existing Pod status/stop
+    /// grant and short manager lease. Expiry alone does not change the owner:
+    /// fresh OS peer and store-owner witnesses are required on every renewal.
+    /// This never mints a grant, changes its identity or expands its rights.
+    pub fn renew_existing_manager_pod_control(
+        &mut self,
+        peer: &AttestedPeer,
+        grant_id: &PeerGrantId,
+        witness: &impl OwnerEpochWitness,
+        now_ms: u64,
+    ) -> Result<(), FenceError> {
+        self.require_active(peer, witness, now_ms, false)?;
+        let manager_until = now_ms
+            .checked_add(MAX_MANAGER_LEASE_MS)
+            .ok_or(FenceError::CounterOverflow)?;
+        let grant_until = now_ms
+            .checked_add(MAX_GRANT_LEASE_MS)
+            .ok_or(FenceError::CounterOverflow)?;
+        short_lease(now_ms, manager_until, MAX_MANAGER_LEASE_MS)?;
+        short_lease(now_ms, grant_until, MAX_GRANT_LEASE_MS)?;
+        let grant = self.grants.get(grant_id).ok_or(FenceError::GrantDenied)?;
+        if grant.peer != self.manager.peer || grant.peer != *peer {
+            return Err(FenceError::WrongPeer);
+        }
+        if grant.owner_epoch != self.manager.owner_epoch
+            || grant.credential_epoch != self.manager.credential_epoch
+        {
+            return Err(FenceError::StaleEpoch);
+        }
+        if grant.kind != GrantKind::Controller
+            || grant.target != FenceTarget::Pod
+            || grant.operations
+                != BTreeSet::from([FenceOperation::ObservePod, FenceOperation::StopPod])
+        {
+            return Err(FenceError::GrantDenied);
+        }
+        self.manager.lease_until_ms = manager_until;
+        self.grants
+            .get_mut(grant_id)
+            .expect("same installed grant checked above")
+            .expires_at_ms = grant_until;
+        Ok(())
+    }
+
     pub fn install_grant(
         &mut self,
         issuer: &AttestedPeer,
@@ -1767,6 +1811,97 @@ mod tests {
             fence.authorize(&manager(), &request, &witness, 150),
             Err(FenceError::GrantDenied)
         );
+    }
+
+    #[test]
+    fn same_manager_can_renew_expired_status_grant_after_sixty_seconds() {
+        let witness = Witness::new(Some(owner(1)));
+        let grant_id = grant_id("grant.manager.pod.bootstrap");
+        let mut fence = PodPeerFence::new(
+            id(),
+            manager(),
+            owner(1),
+            credential(1),
+            BTreeMap::from([(resource(), input(1))]),
+            1,
+            30_001,
+        )
+        .unwrap();
+        fence
+            .install_grant(
+                &manager(),
+                PeerGrant::new(
+                    grant_id.clone(),
+                    manager(),
+                    GrantKind::Controller,
+                    FenceTarget::Pod,
+                    BTreeSet::from([FenceOperation::ObservePod, FenceOperation::StopPod]),
+                    owner(1),
+                    credential(1),
+                    60_001,
+                )
+                .unwrap(),
+                &witness,
+                1,
+            )
+            .unwrap();
+        let status = PeerRequest {
+            identity: id(),
+            grant_id: grant_id.clone(),
+            owner_epoch: owner(1),
+            credential_epoch: credential(1),
+            target: FenceTarget::Pod,
+            operation: FenceOperation::ObservePod,
+            input_epoch: None,
+        };
+        assert_eq!(
+            fence.authorize(&manager(), &status, &witness, 70_001),
+            Err(FenceError::LeaseExpired),
+        );
+        let original = fence.grants.get(&grant_id).unwrap().clone();
+        assert_eq!(
+            fence.renew_existing_manager_pod_control(&sibling(), &grant_id, &witness, 70_001),
+            Err(FenceError::WrongPeer),
+        );
+        assert_eq!(
+            fence.renew_existing_manager_pod_control(
+                &manager(),
+                &grant_id,
+                &Witness::new(Some(owner(2))),
+                70_001,
+            ),
+            Err(FenceError::OwnerUnverified),
+        );
+        fence.phase = RebindPhase::PendingStore;
+        assert_eq!(
+            fence.renew_existing_manager_pod_control(&manager(), &grant_id, &witness, 70_001),
+            Err(FenceError::PendingRebind),
+        );
+        fence.phase = RebindPhase::Active;
+        assert_eq!(fence.manager.lease_until_ms, 30_001);
+        assert_eq!(fence.grants.get(&grant_id), Some(&original));
+        fence
+            .renew_existing_manager_pod_control(&manager(), &grant_id, &witness, 70_001)
+            .unwrap();
+        assert_eq!(fence.manager.lease_until_ms, 100_001);
+        assert_eq!(fence.grants.get(&grant_id).unwrap().expires_at_ms, 130_001);
+        assert_eq!(fence.grants.len(), 1);
+        let renewed = fence.grants.get(&grant_id).unwrap();
+        assert_eq!(renewed.id, original.id);
+        assert_eq!(renewed.peer, original.peer);
+        assert_eq!(renewed.target, original.target);
+        assert_eq!(renewed.operations, original.operations);
+        assert_eq!(renewed.owner_epoch, original.owner_epoch);
+        assert_eq!(renewed.credential_epoch, original.credential_epoch);
+        assert_eq!(
+            fence.authorize(&manager(), &status, &witness, 70_002),
+            Ok(())
+        );
+        let stop = PeerRequest {
+            operation: FenceOperation::StopPod,
+            ..status
+        };
+        assert_eq!(fence.authorize(&manager(), &stop, &witness, 70_002), Ok(()));
     }
 
     #[test]

@@ -1351,6 +1351,37 @@ fn current_codex_v2_binding(
     Ok(())
 }
 
+fn renew_and_authorize_manager_pod_control(
+    fence: &mut PodPeerFence,
+    peer: &AttestedPeer,
+    request: &PeerRequest,
+    owner_witness: &impl OwnerEpochWitness,
+    os_peer_current: bool,
+    manager_binding_current: bool,
+    now_ms: u64,
+) -> Result<(), podbay_core::FenceError> {
+    if !os_peer_current {
+        return Err(podbay_core::FenceError::WrongPeer);
+    }
+    if !manager_binding_current {
+        return Err(podbay_core::FenceError::OwnerUnverified);
+    }
+    if request.identity != *fence.identity()
+        || request.target != FenceTarget::Pod
+        || !matches!(request.operation, FenceOperation::ObservePod | FenceOperation::StopPod)
+        || request.input_epoch.is_some()
+    {
+        return Err(podbay_core::FenceError::WrongAssociation);
+    }
+    if request.owner_epoch != fence.owner_epoch()
+        || request.credential_epoch != fence.credential_epoch()
+    {
+        return Err(podbay_core::FenceError::StaleEpoch);
+    }
+    fence.renew_existing_manager_pod_control(peer, &request.grant_id, owner_witness, now_ms)?;
+    fence.authorize(peer, request, owner_witness, now_ms)
+}
+
 /// Internal systemd service entry. The authenticated socket binds before any child is spawned.
 pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let manifest = read_manifest(manifest_path.as_ref())?;
@@ -1940,16 +1971,24 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 operation: fence_operation,
                 input_epoch: None,
             };
-            if !current
-                || !manager_witness.matches_current(
+            // Startup may consume the original 30s/60s local timeouts. Only
+            // the same kernel-attested manager with today's durable owner and
+            // credential binding may refresh this exact existing Pod grant.
+            let manager_current = manager_witness.matches_current(
                     owner_epoch.get(),
                     credential_epoch.get(),
                     &manager_peer,
-                )
-                || fence
-                    .authorize(observed.attested_peer(), &checked, &witness, now)
-                    .is_err()
-            {
+                );
+            if renew_and_authorize_manager_pod_control(
+                &mut fence,
+                observed.attested_peer(),
+                &checked,
+                &witness,
+                current,
+                manager_current,
+                now,
+            )
+            .is_err() {
                 respond(
                     &mut stream,
                     Response {
@@ -2240,6 +2279,103 @@ mod tests {
             credential: 2,
         };
         (identity, fence, next, request, owner, manager)
+    }
+
+    #[test]
+    fn status_and_stop_renew_only_attested_current_manager_after_sixty_seconds() {
+        let identity = PodFenceIdentity {
+            scope_id: ScopeId::try_from("scope.renew.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.renew.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.renew.fixture").unwrap(),
+            incarnation: podbay_core::Epoch::new(1).unwrap(),
+            store_lineage: StoreLineageId::try_from("store.renew.fixture").unwrap(),
+        };
+        let peer = AttestedPeer::from_port(
+            "uid.1000", "pid.100", "boot.fixture", "birth.100", "manager.unit",
+        ).unwrap();
+        let sibling = AttestedPeer::from_port(
+            "uid.1000", "pid.101", "boot.fixture", "birth.101", "manager.unit",
+        ).unwrap();
+        let owner = OwnerEpoch::new(1).unwrap();
+        let credential = CredentialEpoch::new(1).unwrap();
+        let grant_id = PeerGrantId::try_from("grant.manager.pod.bootstrap").unwrap();
+        let witness = InspectOwnerWitness { identity: identity.clone(), owner: Some(owner) };
+        let mut fence = PodPeerFence::new(
+            identity.clone(), peer.clone(), owner, credential,
+            BTreeMap::from([(
+                ResourceId::try_from("resource.renew.fixture").unwrap(),
+                InputEpoch::new(1).unwrap(),
+            )]),
+            1, 30_001,
+        ).unwrap();
+        fence.install_grant(
+            &peer,
+            PeerGrant::new(
+                grant_id.clone(), peer.clone(), GrantKind::Controller, FenceTarget::Pod,
+                BTreeSet::from([FenceOperation::ObservePod, FenceOperation::StopPod]),
+                owner, credential, 60_001,
+            ).unwrap(),
+            &witness, 1,
+        ).unwrap();
+        let status = PeerRequest {
+            identity: identity.clone(), grant_id: grant_id.clone(), owner_epoch: owner,
+            credential_epoch: credential, target: FenceTarget::Pod,
+            operation: FenceOperation::ObservePod, input_epoch: None,
+        };
+        assert_eq!(
+            fence.authorize(&peer, &status, &witness, 70_001),
+            Err(podbay_core::FenceError::LeaseExpired),
+        );
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &status, &witness, false, true, 70_001,
+            ),
+            Err(podbay_core::FenceError::WrongPeer),
+        );
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &status, &witness, true, false, 70_001,
+            ),
+            Err(podbay_core::FenceError::OwnerUnverified),
+        );
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &sibling, &status, &witness, true, true, 70_001,
+            ),
+            Err(podbay_core::FenceError::WrongPeer),
+        );
+        let changed_owner = InspectOwnerWitness {
+            identity: identity.clone(), owner: Some(OwnerEpoch::new(2).unwrap()),
+        };
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &status, &changed_owner, true, true, 70_001,
+            ),
+            Err(podbay_core::FenceError::OwnerUnverified),
+        );
+        assert_eq!(
+            fence.authorize(&peer, &status, &witness, 70_001),
+            Err(podbay_core::FenceError::LeaseExpired),
+        );
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &status, &witness, true, true, 70_001,
+            ),
+            Ok(()),
+        );
+        let stop = PeerRequest { operation: FenceOperation::StopPod, ..status };
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &stop, &witness, true, true, 70_002,
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            renew_and_authorize_manager_pod_control(
+                &mut fence, &peer, &stop, &changed_owner, true, true, 130_003,
+            ),
+            Err(podbay_core::FenceError::OwnerUnverified),
+        );
     }
 
     #[test]
