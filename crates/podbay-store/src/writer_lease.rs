@@ -17,6 +17,93 @@ use crate::store::PodBayStore;
 const MAX_TTL_SECONDS: u64 = 3_600;
 
 impl PodBayStore {
+    /// Resolve the one current V2 structured child of a Session without
+    /// trusting a wire-supplied Run, Pod or Resource ID. This is database
+    /// evidence only; actor, grant and live pod checks belong to the host.
+    pub fn current_native_writer_target_for_session(
+        &mut self,
+        scope_id: &ScopeId,
+        session_id: &SessionId,
+    ) -> Result<(NativeWriterTarget, u64), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut statement = transaction.prepare(
+            "SELECT binding.command_rowid,resource.resource_id,resource.resource_epoch,
+                    registered.input_epoch,session.revision
+             FROM runtime_sessions AS session
+             JOIN runtime_runs AS run ON run.run_id=session.current_run_id
+               AND run.session_id=session.session_id AND run.scope_id=session.scope_id
+             JOIN launch_bindings AS binding ON binding.session_id=session.session_id
+               AND binding.run_id=run.run_id AND binding.scope_id=session.scope_id
+               AND binding.attempt_id=run.current_attempt_id
+             JOIN launch_resources AS resource ON resource.command_rowid=binding.command_rowid
+               AND resource.resource_ordinal=0
+             JOIN authority_resources AS registered ON registered.resource_id=resource.resource_id
+             WHERE session.session_id=?1 AND session.scope_id=?2 AND session.state='open'
+               AND binding.resource_count=1 AND resource.resource_kind='structured_provider'",
+        )?;
+        let rows = statement
+            .query_map(params![session_id.as_str(), scope_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let [(rowid, resource_id, resource_epoch, input_epoch, session_revision)] = rows.as_slice()
+        else {
+            return if rows.is_empty() {
+                Err(StoreError::NotFound)
+            } else {
+                Err(StoreError::Conflict(
+                    "Session has ambiguous V2 writer target",
+                ))
+            };
+        };
+        let launch = read_bound_record(&transaction, *rowid)?;
+        if launch.format != BoundLaunchFormat::CodexV2
+            || launch.scope_id != scope_id.as_str()
+            || launch.session_id != session_id.as_str()
+            || launch.resources.len() != 1
+            || launch.resources[0].id != *resource_id
+            || launch.resources[0].epoch != u64::try_from(*resource_epoch).unwrap_or(0)
+            || launch.resources[0].kind != "structured_provider"
+        {
+            return Err(StoreError::Conflict("Session V2 writer binding differs"));
+        }
+        let positive = |value: i64| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(StoreError::Conflict("Session writer epoch is invalid"))
+        };
+        let target = NativeWriterTarget {
+            store_lineage: StoreLineageId::try_from(self.store_lineage.as_str())
+                .map_err(|_| StoreError::Conflict("store lineage is invalid"))?,
+            scope_id: scope_id.clone(),
+            session_id: session_id.clone(),
+            run_id: RunId::try_from(launch.run_id.as_str())
+                .map_err(|_| StoreError::Conflict("Run ID is invalid"))?,
+            attempt_id: AttemptId::try_from(launch.attempt_id.as_str())
+                .map_err(|_| StoreError::Conflict("Attempt ID is invalid"))?,
+            pod_id: PodId::try_from(launch.pod_id.as_str())
+                .map_err(|_| StoreError::Conflict("Pod ID is invalid"))?,
+            pod_incarnation: launch.pod_incarnation,
+            resource_id: ResourceId::try_from(resource_id.as_str())
+                .map_err(|_| StoreError::Conflict("Resource ID is invalid"))?,
+            resource_epoch: positive(*resource_epoch)?,
+            resource_input_epoch: positive(*input_epoch)?,
+        };
+        check_current_target(&transaction, &self.store_lineage, &target)?;
+        transaction.commit()?;
+        Ok((target, positive(*session_revision)?))
+    }
+
     /// Initial acquisition (`None`) or explicit takeover (`Some(old_epoch)`).
     /// The request is a forgeable trusted-host DTO: this transaction validates
     /// committed identities and CAS fences but cannot prove OS peer, grant,
@@ -188,7 +275,12 @@ pub(crate) fn checked_native_writer_lease(
         authority_revision,
     )?;
     check_current_target(transaction, cached_lineage, target)?;
-    check_actor(transaction, &target.scope_id, holder_actor_id, holder_generation)?;
+    check_actor(
+        transaction,
+        &target.scope_id,
+        holder_actor_id,
+        holder_generation,
+    )?;
     let lease = read_lease(transaction, &target.resource_id)?.ok_or(StoreError::NotFound)?;
     if lease.target != *target
         || lease.holder_actor_id != *holder_actor_id

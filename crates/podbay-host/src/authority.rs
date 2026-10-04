@@ -9,21 +9,23 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
-    ActorId, Attempt, AttestedPeer, Epoch, LaunchBinding, PlannedRootBinding, Pod, PodId, Resource,
-    ResourceId, ResourceKind, Role, Run, ScopeId, Session, StoreLineageId, WorkKind,
+    ActorId, Attempt, AttestedPeer, CommandId, Epoch, LaunchBinding, PlannedRootBinding, Pod,
+    PodId, Resource, ResourceId, ResourceKind, Role, Run, ScopeId, Session, SessionId,
+    StoreLineageId, WorkKind,
 };
 use podbay_store::{
-    AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
-    BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
-    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection, CommandLookupSelector,
-    EffectClaim, LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest,
-    LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness,
-    StoreError, VerifiedPrincipal,
+    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
+    AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BootstrapSendSelector,
+    BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
+    BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
+    CommandLookupSelector, EffectClaim, EffectState, LaunchDispatchStage, LaunchDispatchStatus,
+    LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
+    NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness, StoreError,
+    TrustedBootstrapSendRequest, TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
-    CommandBody, CommandEnvelope, EffectiveLaunchContract, EffectiveLaunchContractV2,
-    FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole,
+    CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
+    FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole, SendPolicy,
     SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
     WorkspaceAccess as WireWorkspaceAccess,
 };
@@ -942,6 +944,22 @@ pub trait HostDispatchPort {
         false
     }
 
+    /// The selector was claimed once in the durable store. A production port
+    /// must still attest the exact pod and let it prove the current command,
+    /// writer lease, journal and direct child before any native input. No
+    /// prompt or permit is supplied by the socket request.
+    fn send_claimed_codex_bootstrap(
+        &mut self,
+        _claimed: ResolvedClaimedBootstrap,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    /// Default-deny while the Linux selector-only pod IPC is unavailable.
+    fn accepts_claimed_codex_bootstrap(&self) -> bool {
+        false
+    }
+
     fn accepts_resolved_native_launch(&self) -> bool {
         false
     }
@@ -979,6 +997,106 @@ pub struct TrustedWireRootLaunchPolicy {
     grant_id: GrantId,
     deadline: Instant,
     result_contract_ref: Box<str>,
+}
+
+/// Trusted manager mapping to an already installed scope SendSession grant.
+/// The wire request supplies only a SessionId and optional guards; it cannot
+/// nominate this grant or a monotonic effect deadline.
+#[derive(Clone, Debug)]
+pub struct TrustedBootstrapSendPolicy {
+    grant_id: GrantId,
+    deadline: Instant,
+}
+
+impl TrustedBootstrapSendPolicy {
+    pub fn from_trusted_policy(grant_id: GrantId, deadline: Instant) -> Result<Self, HostError> {
+        if deadline <= Instant::now() {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self { grant_id, deadline })
+    }
+}
+
+/// Private, claim-backed selector for a pod port. Constructed only after a
+/// durable claim and fresh host checks. It is not a pod or native effect proof.
+pub struct ResolvedClaimedBootstrap {
+    selector: BootstrapSendSelector,
+    writer_epoch: u64,
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    authority_revision: u64,
+    store_path: PathBuf,
+}
+
+impl ResolvedClaimedBootstrap {
+    pub fn selector(&self) -> &BootstrapSendSelector {
+        &self.selector
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn manager_credential_epoch(&self) -> u64 {
+        self.manager_credential_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+}
+
+/// The command/outbox stage is durable. The optional port observation is
+/// immediate call evidence only; it is never provider settlement and is not
+/// replayed as a durable status after a lost reply or manager restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapSendReceipt {
+    /// Scope derived from the live authenticated actor, never request JSON.
+    pub scope_id: ScopeId,
+    pub receipt: Receipt,
+    pub effect_state: EffectState,
+    pub duplicate: bool,
+    pub port_called: bool,
+    pub port_observation: Option<BootstrapPortObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapPortObservation {
+    PodAccepted(String),
+    RefusedBeforeEffect,
+    UncertainAfterPossibleEffect(Option<String>),
+}
+
+#[derive(Debug)]
+pub enum BootstrapSendError {
+    Host(HostError),
+    Store(StoreError),
+    Authority(DurableAuthorityError),
+    /// Admission committed, so the known CommandId must be queried. A claim
+    /// may already exist; the caller must never send under a new key.
+    PostAdmission {
+        receipt: Receipt,
+        source: Box<BootstrapSendError>,
+    },
+}
+
+impl From<HostError> for BootstrapSendError {
+    fn from(value: HostError) -> Self {
+        Self::Host(value)
+    }
+}
+impl From<StoreError> for BootstrapSendError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+impl From<DurableAuthorityError> for BootstrapSendError {
+    fn from(value: DurableAuthorityError) -> Self {
+        Self::Authority(value)
+    }
 }
 
 impl TrustedWireRootLaunchPolicy {
@@ -2567,6 +2685,421 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             self.recheck_actor_resolution_manager()?;
             found.map_err(Into::into)
         }
+    }
+
+    fn current_bootstrap_actor<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+    ) -> Result<ActorRegistration, BootstrapSendError> {
+        self.recheck_actor_resolution_manager()?;
+        let actor = self.host.authenticate(transport)?.clone();
+        let current = self.store.authority_snapshot()?;
+        if current.owner_epoch != self.manager_claim.owner_epoch()
+            || current.owner_epoch != self.host.manager_epoch.get()
+            || current.revision != self.recorded.revision
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let expected = durable_actor(&actor);
+        for snapshot in [&current, &self.recorded] {
+            let mut matching = snapshot
+                .actors
+                .iter()
+                .filter(|record| record.actor_id == actor.actor_id.as_str());
+            if matching.next() != Some(&expected) || matching.next().is_some() {
+                return Err(HostError::Unauthenticated.into());
+            }
+        }
+        self.recheck_actor_resolution_manager()?;
+        let fresh = self.store.authority_snapshot()?;
+        if fresh.owner_epoch != current.owner_epoch || fresh.revision != current.revision {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(actor)
+    }
+
+    /// Mint only the first exclusive writer lease for the current V2
+    /// structured resource. An exact live same-holder replay returns the
+    /// original writer epoch and expiry without extending either. Takeover or
+    /// stale-lease recovery requires a separate reviewed protocol.
+    pub fn acquire_initial_bootstrap_writer_lease<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        session_id: &SessionId,
+        policy: &TrustedBootstrapSendPolicy,
+        ttl_seconds: u64,
+    ) -> Result<NativeWriterLease, BootstrapSendError> {
+        if !(1..=3_600).contains(&ttl_seconds) {
+            return Err(HostError::InvalidInput.into());
+        }
+        let actor = self.current_bootstrap_actor(transport)?;
+        if policy.deadline <= Instant::now() {
+            return Err(HostError::DeadlineExpired.into());
+        }
+        self.host.check_grant(
+            &actor,
+            policy.grant_id,
+            &actor.scope_id,
+            &Right::new(
+                Operation::SendSession,
+                Target::Scope(actor.scope_id.clone()),
+            ),
+        )?;
+        let (target, _) = self
+            .store
+            .current_native_writer_target_for_session(&actor.scope_id, session_id)?;
+        let bound = self
+            .store
+            .current_bound_pod_snapshot(actor.scope_id.as_str(), target.pod_id.as_str())?;
+        if bound.launch().format != BoundLaunchFormat::CodexV2
+            || bound.launch().session_id != session_id.as_str()
+            || bound.launch().run_id != target.run_id.as_str()
+            || bound.launch().attempt_id != target.attempt_id.as_str()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let launch_status = self.store.launch_dispatch_status(
+            bound.launch().receipt.outbox_id,
+            actor.scope_id.as_str(),
+            target.pod_id.as_str(),
+        )?;
+        if !matches!(
+            launch_status.stage,
+            LaunchDispatchStage::HostAccepted | LaunchDispatchStage::PortSettled
+        ) {
+            return Err(HostError::StaleGuard.into());
+        }
+        let expected_owner = self.manager_claim.owner_epoch();
+        let expected_manager_credential = self.manager_claim.credential_epoch();
+        let expected_revision = self.recorded.revision;
+        let same_initial = |lease: &NativeWriterLease| {
+            lease.target() == &target
+                && lease.holder_actor_id() == &actor.actor_id
+                && lease.holder_credential_generation() == actor.credential_generation.get()
+                && lease.owner_epoch() == expected_owner
+                && lease.manager_credential_epoch() == expected_manager_credential
+                && lease.authority_revision() == expected_revision
+                && lease.writer_epoch() == 1
+        };
+        let lease = match self.store.inspect_native_writer_lease(&target) {
+            Ok(existing) if same_initial(&existing) => existing,
+            Ok(_) => return Err(HostError::LeaseHeld.into()),
+            Err(StoreError::NotFound) => {
+                let request = TrustedNativeWriterLeaseRequest {
+                    target: target.clone(),
+                    holder_actor_id: actor.actor_id.clone(),
+                    holder_credential_generation: actor.credential_generation.get(),
+                    expected_owner_epoch: expected_owner,
+                    expected_manager_credential_epoch: expected_manager_credential,
+                    expected_authority_revision: expected_revision,
+                    expected_writer_epoch: None,
+                    ttl_seconds,
+                };
+                match self
+                    .store
+                    .acquire_native_writer_lease_from_trusted_host(&request)
+                {
+                    Ok(lease) => lease,
+                    Err(StoreError::Conflict(_)) => {
+                        let raced = self.store.inspect_native_writer_lease(&target)?;
+                        if same_initial(&raced) {
+                            raced
+                        } else {
+                            return Err(HostError::LeaseHeld.into());
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let fresh = self.current_bootstrap_actor(transport)?;
+        if fresh.actor_id != actor.actor_id
+            || fresh.scope_id != actor.scope_id
+            || fresh.credential_generation != actor.credential_generation
+        {
+            return Err(HostError::Unauthenticated.into());
+        }
+        self.host.check_grant(
+            &fresh,
+            policy.grant_id,
+            &actor.scope_id,
+            &Right::new(
+                Operation::SendSession,
+                Target::Scope(actor.scope_id.clone()),
+            ),
+        )?;
+        let current = self.store.inspect_native_writer_lease(&target)?;
+        if current != lease || !same_initial(&current) || policy.deadline <= Instant::now() {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(current)
+    }
+
+    /// The first text-only `session.send` uses a separately installed scope
+    /// grant and current V2 Session→Run→Pod→Resource association. A duplicate
+    /// is looked up after live actor authentication, before today's grant or
+    /// writer lease, and never invokes the port. New sends are durably admitted
+    /// before one CAS claim; a claimed command is never sent a second time.
+    pub fn send_first_codex_bootstrap_from_wire<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        envelope: CommandEnvelope,
+        policy: &TrustedBootstrapSendPolicy,
+    ) -> Result<BootstrapSendReceipt, BootstrapSendError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        envelope
+            .encode_json()
+            .map_err(|_| HostError::InvalidInput)?;
+        let WireTarget::Session { session_id } = &envelope.target else {
+            return Err(HostError::Unsupported.into());
+        };
+        let session_id =
+            SessionId::try_from(session_id.as_str()).map_err(|_| HostError::InvalidInput)?;
+        let CommandBody::SessionSend(body) = &envelope.body else {
+            return Err(HostError::Unsupported.into());
+        };
+        if body.policy != SendPolicy::WhenIdle
+            || !matches!(body.content.as_slice(), [ContentBlock::Text { text }] if !text.is_empty())
+        {
+            return Err(HostError::Unsupported.into());
+        }
+        let actor = self.current_bootstrap_actor(transport)?;
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let prepared_duplicate = if let Some(original) =
+            self.store
+                .lookup_bootstrap_send_by_key(&principal, &actor.scope_id, &envelope)?
+        {
+            if original.effect_state() != EffectState::Prepared {
+                return Ok(BootstrapSendReceipt {
+                    scope_id: actor.scope_id.clone(),
+                    receipt: original.receipt().clone(),
+                    effect_state: original.effect_state(),
+                    duplicate: true,
+                    port_called: false,
+                    port_observation: None,
+                });
+            }
+            Some(original.receipt().clone())
+        } else {
+            None
+        };
+        let preserve_known = |source: BootstrapSendError| match &prepared_duplicate {
+            Some(receipt) => BootstrapSendError::PostAdmission {
+                receipt: receipt.clone(),
+                source: Box::new(source),
+            },
+            None => source,
+        };
+        if policy.deadline <= Instant::now() {
+            return Err(preserve_known(HostError::DeadlineExpired.into()));
+        }
+        self.host
+            .check_grant(
+                &actor,
+                policy.grant_id,
+                &actor.scope_id,
+                &Right::new(
+                    Operation::SendSession,
+                    Target::Scope(actor.scope_id.clone()),
+                ),
+            )
+            .map_err(|error| preserve_known(error.into()))?;
+        let (target, session_revision) = self
+            .store
+            .current_native_writer_target_for_session(&actor.scope_id, &session_id)
+            .map_err(|error| preserve_known(error.into()))?;
+        if envelope
+            .guard
+            .as_ref()
+            .and_then(|guard| guard.target_revision)
+            .is_none_or(|revision| revision.get() != session_revision)
+        {
+            return Err(preserve_known(HostError::StaleGuard.into()));
+        }
+        let lease = self
+            .store
+            .inspect_native_writer_lease(&target)
+            .map_err(|error| preserve_known(error.into()))?;
+        if lease.holder_actor_id() != &actor.actor_id
+            || lease.holder_credential_generation() != actor.credential_generation.get()
+            || envelope
+                .guard
+                .as_ref()
+                .and_then(|guard| guard.writer_epoch)
+                .is_none_or(|epoch| epoch.get() != lease.writer_epoch())
+        {
+            return Err(preserve_known(HostError::StaleGuard.into()));
+        }
+        let request = TrustedBootstrapSendRequest {
+            principal: principal.clone(),
+            scope_id: actor.scope_id.clone(),
+            envelope: &envelope,
+            native_target: target.clone(),
+            holder_actor_id: actor.actor_id.clone(),
+            holder_credential_generation: actor.credential_generation.get(),
+            expected_owner_epoch: self.manager_claim.owner_epoch(),
+            expected_manager_credential_epoch: self.manager_claim.credential_epoch(),
+            expected_authority_revision: self.recorded.revision,
+        };
+        let admission = self
+            .store
+            .admit_bootstrap_send(&request)
+            .map_err(|error| preserve_known(error.into()))?;
+        let (receipt, duplicate) = match admission {
+            Admission::Committed(receipt) => (receipt, false),
+            Admission::Duplicate(receipt) => {
+                let original = self
+                    .store
+                    .lookup_bootstrap_send_by_key(&principal, &actor.scope_id, &envelope)
+                    .and_then(|record| record.ok_or(StoreError::NotFound))
+                    .map_err(|source| BootstrapSendError::PostAdmission {
+                        receipt: receipt.clone(),
+                        source: Box::new(BootstrapSendError::Store(source)),
+                    })?;
+                if original.effect_state() != EffectState::Prepared {
+                    return Ok(BootstrapSendReceipt {
+                        scope_id: actor.scope_id.clone(),
+                        receipt,
+                        effect_state: original.effect_state(),
+                        duplicate: true,
+                        port_called: false,
+                        port_observation: None,
+                    });
+                }
+                (receipt, true)
+            }
+        };
+        let prepared = || BootstrapSendReceipt {
+            scope_id: actor.scope_id.clone(),
+            receipt: receipt.clone(),
+            effect_state: EffectState::Prepared,
+            duplicate,
+            port_called: false,
+            port_observation: None,
+        };
+        if !self.host.port.accepts_claimed_codex_bootstrap() {
+            return Ok(prepared());
+        }
+        let selector = BootstrapSendSelector {
+            scope_id: actor.scope_id.clone(),
+            command_id: CommandId::try_from(receipt.command_id.as_str()).map_err(|_| {
+                BootstrapSendError::PostAdmission {
+                    receipt: receipt.clone(),
+                    source: Box::new(BootstrapSendError::Host(HostError::InvalidInput)),
+                }
+            })?,
+            native_target: target,
+        };
+        enum ClaimResult {
+            Existing(EffectState),
+            New(ResolvedClaimedBootstrap),
+        }
+        let after_admission = (|| -> Result<ClaimResult, BootstrapSendError> {
+            let fresh_actor = self.current_bootstrap_actor(transport)?;
+            if fresh_actor.actor_id != actor.actor_id
+                || fresh_actor.scope_id != actor.scope_id
+                || fresh_actor.credential_generation != actor.credential_generation
+            {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.host.check_grant(
+                &fresh_actor,
+                policy.grant_id,
+                &actor.scope_id,
+                &Right::new(
+                    Operation::SendSession,
+                    Target::Scope(actor.scope_id.clone()),
+                ),
+            )?;
+            if policy.deadline <= Instant::now() {
+                return Err(HostError::DeadlineExpired.into());
+            }
+            match self.store.claim_bootstrap_send(&selector)? {
+                EffectClaim::ExistingUncertain => {
+                    return Ok(ClaimResult::Existing(EffectState::ClaimedUncertain));
+                }
+                EffectClaim::AlreadyObserved => {
+                    return Ok(ClaimResult::Existing(EffectState::Observed));
+                }
+                EffectClaim::NewClaim => {}
+            }
+            let fresh_actor = self.current_bootstrap_actor(transport)?;
+            if fresh_actor.actor_id != actor.actor_id
+                || fresh_actor.scope_id != actor.scope_id
+                || fresh_actor.credential_generation != actor.credential_generation
+            {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.host.check_grant(
+                &fresh_actor,
+                policy.grant_id,
+                &actor.scope_id,
+                &Right::new(
+                    Operation::SendSession,
+                    Target::Scope(actor.scope_id.clone()),
+                ),
+            )?;
+            if policy.deadline <= Instant::now() {
+                return Err(HostError::DeadlineExpired.into());
+            }
+            let claimed = self.store.inspect_claimed_bootstrap_send(&selector)?;
+            if claimed.receipt() != &receipt
+                || claimed.holder_actor_id() != &actor.actor_id
+                || claimed.holder_credential_generation() != actor.credential_generation.get()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            Ok(ClaimResult::New(ResolvedClaimedBootstrap {
+                selector,
+                writer_epoch: claimed.writer_epoch(),
+                owner_epoch: claimed.owner_epoch(),
+                manager_credential_epoch: claimed.manager_credential_epoch(),
+                authority_revision: claimed.authority_revision(),
+                store_path: self.canonical_database.clone(),
+            }))
+        })()
+        .map_err(|source| BootstrapSendError::PostAdmission {
+            receipt: receipt.clone(),
+            source: Box::new(source),
+        })?;
+        let claimed = match after_admission {
+            ClaimResult::New(claimed) => claimed,
+            ClaimResult::Existing(effect_state) => {
+                return Ok(BootstrapSendReceipt {
+                    scope_id: actor.scope_id.clone(),
+                    receipt,
+                    effect_state,
+                    duplicate,
+                    port_called: false,
+                    port_observation: None,
+                });
+            }
+        };
+        let port_observation = match self.host.port.send_claimed_codex_bootstrap(claimed) {
+            Ok(PortDispatchOutcome::Accepted(value) | PortDispatchOutcome::Settled(value)) => {
+                BootstrapPortObservation::PodAccepted(value.stable_reference().to_owned())
+            }
+            Err(PortDispatchError::RefusedBeforeEffect) => {
+                BootstrapPortObservation::RefusedBeforeEffect
+            }
+            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
+                BootstrapPortObservation::UncertainAfterPossibleEffect(
+                    receipt_ref.map(|value| value.as_str().to_owned()),
+                )
+            }
+        };
+        Ok(BootstrapSendReceipt {
+            scope_id: actor.scope_id.clone(),
+            receipt,
+            effect_state: EffectState::ClaimedUncertain,
+            duplicate,
+            port_called: true,
+            port_observation: Some(port_observation),
+        })
     }
 
     /// Trusted policy must register the effective profile on every manager

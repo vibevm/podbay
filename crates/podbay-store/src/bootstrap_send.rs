@@ -388,6 +388,57 @@ fn check_host_accepted_launch(
 }
 
 impl PodBayStore {
+    /// Lookup an authenticated actor's original first-send key before today's
+    /// grant, writer lease or pod state is checked. A miss authorises nothing;
+    /// the host must perform those fresh checks before admitting a new send.
+    pub fn lookup_bootstrap_send_by_key(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope_id: &ScopeId,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<BootstrapSendRecord>, StoreError> {
+        valid_id(&envelope.key)?;
+        let Target::Session { session_id } = &envelope.target else {
+            return Err(StoreError::InvalidInput(
+                "bootstrap requires Session target",
+            ));
+        };
+        let session = SessionId::try_from(session_id.as_str())
+            .map_err(|_| StoreError::InvalidInput("bootstrap Session ID is invalid"))?;
+        let text = first_text(envelope, &session)?;
+        let canonical = canonical_payload(
+            &envelope.payload_digest,
+            envelope.deadline_at.as_deref(),
+            text,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let existing: Option<(i64, String, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT command_rowid,scope_id,target_id,canonical_request FROM commands
+                 WHERE principal=?1 AND namespace=?2 AND command_key=?3",
+                params![principal.as_str(), NAMESPACE, envelope.key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((rowid, scope, target, bytes)) = existing else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if scope != scope_id.as_str() || target != session.as_str() {
+            return Err(StoreError::NotFound);
+        }
+        if bytes != canonical {
+            return Err(StoreError::Conflict(
+                "bootstrap key changed canonical payload",
+            ));
+        }
+        let record = read_bootstrap_record(&transaction, rowid)?;
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     /// Durable first bootstrap intent only. The host must authenticate the
     /// principal, send grant and live pod separately; this method calls no port.
     pub fn admit_bootstrap_send(

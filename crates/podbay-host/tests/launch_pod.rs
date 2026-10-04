@@ -4,7 +4,7 @@ use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
@@ -14,25 +14,27 @@ use podbay_core::{
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
-    AuthorisedBoundLaunch, AuthorisedDispatch, BoundHostLaunchProposal, BoundLaunchPodRequest,
-    CredentialGeneration, CredentialRef, DurableAuthority, DurableAuthorityError, ExecutionMode,
-    GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
-    LaunchPodError, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
+    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapPortObservation, BootstrapSendError,
+    BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
+    DurableAuthority, DurableAuthorityError, ExecutionMode, GrantId, GrantMode, GrantSpec,
+    GuardSet, HostAction, HostDispatchPort, HostError, HostRequest, LaunchPodError,
+    LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
     PortDispatchOutcome, PortReceiptRef, RebindContextError, RegisteredLaunchProfile,
-    ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target, TrustedDriverTemplate,
-    TrustedLaunchProfileInput, TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
-    WorkspaceAccess, WorkspaceSelection,
+    ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target,
+    TrustedBootstrapSendPolicy, TrustedDriverTemplate, TrustedLaunchProfileInput,
+    TrustedNativeHostConfig, TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
-    BoundLaunchFormat, EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore,
-    StoreError, VerifiedPrincipal,
+    BoundLaunchFormat, EffectClaim, EffectState, LaunchDispatchStage, LaunchLookupRequest,
+    NativeWriterTarget, PodBayStore, StoreError, TrustedNativeWriterLeaseRequest,
+    VerifiedPrincipal,
 };
 use podbay_wire::{
     CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
     FallbackPolicy, Guard as WireGuard, ImmutableLaunchDescriptor, LaunchBody, LaunchLimits,
     LaunchRole, LaunchSelection as WireLaunchSelection, LaunchWork, NativeRole, RequestedAuthority,
-    ResourceDriver, SessionChoice, Target as WireTarget, TargetOs, WorkKind as WireWorkKind,
-    WorkspaceAccess as WireWorkspaceAccess, WorkspaceBinding,
+    ResourceDriver, SendPolicy, SessionChoice, SessionSendBody, Target as WireTarget, TargetOs,
+    WorkKind as WireWorkKind, WorkspaceAccess as WireWorkspaceAccess, WorkspaceBinding,
 };
 use sha2::{Digest, Sha256};
 
@@ -89,6 +91,8 @@ struct FakeLaunchPort {
     fixture_opt_in: bool,
     resolved_opt_in: bool,
     codex_v2_opt_in: bool,
+    bootstrap_opt_in: Arc<AtomicBool>,
+    bootstrap_preclaim_change: Mutex<Option<PathBuf>>,
     resolved_seen: Mutex<Vec<(PathBuf, PathBuf, String)>>,
     manager_seen: Mutex<Vec<ResolvedManagerSeen>>,
     preclaim_change: Mutex<Option<(PathBuf, bool)>>,
@@ -108,6 +112,8 @@ impl FakeLaunchPort {
                 fixture_opt_in: true,
                 resolved_opt_in: false,
                 codex_v2_opt_in: false,
+                bootstrap_opt_in: Arc::new(AtomicBool::new(false)),
+                bootstrap_preclaim_change: Mutex::new(None),
                 resolved_seen: Mutex::new(Vec::new()),
                 manager_seen: Mutex::new(Vec::new()),
                 preclaim_change: Mutex::new(None),
@@ -131,6 +137,12 @@ impl FakeLaunchPort {
 
     fn codex_v2(mut self) -> Self {
         self.codex_v2_opt_in = true;
+        self
+    }
+
+    fn codex_v2_and_bootstrap(mut self) -> Self {
+        self.codex_v2_opt_in = true;
+        self.bootstrap_opt_in.store(true, Ordering::SeqCst);
         self
     }
 }
@@ -172,6 +184,56 @@ impl HostDispatchPort for FakeLaunchPort {
 
     fn accepts_resolved_codex_v2(&self) -> bool {
         self.codex_v2_opt_in
+    }
+
+    fn accepts_claimed_codex_bootstrap(&self) -> bool {
+        if let Some(path) = self.bootstrap_preclaim_change.lock().unwrap().take() {
+            let mut store = PodBayStore::open(path).unwrap();
+            let snapshot = store.authority_snapshot().unwrap();
+            let mut resource = snapshot.resources[0].clone();
+            resource.input_epoch += 1;
+            store
+                .apply_authority_mutation(
+                    snapshot.owner_epoch,
+                    snapshot.revision,
+                    podbay_store::AuthorityMutation::PutResource(resource),
+                )
+                .unwrap();
+        }
+        self.bootstrap_opt_in.load(Ordering::SeqCst)
+    }
+
+    fn send_claimed_codex_bootstrap(
+        &mut self,
+        claimed: ResolvedClaimedBootstrap,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        assert!(self.bootstrap_opt_in.load(Ordering::SeqCst));
+        let mut store = PodBayStore::open(claimed.store_path()).unwrap();
+        let record = store
+            .inspect_claimed_bootstrap_send(claimed.selector())
+            .unwrap();
+        assert_eq!(record.writer_epoch(), claimed.writer_epoch());
+        assert_eq!(record.owner_epoch(), claimed.owner_epoch());
+        assert_eq!(
+            record.manager_credential_epoch(),
+            claimed.manager_credential_epoch()
+        );
+        assert_eq!(record.authority_revision(), claimed.authority_revision());
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        let receipt = PortReceiptRef::from_port("receipt.bootstrap.one").unwrap();
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(PortDispatchError::RefusedBeforeEffect),
+            2 => {
+                self.possible_effects.fetch_add(1, Ordering::SeqCst);
+                Err(PortDispatchError::UncertainAfterPossibleEffect {
+                    receipt_ref: Some(receipt),
+                })
+            }
+            _ => {
+                self.possible_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
+        }
     }
 
     fn launch_resolved_codex_v2(
@@ -788,6 +850,371 @@ fn install_wire_root_policy(
     )
     .unwrap();
     (grant, policy)
+}
+
+fn bootstrap_request(
+    target: &NativeWriterTarget,
+    owner_epoch: u64,
+    writer_epoch: u64,
+    session_revision: u64,
+    request_id: &str,
+    key: &str,
+    text: &str,
+) -> CommandEnvelope {
+    CommandEnvelope::new(
+        request_id,
+        key,
+        WireTarget::Session {
+            session_id: target.session_id.as_str().into(),
+        },
+        Some(WireGuard {
+            manager_epoch: Some(DecimalString::new(owner_epoch)),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(writer_epoch)),
+            target_revision: Some(DecimalString::new(session_revision)),
+            ..WireGuard::default()
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap()
+}
+
+fn prepared_bootstrap_host(
+    fixture: &Fixture,
+    send_port_enabled: bool,
+) -> (
+    Identity,
+    DurableAuthority<FakeLaunchPort>,
+    TrustedBootstrapSendPolicy,
+    CommandEnvelope,
+    GrantId,
+    Arc<AtomicUsize>,
+) {
+    let who = identity(fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let port = if send_port_enabled {
+        port.codex_v2_and_bootstrap()
+    } else {
+        port.codex_v2()
+    };
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    // Grant installation precedes V2 launch: the committed manifest pins
+    // authority revision and this first slice has no mutating rebind.
+    let send_grant = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([Right::new(
+                    Operation::SendSession,
+                    Target::Scope(who.scope.clone()),
+                )]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let (launch_grant, launch_policy) = install_wire_root_policy(&mut host, &who);
+    let launch = host
+        .launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request(
+                "request.bootstrap.launch",
+                "key.bootstrap.launch",
+                wire_root_body(launch_grant, "gpt-6-sol"),
+            ),
+            &launch_policy,
+        )
+        .unwrap();
+    assert_eq!(launch.status.stage, LaunchDispatchStage::HostAccepted);
+    let pod = &host.recorded_snapshot().pods[0].pod_id;
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let bound = store
+        .current_bound_pod_snapshot(who.scope.as_str(), pod)
+        .unwrap();
+    let session_id = SessionId::try_from(bound.launch().session_id.as_str()).unwrap();
+    let (target, session_revision) = store
+        .current_native_writer_target_for_session(&who.scope, &session_id)
+        .unwrap();
+    drop(store);
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        send_grant,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let lease = host
+        .acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &policy, 120)
+        .unwrap();
+    let envelope = bootstrap_request(
+        &target,
+        host.owner_epoch().get(),
+        lease.writer_epoch(),
+        session_revision,
+        "request.bootstrap.first",
+        "key.bootstrap.first",
+        "hello bootstrap",
+    );
+    (who, host, policy, envelope, send_grant, calls)
+}
+
+#[test]
+fn first_bootstrap_send_claims_once_and_duplicate_survives_grant_revocation() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, send_grant, calls) =
+        prepared_bootstrap_host(&fixture, true);
+    let WireTarget::Session { session_id } = &envelope.target else {
+        unreachable!()
+    };
+    let session_id = SessionId::try_from(session_id.as_str()).unwrap();
+    let first_lease = host
+        .acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &policy, 30)
+        .unwrap();
+    let repeated_lease = host
+        .acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &policy, 60)
+        .unwrap();
+    assert_eq!(first_lease, repeated_lease);
+    assert_eq!(first_lease.writer_epoch(), 1);
+    let first = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope.clone(), &policy)
+        .unwrap();
+    assert_eq!(first.scope_id, who.scope);
+    assert!(!first.duplicate);
+    assert!(first.port_called);
+    assert_eq!(first.effect_state, EffectState::ClaimedUncertain);
+    assert_eq!(
+        first.port_observation,
+        Some(BootstrapPortObservation::PodAccepted(
+            "receipt.bootstrap.one".into()
+        ))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2); // V2 launch + first send
+    let mut duplicate = envelope.clone();
+    duplicate.request_id = "request.bootstrap.retry".into();
+    let replay = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, duplicate.clone(), &policy)
+        .unwrap();
+    assert_eq!(replay.receipt, first.receipt);
+    assert_eq!(replay.scope_id, who.scope);
+    assert_eq!(replay.effect_state, EffectState::ClaimedUncertain);
+    assert!(replay.duplicate);
+    assert!(!replay.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let changed = CommandEnvelope::new(
+        "request.bootstrap.changed",
+        &envelope.key,
+        envelope.target.clone(),
+        envelope.guard.clone(),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text {
+                text: "changed prompt".into(),
+            }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&who.transport, changed, &policy),
+        Err(BootstrapSendError::Store(StoreError::Conflict(_)))
+    ));
+    host.revoke_grant_from_trusted_policy(send_grant).unwrap();
+    assert!(matches!(
+        host.acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &policy, 30),
+        Err(BootstrapSendError::Host(HostError::Unauthorised))
+    ));
+    let after_revoke = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, duplicate, &policy)
+        .unwrap();
+    assert_eq!(after_revoke.receipt, first.receipt);
+    assert_eq!(after_revoke.scope_id, who.scope);
+    assert!(after_revoke.duplicate);
+    assert!(!after_revoke.port_called);
+    let mut new_key = envelope;
+    new_key.key = "key.bootstrap.after.revoke".into();
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&who.transport, new_key, &policy),
+        Err(BootstrapSendError::Host(HostError::Unauthorised))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn bootstrap_send_default_denies_port_and_stale_writer() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, _, calls) = prepared_bootstrap_host(&fixture, false);
+    let prepared = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope.clone(), &policy)
+        .unwrap();
+    assert_eq!(prepared.scope_id, who.scope);
+    assert_eq!(prepared.effect_state, EffectState::Prepared);
+    assert!(!prepared.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 1); // launch only
+    let held = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope.clone(), &policy)
+        .unwrap();
+    assert_eq!(held.receipt, prepared.receipt);
+    assert!(held.duplicate);
+    assert!(!held.port_called);
+    host.port().bootstrap_opt_in.store(true, Ordering::SeqCst);
+    let mut envelope = envelope;
+    envelope.request_id = "request.bootstrap.resumed".into();
+    let resumed = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope, &policy)
+        .unwrap();
+    assert_eq!(resumed.receipt, prepared.receipt);
+    assert_eq!(resumed.scope_id, who.scope);
+    assert!(resumed.duplicate);
+    assert!(resumed.port_called);
+    assert_eq!(resumed.effect_state, EffectState::ClaimedUncertain);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, _, calls) = prepared_bootstrap_host(&fixture, true);
+    let WireTarget::Session { session_id } = &envelope.target else {
+        unreachable!()
+    };
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (target, _) = store
+        .current_native_writer_target_for_session(
+            &who.scope,
+            &SessionId::try_from(session_id.as_str()).unwrap(),
+        )
+        .unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    let claim = store
+        .current_manager_credential_claim(snapshot.owner_epoch)
+        .unwrap();
+    store
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target,
+            holder_actor_id: who.actor.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: snapshot.owner_epoch,
+            expected_manager_credential_epoch: claim.credential_epoch(),
+            expected_authority_revision: snapshot.revision,
+            expected_writer_epoch: Some(1),
+            ttl_seconds: 120,
+        })
+        .unwrap();
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&who.transport, envelope, &policy),
+        Err(BootstrapSendError::Host(HostError::StaleGuard))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn prepared_bootstrap_replay_keeps_command_id_when_grant_is_revoked() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, send_grant, calls) =
+        prepared_bootstrap_host(&fixture, false);
+    let prepared = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope.clone(), &policy)
+        .unwrap();
+    assert_eq!(prepared.effect_state, EffectState::Prepared);
+    host.revoke_grant_from_trusted_policy(send_grant).unwrap();
+    let prior = match host.send_first_codex_bootstrap_from_wire(&who.transport, envelope, &policy) {
+        Err(BootstrapSendError::PostAdmission { receipt, .. }) => receipt,
+        other => panic!("expected known Prepared receipt: {other:?}"),
+    };
+    assert_eq!(prior, prepared.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bootstrap_send_refuses_stale_actor_and_manager_before_admission() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, _, calls) = prepared_bootstrap_host(&fixture, true);
+    let stale_actor = FakeTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        who.process.clone(),
+        CredentialGeneration::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&stale_actor, envelope.clone(), &policy),
+        Err(BootstrapSendError::Host(HostError::Unauthenticated))
+    ));
+    let mut external = PodBayStore::open(&fixture.database).unwrap();
+    let old_owner = external.owner_epoch().unwrap();
+    external
+        .begin_authority_replay(old_owner, old_owner + 1)
+        .unwrap();
+    let WireTarget::Session { session_id } = &envelope.target else {
+        unreachable!()
+    };
+    assert!(matches!(
+        host.acquire_initial_bootstrap_writer_lease(
+            &who.transport,
+            &SessionId::try_from(session_id.as_str()).unwrap(),
+            &policy,
+            60,
+        ),
+        Err(BootstrapSendError::Authority(_))
+            | Err(BootstrapSendError::Host(HostError::StaleGuard))
+    ));
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&who.transport, envelope, &policy),
+        Err(BootstrapSendError::Authority(_))
+            | Err(BootstrapSendError::Host(HostError::StaleGuard))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn bootstrap_uncertain_port_and_post_admission_error_keep_command_id() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, _, calls) = prepared_bootstrap_host(&fixture, true);
+    host.port()
+        .mode
+        .store(Mode::LostReply as u8, Ordering::SeqCst);
+    let uncertain = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope.clone(), &policy)
+        .unwrap();
+    assert!(matches!(
+        uncertain.port_observation,
+        Some(BootstrapPortObservation::UncertainAfterPossibleEffect(
+            Some(_)
+        ))
+    ));
+    assert_eq!(uncertain.effect_state, EffectState::ClaimedUncertain);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let replay = host
+        .send_first_codex_bootstrap_from_wire(&who.transport, envelope, &policy)
+        .unwrap();
+    assert_eq!(replay.receipt, uncertain.receipt);
+    assert!(replay.duplicate);
+    assert!(!replay.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let fixture = Fixture::new();
+    let (who, mut host, policy, envelope, _, calls) = prepared_bootstrap_host(&fixture, true);
+    *host.port().bootstrap_preclaim_change.lock().unwrap() = Some(fixture.database.clone());
+    let receipt = match host.send_first_codex_bootstrap_from_wire(
+        &who.transport,
+        envelope.clone(),
+        &policy,
+    ) {
+        Err(BootstrapSendError::PostAdmission { receipt, .. }) => receipt,
+        other => panic!("expected post-admission fence: {other:?}"),
+    };
+    assert!(!receipt.command_id.is_empty());
+    let original = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .lookup_bootstrap_send_by_key(
+            &VerifiedPrincipal::from_authenticated_boundary(who.actor.as_str()).unwrap(),
+            &who.scope,
+            &envelope,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.receipt(), &receipt);
+    assert_eq!(original.effect_state(), EffectState::Prepared);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
