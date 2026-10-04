@@ -494,6 +494,7 @@ pub enum CodexError {
     InvalidInput(&'static str),
     InvalidState(&'static str),
     Unsupported(&'static str),
+    AtomicFrameTooLarge,
     Protocol(&'static str),
     Codec(CodecError),
     TransportUncertain,
@@ -1345,7 +1346,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             .map_err(CodexError::Codec)?;
         if read_frame.len() > MAX_ATOMIC_READ_PROBE_FRAME
             || start_frame.len() > MAX_ATOMIC_READ_PROBE_FRAME
-        { return Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound")); }
+        { return Err(CodexError::AtomicFrameTooLarge); }
         Ok(PreparedNonblockingLaterTurn {
             permit: permit.clone(), expected_thread_id: expected_thread_id.into(),
             expected_session_id: expected_session_id.into(),

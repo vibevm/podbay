@@ -89,14 +89,21 @@ turn control is exposed to a live provider.
 `send_turn_after_checkpoint_checked` is the historical synchronous, idle-only
 primitive. The v22 pod route now uses `prepare_nonblocking_later_turn` before
 fsyncing journal Intent. It encodes the **whole** `turn/start` JSONL frame and
-refuses if it exceeds 512 bytes, the atomic pipe-write bound. After Intent,
-`begin_nonblocking_later_turn_after_intent` schedules no write; one outer-loop
+reports `AtomicFrameTooLarge` if it exceeds 512 bytes, the atomic pipe-write
+bound. The pod routes only that typed result to the prior checked synchronous
+submission **before** appending Intent; it fsyncs the same journal Intent and
+attempts one native start. A lost reply stays uncertain and never resends.
+After Intent on the atomic path, `begin_nonblocking_later_turn_after_intent`
+schedules no write; one outer-loop
 tick writes or reads at most one nonblocking native frame. `Pending` certifies
 zero bytes written and may retry only that same frame in the same process.
 A partial write, timeout, lost/malformed reply, or crash after Intent remains
 uncertain and never resends `turn/start`. Only a valid native reply fsyncs the
-exact turn ID. This is a bounded capability, not 64 KiB prompt support; larger
-encoded frames fail closed without truncation. A 36-byte UUID-shaped thread ID,
+exact turn ID. The nonblocking capability is bounded to 512-byte frames; larger
+encoded frames retain the older blocking capability without truncation. Pod
+status can wait up to the native 30-second read timeout on that fallback;
+responsive in-flight status is guaranteed only for the atomic path. A 36-byte
+UUID-shaped thread ID,
 77-byte PodBay CommandId, 60-byte text and gpt-6-sol/medium encoded to 328
 bytes in the focused fixture. A real disposable Codex smoke observed native
 thread and Session ID lengths of 36 bytes each (metadata only).

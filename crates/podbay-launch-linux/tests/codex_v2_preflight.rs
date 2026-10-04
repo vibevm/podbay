@@ -3233,7 +3233,7 @@ sleep __WAIT_AFTER_TURN__
     fs::write(&fixture.executable, updated).unwrap();
 }
 
-fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
+fn run_disposable_codex_v22_second_turn(lost_reply: bool, long_prompt: bool) {
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let fixture = Fixture::new();
     install_fake_completed_then_second_turn(&fixture, lost_reply,
@@ -3292,21 +3292,31 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(reopened_bootstrap_journal(&fixture).stage, CodexJournalStage::BootstrapCompleted);
+    let second_text = if long_prompt { "x".repeat(450) }
+        else { "fixture second turn".into() };
     let second = CommandEnvelope::new(
         "request.v22.second", "key.v22.second",
         WireTarget::Session { session_id: session.as_str().into() }, guard.clone(), None,
         CommandBody::SessionSend(SessionSendBody {
-            content: vec![ContentBlock::Text { text: "fixture second turn".into() }],
+            content: vec![ContentBlock::Text { text: second_text.clone() }],
             policy: SendPolicy::WhenIdle,
         }),
     ).unwrap();
     let begin_send = Instant::now();
     let second_receipt = host.send_codex_session_from_wire(&transport, second.clone(), &policy).unwrap();
-    assert!(begin_send.elapsed() < Duration::from_secs(3),
-        "second-turn IPC blocked on a native RPC: elapsed={:?}, observation={:?}",
-        begin_send.elapsed(), second_receipt.port_observation);
-    assert!(matches!(second_receipt.port_observation,
-        Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
+    if !long_prompt {
+        assert!(begin_send.elapsed() < Duration::from_secs(3),
+            "atomic second-turn IPC blocked on a native RPC: elapsed={:?}, observation={:?}",
+            begin_send.elapsed(), second_receipt.port_observation);
+        assert!(matches!(second_receipt.port_observation,
+            Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
+    } else if lost_reply {
+        assert!(matches!(second_receipt.port_observation,
+            Some(BootstrapPortObservation::UncertainAfterPossibleEffect(_))));
+    } else {
+        assert!(matches!(second_receipt.port_observation,
+            Some(BootstrapPortObservation::PodAccepted(_))));
+    }
     let second_id = CommandId::try_from(second_receipt.receipt.command_id.as_str()).unwrap();
     let selector = LaterCodexSendSelector {
         scope_id: fixture.scope.clone(), command_id: second_id,
@@ -3322,7 +3332,7 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
         ).unwrap();
         let starts = fs::read_to_string(&frames).unwrap_or_default().lines()
             .filter(|line| line.contains("\"method\":\"turn/start\"")).count();
-        if starts == 2 && status_during_native_reply.is_none() {
+        if !long_prompt && starts == 2 && status_during_native_reply.is_none() {
             let before_status = Instant::now();
             let status = client.attested_status().unwrap();
             let latency = before_status.elapsed();
@@ -3343,7 +3353,7 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
             "later turn did not settle its native reply uncertainty: {:?}", observed.stage);
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(status_during_native_reply.is_some());
+    if !long_prompt { assert!(status_during_native_reply.is_some()); }
     let command_selector = CommandLookupSelector::Key { key: "key.v22.second".into() };
     for _ in 0..2 {
         let (durable, native) = host.lookup_command_with_any_native_observation(
@@ -3416,13 +3426,25 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
 #[test]
 #[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
 fn disposable_codex_v22_second_turn_claims_once_and_reconciles_without_resend() {
-    run_disposable_codex_v22_second_turn(false);
+    run_disposable_codex_v22_second_turn(false, false);
 }
 
 #[test]
 #[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
 fn disposable_codex_v22_lost_second_reply_is_uncertain_and_never_resends() {
-    run_disposable_codex_v22_second_turn(true);
+    run_disposable_codex_v22_second_turn(true, false);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_large_second_turn_uses_checked_fallback_once() {
+    run_disposable_codex_v22_second_turn(false, true);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_large_lost_reply_is_uncertain_without_resend() {
+    run_disposable_codex_v22_second_turn(true, true);
 }
 
 #[test]

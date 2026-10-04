@@ -1745,7 +1745,7 @@ fn nonblocking_later_turn_checks_full_atomic_frame_and_pending_writes_zero_bytes
     let before = adapter.transport().writes.len();
     assert!(matches!(adapter.prepare_nonblocking_later_turn(
         &permit, "thread.one", "thread.one", &"x".repeat(450), "message.async",
-    ), Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound"))));
+    ), Err(CodexError::AtomicFrameTooLarge)));
     assert_eq!(adapter.transport().writes.len(), before);
     let prepared = adapter.prepare_nonblocking_later_turn(
         &permit, "thread.one", "thread.one", "Short", "message.async",
@@ -1840,7 +1840,7 @@ fn nonblocking_later_turn_refuses_long_realistic_ids_before_intent() {
     let before = long.transport().writes.len();
     assert!(matches!(long.prepare_nonblocking_later_turn(
         &writer_permit(1), &long_thread, &long_thread, &prompt, &message_id,
-    ), Err(CodexError::Unsupported("later turn exceeds atomic pipe frame bound"))));
+    ), Err(CodexError::AtomicFrameTooLarge)));
     assert_eq!(long.transport().writes.len(), before,
         "oversize frame must refuse before any native later-turn write");
 }

@@ -3,10 +3,9 @@
 
 use podbay_adapter_codex::{
     BlockReason, BootstrapReadPoll, CodexError, CodexResource, JsonlTransport,
-    LaterTurnCompletionObservation, LaterTurnStartPoll, LaterTurnTerminalStatus, WriterPermit,
+    LaterTurnCompletionObservation, LaterTurnStartPoll, LaterTurnTerminalStatus,
+    TurnSubmissionStage, WriterPermit,
 };
-#[cfg(test)]
-use podbay_adapter_codex::TurnSubmissionStage;
 use podbay_core::Epoch;
 use podbay_store::{EffectState, LaterCodexSendRecord};
 
@@ -116,13 +115,22 @@ fn submit_claimed_nonblocking<T: JsonlTransport, P: ClaimedLaterTurn>(
         .ok_or(PodError::Refused("later-turn native Session anchor is absent"))?;
     // The complete turn/start frame is encoded and checked against PIPE_BUF
     // before any journal Intent or native write. No text is truncated.
-    let prepared = resource.prepare_nonblocking_later_turn(
+    let prepared = match resource.prepare_nonblocking_later_turn(
         &permit,
         thread_id,
         session_id,
         proof.text(),
         proof.client_message_id(),
-    ).map_err(|_| PodError::Refused("later turn exceeds or fails atomic native preflight"))?;
+    ) {
+        Ok(prepared) => prepared,
+        Err(CodexError::AtomicFrameTooLarge) => {
+            // The published checked synchronous path supports larger text.
+            // It owns the same journal Intent and at-most-once native write;
+            // no Intent has been appended by this routing decision yet.
+            return submit_claimed(resource, bootstrap, later, proof, recheck);
+        }
+        Err(_) => return Err(PodError::Refused("later turn native preflight failed")),
+    };
     let view = match later.begin_turn(key, digest, proof.client_message_id(), proof.writer_epoch())? {
         LaterTurnIntentResult::Duplicate(view) => return Ok(view),
         LaterTurnIntentResult::NewlyDurable(view) => view,
@@ -172,9 +180,10 @@ fn uncertain_view(
         .map_err(|_| PodError::Uncertain("later-turn native outcome lacks durable receipt"))
 }
 
-/// Historical synchronous fixture controller. Production uses the bounded
-/// nonblocking path above; this stays only to exercise journal transitions.
-#[cfg(test)]
+/// Checked synchronous fallback for encoded native frames above PIPE_BUF.
+/// It fsyncs the same later journal Intent before one native `turn/start`;
+/// a duplicate or ambiguous reply is never resent. Status can block during
+/// its native RPC, unlike the short-frame nonblocking capability above.
 fn submit_claimed<T: JsonlTransport, P: ClaimedLaterTurn>(
     resource: &mut CodexResource<T>,
     bootstrap: &mut CodexCommandJournal,
@@ -752,6 +761,23 @@ mod tests {
                 },
             )
         }
+        fn submit_routed(&mut self, claim: &FixtureClaim) -> Result<LaterTurnView, PodError> {
+            let resource_id = resource_identity();
+            let owner = self.owner.clone();
+            let child = &mut self.guard_child;
+            let birth = self.guard_birth.clone();
+            submit_claimed_nonblocking(
+                &mut self.resource, &mut self.bootstrap, &mut self.later, claim,
+                &mut |resource| {
+                    if resource.identity() != &resource_id
+                        || LinuxPeerEvidence::for_current_process().ok().as_ref() != Some(&owner)
+                        || resource.turn_control_state().writer_epoch
+                            != Some(Epoch::new(1).unwrap())
+                    { return Err(PodError::Refused("fixture writer fence changed")); }
+                    recheck_child(child, &birth)
+                },
+            )
+        }
         fn tick(&mut self) -> Result<bool, PodError> {
             let events = &mut self.events;
             let owner = self.owner.clone();
@@ -914,6 +940,36 @@ mod tests {
             reopened_journal.view(&lost.key).unwrap().stage,
             LaterTurnStage::SubmissionUncertain
         );
+    }
+
+    #[test]
+    fn long_atomic_frame_uses_one_synchronous_checked_fallback() {
+        let mut fixture = Fixture::new();
+        let mut long = claim(1);
+        long.text = "x".repeat(450);
+        fixture.queue(read(6, "idle", &fixture.cwd));
+        fixture.queue(response(7, "turn.long"));
+        let first = fixture.submit_routed(&long).unwrap();
+        assert_eq!(first.stage, LaterTurnStage::Submitted);
+        assert_eq!(first.native_turn_id.as_deref(), Some("turn.long"));
+        assert_eq!(fixture.turn_starts(), 2,
+            "one bootstrap plus exactly one large later turn");
+        assert_eq!(fixture.submit_routed(&long).unwrap(), first);
+        assert_eq!(fixture.turn_starts(), 2);
+        assert_eq!(fixture.later.view(&long.key).unwrap().stage, LaterTurnStage::Submitted);
+    }
+
+    #[test]
+    fn long_atomic_frame_lost_reply_stays_uncertain_without_resend() {
+        let mut fixture = Fixture::new();
+        let mut long = claim(1);
+        long.text = "x".repeat(450);
+        fixture.queue(read(6, "idle", &fixture.cwd));
+        let uncertain = fixture.submit_routed(&long).unwrap();
+        assert_eq!(uncertain.stage, LaterTurnStage::SubmissionUncertain);
+        assert_eq!(fixture.turn_starts(), 2);
+        assert_eq!(fixture.submit_routed(&long).unwrap(), uncertain);
+        assert_eq!(fixture.turn_starts(), 2);
     }
 
     #[test]
