@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use podbay_adapter_codex::{
     AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason,
-    BootstrapState, CodecError, CodexError, CodexResource, InterruptState, JsonlTransport,
-    MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind, NativeRequestStage, NativeRpcId,
-    PinnedCodexConfig, ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION,
+    BootstrapState, BootstrapTurnStage, CodecError, CodexError, CodexResource, InterruptState,
+    JsonlTransport, MAX_FRAME_BYTES, NativeAnswer, NativeRequestKind, NativeRequestStage,
+    NativeRpcId, PinnedCodexConfig, ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION,
     TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage, WriterPermit, decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
@@ -307,6 +307,249 @@ fn schema_receipt_and_exact_model_effort_are_pinned_before_bootstrap_ready() {
     assert!(!adapter.bootstrap_ready());
     adapter.poll_once().unwrap();
     assert!(adapter.bootstrap_ready());
+}
+
+#[test]
+fn split_bootstrap_uses_checkpointed_thread_and_one_fresh_idle_turn_start() {
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "idle", None),
+        work_turn_response(4, "turn.split.bootstrap"),
+    ]);
+    adapter.initialize().unwrap();
+    let thread = adapter.start_thread_without_turn().unwrap();
+    assert_eq!(thread.thread_id, "thread.one");
+    assert_eq!(thread.session_id, "thread.one");
+    assert_eq!(adapter.bootstrap_state(), &BootstrapState::NotStarted);
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    let receipt = adapter
+        .submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            &thread.thread_id,
+            &thread.session_id,
+            "Begin work",
+            "bootstrap:session.one",
+        )
+        .unwrap();
+    assert_eq!(receipt.native_thread_id, "thread.one");
+    assert_eq!(receipt.native_session_id, "thread.one");
+    assert_eq!(receipt.client_message_id, "bootstrap:session.one");
+    assert_eq!(
+        receipt.stage,
+        BootstrapTurnStage::Submitted {
+            turn_id: "turn.split.bootstrap".into()
+        }
+    );
+    assert_eq!(
+        adapter.bootstrap_state(),
+        &BootstrapState::Submitted {
+            turn_id: "turn.split.bootstrap".into()
+        }
+    );
+    assert_eq!(
+        adapter.transport().methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
+    let params = &adapter.transport().writes[4]["params"];
+    assert_eq!(params["threadId"], "thread.one");
+    assert_eq!(params["clientUserMessageId"], "bootstrap:session.one");
+    assert_eq!(params["model"], "gpt-6-sol");
+    assert_eq!(params["effort"], "medium");
+    assert!(matches!(
+        adapter.submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Blocked(BlockReason::BootstrapUnsettled))
+    ));
+    assert_eq!(adapter.transport().methods().len(), 5);
+}
+
+#[test]
+fn split_bootstrap_refuses_wrong_checkpoint_stale_writer_and_native_busy() {
+    let mut wrong = resource([initialized(), effective(2, "thread.one")]);
+    wrong.initialize().unwrap();
+    wrong.start_thread_without_turn().unwrap();
+    wrong
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    assert!(matches!(
+        wrong.submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.other",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Mismatch(_))
+    ));
+    assert_eq!(wrong.transport().methods().len(), 3);
+
+    let mut wrong_session = resource([initialized(), effective(2, "thread.one")]);
+    wrong_session.initialize().unwrap();
+    wrong_session.start_thread_without_turn().unwrap();
+    wrong_session
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    assert!(matches!(
+        wrong_session.submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "session.other",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Mismatch(_))
+    ));
+    assert_eq!(wrong_session.transport().methods().len(), 3);
+
+    let mut stale = resource([initialized(), effective(2, "thread.one")]);
+    stale.initialize().unwrap();
+    stale.start_thread_without_turn().unwrap();
+    stale
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        stale.submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Blocked(BlockReason::StaleWriterPermit))
+    );
+    assert_eq!(stale.transport().methods().len(), 3);
+    let wrong_resource =
+        WriterPermit::from_trusted_boundary(identity("resource.other"), Epoch::new(2).unwrap());
+    assert_eq!(
+        stale.submit_bootstrap_after_checkpoint(
+            &wrong_resource,
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Blocked(BlockReason::StaleResourcePermit))
+    );
+    assert_eq!(stale.transport().methods().len(), 3);
+
+    let mut busy = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "active", None),
+    ]);
+    busy.initialize().unwrap();
+    busy.start_thread_without_turn().unwrap();
+    busy.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    assert!(matches!(
+        busy.submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one"
+        ),
+        Err(CodexError::Blocked(
+            BlockReason::ExternalWriter | BlockReason::NativeBusy
+        ))
+    ));
+    assert_eq!(
+        busy.transport().methods(),
+        ["initialize", "initialized", "thread/start", "thread/read"]
+    );
+}
+
+#[test]
+fn split_bootstrap_lost_reply_is_uncertain_and_never_retried() {
+    let mut adapter = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "idle", None),
+    ]);
+    adapter.initialize().unwrap();
+    adapter.start_thread_without_turn().unwrap();
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    let receipt = adapter
+        .submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one",
+        )
+        .unwrap();
+    assert_eq!(receipt.stage, BootstrapTurnStage::Uncertain);
+    assert_eq!(adapter.bootstrap_state(), &BootstrapState::Unknown);
+    assert!(
+        adapter
+            .submit_bootstrap_after_checkpoint(
+                &writer_permit(1),
+                "thread.one",
+                "thread.one",
+                "Begin work",
+                "bootstrap:session.one"
+            )
+            .is_err()
+    );
+    assert_eq!(
+        adapter.transport().methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
+
+    let mut malformed = resource([
+        initialized(),
+        effective(2, "thread.one"),
+        read_response(3, "idle", None),
+        json!({"id":4,"result":{"turn":{"id":"turn.maybe","status":"completed"}}}),
+    ]);
+    malformed.initialize().unwrap();
+    malformed.start_thread_without_turn().unwrap();
+    malformed
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    let uncertain = malformed
+        .submit_bootstrap_after_checkpoint(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Begin work",
+            "bootstrap:session.one",
+        )
+        .unwrap();
+    assert_eq!(uncertain.stage, BootstrapTurnStage::Uncertain);
+    assert_eq!(malformed.bootstrap_state(), &BootstrapState::Unknown);
+    assert_eq!(
+        malformed.transport().methods(),
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
 }
 
 #[test]

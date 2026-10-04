@@ -58,8 +58,15 @@ after `thread/start` without sending `turn/start`. A fake transport test verifie
 that this split writes no model input and leaves bootstrap NotStarted. It gives
 the pod a checkpoint point for the native thread ID. The higher layer must
 authorise and journal the thread-create intent before invoking it. No durable journal or
-writer authority is supplied by this adapter method, and no separate bootstrap
-submission path is exposed yet.
+writer authority is supplied by this adapter method.
+`submit_bootstrap_after_checkpoint` is the separate turn half. It checks a
+caller-supplied `WriterPermit` against the installed local epoch, exact native
+thread/session IDs and a fresh idle `thread/read` before one `turn/start`. A
+lost or malformed reply returns an Uncertain receipt and blocks retry; a valid
+in-progress reply retains the exact native turn ID for the pod journal. The
+higher layer must fsync bootstrap intent before calling and fsync the receipt
+afterward. The in-memory permit is not durable authority, and the adapter
+cannot fence an uncontrolled external native writer on its own.
 Idle chooses `turn/start`. An active turn permits `turn/steer` only when this
 same adapter process owns the exact turn ID from its `turn/start` receipt and
 the caller supplies that ID. Native `expectedTurnId` is the final compare-and-set

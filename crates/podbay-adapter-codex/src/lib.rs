@@ -12,9 +12,9 @@ mod process_transport;
 
 pub use adapter::{
     AnswerWriteOutcome, ApprovalPolicy, AuthorizedAnswerPermit, BlockReason, BootstrapState,
-    CodexError, CodexResource, InterruptState, JsonlTransport, NativeThread, PinnedCodexConfig,
-    ResourceIdentity, Sandbox, StartReceipt, ThreadStatus, TurnControlState, TurnMode,
-    TurnSubmission, TurnSubmissionStage, WriterPermit,
+    BootstrapTurnStage, BootstrapTurnSubmission, CodexError, CodexResource, InterruptState,
+    JsonlTransport, NativeThread, PinnedCodexConfig, ResourceIdentity, Sandbox, StartReceipt,
+    ThreadStatus, TurnControlState, TurnMode, TurnSubmission, TurnSubmissionStage, WriterPermit,
 };
 pub use codec::{CodecError, MAX_FRAME_BYTES, decode, encode};
 pub use host_requests::{

@@ -226,6 +226,22 @@ pub struct StartReceipt {
     pub bootstrap_turn_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapTurnStage {
+    Submitted { turn_id: String },
+    Uncertain,
+}
+
+/// Native receipt only. The pod must have journaled the bootstrap intent and
+/// verified durable writer authority before invoking the split operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapTurnSubmission {
+    pub native_thread_id: String,
+    pub native_session_id: String,
+    pub client_message_id: String,
+    pub stage: BootstrapTurnStage,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TurnMode {
     Start,
@@ -598,6 +614,98 @@ impl<T: JsonlTransport> CodexResource<T> {
         Ok(StartReceipt {
             thread,
             bootstrap_turn_id: turn_id,
+        })
+    }
+
+    /// Submit the first native turn only after the higher layer has durably
+    /// checkpointed the exact thread/session IDs and bootstrap intent. This
+    /// method checks a local WriterPermit; it does not establish durable
+    /// authority. Any attempted RPC without a trusted reply becomes Unknown
+    /// and cannot be retried through this adapter instance. A fresh idle read
+    /// cannot fence an uncontrolled external native writer by itself.
+    pub fn submit_bootstrap_after_checkpoint(
+        &mut self,
+        permit: &WriterPermit,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        bootstrap_text: &str,
+        client_message_id: &str,
+    ) -> Result<BootstrapTurnSubmission, CodexError> {
+        self.check_permit(permit)?;
+        if bootstrap_text.is_empty()
+            || bootstrap_text.len() > 1_000_000
+            || !valid_token(client_message_id)
+        {
+            return Err(CodexError::InvalidInput("bootstrap text or key is invalid"));
+        }
+        if !matches!(self.bootstrap, BootstrapState::NotStarted) {
+            return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
+        }
+        let bound = self
+            .thread
+            .as_ref()
+            .ok_or(CodexError::InvalidState("native thread is not bound"))?;
+        if bound.thread_id != expected_thread_id || bound.session_id != expected_session_id {
+            return Err(CodexError::Mismatch("native thread checkpoint differs"));
+        }
+        self.check_native_blockers()?;
+        let observed = self.read_thread()?;
+        self.check_native_blockers()?;
+        if !matches!(self.bootstrap, BootstrapState::NotStarted)
+            || observed.thread_id != expected_thread_id
+            || observed.session_id != expected_session_id
+            || observed.status != ThreadStatus::Idle
+            || self.native_status != ThreadStatus::Idle
+            || self.owned_active_turn_id.is_some()
+            || self.observed_active_turn_id.is_some()
+        {
+            return Err(CodexError::Blocked(BlockReason::NativeBusy));
+        }
+        let uncertain = BootstrapTurnSubmission {
+            native_thread_id: expected_thread_id.into(),
+            native_session_id: expected_session_id.into(),
+            client_message_id: client_message_id.into(),
+            stage: BootstrapTurnStage::Uncertain,
+        };
+        self.bootstrap = BootstrapState::Unknown;
+        let response = match self.request(
+            "turn/start",
+            json!({
+                "threadId": expected_thread_id,
+                "input": [{"type":"text", "text":bootstrap_text}],
+                "clientUserMessageId": client_message_id,
+                "model": self.config.model,
+                "effort": self.config.effort,
+            }),
+        ) {
+            Ok(response) => response,
+            Err(_) => {
+                self.poisoned = true;
+                return Ok(uncertain);
+            }
+        };
+        let Some(turn_id) = nonempty_string(response.pointer("/turn/id")) else {
+            self.poisoned = true;
+            return Ok(uncertain);
+        };
+        if response.pointer("/turn/status").and_then(Value::as_str) != Some("inProgress") {
+            self.poisoned = true;
+            return Ok(uncertain);
+        }
+        let turn_id = turn_id.to_owned();
+        self.bootstrap = BootstrapState::Submitted {
+            turn_id: turn_id.clone(),
+        };
+        self.native_status = ThreadStatus::Active;
+        self.idle_after_completion = false;
+        if self.apply_queued().is_err() {
+            // The turn/start receipt remains exact even when a later queued
+            // notification makes observation uncertain.
+            self.poisoned = true;
+        }
+        Ok(BootstrapTurnSubmission {
+            stage: BootstrapTurnStage::Submitted { turn_id },
+            ..uncertain
         })
     }
 
