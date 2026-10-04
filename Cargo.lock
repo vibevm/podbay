@@ -348,6 +348,7 @@ dependencies = [
  "podbay-core",
  "podbay-store",
  "podbay-wire",
+ "rusqlite",
  "sha2",
 ]
 

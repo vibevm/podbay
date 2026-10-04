@@ -239,10 +239,10 @@ mod linux {
                 }
             }
         }
-        let current_v2 = authority
-            .current_codex_v2_rebind_candidates()
+        let first_v2_page = authority
+            .current_codex_v2_rebind_page(None)
             .map_err(|error| format!("current V2 Pod inventory unavailable: {error:?}"))?;
-        if !current_v2.is_empty() && prepared.is_none() {
+        if !first_v2_page.candidates().is_empty() && prepared.is_none() {
             return Err("current V2 Pods require the original trusted policy for recovery".into());
         }
         let templates = if let Some(policy) = prepared {
@@ -256,41 +256,62 @@ mod linux {
                 .map_err(|error| {
                     format!("trusted launch profile registration refused: {error:?}")
                 })?;
-            for (scope, pod) in current_v2 {
-                let key =
-                    auto_rebind_key(authority.owner_epoch().get(), scope.as_str(), pod.as_str());
-                let pending = authority
-                    .prepare_current_codex_v2_rebind(&scope, &pod, &key)
-                    .map_err(|error| format!(
-                        "current V2 Pod {pod} in {scope} is unverified; manager not ready: {error:?}"
+            let mut page = first_v2_page;
+            let mut page_number = 1usize;
+            let mut settled = 0usize;
+            loop {
+                let next = page.next_cursor().cloned();
+                for (scope, pod) in page.candidates() {
+                    let key = auto_rebind_key(
+                        authority.owner_epoch().get(),
+                        scope.as_str(),
+                        pod.as_str(),
+                    );
+                    let pending = authority
+                        .prepare_current_codex_v2_rebind(&scope, &pod, &key)
+                        .map_err(|error| format!(
+                            "current V2 Pod {pod} in {scope} is unverified after {settled} settled Pods on page {page_number}; manager not ready: {error:?}"
+                        ))?;
+                    eprintln!(
+                        "podbay V2 rebind: pod={} scope={} key={} phase={:?}",
+                        pod, scope, key, pending.phase
+                    );
+                    let completed = authority
+                        .complete_current_codex_v2_rebind(&scope, &pod, &key)
+                        .map_err(|error| format!(
+                            "current V2 Pod {pod} in {scope} rebind failed after {settled} settled Pods on page {page_number}; manager not ready: {error:?}"
+                        ))?;
+                    if completed.stage != RebindCompletionStage::PodActive {
+                        return Err(format!(
+                            "current V2 Pod {pod} in {scope} rebind remains {:?} after {settled} settled Pods on page {page_number}; manager not ready",
+                            completed.stage
+                        ));
+                    }
+                    let writer = authority.takeover_initial_writer_after_active_rebind(
+                        &scope, &pod, &key, &policy.owner, grant, policy.writer_lease_seconds,
+                    ).map_err(|error| format!(
+                        "current V2 Pod {pod} in {scope} writer takeover unavailable after {settled} settled Pods on page {page_number}; manager not ready: {error:?}"
                     ))?;
-                eprintln!(
-                    "podbay V2 rebind: pod={} scope={} key={} phase={:?}",
-                    pod, scope, key, pending.phase
-                );
-                let completed = authority
-                    .complete_current_codex_v2_rebind(&scope, &pod, &key)
-                    .map_err(|error| format!(
-                        "current V2 Pod {pod} in {scope} rebind failed; manager not ready: {error:?}"
-                    ))?;
-                if completed.stage != RebindCompletionStage::PodActive {
-                    return Err(format!(
-                        "current V2 Pod {pod} in {scope} rebind remains {:?}; manager not ready",
-                        completed.stage
-                    ));
+                    eprintln!(
+                        "podbay V2 rebind active: pod={} scope={} key={} writerEpoch={}",
+                        pod,
+                        scope,
+                        key,
+                        writer.writer_epoch()
+                    );
+                    settled += 1;
                 }
-                let writer = authority.takeover_initial_writer_after_active_rebind(
-                    &scope, &pod, &key, &policy.owner, grant, policy.writer_lease_seconds,
-                ).map_err(|error| format!(
-                    "current V2 Pod {pod} in {scope} writer takeover unavailable; manager not ready: {error:?}"
-                ))?;
+                let Some(cursor) = next else { break };
                 eprintln!(
-                    "podbay V2 rebind active: pod={} scope={} key={} writerEpoch={}",
-                    pod,
-                    scope,
-                    key,
-                    writer.writer_epoch()
+                    "podbay V2 rebind page complete: page={} settled={}; manager unready until all pages finish",
+                    page_number, settled
                 );
+                page_number += 1;
+                page = authority.current_codex_v2_rebind_page(Some(&cursor))
+                    .map_err(|error| format!(
+                        "current V2 Pod page {} unavailable after {} settled Pods; manager unready: {error:?}",
+                        page_number, settled
+                    ))?;
             }
             let launch = TrustedWireRootLaunchTemplate::from_trusted_policy(
                 grant,

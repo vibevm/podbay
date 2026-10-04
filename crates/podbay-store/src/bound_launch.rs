@@ -24,7 +24,33 @@ use crate::store::{
 };
 
 const NAMESPACE: &str = "podbay.launch";
-const CURRENT_V2_REBIND_LIMIT: usize = 128;
+const CURRENT_V2_REBIND_PAGE_SIZE: usize = 128;
+
+/// Store-issued cursor. Its exact lineage, owner epoch and authority revision
+/// bind every later page to the first manager view; callers cannot construct
+/// a cursor from arbitrary selector text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentV2RebindCursor {
+    scope_id: ScopeId,
+    pod_id: PodId,
+    store_lineage: StoreLineageId,
+    owner_epoch: u64,
+    authority_revision: u64,
+}
+
+pub struct CurrentV2RebindPage {
+    candidates: Vec<(ScopeId, PodId)>,
+    next_cursor: Option<CurrentV2RebindCursor>,
+}
+
+impl CurrentV2RebindPage {
+    pub fn candidates(&self) -> &[(ScopeId, PodId)] {
+        &self.candidates
+    }
+    pub fn next_cursor(&self) -> Option<&CurrentV2RebindCursor> {
+        self.next_cursor.as_ref()
+    }
+}
 
 fn positive_stored_epoch(value: i64, reason: &'static str) -> Result<u64, StoreError> {
     if value <= 0 {
@@ -591,33 +617,63 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
-    /// Bounded readback of current V2 launch selectors. The authority Pod
-    /// table drives indexed target/binding lookups; no command or event log is
-    /// scanned. Host revalidates each complete binding and live OS pod before
-    /// any rebind effect. A malformed mixed-version binding is not skipped.
-    pub fn current_codex_v2_rebind_candidates(
+    /// One indexed page of current V2 selectors in `(scope_id,pod_id)` order.
+    /// The target-epoch key drives indexed Pod/binding lookups; no command or
+    /// event log is scanned. Host revalidates each complete binding and live
+    /// OS pod before any rebind effect. Mixed-version bindings fail closed.
+    pub fn current_codex_v2_rebind_page(
         &mut self,
-    ) -> Result<Vec<(ScopeId, PodId)>, StoreError> {
+        cursor: Option<&CurrentV2RebindCursor>,
+        expected_owner_epoch: u64,
+        expected_authority_revision: u64,
+    ) -> Result<CurrentV2RebindPage, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (lineage, owner, revision): (String, i64, i64) = transaction.query_row(
+            "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),
+                    (SELECT value FROM metadata WHERE key='owner_epoch'),
+                    (SELECT value FROM metadata WHERE key='authority_revision')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if lineage != self.store_lineage
+            || owner != expected_owner_epoch as i64
+            || revision != expected_authority_revision as i64
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        let (after_scope, after_pod) = match cursor {
+            Some(value)
+                if value.store_lineage.as_str() == lineage
+                    && value.owner_epoch == expected_owner_epoch
+                    && value.authority_revision == expected_authority_revision =>
+            {
+                (value.scope_id.as_str(), value.pod_id.as_str())
+            }
+            Some(_) => return Err(StoreError::StaleEpoch),
+            None => ("", ""),
+        };
         let mut statement = transaction.prepare(
-            "SELECT p.scope_id,p.pod_id,b.effective_spec_version,b.descriptor_version
-             FROM authority_pods AS p
-             CROSS JOIN target_epochs AS t
+            "SELECT t.scope_id,t.target_id,b.effective_spec_version,b.descriptor_version
+             FROM target_epochs AS t
+             CROSS JOIN authority_pods AS p
              CROSS JOIN launch_bindings AS b
-             WHERE t.scope_id=p.scope_id AND t.target_id=p.pod_id
+             WHERE (t.scope_id,t.target_id)>(?1,?2)
+               AND t.scope_id=p.scope_id AND t.target_id=p.pod_id
                AND t.epoch=p.incarnation
                AND b.scope_id=p.scope_id AND b.pod_id=p.pod_id
                AND b.pod_incarnation=p.incarnation
-               AND (b.effective_spec_version=?1 OR b.descriptor_version=?2)
-             ORDER BY p.pod_id LIMIT ?3",
+               AND (b.effective_spec_version=?3 OR b.descriptor_version=?4)
+             ORDER BY t.scope_id,t.target_id LIMIT ?5",
         )?;
         let rows = statement.query_map(
             params![
+                after_scope,
+                after_pod,
                 EFFECTIVE_LAUNCH_V2_VERSION,
                 LAUNCH_DESCRIPTOR_V2_SCHEMA,
-                (CURRENT_V2_REBIND_LIMIT + 1) as i64
+                (CURRENT_V2_REBIND_PAGE_SIZE + 1) as i64
             ],
             |row| {
                 Ok((
@@ -644,14 +700,29 @@ impl PodBayStore {
                     .map_err(|_| StoreError::Conflict("current V2 Pod ID is malformed"))?,
             ));
         }
-        if candidates.len() > CURRENT_V2_REBIND_LIMIT {
-            return Err(StoreError::Conflict(
-                "current V2 pod inventory exceeds bound",
-            ));
-        }
+        let has_more = candidates.len() > CURRENT_V2_REBIND_PAGE_SIZE;
+        candidates.truncate(CURRENT_V2_REBIND_PAGE_SIZE);
+        let next_cursor = if has_more {
+            let (scope_id, pod_id) = candidates
+                .last()
+                .ok_or(StoreError::Conflict("current V2 page cursor is empty"))?;
+            Some(CurrentV2RebindCursor {
+                scope_id: scope_id.clone(),
+                pod_id: pod_id.clone(),
+                store_lineage: StoreLineageId::try_from(lineage.as_str())
+                    .map_err(|_| StoreError::Conflict("current V2 lineage is malformed"))?,
+                owner_epoch: expected_owner_epoch,
+                authority_revision: expected_authority_revision,
+            })
+        } else {
+            None
+        };
         drop(statement);
         transaction.commit()?;
-        Ok(candidates)
+        Ok(CurrentV2RebindPage {
+            candidates,
+            next_cursor,
+        })
     }
 
     /// Read the exact current parent Run/Pod in a validated store snapshot,

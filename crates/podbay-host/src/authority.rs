@@ -21,7 +21,8 @@ use podbay_store::{
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BootstrapSendSelector,
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
-    CommandLookupSelector, CurrentScopeSnapshot, DurableRebindPhase, DurableRebindReceipt,
+    CommandLookupSelector, CurrentScopeSnapshot, CurrentV2RebindCursor, CurrentV2RebindPage,
+    DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     ManagerCredentialClaim, NativeWriterLease, OwnerActorRotationReceipt, PodBayStore, Receipt,
@@ -2910,12 +2911,13 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
     }
 
-    /// Read only bounded current V2 selectors under the same manager lease
-    /// used by proof-bearing rebind. Each selector still needs complete
-    /// store, policy, OS and pod inspection before any effect.
-    pub fn current_codex_v2_rebind_candidates(
+    /// Read one indexed current V2 page under the manager lease. Each cursor
+    /// is bound to this manager's owner epoch and authority revision; each
+    /// selector still needs complete policy, OS and Pod proof before effect.
+    pub fn current_codex_v2_rebind_page(
         &mut self,
-    ) -> Result<Vec<(ScopeId, PodId)>, RebindContextError> {
+        cursor: Option<&CurrentV2RebindCursor>,
+    ) -> Result<CurrentV2RebindPage, RebindContextError> {
         #[cfg(not(target_os = "linux"))]
         return Err(HostError::Unsupported.into());
         #[cfg(target_os = "linux")]
@@ -2927,7 +2929,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 &self.manager_peer,
                 &self.manager_claim,
             )?;
-            let candidates = self.store.current_codex_v2_rebind_candidates()?;
+            let page = self.store.current_codex_v2_rebind_page(
+                cursor,
+                self.manager_claim.owner_epoch(),
+                self.recorded.revision,
+            )?;
             recheck_current_manager(
                 &mut self.store,
                 &self.canonical_database,
@@ -2935,7 +2941,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 &self.manager_peer,
                 &self.manager_claim,
             )?;
-            Ok(candidates)
+            Ok(page)
         }
     }
 

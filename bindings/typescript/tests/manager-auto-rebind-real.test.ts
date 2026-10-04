@@ -72,7 +72,7 @@ async function runScenario(kind: "normal" | "stale_policy" | "missing_pod"): Pro
     if (kind !== "normal") {
       assert.notEqual(second.code, 0);
       assert.match(second.stderr, /manager exited before socket|owner recovery response ended/u);
-      assert.match(second.stderr, /current V2 Pod .* is unverified; manager not ready/u);
+      assert.match(second.stderr, /current V2 Pod .* is unverified after [0-9]+ settled Pods on page [0-9]+; manager not ready/u);
       const db = new DatabaseSync(join(root, "state", "podbay.sqlite"), { readOnly: true });
       try {
         const count = db.prepare("SELECT COUNT(*) AS count FROM manager_rebinds").get() as { count: number };

@@ -20,7 +20,8 @@ pub use bootstrap_send::{
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
-    CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot, RunChildBudget,
+    CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot,
+    CurrentV2RebindCursor, CurrentV2RebindPage, RunChildBudget,
 };
 pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use manager_peer::SqliteManagerPeerWitness;
