@@ -941,3 +941,211 @@ fn installed_outer_zap_pod_nests_one_fake_codex_coordinator_without_resend() {
         .exists()
     );
 }
+
+fn setup_disposable_stop() -> (Fixture, PathBuf, serde_json::Value, PodManifest) {
+    let pod_binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let source_zap = fs::canonicalize(std::env::var_os("PODBAY_TEST_ZAP_ROOT").unwrap()).unwrap();
+    let node = node_binary();
+    let mut fixture = Fixture::new();
+    install_private_zap(&source_zap, &fixture.installed_zap);
+    let artifact = TrustedOperatorArtifact::inspect_tree(&fixture.installed_zap).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ui_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let settings = serde_json::json!({
+        "version":1,"uiPort":ui_port,"proxy":{"mode":"inherit"},
+        "coordinatorDefaults":{"modelId":"gpt-5.6-luna","effort":"low"}
+    });
+    let settings_path = fixture.zap_state.join("settings.json");
+    fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let pod_id = PodId::try_from("pod.zap.stop.one").unwrap();
+    let attempt = AttemptId::try_from("attempt.zap.stop.one").unwrap();
+    let policy = serde_json::json!({
+        "schema":"podbay.operator-zap-policy/1",
+        "stateDirectory":fixture.outer,
+        "podExecutable":pod_binary,
+        "podExecutableSha256":sha256_file(&pod_binary),
+        "nodeExecutable":node,
+        "nodeExecutableSha256":sha256_file(&node),
+        "zapRoot":fixture.installed_zap,
+        "zapArtifactSha256":artifact.sha256,
+        "zapStateDirectory":fixture.zap_state,
+        "actorId":"actor.zap.stop.one",
+        "scopeId":"scope.zap.stop.one",
+        "podId":pod_id.as_str(),
+        "sessionId":"session.zap.stop.one",
+        "runId":"run.zap.stop.one",
+        "attemptId":attempt.as_str(),
+        "resourceId":"resource.zap.stop.one",
+        "workspaceBasisRef":"basis.zap.stop.one",
+        "hostId":"host.zap.stop.one",
+        "commandKey":"launch.zap.stop.one",
+        "wallSeconds":120
+    });
+    let policy_path = fixture.outer.join("operator-zap-policy.json");
+    fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // A crash before final key publication cannot have signed enrollment.
+    let key_temp = fixture.outer.join(".owner-key.1.json.pending");
+    fs::write(&key_temp, b"partial prepublication key").unwrap();
+    fs::set_permissions(&key_temp, fs::Permissions::from_mode(0o600)).unwrap();
+    let first = run_operator(&policy_path);
+    assert_eq!(first["duplicate"], false);
+    assert!(!key_temp.exists());
+    let manifest_path = manifest_path_for_identity(
+        &fixture.outer.join("pods"),
+        &pod_id,
+        &attempt,
+        Epoch::new(1).unwrap(),
+    );
+    let stem = manifest_path.file_stem().unwrap().to_string_lossy();
+    fixture.unit = Some(format!("podbay-pod-{stem}.service"));
+    let manifest: PodManifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let zap = wait_for_zap_receipt(
+        &fixture
+            .outer
+            .join("pods")
+            .join(format!("{stem}.process-output")),
+    );
+    assert_eq!(zap["headless"], true);
+    (fixture, policy_path, first, manifest)
+}
+
+fn operator_stop_output(policy: &Path, lose_reply: bool) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_podbay"));
+    command
+        .args(["operator", "zap", "stop", "--policy"])
+        .arg(policy);
+    if lose_reply {
+        command.env("PODBAY_TEST_OPERATOR_STOP_DROP_REPLY", "1");
+    }
+    command.output().unwrap()
+}
+
+fn successful_operator_stop(policy: &Path) -> serde_json::Value {
+    let output = operator_stop_output(policy, false);
+    assert!(
+        output.status.success(),
+        "operator stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_unit_unloaded(unit: &str) {
+    let shown = Command::new("systemctl")
+        .args(["--user", "show", "--property=LoadState", "--value", unit])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "not-found");
+}
+
+#[test]
+#[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
+fn installed_operator_stop_refuses_wrong_actor_pod_then_settles_once_and_reads_duplicate() {
+    let (fixture, policy_path, first, manifest) = setup_disposable_stop();
+    let original = fs::read(&policy_path).unwrap();
+    for (field, changed) in [
+        ("actorId", "actor.zap.stop.foreign"),
+        ("podId", "pod.zap.stop.foreign"),
+    ] {
+        let mut wrong: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        wrong[field] = changed.into();
+        fs::write(&policy_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+        let refused = operator_stop_output(&policy_path, false);
+        assert!(
+            !refused.status.success(),
+            "wrong {field} acquired stop authority"
+        );
+        assert!(!fixture.outer.join("operator-zap-stop-intent.json").exists());
+        assert!(
+            Path::new(&format!(
+                "/proc/{}/stat",
+                first["childPid"].as_u64().unwrap()
+            ))
+            .exists()
+        );
+        fs::write(&policy_path, &original).unwrap();
+    }
+    let intent_temp = fixture.outer.join(".operator-zap-stop-intent.json.pending");
+    fs::write(&intent_temp, b"partial prepublication stop intent").unwrap();
+    fs::set_permissions(&intent_temp, fs::Permissions::from_mode(0o600)).unwrap();
+    let stopped = successful_operator_stop(&policy_path);
+    assert!(!intent_temp.exists());
+    assert_eq!(stopped["terminal"], true);
+    assert_eq!(stopped["duplicate"], false);
+    assert_eq!(stopped["launchCommandId"], first["commandId"]);
+    assert!(!manifest.socket_path.exists());
+    assert!(
+        !Path::new(&format!(
+            "/proc/{}/stat",
+            first["childPid"].as_u64().unwrap()
+        ))
+        .exists()
+    );
+    assert_unit_unloaded(fixture.unit.as_deref().unwrap());
+    let intent_before = fs::read(fixture.outer.join("operator-zap-stop-intent.json")).unwrap();
+    let terminal = fixture.outer.join("operator-zap-stop-terminal.json");
+    let terminal_temp = fixture
+        .outer
+        .join(".operator-zap-stop-terminal.json.pending");
+    fs::hard_link(&terminal, &terminal_temp).unwrap();
+    let duplicate = successful_operator_stop(&policy_path);
+    assert!(!terminal_temp.exists());
+    assert_eq!(duplicate["terminal"], true);
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["intentDigest"], stopped["intentDigest"]);
+    assert_eq!(
+        fs::read(fixture.outer.join("operator-zap-stop-intent.json")).unwrap(),
+        intent_before
+    );
+    assert!(!manifest.socket_path.exists());
+}
+
+#[test]
+#[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
+fn installed_operator_stop_lost_reply_is_settled_by_readback_without_second_stop() {
+    let (fixture, policy_path, first, manifest) = setup_disposable_stop();
+    let lost = operator_stop_output(&policy_path, true);
+    assert!(!lost.status.success());
+    assert!(String::from_utf8_lossy(&lost.stderr).contains("test-only lost stop reply"));
+    assert!(
+        fixture
+            .outer
+            .join("operator-zap-stop-intent.json")
+            .is_file()
+    );
+    assert!(
+        !fixture
+            .outer
+            .join("operator-zap-stop-terminal.json")
+            .exists()
+    );
+    let terminal_temp = fixture
+        .outer
+        .join(".operator-zap-stop-terminal.json.pending");
+    fs::write(&terminal_temp, b"partial prepublication terminal receipt").unwrap();
+    fs::set_permissions(&terminal_temp, fs::Permissions::from_mode(0o600)).unwrap();
+    let settled = successful_operator_stop(&policy_path);
+    assert!(!terminal_temp.exists());
+    assert_eq!(settled["terminal"], true);
+    assert_eq!(settled["duplicate"], true);
+    assert_eq!(settled["launchCommandId"], first["commandId"]);
+    assert!(
+        fixture
+            .outer
+            .join("operator-zap-stop-terminal.json")
+            .is_file()
+    );
+    assert_unit_unloaded(fixture.unit.as_deref().unwrap());
+    assert!(!manifest.socket_path.exists());
+    assert!(
+        !Path::new(&format!(
+            "/proc/{}/stat",
+            first["childPid"].as_u64().unwrap()
+        ))
+        .exists()
+    );
+}

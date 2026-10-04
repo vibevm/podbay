@@ -479,7 +479,7 @@ impl TrustedInitialOwnerPolicy {
         })
     }
 
-    /// A local operator launcher receives only the exact Pod launch right.
+    /// A local operator receives only launch and stop for one exact Pod.
     /// It cannot submit provider input or select another credential or Pod.
     pub fn for_operator_pod(
         actor_id: ActorId,
@@ -505,6 +505,7 @@ impl TrustedInitialOwnerPolicy {
             ]),
             InitialOwnerAuthority::OperatorPod(pod) => BTreeSet::from([
                 Right::new(Operation::LaunchPod, Target::Pod(pod.clone())),
+                Right::new(Operation::StopPod, Target::Pod(pod.clone())),
             ]),
         };
         GrantSpec {
@@ -619,7 +620,7 @@ fn initial_owner_challenge(
         ),
         InitialOwnerAuthority::OperatorPod(pod) => (
             pod.as_str(),
-            "launch_pod.exact.operator_process_v1",
+            "launch_pod.exact+stop_pod.exact.operator_process_v1",
         ),
     };
     for (tag, field) in [
@@ -2927,10 +2928,12 @@ impl<P: HostDispatchPort> HostAuthority<P> {
                             .pods
                             .get(id)
                             .is_none_or(|pod| pod.scope_id == spec.scope_id),
-                        Operation::StopPod => self
-                            .pods
-                            .get(id)
-                            .is_some_and(|pod| pod.scope_id == spec.scope_id),
+                        Operation::StopPod => self.pods.get(id).map_or_else(
+                            || spec.rights.contains(&Right::new(
+                                Operation::LaunchPod, Target::Pod(id.clone()),
+                            )),
+                            |pod| pod.scope_id == spec.scope_id,
+                        ),
                         _ => false,
                     }
             }
@@ -7483,6 +7486,28 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return self.bound_receipt(record, true);
         }
         self.dispatch_committed_bound(authorised.ok_or(HostError::InvalidInput)?, record, false)
+    }
+
+    /// Read-only exact-Pod StopPod grant and current operator binding check.
+    /// The installed caller performs the fenced PodClient stop only after
+    /// this check; no generic host port or request body chooses the Pod.
+    pub fn authorise_current_operator_stop<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &HostRequest,
+    ) -> Result<(), RebindContextError> {
+        self.ensure_current_owner_epoch()?;
+        let HostAction::StopPod { pod_id } = &request.action else {
+            return Err(HostError::InvalidInput.into());
+        };
+        self.host.authorise_request(transport, request)?;
+        let reviewed = self.inspect_committed_operator_process(&request.scope_id, pod_id)?;
+        if reviewed.committed_record().scope_id != request.scope_id.as_str()
+            || reviewed.committed_record().pod_id != pod_id.as_str()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(())
     }
 
     /// Commit the same typed operator root without entering the OS port.

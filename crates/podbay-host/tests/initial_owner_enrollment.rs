@@ -142,7 +142,7 @@ fn signed_initial_owner_enrollment_activates_only_after_atomic_commit() {
 }
 
 #[test]
-fn signed_operator_owner_receives_only_exact_pod_launch_right() {
+fn signed_operator_owner_receives_only_exact_pod_launch_and_stop_rights() {
     let fixture = Fixture::new();
     let mut host = DurableAuthority::open(&fixture.database, NoPort).unwrap();
     let actor = ActorId::try_from("actor.operator.owner").unwrap();
@@ -156,8 +156,8 @@ fn signed_operator_owner_receives_only_exact_pod_launch_right() {
     let pending = host.begin_initial_owner_enrollment(
         policy.clone(), owner.clone(), *key.pk,
     ).unwrap();
-    assert!(pending.challenge_bytes().windows(b"launch_pod.exact.operator_process_v1".len())
-        .any(|part| part == b"launch_pod.exact.operator_process_v1"));
+    assert!(pending.challenge_bytes().windows(b"launch_pod.exact+stop_pod.exact.operator_process_v1".len())
+        .any(|part| part == b"launch_pod.exact+stop_pod.exact.operator_process_v1"));
     let signature = key.sk.sign(pending.challenge_bytes(), None);
     host.commit_initial_owner_enrollment(
         pending.verify(signature.as_ref()).unwrap(), &owner,
@@ -166,11 +166,14 @@ fn signed_operator_owner_receives_only_exact_pod_launch_right() {
     assert!(grant.get() > 0);
     let snapshot = host.recorded_snapshot();
     assert_eq!(snapshot.grants.len(), 1);
-    assert_eq!(snapshot.grants[0].rights.len(), 1);
-    let right = &snapshot.grants[0].rights[0];
-    assert_eq!(right.operation, "launch_pod");
-    assert_eq!(right.target_kind, "pod");
-    assert_eq!(right.target_id, pod.as_str());
+    assert_eq!(snapshot.grants[0].rights.len(), 2);
+    let rights = snapshot.grants[0].rights.iter()
+        .map(|right| (right.operation.as_str(), right.target_kind.as_str(), right.target_id.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(rights, std::collections::BTreeSet::from([
+        ("launch_pod", "pod", pod.as_str()),
+        ("stop_pod", "pod", pod.as_str()),
+    ]));
 }
 
 #[test]

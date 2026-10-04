@@ -7,9 +7,9 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use ed25519_compact::{KeyPair, Seed};
@@ -31,7 +31,7 @@ use podbay_launch_linux::{
 };
 use podbay_pod::{
     LinuxPeerEvidence, OPERATOR_PROCESS_CAPABILITY, OPERATOR_PROCESS_PROFILE_REF, PodClient,
-    manifest_path_for_identity,
+    PodManifest, manifest_path_for_identity,
 };
 use podbay_store::{CommandLookupSelector, LaunchDispatchStage, StoreError};
 use podbay_wire::ResourceDriver;
@@ -42,6 +42,8 @@ const POLICY_SCHEMA: &str = "podbay.operator-zap-policy/1";
 const KEY_SCHEMA: &str = "podbay.operator-owner-key/1";
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const STOP_INTENT_SCHEMA: &str = "podbay.operator-zap-stop-intent/1";
+const STOP_TERMINAL_SCHEMA: &str = "podbay.operator-zap-stop-terminal/1";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -99,6 +101,36 @@ struct KeyCustody {
     public_key_hex: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StopIntent {
+    schema: String,
+    policy_digest: String,
+    stop_key: String,
+    actor_id: String,
+    scope_id: String,
+    pod_id: String,
+    launch_command_id: String,
+    manifest_digest: String,
+    unit_name: String,
+    socket_dev: u64,
+    socket_ino: u64,
+    supervisor_pid: u32,
+    supervisor_birth: u64,
+    child_pid: u32,
+    child_birth: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StopTerminal {
+    schema: String,
+    policy_digest: String,
+    stop_key: String,
+    launch_command_id: String,
+    intent_digest: String,
+}
+
 struct SelfTransport {
     peer: AuthenticatedPeer,
     generation: CredentialGeneration,
@@ -154,14 +186,18 @@ fn run() -> Result<(), String> {
     if args.len() != 6
         || args[1] != "operator"
         || args[2] != "zap"
-        || args[3] != "launch"
+        || (args[3] != "launch" && args[3] != "stop")
         || args[4] != "--policy"
     {
-        return Err("usage: podbay operator zap hash --root ABSOLUTE_PRIVATE_DIRECTORY | podbay operator zap launch --policy ABSOLUTE_PRIVATE_JSON".into());
+        return Err("usage: podbay operator zap hash --root ABSOLUTE_PRIVATE_DIRECTORY | podbay operator zap launch|stop --policy ABSOLUTE_PRIVATE_JSON".into());
     }
     let policy_path = PathBuf::from(&args[5]);
     let policy = Policy::load(&policy_path)?;
-    launch(policy)
+    if args[3] == "stop" {
+        stop(policy)
+    } else {
+        launch(policy)
+    }
 }
 
 impl Policy {
@@ -488,6 +524,7 @@ fn key_path(policy: &Policy, generation: u64) -> PathBuf {
 
 fn owner_key(policy: &Policy, generation: u64, create: bool) -> Result<KeyPair, String> {
     let path = key_path(policy, generation);
+    repair_private_publication(&path, &policy.raw.state_directory)?;
     if !path.exists() {
         if !create {
             return Err("recorded owner key custody is missing".into());
@@ -508,18 +545,7 @@ fn owner_key(policy: &Policy, generation: u64, create: bool) -> Result<KeyPair, 
         };
         let bytes =
             serde_json::to_vec(&custody).map_err(|_| "owner key custody encoding failed")?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| format!("owner key custody creation failed: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("owner key custody sync failed: {error}"))?;
-        File::open(&policy.raw.state_directory)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|error| format!("owner key directory sync failed: {error}"))?;
+        write_private_once(&path, &policy.raw.state_directory, &bytes)?;
     }
     let uid = LinuxPeerEvidence::for_current_process()
         .map_err(|_| "operator process identity changed")?
@@ -556,7 +582,376 @@ fn current_process() -> Result<AuthenticatedProcessSubject, String> {
     .map_err(|_| "operator process subject is invalid".into())
 }
 
-fn launch(policy: Policy) -> Result<(), String> {
+fn stop_key(policy: &Policy) -> String {
+    format!("stop.operator.{}", &policy.policy_digest[..24])
+}
+
+fn stop_intent_path(policy: &Policy) -> PathBuf {
+    policy
+        .raw
+        .state_directory
+        .join("operator-zap-stop-intent.json")
+}
+
+fn stop_terminal_path(policy: &Policy) -> PathBuf {
+    policy
+        .raw
+        .state_directory
+        .join("operator-zap-stop-terminal.json")
+}
+
+fn operator_manifest_path(policy: &Policy) -> PathBuf {
+    manifest_path_for_identity(
+        &policy.pod_directory,
+        &policy.pod,
+        &policy.attempt,
+        Epoch::new(1).unwrap(),
+    )
+}
+
+fn pending_publication_path(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("private publication filename is invalid")?;
+    Ok(path.with_file_name(format!(".{name}.pending")))
+}
+
+fn publication_metadata(path: &Path, uid: u32) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o600 {
+                return Err("private publication file identity differs".into());
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("private publication stat failed: {error}")),
+    }
+}
+
+/// A temp-only crash preceded publication and therefore any signed/effectful
+/// step. A two-link final/temp pair is the post-link, pre-unlink crash shape.
+/// Every other shape fails closed rather than replacing a possible intent.
+fn repair_private_publication(path: &Path, directory: &Path) -> Result<(), String> {
+    if path.parent() != Some(directory) {
+        return Err("private publication directory differs".into());
+    }
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    private_directory(directory, uid)?;
+    let pending = pending_publication_path(path)?;
+    let final_meta = publication_metadata(path, uid)?;
+    let pending_meta = publication_metadata(&pending, uid)?;
+    match (final_meta, pending_meta) {
+        (None, None) => Ok(()),
+        (None, Some(temp)) if temp.nlink() == 1 => {
+            fs::remove_file(&pending)
+                .map_err(|error| format!("prepublication temp removal failed: {error}"))?;
+            File::open(directory)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("prepublication directory sync failed: {error}"))
+        }
+        (Some(final_meta), Some(temp))
+            if final_meta.nlink() == 2
+                && temp.nlink() == 2
+                && (final_meta.dev(), final_meta.ino()) == (temp.dev(), temp.ino()) =>
+        {
+            fs::remove_file(&pending)
+                .map_err(|error| format!("published temp removal failed: {error}"))?;
+            File::open(directory)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("published directory sync failed: {error}"))?;
+            let after =
+                publication_metadata(path, uid)?.ok_or("published private file vanished")?;
+            if after.nlink() != 1
+                || (after.dev(), after.ino()) != (final_meta.dev(), final_meta.ino())
+            {
+                return Err("published private file changed during repair".into());
+            }
+            Ok(())
+        }
+        (Some(final_meta), None) if final_meta.nlink() == 1 => Ok(()),
+        _ => Err("private publication links are ambiguous".into()),
+    }
+}
+
+fn write_private_once(path: &Path, directory: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.parent() != Some(directory) || bytes.is_empty() || bytes.len() > 16_384 {
+        return Err("private operator receipt path or size differs".into());
+    }
+    repair_private_publication(path, directory)?;
+    if path.exists() {
+        return Err("private operator receipt already exists".into());
+    }
+    let pending = pending_publication_path(path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&pending)
+        .map_err(|error| format!("private operator temp creation failed: {error}"))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("private operator temp sync failed: {error}"))?;
+    drop(file);
+    fs::hard_link(&pending, path)
+        .map_err(|error| format!("private operator publication failed: {error}"))?;
+    fs::remove_file(&pending)
+        .map_err(|error| format!("private operator temp unlink failed: {error}"))?;
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| format!("private operator directory sync failed: {error}"))?;
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    if private_file(path, directory, uid, 16_384)? != bytes {
+        return Err("published private operator receipt changed".into());
+    }
+    Ok(())
+}
+
+fn checked_stop_intent(
+    policy: &Policy,
+    original_command_id: &str,
+) -> Result<Option<(StopIntent, String)>, String> {
+    let path = stop_intent_path(policy);
+    repair_private_publication(&path, &policy.raw.state_directory)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    let bytes = private_file(&path, &policy.raw.state_directory, uid, 16_384)?;
+    let intent: StopIntent = serde_json::from_slice(&bytes)
+        .map_err(|_| "operator stop intent is malformed".to_owned())?;
+    let manifest = operator_manifest_path(policy);
+    let stem = manifest
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or("operator manifest slot is invalid")?;
+    if intent.schema != STOP_INTENT_SCHEMA
+        || intent.policy_digest != policy.policy_digest
+        || intent.stop_key != stop_key(policy)
+        || intent.actor_id != policy.actor.as_str()
+        || intent.scope_id != policy.scope.as_str()
+        || intent.pod_id != policy.pod.as_str()
+        || intent.launch_command_id != original_command_id
+        || intent.unit_name != format!("podbay-pod-{stem}.service")
+        || intent.supervisor_pid == 0
+        || intent.supervisor_birth == 0
+        || intent.child_pid == 0
+        || intent.child_birth == 0
+        || intent.socket_dev == 0
+        || intent.socket_ino == 0
+        || !valid_digest(&intent.manifest_digest)
+    {
+        return Err("operator stop intent differs from exact launch".into());
+    }
+    Ok(Some((intent, hex_digest(&bytes))))
+}
+
+fn checked_stop_terminal(
+    policy: &Policy,
+    intent: &StopIntent,
+    intent_digest: &str,
+) -> Result<bool, String> {
+    let path = stop_terminal_path(policy);
+    repair_private_publication(&path, &policy.raw.state_directory)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    let bytes = private_file(&path, &policy.raw.state_directory, uid, 4096)?;
+    let terminal: StopTerminal = serde_json::from_slice(&bytes)
+        .map_err(|_| "operator terminal receipt is malformed".to_owned())?;
+    if terminal.schema != STOP_TERMINAL_SCHEMA
+        || terminal.policy_digest != policy.policy_digest
+        || terminal.stop_key != intent.stop_key
+        || terminal.launch_command_id != intent.launch_command_id
+        || terminal.intent_digest != intent_digest
+    {
+        return Err("operator terminal receipt differs from stop intent".into());
+    }
+    Ok(true)
+}
+
+fn process_birth_still_matches(pid: u32, birth: u64) -> Result<bool, String> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("operator process observation unavailable: {error}")),
+    };
+    let observed = stat
+        .rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("operator process birth observation is malformed")?;
+    Ok(observed == birth)
+}
+
+fn unit_load_and_pid(unit: &str) -> Result<(String, u32), String> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=LoadState",
+            "--property=MainPID",
+            unit,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("operator unit observation failed: {error}"))?;
+    if !output.status.success() || output.stdout.len() > 4096 {
+        return Err("operator unit observation is unavailable".into());
+    }
+    let text =
+        String::from_utf8(output.stdout).map_err(|_| "operator unit observation is malformed")?;
+    let mut load = None;
+    let mut pid = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("LoadState=") {
+            if load.replace(value.to_owned()).is_some() {
+                return Err("duplicate LoadState".into());
+            }
+        } else if let Some(value) = line.strip_prefix("MainPID=") {
+            if pid
+                .replace(value.parse::<u32>().map_err(|_| "invalid MainPID")?)
+                .is_some()
+            {
+                return Err("duplicate MainPID".into());
+            }
+        } else {
+            return Err("operator unit observation has unknown field".into());
+        }
+    }
+    Ok((
+        load.ok_or("unit LoadState is missing")?,
+        pid.ok_or("unit MainPID is missing")?,
+    ))
+}
+
+/// This is observation only. It never sends another stop after an intent is
+/// fsynced, even if the original Pod reply was lost.
+fn terminal_stop_observed(policy: &Policy, intent: &StopIntent) -> Result<bool, String> {
+    let manifest_path = operator_manifest_path(policy);
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    let bytes = private_file(&manifest_path, &policy.pod_directory, uid, 65_536)?;
+    let manifest: PodManifest =
+        serde_json::from_slice(&bytes).map_err(|_| "operator manifest readback is malformed")?;
+    let socket = manifest_path.with_extension("sock");
+    if manifest.digest != intent.manifest_digest
+        || manifest.unit_name != intent.unit_name
+        || manifest.socket_path != socket
+        || manifest.descriptor.pod_id != policy.pod.as_str()
+        || manifest.descriptor.attempt_id != policy.attempt.as_str()
+        || manifest
+            .peer_binding
+            .as_ref()
+            .is_none_or(|binding| binding.capability != OPERATOR_PROCESS_CAPABILITY)
+    {
+        return Err("operator manifest changed since stop intent".into());
+    }
+    let (load, main_pid) = unit_load_and_pid(&intent.unit_name)?;
+    if load != "not-found" {
+        if main_pid == 0 {
+            return Ok(false);
+        }
+        if main_pid != intent.supervisor_pid
+            || !process_birth_still_matches(main_pid, intent.supervisor_birth)?
+        {
+            return Err("operator unit was substituted while stop was pending".into());
+        }
+        return Ok(false);
+    }
+    if main_pid != 0
+        || process_birth_still_matches(intent.supervisor_pid, intent.supervisor_birth)?
+        || process_birth_still_matches(intent.child_pid, intent.child_birth)?
+    {
+        return Ok(false);
+    }
+    if socket.exists() {
+        let metadata = fs::symlink_metadata(&socket)
+            .map_err(|error| format!("operator socket observation failed: {error}"))?;
+        if !metadata.file_type().is_socket()
+            || (metadata.dev(), metadata.ino()) != (intent.socket_dev, intent.socket_ino)
+        {
+            return Err("operator socket was substituted while stop was pending".into());
+        }
+        fs::remove_file(&socket)
+            .map_err(|error| format!("stale operator socket removal failed: {error}"))?;
+        File::open(&policy.pod_directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("operator Pod directory sync failed: {error}"))?;
+    }
+    Ok(!socket.exists())
+}
+
+fn await_terminal_stop(policy: &Policy, intent: &StopIntent) -> Result<bool, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if terminal_stop_observed(policy, intent)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn record_terminal_stop(policy: &Policy, intent: &StopIntent, digest: &str) -> Result<(), String> {
+    let terminal = StopTerminal {
+        schema: STOP_TERMINAL_SCHEMA.into(),
+        policy_digest: policy.policy_digest.clone(),
+        stop_key: intent.stop_key.clone(),
+        launch_command_id: intent.launch_command_id.clone(),
+        intent_digest: digest.into(),
+    };
+    let bytes =
+        serde_json::to_vec(&terminal).map_err(|_| "operator terminal receipt encoding failed")?;
+    write_private_once(
+        &stop_terminal_path(policy),
+        &policy.raw.state_directory,
+        &bytes,
+    )
+}
+
+fn print_terminal_stop(policy: &Policy, intent: &StopIntent, digest: &str, duplicate: bool) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "protocol": "podbay.operator-zap-stop/1",
+            "stopKey": intent.stop_key,
+            "launchCommandId": intent.launch_command_id,
+            "intentDigest": digest,
+            "podId": policy.pod.as_str(),
+            "unitName": intent.unit_name,
+            "terminal": true,
+            "duplicate": duplicate,
+        })
+    );
+}
+
+fn open_operator(
+    policy: &Policy,
+) -> Result<
+    (
+        DurableAuthority<LinuxLaunchPort>,
+        TrustedInitialOwnerPolicy,
+        SelfTransport,
+        podbay_host::GrantId,
+    ),
+    String,
+> {
     let port_config = TrustedLinuxLaunchConfig::from_trusted_policy(
         policy.raw.pod_executable.clone(),
         policy.raw.pod_executable_sha256.clone(),
@@ -638,7 +1033,12 @@ fn launch(policy: Policy) -> Result<(), String> {
     let grant = host
         .current_owner_grant_from_trusted_policy(&owner_policy)
         .map_err(|error| format!("exact operator Pod grant unavailable: {error:?}"))?;
-    register_operator_policy(&mut host, &policy)?;
+    register_operator_policy(&mut host, policy)?;
+    Ok((host, owner_policy, transport, grant))
+}
+
+fn launch(policy: Policy) -> Result<(), String> {
+    let (mut host, _owner_policy, transport, grant) = open_operator(&policy)?;
     let selector = CommandLookupSelector::Key {
         key: policy.raw.command_key.clone(),
     };
@@ -647,7 +1047,7 @@ fn launch(policy: Policy) -> Result<(), String> {
         Err(DurableAuthorityError::Store(StoreError::NotFound)) => None,
         Err(error) => return Err(format!("operator command readback failed: {error:?}")),
     };
-    let request = bound_request(&policy, grant, host.owner_epoch(), generation)?;
+    let request = bound_request(&policy, grant, host.owner_epoch(), transport.generation)?;
     let duplicate = existing.is_some();
     match existing.and_then(|inspection| inspection.launch_dispatch_status) {
         None => {
@@ -769,6 +1169,162 @@ fn launch(policy: Policy) -> Result<(), String> {
         "wallSeconds": policy.raw.wall_seconds,
     });
     println!("{output}");
+    Ok(())
+}
+
+fn stop(policy: Policy) -> Result<(), String> {
+    let (mut host, _owner_policy, transport, grant) = open_operator(&policy)?;
+    let selector = CommandLookupSelector::Key {
+        key: policy.raw.command_key.clone(),
+    };
+    let original = host
+        .lookup_command(&transport, &policy.scope, &selector)
+        .map_err(|error| format!("original operator launch is unavailable: {error:?}"))?;
+    if original
+        .launch_dispatch_status
+        .as_ref()
+        .is_none_or(|status| {
+            status.stage != LaunchDispatchStage::HostAccepted
+                && status.stage != LaunchDispatchStage::PortSettled
+        })
+    {
+        return Err("original operator Pod was not HostAccepted".into());
+    }
+    if let Some((intent, digest)) = checked_stop_intent(&policy, &original.receipt.command_id)? {
+        let terminal_recorded = checked_stop_terminal(&policy, &intent, &digest)?;
+        if !await_terminal_stop(&policy, &intent)? {
+            return Err(format!(
+                "operator stop {digest} is uncertain; no second stop sent"
+            ));
+        }
+        if !terminal_recorded {
+            record_terminal_stop(&policy, &intent, &digest)?;
+        }
+        print_terminal_stop(&policy, &intent, &digest, true);
+        return Ok(());
+    }
+
+    let rebind_key = format!("rebind.operator.owner.{}", host.owner_epoch().get());
+    host.prepare_current_operator_process_rebind(&policy.scope, &policy.pod, &rebind_key)
+        .map_err(|error| format!("operator stop rebind preparation failed: {error:?}"))?;
+    let active = host
+        .complete_current_operator_process_rebind(&policy.scope, &policy.pod, &rebind_key)
+        .map_err(|error| format!("operator stop rebind failed: {error:?}"))?;
+    if active.stage != RebindCompletionStage::PodActive {
+        return Err(format!(
+            "operator Pod is not Active for stop: {:?}",
+            active.stage
+        ));
+    }
+    let checked = HostRequest {
+        scope_id: policy.scope.clone(),
+        grant_id: grant,
+        guards: GuardSet {
+            manager_epoch: host.owner_epoch(),
+            pod_incarnation: PodIncarnation::new(1).unwrap(),
+            resource_epoch: None,
+            credential_generation: transport.generation,
+        },
+        command_key: stop_key(&policy),
+        correlation_id: format!("correlation.operator.stop.{}", &policy.policy_digest[..24]),
+        deadline: Instant::now() + Duration::from_secs(30),
+        action: HostAction::StopPod {
+            pod_id: policy.pod.clone(),
+        },
+    };
+    host.authorise_current_operator_stop(&transport, &checked)
+        .map_err(|error| format!("exact operator StopPod authority unavailable: {error:?}"))?;
+    let reviewed = host
+        .inspect_committed_operator_process(&policy.scope, &policy.pod)
+        .map_err(|error| format!("current operator Pod proof unavailable: {error:?}"))?;
+    if reviewed.committed_record().receipt != original.receipt
+        || reviewed.committed_record().session_id != policy.session.as_str()
+        || reviewed.committed_record().run_id != policy.run.as_str()
+        || reviewed.committed_record().attempt_id != policy.attempt.as_str()
+        || reviewed.committed_record().resources.len() != 1
+        || reviewed.committed_record().resources[0].id != policy.resource.as_str()
+    {
+        return Err("operator stop target differs from original launch".into());
+    }
+    let manifest_path = operator_manifest_path(&policy);
+    let uid = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| "operator identity changed")?
+        .uid();
+    let manifest_bytes = private_file(&manifest_path, &policy.pod_directory, uid, 65_536)?;
+    let manifest: PodManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| "operator stop manifest is malformed")?;
+    let client = PodClient::connect(&manifest_path)
+        .map_err(|error| format!("operator Pod connection failed: {error}"))?;
+    let status = client
+        .attested_status()
+        .map_err(|error| format!("operator Pod status failed: {error}"))?;
+    if !status.child_running
+        || status.pod_id != policy.pod.as_str()
+        || status.unit_name != manifest.unit_name
+        || status.bound.as_ref().is_none_or(|bound| {
+            bound.capability != OPERATOR_PROCESS_CAPABILITY
+                || bound.resource_id != policy.resource.as_str()
+        })
+        || manifest.descriptor.pod_id != policy.pod.as_str()
+        || manifest.descriptor.attempt_id != policy.attempt.as_str()
+        || manifest.socket_path != manifest_path.with_extension("sock")
+    {
+        return Err("operator stop Pod attestation differs".into());
+    }
+    let (load, main_pid) = unit_load_and_pid(&manifest.unit_name)?;
+    if load != "loaded"
+        || main_pid != status.supervisor_pid
+        || !process_birth_still_matches(status.supervisor_pid, status.supervisor_start_ticks)?
+        || !process_birth_still_matches(status.child_pid, status.child_start_ticks)?
+    {
+        return Err("operator stop systemd unit or process births differ".into());
+    }
+    let socket = fs::symlink_metadata(&manifest.socket_path)
+        .map_err(|error| format!("operator stop socket unavailable: {error}"))?;
+    if !socket.file_type().is_socket() || socket.uid() != uid {
+        return Err("operator stop socket identity differs".into());
+    }
+    let intent = StopIntent {
+        schema: STOP_INTENT_SCHEMA.into(),
+        policy_digest: policy.policy_digest.clone(),
+        stop_key: stop_key(&policy),
+        actor_id: policy.actor.as_str().into(),
+        scope_id: policy.scope.as_str().into(),
+        pod_id: policy.pod.as_str().into(),
+        launch_command_id: original.receipt.command_id,
+        manifest_digest: manifest.digest,
+        unit_name: manifest.unit_name,
+        socket_dev: socket.dev(),
+        socket_ino: socket.ino(),
+        supervisor_pid: status.supervisor_pid,
+        supervisor_birth: status.supervisor_start_ticks,
+        child_pid: status.child_pid,
+        child_birth: status.child_start_ticks,
+    };
+    let bytes = serde_json::to_vec(&intent).map_err(|_| "operator stop intent encoding failed")?;
+    let digest = hex_digest(&bytes);
+    write_private_once(
+        &stop_intent_path(&policy),
+        &policy.raw.state_directory,
+        &bytes,
+    )?;
+    // The intent is durable now. Neither a lost reply nor another CLI birth
+    // may issue this Pod stop again without explicit external reconciliation.
+    let stop_result = client.stop();
+    #[cfg(debug_assertions)]
+    if env::var_os("PODBAY_TEST_OPERATOR_STOP_DROP_REPLY").is_some() {
+        let _ = stop_result;
+        return Err(format!(
+            "test-only lost stop reply for {digest}; inspect original intent"
+        ));
+    }
+    if !await_terminal_stop(&policy, &intent)? {
+        return Err(format!(
+            "operator stop {digest} is uncertain after one port call: {stop_result:?}"
+        ));
+    }
+    record_terminal_stop(&policy, &intent, &digest)?;
+    print_terminal_stop(&policy, &intent, &digest, false);
     Ok(())
 }
 

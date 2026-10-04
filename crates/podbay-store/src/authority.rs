@@ -1507,11 +1507,13 @@ fn validate_initial_owner_enrollment(
             )
         })
         .collect::<BTreeSet<_>>();
-    if rights.len() == 1 && grant.rights.len() == 1 {
-        let only = &grant.rights[0];
-        if only.operation == "launch_pod"
-            && only.target_kind == "pod"
-            && valid_identity(&only.target_id).is_ok()
+    if rights.len() == 2 && grant.rights.len() == 2 {
+        let pod = grant.rights.iter().find(|right|
+            right.operation == "launch_pod" && right.target_kind == "pod");
+        if pod.is_some_and(|right| valid_identity(&right.target_id).is_ok())
+            && pod.is_some_and(|right| rights.contains(&(
+                "stop_pod".into(), "pod".into(), right.target_id.clone(),
+            )))
         {
             return Ok(());
         }
