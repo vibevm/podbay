@@ -657,6 +657,15 @@ impl PodBayStore {
             {
                 return Err(StoreError::Conflict("owner rotation key changed intent"));
             }
+            let stale_grants: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM authority_grants WHERE actor_id=?1 AND scope_id=?2 AND credential_generation=?3",
+                params![proof.expected_actor.actor_id, proof.expected_actor.scope_id,
+                    sqlite_integer(proof.expected_actor.credential_generation)?],
+                |row| row.get(0),
+            )?;
+            if stale_grants != 0 {
+                return Err(StoreError::Conflict("rotated owner grant generation differs"));
+            }
             transaction.commit()?;
             return Ok(owner_rotation_receipt(proof, digest, revision));
         }
@@ -723,6 +732,25 @@ impl PodBayStore {
         )?;
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
+        }
+        // Carry only grants that still exist for this exact owner generation.
+        // Revoked grants have no row; rights, IDs, mode and depth stay unchanged.
+        let current_grants: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authority_grants WHERE actor_id=?1 AND scope_id=?2 AND credential_generation=?3",
+            params![proof.expected_actor.actor_id, proof.expected_actor.scope_id,
+                sqlite_integer(proof.expected_actor.credential_generation)?],
+            |row| row.get(0),
+        )?;
+        let carried = transaction.execute(
+            "UPDATE authority_grants SET credential_generation=?1 WHERE actor_id=?2 AND scope_id=?3 AND credential_generation=?4",
+            params![sqlite_integer(proof.next_actor.credential_generation)?,
+                proof.expected_actor.actor_id, proof.expected_actor.scope_id,
+                sqlite_integer(proof.expected_actor.credential_generation)?],
+        )?;
+        if carried != usize::try_from(current_grants)
+            .map_err(|_| StoreError::Conflict("owner grant count is invalid"))?
+        {
+            return Err(StoreError::Conflict("owner grant set changed during rotation"));
         }
         let revision = advance_authority_revision(&transaction, proof.expected_revision)?;
         transaction.execute(
