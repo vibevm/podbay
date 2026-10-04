@@ -19,3 +19,6 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "UPL-1.0"
+
+[profile.dev.package.sha2]
+opt-level = 3
