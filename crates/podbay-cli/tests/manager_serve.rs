@@ -191,6 +191,7 @@ impl Running {
             }
             if fs::symlink_metadata(fixture.socket())
                 .is_ok_and(|metadata| metadata.file_type().is_socket())
+                && UnixStream::connect(fixture.socket()).is_ok()
             {
                 return;
             }
@@ -228,7 +229,10 @@ impl Running {
             }) {
                 return;
             }
-            assert!(Instant::now() < until, "owner recovery socket did not appear");
+            assert!(
+                Instant::now() < until,
+                "owner recovery socket did not appear"
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -442,7 +446,7 @@ fn authenticated_wrong_model_launch(fixture: &Fixture, signer: &KeyPair) -> Valu
 }
 
 #[test]
-fn exclusive_manager_stops_cleanly_restarts_and_preserves_stale_socket() {
+fn exclusive_manager_stops_cleanly_and_restarts_over_private_stale_socket() {
     let fixture = Fixture::new();
     let mut first = Running::spawn(&fixture);
     first.wait_ready(&fixture);
@@ -464,19 +468,82 @@ fn exclusive_manager_stops_cleanly_restarts_and_preserves_stale_socket() {
     let epoch_before_stale_socket = fixture.owner_epoch();
 
     let stale = UnixListener::bind(fixture.socket()).unwrap();
-    let identity = fs::symlink_metadata(fixture.socket()).unwrap();
+    fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o600)).unwrap();
     drop(stale);
-    let (failed_status, failed_error) = run_short(&fixture);
-    assert!(!failed_status.success());
-    assert!(failed_error.contains("existing manager socket path"));
-    assert_eq!(fixture.owner_epoch(), epoch_before_stale_socket);
+    let mut recovered = Running::spawn(&fixture);
+    recovered.wait_ready(&fixture);
+    assert_eq!(fixture.owner_epoch(), epoch_before_stale_socket + 1);
+    assert!(recovered.stop_with("TERM").success());
+}
+
+#[test]
+fn sigkill_leaves_manager_socket_and_next_process_reconciles_it_under_lock() {
+    let fixture = Fixture::new();
+    let mut first = Running::spawn(&fixture);
+    first.wait_ready(&fixture);
+    let epoch = fixture.owner_epoch();
+    assert!(!first.stop_with("KILL").success());
+    assert!(fixture.socket().exists());
+    let mut second = Running::spawn(&fixture);
+    second.wait_ready(&fixture);
+    assert_eq!(fixture.owner_epoch(), epoch + 1);
+    assert!(second.stop_with("TERM").success());
+}
+
+#[test]
+fn live_or_substituted_socket_refuses_before_owner_epoch_change() {
+    let fixture = Fixture::new();
+    let mut initial = Running::spawn(&fixture);
+    initial.wait_ready(&fixture);
+    assert!(initial.stop_with("TERM").success());
+    let epoch = fixture.owner_epoch();
+    let live = UnixListener::bind(fixture.socket()).unwrap();
+    fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+    let live_identity = fs::symlink_metadata(fixture.socket()).unwrap();
+    let (status, error) = run_short(&fixture);
+    assert!(!status.success());
+    assert!(error.contains("live listener"), "{error}");
+    assert_eq!(fixture.owner_epoch(), epoch);
     let preserved = fs::symlink_metadata(fixture.socket()).unwrap();
-    assert!(preserved.file_type().is_socket());
     assert_eq!(
         (preserved.dev(), preserved.ino()),
-        (identity.dev(), identity.ino())
+        (live_identity.dev(), live_identity.ino())
     );
+    drop(live);
     fs::remove_file(fixture.socket()).unwrap();
+
+    fs::write(fixture.socket(), b"substituted").unwrap();
+    fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o600)).unwrap();
+    let (status, error) = run_short(&fixture);
+    assert!(!status.success());
+    assert!(error.contains("non-socket"), "{error}");
+    assert_eq!(fs::read(fixture.socket()).unwrap(), b"substituted");
+    assert_eq!(fixture.owner_epoch(), epoch);
+    fs::remove_file(fixture.socket()).unwrap();
+
+    let marker = fixture.root.join("marker");
+    fs::write(&marker, b"marker").unwrap();
+    std::os::unix::fs::symlink(&marker, fixture.socket()).unwrap();
+    let (status, error) = run_short(&fixture);
+    assert!(!status.success());
+    assert!(error.contains("non-socket"), "{error}");
+    assert!(
+        fs::symlink_metadata(fixture.socket())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&marker).unwrap(), b"marker");
+    assert_eq!(fixture.owner_epoch(), epoch);
+    fs::remove_file(fixture.socket()).unwrap();
+
+    let stale = UnixListener::bind(fixture.socket()).unwrap();
+    fs::set_permissions(fixture.socket(), fs::Permissions::from_mode(0o644)).unwrap();
+    drop(stale);
+    let (status, error) = run_short(&fixture);
+    assert!(!status.success());
+    assert!(error.contains("mode 0600"), "{error}");
+    assert_eq!(fixture.owner_epoch(), epoch);
 }
 
 #[test]
@@ -615,28 +682,83 @@ fn lost_receipt_reconciles_same_parent_key_without_second_enrollment() {
 }
 
 #[test]
-fn stale_owner_setup_path_is_preserved_and_never_adopted() {
+fn stale_owner_setup_path_is_reconciled_before_new_setup() {
     let fixture = Fixture::new();
     let path = fixture.setup_socket();
     let stale = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let identity = fs::symlink_metadata(&path).unwrap();
     drop(stale);
-    let mut child = Running(
-        fixture
-            .setup_command()
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+    let mut child = spawn_setup(&fixture);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.0.try_wait().unwrap().is_some() {
+            panic!("replacement setup manager exited");
+        }
+        if fixture.database.exists()
+            && fixture.owner_epoch() > 0
+            && fs::read_to_string(fixture.root.join("manager.log"))
+                .unwrap_or_default()
+                .contains("podbay owner setup socket:")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "replacement setup owner epoch did not advance"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+    assert_eq!(identity.mode() & 0o7777, 0o600);
+    assert!(child.stop_with("TERM").success());
+    assert!(!path.exists());
+}
+
+#[test]
+fn sigkill_recovery_socket_is_reconciled_before_next_owner_challenge() {
+    let fixture = Fixture::new();
+    let policy = fixture.trusted_policy_file();
+    let mut enrolled = spawn_policy(&fixture, &policy);
+    enrolled.wait_setup_ready(&fixture);
+    let signer = KeyPair::from_seed(Seed::new([18; 32]));
+    let _receipt = setup_attempt(&fixture, &signer, &signer, true).unwrap();
+    enrolled.wait_ready(&fixture);
+    assert!(enrolled.stop_with("TERM").success());
+    let before = fixture.owner_epoch();
+
+    let mut interrupted = spawn_policy(&fixture, &policy);
+    interrupted.wait_recovery_ready(&fixture);
+    assert_eq!(fixture.owner_epoch(), before + 1);
+    assert!(!interrupted.stop_with("KILL").success());
+    assert!(fixture.recovery_socket().exists());
+
+    let mut next = spawn_policy(&fixture, &policy);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if next.0.try_wait().unwrap().is_some() {
+            panic!("replacement recovery manager exited");
+        }
+        let log = fs::read_to_string(fixture.root.join("manager.log")).unwrap_or_default();
+        if fixture.owner_epoch() == before + 2
+            && log.matches("podbay owner recovery socket:").count() == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "replacement owner recovery socket did not bind"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fs::symlink_metadata(fixture.recovery_socket())
+            .unwrap()
+            .file_type()
+            .is_socket()
     );
-    assert!(!child.wait_exit().success());
-    let preserved = fs::symlink_metadata(&path).unwrap();
-    assert_eq!(
-        (preserved.dev(), preserved.ino()),
-        (identity.dev(), identity.ino())
-    );
-    assert!(!fixture.database.exists());
-    fs::remove_file(path).unwrap();
+    let _ = next.stop_with("TERM");
+    assert!(!fixture.recovery_socket().exists());
 }
 
 #[test]

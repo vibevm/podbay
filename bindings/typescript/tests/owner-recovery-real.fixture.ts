@@ -13,7 +13,7 @@ import { recoverInstalledOwner } from "../src/owner-recovery.ts";
 import { stageNextOwnerKeyCustody } from "../src/owner-key-custody.ts";
 
 const [mode, root, managerBinary, podBinary] = process.argv.slice(2);
-if (!mode || !root || !managerBinary || !podBinary || !["A", "B", "B_FAIL", "B_NO_PUBLIC", "B_LOST_ACK", "C"].includes(mode)) throw new Error();
+if (!mode || !root || !managerBinary || !podBinary || !["A", "A_KILL", "B", "B_FAIL", "B_NO_PUBLIC", "B_LOST_ACK", "C"].includes(mode)) throw new Error();
 const state = join(root, "state");
 const database = join(state, "podbay.sqlite");
 const podDigest = createHash("sha256").update(readFileSync(podBinary)).digest("hex");
@@ -27,9 +27,9 @@ const diagnostics: Buffer[] = [];
 manager.stderr.on("data", (chunk: Buffer) => diagnostics.push(chunk));
 
 try {
-  const socketName = mode === "A" ? "owner-setup.sock" : "owner-recovery.sock";
+  const socketName = mode === "A" || mode === "A_KILL" ? "owner-setup.sock" : "owner-recovery.sock";
   await waitSocket(join(state, socketName));
-  if (mode === "A") {
+  if (mode === "A" || mode === "A_KILL") {
     const db = new DatabaseSync(database, { readOnly: true });
     const ownerEpoch = BigInt((db.prepare("SELECT value FROM metadata WHERE key='owner_epoch'").get() as { value: number }).value);
     const authorityRevision = BigInt((db.prepare("SELECT value FROM metadata WHERE key='authority_revision'").get() as { value: number }).value);
@@ -138,7 +138,8 @@ try {
   writeFileSync(join(root, `failure-${mode}.txt`), `${String(error)}\n${Buffer.concat(diagnostics).toString("utf8")}`, { mode: 0o600 });
   throw error;
 } finally {
-  if (manager.exitCode === null && manager.signalCode === null) manager.kill("SIGTERM");
+  if (manager.exitCode === null && manager.signalCode === null)
+    manager.kill(mode === "A_KILL" ? "SIGKILL" : "SIGTERM");
   await waitExit();
 }
 

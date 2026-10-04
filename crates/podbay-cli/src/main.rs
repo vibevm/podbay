@@ -4,6 +4,8 @@
 
 #[cfg(target_os = "linux")]
 mod manager_policy;
+#[cfg(target_os = "linux")]
+mod socket_reconcile;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -12,8 +14,7 @@ mod linux {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::sync::{
@@ -22,6 +23,7 @@ mod linux {
     };
 
     use crate::manager_policy::PreparedManagerPolicy;
+    use crate::socket_reconcile::reconcile_abandoned_sockets;
     use podbay_core::{ActorId, ScopeId};
     use podbay_host::{
         CredentialRef, DurableAuthority, DurableAuthorityError, TrustedInitialOwnerPolicy,
@@ -30,16 +32,16 @@ mod linux {
     use podbay_pod::LinuxPeerEvidence;
     use podbay_server::{
         InitialOwnerSetupError, LinuxInitialOwnerSetupListener, LinuxListenerError,
-        LinuxOwnerRecoveryListener, OWNER_RECOVERY_SOCKET_NAME,
-        LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME,
-        TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
+        LinuxManagerCommandsGetListener, LinuxOwnerRecoveryListener, MANAGER_SOCKET_NAME,
+        OWNER_RECOVERY_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME, TrustedBootstrapSendTemplate,
+        TrustedWireRootLaunchTemplate,
     };
     use signal_hook::{
         consts::signal::{SIGINT, SIGTERM},
         flag,
     };
 
-    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--trusted-policy FILE | --initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh initial owner setup uses DIR/owner-setup.sock before DIR/manager.sock. A trusted policy file explicitly enables one V2 root launch and first send.";
+    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--trusted-policy FILE | --initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh owner uses DIR/owner-setup.sock; a recorded owner uses DIR/owner-recovery.sock. Both precede DIR/manager.sock. A trusted policy file enables one V2 root launch and first send.";
 
     struct InitialOwnerConfig {
         actor_id: String,
@@ -140,20 +142,30 @@ mod linux {
         let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
         let setup_path = config.state_dir.join(OWNER_SETUP_SOCKET_NAME);
         let recovery_path = config.state_dir.join(OWNER_RECOVERY_SOCKET_NAME);
-        // A stale pathname must not advance the durable owner epoch. Probe it
-        // before opening the manager; the later check still catches races.
-        check_manager_socket_path(&socket_path)?;
-        if owner_policy.is_some() {
-            check_owner_setup_socket_path(&setup_path)?;
-            check_owner_recovery_socket_path(&recovery_path)?;
-        }
-        ensure_private_database(&config.database, &config.state_dir, self_peer.uid())?;
-        // One lock and manager OS identity live for this entire serve loop.
-        let mut authority =
-            DurableAuthority::open(&config.database, port).map_err(|error| match error {
-                DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
-                other => format!("durable manager open failed: {other:?}"),
-            })?;
+        // The host takes its lifetime lock first. Reconcile only exact stale
+        // private socket inodes before PodBayStore::open advances the epoch.
+        let mut authority = DurableAuthority::open_with_locked_preflight(
+            &config.database,
+            port,
+            |canonical_database| {
+                reconcile_abandoned_sockets(
+                    &config.state_dir,
+                    canonical_database,
+                    self_peer.uid(),
+                    &[
+                        MANAGER_SOCKET_NAME,
+                        OWNER_SETUP_SOCKET_NAME,
+                        OWNER_RECOVERY_SOCKET_NAME,
+                    ],
+                )?;
+                ensure_private_database(&config.database, &config.state_dir, self_peer.uid())
+                    .map_err(io::Error::other)
+            },
+        )
+        .map_err(|error| match error {
+            DurableAuthorityError::Busy => "manager owner busy for this database".to_owned(),
+            other => format!("durable manager open failed: {other:?}"),
+        })?;
         check_manager_socket_path(&socket_path)?;
         let mut enrolled_grant = None;
         if let Some(policy) = owner_policy {
@@ -167,20 +179,32 @@ mod linux {
                 check_owner_recovery_socket_path(&recovery_path)?;
                 let mut recovery = LinuxOwnerRecoveryListener::bind(&config.state_dir, parent)
                     .map_err(|error| format!("owner recovery bind failed: {error}"))?;
-                eprintln!("podbay owner recovery socket: {}", recovery.path().display());
+                eprintln!(
+                    "podbay owner recovery socket: {}",
+                    recovery.path().display()
+                );
                 let recovered = recovery.serve(&mut authority, &policy, &stop);
                 let cleanup = recovery.shutdown();
                 match (recovered, cleanup) {
                     (Ok(receipt), Ok(())) => {
-                        eprintln!("podbay owner recovered: actor={} scope={} grant=grant.{} ownerEpoch={}",
-                            receipt.rotation.actor_id, receipt.rotation.scope_id,
-                            receipt.grant_id.get(), receipt.rotation.owner_epoch);
+                        eprintln!(
+                            "podbay owner recovered: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                            receipt.rotation.actor_id,
+                            receipt.rotation.scope_id,
+                            receipt.grant_id.get(),
+                            receipt.rotation.owner_epoch
+                        );
                         enrolled_grant = Some(receipt.grant_id);
                     }
                     (Err(error), Ok(())) => return Err(format!("owner recovery failed: {error}")),
-                    (Ok(_), Err(error)) => return Err(format!("owner recovery cleanup failed: {error}")),
-                    (Err(recovery_error), Err(cleanup_error)) => return Err(format!(
-                        "owner recovery failed: {recovery_error}; socket cleanup failed: {cleanup_error}")),
+                    (Ok(_), Err(error)) => {
+                        return Err(format!("owner recovery cleanup failed: {error}"));
+                    }
+                    (Err(recovery_error), Err(cleanup_error)) => {
+                        return Err(format!(
+                            "owner recovery failed: {recovery_error}; socket cleanup failed: {cleanup_error}"
+                        ));
+                    }
                 }
             } else {
                 check_owner_setup_socket_path(&setup_path)?;
@@ -191,16 +215,25 @@ mod linux {
                 let cleanup = setup.shutdown();
                 match (enrolled, cleanup) {
                     (Ok(receipt), Ok(())) => {
-                        eprintln!("podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
-                            receipt.actor_id.as_str(), receipt.scope_id.as_str(),
-                            receipt.grant_id.get(), receipt.owner_epoch);
+                        eprintln!(
+                            "podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                            receipt.actor_id.as_str(),
+                            receipt.scope_id.as_str(),
+                            receipt.grant_id.get(),
+                            receipt.owner_epoch
+                        );
                         enrolled_grant = Some(receipt.grant_id);
                     }
                     (Err(InitialOwnerSetupError::Stopped), Ok(())) => return Ok(()),
                     (Err(error), Ok(())) => return Err(format!("owner setup failed: {error}")),
-                    (Ok(_), Err(error)) => return Err(format!("owner setup cleanup failed: {error}")),
-                    (Err(setup_error), Err(cleanup_error)) => return Err(format!(
-                        "owner setup failed: {setup_error}; cleanup failed: {cleanup_error}")),
+                    (Ok(_), Err(error)) => {
+                        return Err(format!("owner setup cleanup failed: {error}"));
+                    }
+                    (Err(setup_error), Err(cleanup_error)) => {
+                        return Err(format!(
+                            "owner setup failed: {setup_error}; cleanup failed: {cleanup_error}"
+                        ));
+                    }
                 }
             }
         }
@@ -378,15 +411,10 @@ mod linux {
 
     fn check_manager_socket_path(path: &Path) -> Result<(), String> {
         match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_socket() && UnixStream::connect(path).is_ok() {
-                    return Err("manager owner busy for this database".into());
-                }
-                Err(format!(
-                    "existing manager socket path {}; inspect the prior owner and reconcile it manually",
-                    path.display()
-                ))
-            }
+            Ok(_) => Err(format!(
+                "existing manager socket path {}; inspect the prior owner and reconcile it manually",
+                path.display()
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("manager socket path inspection failed: {error}")),
         }
@@ -407,9 +435,14 @@ mod linux {
 
     fn check_owner_recovery_socket_path(path: &Path) -> Result<(), String> {
         match fs::symlink_metadata(path) {
-            Ok(_) => Err(format!("existing owner recovery socket path {}; inspect the prior owner", path.display())),
+            Ok(_) => Err(format!(
+                "existing owner recovery socket path {}; inspect the prior owner",
+                path.display()
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("owner recovery socket path inspection failed: {error}")),
+            Err(error) => Err(format!(
+                "owner recovery socket path inspection failed: {error}"
+            )),
         }
     }
 

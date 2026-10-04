@@ -2712,11 +2712,31 @@ pub struct DurableAuthority<P: HostDispatchPort> {
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
     pub fn open(path: impl AsRef<Path>, port: P) -> Result<Self, DurableAuthorityError> {
+        Self::open_locked(path, port, |_| Ok(()))
+    }
+
+    /// Run a trusted local filesystem preflight while holding the manager's
+    /// lifetime lock, before opening the store or advancing any owner epoch.
+    /// This is for reconciling abandoned private socket pathnames on restart.
+    pub fn open_with_locked_preflight(
+        path: impl AsRef<Path>,
+        port: P,
+        preflight: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<Self, DurableAuthorityError> {
+        Self::open_locked(path, port, preflight)
+    }
+
+    fn open_locked(
+        path: impl AsRef<Path>,
+        port: P,
+        preflight: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<Self, DurableAuthorityError> {
         if !cfg!(target_os = "linux") {
             return Err(DurableAuthorityError::Host(HostError::Unsupported));
         }
         let path = path.as_ref();
         let (manager_lock, canonical_database) = acquire_manager_lock(path)?;
+        preflight(&canonical_database)?;
         #[cfg(target_os = "linux")]
         let manager_peer = LinuxManagerPeer::capture()?;
         let mut store = PodBayStore::open(&canonical_database)?;

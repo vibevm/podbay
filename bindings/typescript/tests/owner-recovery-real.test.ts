@@ -15,6 +15,13 @@ test("two Node launcher births recover one real Rust manager owner without pod o
   await runScenario(["A", "B"]);
 });
 
+test("SIGKILL leaves a manager socket and the next Node process recovers without repair", {
+  skip: process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
+    !process.env["PODBAY_TEST_POD_BINARY"],
+}, async () => {
+  await runScenario(["A_KILL", "B"]);
+});
+
 test("a failed B proof advances the manager epoch, then C recovers from the fresh store", {
   skip: process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
     !process.env["PODBAY_TEST_POD_BINARY"],
