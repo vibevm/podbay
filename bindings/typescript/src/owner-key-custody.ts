@@ -41,6 +41,7 @@ export function persistOwnerKeyCustody(
   privateKey: KeyObject,
 ): void {
   validateBinding(binding);
+  assertCurrentLinuxBirth(binding);
   if (privateKey.type !== "private" || privateKey.asymmetricKeyType !== "ed25519")
     throw new TypeError("owner custody requires one Ed25519 private key");
   const directory = pinnedPrivateDirectory(path);
@@ -80,10 +81,10 @@ export function persistOwnerKeyCustody(
 }
 
 /** Fail closed on path, owner, binding, encoding, or key mismatch. */
-export function loadOwnerKeyCustody(
+function loadOwnerKeyMaterial(
   path: string,
   expected: Pick<OwnerKeyCustodyBinding, "actorId" | "scopeId" | "storeLineage">,
-): LoadedOwnerKeyCustody {
+): LoadedOwnerKeyCustody & { readonly privateKey: KeyObject } {
   const directory = pinnedPrivateDirectory(path);
   try {
     const file = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -134,6 +135,7 @@ export function loadOwnerKeyCustody(
     return {
       binding,
       publicKey: new Uint8Array(publicKey),
+      privateKey,
       proveContinuity(nonce) {
         if (!(nonce instanceof Uint8Array) || nonce.length !== 32 || nonce.every((byte) => byte === 0))
           throw new TypeError("owner custody continuity nonce is invalid");
@@ -141,6 +143,66 @@ export function loadOwnerKeyCustody(
       },
     };
   } finally { closeSync(directory); }
+}
+
+export function loadOwnerKeyCustody(
+  path: string,
+  expected: Pick<OwnerKeyCustodyBinding, "actorId" | "scopeId" | "storeLineage">,
+): LoadedOwnerKeyCustody {
+  const material = loadOwnerKeyMaterial(path, expected);
+  return {
+    binding: material.binding,
+    publicKey: material.publicKey,
+    proveContinuity: (nonce) => material.proveContinuity(nonce),
+  };
+}
+
+/**
+ * Reuse the exact pre-enrollment key after a cut before first setup proof.
+ * A different process is admitted only after the prior PID and birth are gone.
+ * This does not authorize rotation of an already enrolled owner actor.
+ */
+export function recoverOwnerKeyForInitialEnrollment(
+  path: string,
+  expected: OwnerKeyCustodyBinding,
+  generatedPublicKey: Uint8Array,
+): { readonly privateKey: KeyObject; readonly publicKey: Uint8Array } {
+  validateBinding(expected);
+  assertCurrentLinuxBirth(expected);
+  const material = loadOwnerKeyMaterial(path, expected);
+  const prior = material.binding;
+  if (prior.credentialRef !== expected.credentialRef ||
+      prior.ownerEpoch !== expected.ownerEpoch ||
+      prior.authorityRevision !== expected.authorityRevision ||
+      prior.osIdentity !== expected.osIdentity)
+    throw new TypeError("owner custody enrollment expectation differs");
+  const sameBirth = prior.processIdentity === expected.processIdentity &&
+    prior.startIdentity === expected.startIdentity &&
+    prior.containmentIdentity === expected.containmentIdentity;
+  if (sameBirth) {
+    if (!Buffer.from(material.publicKey).equals(Buffer.from(generatedPublicKey)))
+      throw new TypeError("another live owner client generated a different key");
+  } else if (priorProcessStillLive(prior)) {
+    throw new TypeError("prior owner process is still live");
+  }
+  const directory = pinnedPrivateDirectory(path);
+  try {
+    const file = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+    try {
+      const metadata = fstatSync(file);
+      if (!metadata.isFile() || metadata.uid !== process.getuid?.() ||
+          (metadata.mode & 0o7777) !== 0o600 || metadata.nlink !== 1)
+        throw new TypeError("owner custody file changed before sync");
+      fsyncSync(file);
+    } finally { closeSync(file); }
+    fsyncSync(directory);
+  } finally { closeSync(directory); }
+  const verified = loadOwnerKeyMaterial(path, expected);
+  if (!Buffer.from(verified.publicKey).equals(Buffer.from(material.publicKey)) ||
+      verified.binding.processIdentity !== prior.processIdentity ||
+      verified.binding.startIdentity !== prior.startIdentity)
+    throw new TypeError("owner custody changed during recovery");
+  return { privateKey: verified.privateKey, publicKey: verified.publicKey };
 }
 
 export function ownerKeyContinuityChallenge(nonce: Uint8Array): Uint8Array {
@@ -165,6 +227,37 @@ function pinnedPrivateDirectory(path: string): number {
     throw new TypeError("owner custody parent changed");
   }
   return descriptor;
+}
+
+function priorProcessStillLive(binding: OwnerKeyCustodyBinding): boolean {
+  const match = /^linux\.pid\.([1-9][0-9]*)$/u.exec(binding.processIdentity);
+  if (!match) return true;
+  try {
+    const stat = readFileSync(`/proc/${match[1]}/stat`, "utf8");
+    const end = stat.lastIndexOf(")");
+    if (end < 0) return true;
+    const start = stat.slice(end + 2).trim().split(/\s+/u)[19];
+    return start === undefined || !/^[1-9][0-9]*$/u.test(start) ||
+      BigInt(start) === binding.startIdentity;
+  } catch (error) {
+    return !isRecord(error) || error["code"] !== "ENOENT";
+  }
+}
+
+function assertCurrentLinuxBirth(binding: OwnerKeyCustodyBinding): void {
+  if (typeof process.getuid !== "function")
+    throw new TypeError("owner custody requires Linux process identity");
+  const stat = readFileSync("/proc/self/stat", "utf8");
+  const end = stat.lastIndexOf(")");
+  const start = end < 0 ? undefined : stat.slice(end + 2).trim().split(/\s+/u)[19];
+  const cgroups = readFileSync("/proc/self/cgroup", "utf8").trimEnd()
+    .split("\n").filter((line) => line.startsWith("0::"));
+  if (start === undefined || !/^[1-9][0-9]*$/u.test(start) || cgroups.length !== 1 ||
+      binding.osIdentity !== `linux.uid.${String(process.getuid())}` ||
+      binding.processIdentity !== `linux.pid.${String(process.pid)}` ||
+      binding.startIdentity !== BigInt(start) ||
+      binding.containmentIdentity !== cgroups[0]!.slice(3))
+    throw new TypeError("owner custody process birth differs from current Linux process");
 }
 
 function rawPublicKey(privateKey: KeyObject): Buffer {

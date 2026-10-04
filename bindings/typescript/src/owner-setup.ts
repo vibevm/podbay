@@ -79,11 +79,11 @@ type Expected = Omit<TrustedOwnerSetupExpectations, "totalTimeoutMs"> & {
   readonly totalTimeoutMs: number;
 };
 
-/** Private KeyObject remains in this process and is never exported. */
+/** The key stays process-local unless explicitly pinned to owner-only custody. */
 export class InitialOwnerSetupClient {
   readonly #expected: Expected;
-  readonly #privateKey: KeyObject;
-  readonly #publicKey: Buffer;
+  #privateKey: KeyObject;
+  #publicKey: Buffer;
   #started = false;
   #receipt: InitialOwnerSetupReceipt | undefined;
   #observedReceipt: InitialOwnerSetupReceipt | undefined;
@@ -105,8 +105,17 @@ export class InitialOwnerSetupClient {
   /** Durably pins the generated key before any setup signature is possible. */
   async prepareOwnerKeyCustody(): Promise<void> {
     if (this.#custodyPrepared || this.#expected.ownerKeyCustodyPath === undefined) return;
-    const { persistOwnerKeyCustody } = await import("./owner-key-custody.ts");
-    persistOwnerKeyCustody(this.#expected.ownerKeyCustodyPath, this.#expected, this.#privateKey);
+    const { persistOwnerKeyCustody, recoverOwnerKeyForInitialEnrollment } =
+      await import("./owner-key-custody.ts");
+    try {
+      persistOwnerKeyCustody(this.#expected.ownerKeyCustodyPath, this.#expected, this.#privateKey);
+    } catch {
+      const recovered = recoverOwnerKeyForInitialEnrollment(
+        this.#expected.ownerKeyCustodyPath, this.#expected, this.#publicKey,
+      );
+      this.#privateKey = recovered.privateKey;
+      this.#publicKey = Buffer.from(recovered.publicKey);
+    }
     this.#custodyPrepared = true;
   }
 
@@ -115,7 +124,12 @@ export class InitialOwnerSetupClient {
     if (this.#receipt) return this.#receipt;
     if (this.#started) throw new OwnerSetupError("reconciliation_failed", "possible_enrollment");
     this.#started = true;
-    await this.prepareOwnerKeyCustody();
+    try {
+      await this.prepareOwnerKeyCustody();
+    } catch (error) {
+      this.#started = false;
+      throw error;
+    }
     const deadline = performance.now() + this.#expected.totalTimeoutMs;
     try {
       this.#receipt = await this.#attempt(deadline, false);
