@@ -19,6 +19,12 @@ nix = { version = "=0.28.0", features = ["socket"] }
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+podbay-macos-sys = { path = "../podbay-macos-sys" }
+libc = "0.2"
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+
 [lib]
 path = "src/lib.rs"
 

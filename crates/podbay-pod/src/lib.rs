@@ -1,4 +1,4 @@
-//! PB05 Linux pod process boundary. No provider turns or PTY semantics are inferred here.
+//! Pod process boundary. Native backends report only attested capabilities.
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
@@ -12,6 +12,8 @@ mod codex_launch;
 mod codex_resource;
 #[cfg(target_os = "linux")]
 mod linux_peer;
+#[cfg(target_os = "macos")]
+mod macos;
 mod manifest;
 mod native_events;
 #[cfg(target_os = "linux")]
@@ -25,10 +27,13 @@ mod rebind_protocol;
 mod runtime;
 #[cfg(target_os = "linux")]
 mod spool;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+#[path = "macos/spool.rs"]
+mod spool;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod terminal;
 mod terminal_protocol;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
 
 #[cfg(target_os = "linux")]
@@ -51,6 +56,8 @@ pub use codex_launch::launch_bound_codex_v2;
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
+#[cfg(target_os = "macos")]
+pub use macos::{MacBackend, PodClient, TerminalViewer, launch, serve};
 #[cfg(target_os = "linux")]
 pub use manifest::{
     BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, PodManifest, PodPeerBootstrap,
@@ -70,17 +77,17 @@ pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_pe
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
     DurableAppendLog, DurableFileIdentity, DurableFiles, LocalConnection, LocalControlTransport,
-    PodControlPort, PodObservation, ProcessIdentity, SupervisorBackend, SupervisorEvidence,
-    TerminalBackend, TerminalResource, TerminalViewerPort,
+    MacScopeFencing, MacTreeCoverage, PodControlPort, PodObservation, ProcessIdentity,
+    SupervisorBackend, SupervisorEvidence, TerminalBackend, TerminalResource, TerminalViewerPort,
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
-    launch, launch_bound, serve,
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
+    launch_bound, serve,
 };
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
     TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,
 };
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unsupported::{PodClient, TerminalViewer, UnsupportedBackend, launch, serve};

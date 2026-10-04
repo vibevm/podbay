@@ -23,6 +23,29 @@ pub enum SupervisorEvidence {
         cgroup_path: String,
         boot_id: String,
     },
+    MacLaunchd {
+        label: String,
+        bootstrap_domain: String,
+        plist_digest: String,
+        tree_coverage: MacTreeCoverage,
+        scope_fencing: MacScopeFencing,
+        login_session_only: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum MacTreeCoverage {
+    Unverified,
+    ObservedSubset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum MacScopeFencing {
+    #[serde(rename = "cooperative/unverified")]
+    CooperativeUnverified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -378,6 +378,7 @@ dependencies = [
  "nix",
  "podbay-adapter-codex",
  "podbay-core",
+ "podbay-macos-sys",
  "podbay-store",
  "podbay-wire",
  "portable-pty",
