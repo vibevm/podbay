@@ -18,6 +18,7 @@ use podbay_core::{
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeStage, BootstrapPortObservation,
+    BootstrapSendError,
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
     DurableAuthority, ExecutionMode, GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
     HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
@@ -1221,12 +1222,8 @@ fn disposable_codex_v3_two_roots_hold_policy_until_revocation() {
     ).unwrap();
     let (target_a, revision_a) = PodBayStore::open_existing_read_only(&fixture.database)
         .unwrap().current_native_writer_target_for_session(&fixture.scope, &session_a).unwrap();
-    host.revoke_grant_from_trusted_policy(grant).unwrap();
-    assert_eq!(PodBayStore::open_existing_read_only(&fixture.database)
-        .unwrap().policy_fence_epoch().unwrap(), epoch + 1);
-    assert!(client_a.attested_status().is_err());
-    let send_a = CommandEnvelope::new(
-        "request.v3.send.a", "key.v3.send.a",
+    let make_send_a = |request_id: &str, key: &str, prompt: &str| CommandEnvelope::new(
+        request_id, key,
         WireTarget::Session { session_id: session_a.as_str().into() },
         Some(Guard {
             manager_epoch: Some(DecimalString::new(lease_a.owner_epoch())),
@@ -1238,14 +1235,38 @@ fn disposable_codex_v3_two_roots_hold_policy_until_revocation() {
         }),
         None,
         CommandBody::SessionSend(SessionSendBody {
-            content: vec![ContentBlock::Text { text: "must not reach native A".into() }],
+            content: vec![ContentBlock::Text { text: prompt.into() }],
             policy: SendPolicy::WhenIdle,
         }),
     ).unwrap();
-    assert!(host.send_first_codex_bootstrap_from_wire(&transport, send_a, &send_policy).is_err());
+    let submitted_a = host.send_first_codex_bootstrap_from_wire(
+        &transport,
+        make_send_a("request.v3.send.a.first", "key.v3.send.a.first", "A after B admission"),
+        &send_policy,
+    ).unwrap();
+    assert!(submitted_a.port_called);
+    assert!(matches!(submitted_a.port_observation,
+        Some(BootstrapPortObservation::PodAccepted(_))));
+    assert!(client_a.attested_status().unwrap().child_running);
     let home_a = codex_private_slot_directory(&fixture.directory, &guard_a.0, false)
         .unwrap().join("home/codex/frames.log");
-    assert_eq!(fs::read_to_string(home_a).unwrap().lines().count(), 2);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if fs::read_to_string(&home_a).unwrap_or_default().lines().count() == 5 { break; }
+        assert!(Instant::now() < deadline, "A did not receive its first native turn after B");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.revoke_grant_from_trusted_policy(grant).unwrap();
+    assert_eq!(PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().policy_fence_epoch().unwrap(), epoch + 1);
+    assert!(client_a.attested_status().is_err());
+    assert!(matches!(host.send_first_codex_bootstrap_from_wire(
+        &transport,
+        make_send_a("request.v3.send.a.after-revoke", "key.v3.send.a.after-revoke",
+            "must not reach native A"),
+        &send_policy,
+    ), Err(BootstrapSendError::Host(HostError::Unauthorised))));
+    assert_eq!(fs::read_to_string(home_a).unwrap().lines().count(), 5);
 
     for unit in [&guard_a.0, &guard_b.0] {
         assert!(Command::new("systemctl").args(["--user", "stop", unit])
