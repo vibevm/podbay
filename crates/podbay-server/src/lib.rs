@@ -2,6 +2,9 @@
 //! No socket listener, host effect, provider, or automatic retry lives here.
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod linux_peer;
+
 use std::fmt;
 use std::io::{self, Read, Write};
 
@@ -12,6 +15,9 @@ use podbay_wire::{
     decode_read_json, encode_frame,
 };
 use serde_json::Value;
+
+#[cfg(target_os = "linux")]
+pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
 
 #[derive(Debug)]
 pub enum ServerFault {
