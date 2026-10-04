@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{
@@ -18,20 +18,24 @@ use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
 use podbay_core::{ActorId, ResourceKind, ScopeId, SessionId};
 use podbay_host::{
-    ActorRegistration, AuthenticatedPeer, AuthenticatedTransport, AuthorisedBoundLaunch,
-    AuthorisedDispatch, CredentialGeneration, CredentialRef, DurableAuthority, ExecutionMode,
-    GrantMode, GrantSpec, HostDispatchPort, HostError, Operation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedClaimedBootstrap,
-    ResolvedNativeCodexLaunch, Right, Target as HostTarget, TrustedBootstrapSendPolicy,
-    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
-    TrustedWireRootLaunchPolicy,
+    ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
+    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
+    BootstrapObservationError, CredentialGeneration, CredentialRef, DurableAuthority,
+    DurableAuthorityError, ExecutionMode, GrantMode, GrantSpec, HostDispatchPort, HostError,
+    Operation, PortDispatchError, PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile,
+    ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, Right,
+    Target as HostTarget, TrustedBootstrapSendPolicy, TrustedDriverTemplate,
+    TrustedLaunchProfileInput, TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
 };
 use podbay_server::{
     LinuxAcceptedPeerEvidence, LinuxManagerCommandsGetListener, LinuxServeOneFault, ServerFault,
     TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
     serve_authenticated_linux_launch_one,
 };
-use podbay_store::{AuthorityMutation, BoundLaunchFormat, PodBayStore};
+use podbay_store::{
+    AuthorityMutation, BoundLaunchFormat, CommandLookupSelector, PodBayStore,
+    TrustedNativeWriterLeaseRequest,
+};
 use podbay_wire::{
     CommandEnvelope, DecimalString, Guard, MutationOperation, ReadEnvelope, ReadOperation,
     ResourceDriver, Target as WireTarget,
@@ -87,6 +91,8 @@ enum PortMode {
 
 struct FakePort {
     calls: Arc<AtomicUsize>,
+    inspect_calls: Arc<AtomicUsize>,
+    observe_stage: Arc<std::sync::atomic::AtomicU8>,
     mode: PortMode,
 }
 
@@ -143,6 +149,54 @@ impl HostDispatchPort for FakePort {
             }),
         }
     }
+
+    fn inspect_claimed_codex_bootstrap(
+        &self,
+        inspection: ResolvedClaimedBootstrapInspection,
+    ) -> Result<BootstrapNativeObservation, BootstrapObservationError> {
+        self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+        let metadata = fs::metadata(inspection.store_path())
+            .map_err(|_| BootstrapObservationError::Unavailable)?;
+        if (metadata.dev(), metadata.ino()) != inspection.store_file_identity() {
+            return Err(BootstrapObservationError::Unavailable);
+        }
+        let mut store = PodBayStore::open_existing_read_only(inspection.store_path())
+            .map_err(|_| BootstrapObservationError::Unavailable)?;
+        let proof = store
+            .inspect_claimed_bootstrap_send(inspection.selector())
+            .map_err(|_| BootstrapObservationError::Unavailable)?;
+        if proof.writer_epoch() != inspection.writer_epoch()
+            || proof.receipt().request_digest != inspection.expected_request_digest()
+        {
+            return Err(BootstrapObservationError::Invalid);
+        }
+        let mode = self.observe_stage.load(Ordering::SeqCst);
+        let stage = match mode {
+            1 | 3 | 4 => BootstrapNativeStage::Submitted {
+                native_thread_id: "thread.native.one".into(),
+                native_session_id: "session.native.one".into(),
+                native_turn_id: "turn.native.one".into(),
+            },
+            2 => BootstrapNativeStage::ClaimedUnobserved,
+            _ => return Err(BootstrapObservationError::Unsupported),
+        };
+        let mut selector = inspection.selector().clone();
+        if mode == 4 {
+            selector.native_target.pod_incarnation += 1;
+        }
+        let digest = if mode == 3 {
+            "0".repeat(64)
+        } else {
+            inspection.expected_request_digest().into()
+        };
+        BootstrapNativeObservation::from_attested_pod(
+            "podbay.codex-bootstrap.inspect/1",
+            selector,
+            inspection.writer_epoch(),
+            digest,
+            stage,
+        )
+    }
 }
 
 struct ReplayTransport(AuthenticatedPeer);
@@ -180,10 +234,14 @@ fn prepared_authority(
         process, generation,
     ));
     let calls = Arc::new(AtomicUsize::new(0));
+    let inspect_calls = Arc::new(AtomicUsize::new(0));
+    let observe_stage = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let mut first = DurableAuthority::open(
         &fixture.database,
         FakePort {
             calls: calls.clone(),
+            inspect_calls: inspect_calls.clone(),
+            observe_stage: observe_stage.clone(),
             mode,
         },
     )
@@ -211,6 +269,8 @@ fn prepared_authority(
         &fixture.database,
         FakePort {
             calls: calls.clone(),
+            inspect_calls,
+            observe_stage,
             mode,
         },
     )
@@ -634,6 +694,173 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
     assert_eq!(responses[2]["ok"]["state"], "uncertain");
     assert_eq!(responses[3]["error"]["code"], "conflict");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let inspect_calls = authority.port().inspect_calls.clone();
+    let observe_stage = authority.port().observe_stage.clone();
+    let command_id = first["commandId"].as_str().unwrap().to_owned();
+    let request_digest = first["value"]["requestDigest"].as_str().unwrap().to_owned();
+    let before = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .scope_snapshot(scope.as_str())
+        .unwrap();
+    let baseline_inspections = inspect_calls.load(Ordering::SeqCst);
+    observe_stage.store(1, Ordering::SeqCst);
+    let submitted = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.bootstrap.submitted", "key.bootstrap.send")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let submitted = &submitted[0]["ok"];
+    assert_eq!(submitted["receipt"]["commandId"], command_id);
+    assert_eq!(submitted["receipt"]["requestDigest"], request_digest);
+    assert_eq!(submitted["state"], "uncertain");
+    assert_eq!(submitted["effectState"], "claimed_uncertain");
+    assert_eq!(submitted["nativeObservation"]["source"], "pod_journal");
+    assert_eq!(submitted["nativeObservation"]["stage"], "submitted");
+    assert_eq!(
+        submitted["nativeObservation"]["requestDigest"],
+        request_digest
+    );
+    assert_eq!(
+        submitted["nativeObservation"]["nativeThreadId"],
+        "thread.native.one"
+    );
+    assert_eq!(
+        submitted["nativeObservation"]["nativeSessionId"],
+        "session.native.one"
+    );
+    assert_eq!(
+        submitted["nativeObservation"]["nativeTurnId"],
+        "turn.native.one"
+    );
+    assert_eq!(
+        inspect_calls.load(Ordering::SeqCst),
+        baseline_inspections + 1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    observe_stage.store(2, Ordering::SeqCst);
+    let unobserved = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.bootstrap.unobserved", "key.bootstrap.send")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(unobserved[0]["ok"]["state"], "uncertain");
+    assert_eq!(unobserved[0]["ok"]["effectState"], "claimed_uncertain");
+    assert_eq!(
+        unobserved[0]["ok"]["nativeObservation"]["stage"],
+        "claimed_unobserved"
+    );
+    assert!(
+        unobserved[0]["ok"]["nativeObservation"]
+            .get("nativeTurnId")
+            .is_none()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    for (mode, request_id) in [
+        (3, "request.bootstrap.wrong.digest"),
+        (4, "request.bootstrap.wrong.target"),
+    ] {
+        observe_stage.store(mode, Ordering::SeqCst);
+        let refused = serve_batch(
+            &mut listener,
+            &mut authority,
+            &actor,
+            vec![
+                read_by_key(request_id, "key.bootstrap.send")
+                    .encode_json()
+                    .unwrap(),
+            ],
+            Some(&launch_template),
+            Some(&send_template),
+        );
+        assert_eq!(refused[0]["ok"]["state"], "uncertain");
+        assert!(refused[0]["ok"].get("nativeObservation").is_none());
+    }
+
+    let wrong_process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000,
+        99_991,
+        123_456,
+        "/user.slice/foreign.scope",
+    )
+    .unwrap();
+    let wrong_actor = ReplayTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        wrong_process,
+        CredentialGeneration::new(1).unwrap(),
+    ));
+    let before_wrong_actor = inspect_calls.load(Ordering::SeqCst);
+    assert!(matches!(
+        authority.lookup_command_with_native_observation(
+            &wrong_actor,
+            &scope,
+            &CommandLookupSelector::Id {
+                command_id: command_id.clone()
+            },
+        ),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    assert_eq!(inspect_calls.load(Ordering::SeqCst), before_wrong_actor);
+
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    let manager = store
+        .current_manager_credential_claim(snapshot.owner_epoch)
+        .unwrap();
+    store
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target,
+            holder_actor_id: actor.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: snapshot.owner_epoch,
+            expected_manager_credential_epoch: manager.credential_epoch(),
+            expected_authority_revision: snapshot.revision,
+            expected_writer_epoch: Some(lease.writer_epoch()),
+            ttl_seconds: 120,
+        })
+        .unwrap();
+    drop(store);
+    let before_stale = inspect_calls.load(Ordering::SeqCst);
+    observe_stage.store(1, Ordering::SeqCst);
+    let stale = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            read_by_key("request.bootstrap.stale.writer", "key.bootstrap.send")
+                .encode_json()
+                .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    assert_eq!(stale[0]["ok"]["receipt"]["commandId"], command_id);
+    assert_eq!(stale[0]["ok"]["state"], "uncertain");
+    assert!(stale[0]["ok"].get("nativeObservation").is_none());
+    assert_eq!(inspect_calls.load(Ordering::SeqCst), before_stale);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .scope_snapshot(scope.as_str())
+            .unwrap(),
+        before
+    );
     listener.shutdown().unwrap();
 }
 

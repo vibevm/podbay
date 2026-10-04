@@ -960,6 +960,16 @@ pub trait HostDispatchPort {
         false
     }
 
+    /// Read a claimed command's pod journal through an independently attested
+    /// pod connection. This must not claim, submit, replay, or answer a native
+    /// request. Unsupported ports leave `commands.get` durable-only.
+    fn inspect_claimed_codex_bootstrap(
+        &self,
+        _inspection: ResolvedClaimedBootstrapInspection,
+    ) -> Result<BootstrapNativeObservation, BootstrapObservationError> {
+        Err(BootstrapObservationError::Unsupported)
+    }
+
     fn accepts_resolved_native_launch(&self) -> bool {
         false
     }
@@ -1054,6 +1064,152 @@ impl ResolvedClaimedBootstrap {
     pub fn store_file_identity(&self) -> (u64, u64) {
         self.store_file_identity
     }
+}
+
+/// A private read-only selector minted after the host rechecks the live actor,
+/// manager and exact claimed writer lease. It carries no prompt or writer
+/// permit, and the port still has to attest its pod socket and journal.
+pub struct ResolvedClaimedBootstrapInspection {
+    selector: BootstrapSendSelector,
+    writer_epoch: u64,
+    expected_request_digest: String,
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    authority_revision: u64,
+    store_path: PathBuf,
+    store_file_identity: (u64, u64),
+}
+
+impl ResolvedClaimedBootstrapInspection {
+    pub fn selector(&self) -> &BootstrapSendSelector {
+        &self.selector
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn expected_request_digest(&self) -> &str {
+        &self.expected_request_digest
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn manager_credential_epoch(&self) -> u64 {
+        self.manager_credential_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapObservationError {
+    Unsupported,
+    Unavailable,
+    Invalid,
+}
+
+/// Supplemental, point-in-time native journal evidence. It never changes a
+/// durable command receipt, proves completion, or authorizes a native write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapNativeObservation {
+    selector: BootstrapSendSelector,
+    writer_epoch: u64,
+    request_digest: String,
+    stage: BootstrapNativeStage,
+}
+
+impl BootstrapNativeObservation {
+    pub fn from_attested_pod(
+        protocol: &str,
+        selector: BootstrapSendSelector,
+        writer_epoch: u64,
+        request_digest: String,
+        stage: BootstrapNativeStage,
+    ) -> Result<Self, BootstrapObservationError> {
+        let digest_valid = request_digest.len() == 64
+            && request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let native_id_valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 512
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        };
+        let ids_valid = match &stage {
+            BootstrapNativeStage::ClaimedUnobserved
+            | BootstrapNativeStage::ThreadCreateUncertain => true,
+            BootstrapNativeStage::ThreadCreated {
+                native_thread_id,
+                native_session_id,
+            }
+            | BootstrapNativeStage::BootstrapUncertain {
+                native_thread_id,
+                native_session_id,
+            } => native_id_valid(native_thread_id) && native_id_valid(native_session_id),
+            BootstrapNativeStage::Submitted {
+                native_thread_id,
+                native_session_id,
+                native_turn_id,
+            } => {
+                native_id_valid(native_thread_id)
+                    && native_id_valid(native_session_id)
+                    && native_id_valid(native_turn_id)
+            }
+        };
+        if protocol != "podbay.codex-bootstrap.inspect/1"
+            || selector.scope_id != selector.native_target.scope_id
+            || writer_epoch == 0
+            || !digest_valid
+            || !ids_valid
+        {
+            return Err(BootstrapObservationError::Invalid);
+        }
+        Ok(Self {
+            selector,
+            writer_epoch,
+            request_digest,
+            stage,
+        })
+    }
+
+    pub fn selector(&self) -> &BootstrapSendSelector {
+        &self.selector
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+    pub fn stage(&self) -> &BootstrapNativeStage {
+        &self.stage
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapNativeStage {
+    ClaimedUnobserved,
+    ThreadCreateUncertain,
+    ThreadCreated {
+        native_thread_id: String,
+        native_session_id: String,
+    },
+    BootstrapUncertain {
+        native_thread_id: String,
+        native_session_id: String,
+    },
+    Submitted {
+        native_thread_id: String,
+        native_session_id: String,
+        native_turn_id: String,
+    },
 }
 
 /// The command/outbox stage is durable. The optional port observation is
@@ -2691,6 +2847,94 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
             self.recheck_actor_resolution_manager()?;
             found.map_err(Into::into)
+        }
+    }
+
+    /// Keep the durable `commands.get` receipt authoritative and optionally
+    /// attach a fresh pod-journal observation for this actor's claimed first
+    /// send. A stale lease, missing pod, malformed reply or port refusal drops
+    /// only the supplemental observation; none can claim or resend an effect.
+    pub fn lookup_command_with_native_observation<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        selector: &CommandLookupSelector,
+    ) -> Result<(CommandInspection, Option<BootstrapNativeObservation>), DurableAuthorityError>
+    {
+        let inspected = self.lookup_command(transport, scope, selector)?;
+        #[cfg(not(target_os = "linux"))]
+        return Ok((inspected, None));
+        #[cfg(target_os = "linux")]
+        {
+            let native = (|| -> Option<BootstrapNativeObservation> {
+                let actor = self.current_bootstrap_actor(transport).ok()?;
+                if actor.scope_id != *scope {
+                    return None;
+                }
+                let principal =
+                    VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str()).ok()?;
+                let command_id = CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
+                let (claimed_selector, writer_epoch) = self
+                    .store
+                    .claimed_bootstrap_selector_for_command(&principal, scope, &command_id)
+                    .ok()??;
+                if claimed_selector.scope_id != *scope {
+                    return None;
+                }
+                // This read validates the current manager claim, exact V2
+                // association, claimed outbox, writer lease and expiry in one
+                // SQLite snapshot before a port sees any selector.
+                let claimed = self
+                    .store
+                    .inspect_claimed_bootstrap_send(&claimed_selector)
+                    .ok()?;
+                if claimed.receipt() != &inspected.receipt
+                    || claimed.holder_actor_id() != &actor.actor_id
+                    || claimed.holder_credential_generation() != actor.credential_generation.get()
+                    || claimed.writer_epoch() != writer_epoch
+                {
+                    return None;
+                }
+                self.recheck_actor_resolution_manager().ok()?;
+                let inspection = ResolvedClaimedBootstrapInspection {
+                    selector: claimed_selector.clone(),
+                    writer_epoch,
+                    expected_request_digest: claimed.receipt().request_digest.clone(),
+                    owner_epoch: claimed.owner_epoch(),
+                    manager_credential_epoch: claimed.manager_credential_epoch(),
+                    authority_revision: claimed.authority_revision(),
+                    store_path: self.canonical_database.clone(),
+                    store_file_identity: self.database_identity,
+                };
+                let observed = self
+                    .host
+                    .port
+                    .inspect_claimed_codex_bootstrap(inspection)
+                    .ok()?;
+                if observed.selector() != &claimed_selector
+                    || observed.writer_epoch() != writer_epoch
+                    || observed.request_digest() != claimed.receipt().request_digest
+                {
+                    return None;
+                }
+                let fresh_actor = self.current_bootstrap_actor(transport).ok()?;
+                if fresh_actor.actor_id != actor.actor_id
+                    || fresh_actor.scope_id != actor.scope_id
+                    || fresh_actor.credential_generation != actor.credential_generation
+                {
+                    return None;
+                }
+                let fresh_claimed = self
+                    .store
+                    .inspect_claimed_bootstrap_send(&claimed_selector)
+                    .ok()?;
+                if fresh_claimed != claimed {
+                    return None;
+                }
+                self.recheck_actor_resolution_manager().ok()?;
+                Some(observed)
+            })();
+            Ok((inspected, native))
         }
     }
 

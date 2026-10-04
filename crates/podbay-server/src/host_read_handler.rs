@@ -2,7 +2,8 @@
 
 use podbay_core::ScopeId;
 use podbay_host::{
-    AuthenticatedTransport, DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError,
+    AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage, DurableAuthority,
+    DurableAuthorityError, HostDispatchPort, HostError,
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, EffectState, LaunchDispatchStage, ObservedStage,
@@ -61,15 +62,18 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
             CommandSelector::Id { command_id } => CommandLookupSelector::Id { command_id },
             CommandSelector::Key { key } => CommandLookupSelector::Key { key },
         };
-        let inspected = self
+        let (inspected, native) = self
             .authority
-            .lookup_command(transport, &scope, &selector)
+            .lookup_command_with_native_observation(transport, &scope, &selector)
             .map_err(authority_error)?;
-        Ok(inspection_json(inspected))
+        Ok(inspection_json(inspected, native.as_ref()))
     }
 }
 
-fn inspection_json(inspected: CommandInspection) -> Value {
+fn inspection_json(
+    inspected: CommandInspection,
+    native: Option<&BootstrapNativeObservation>,
+) -> Value {
     // These are the facts established by the store. A claimed effect remains
     // uncertain; host acceptance does not imply provider consumption.
     let (generic_state, outbox_state) = match inspected.effect_state {
@@ -140,7 +144,52 @@ fn inspection_json(inspected: CommandInspection) -> Value {
             response["portReceiptRef"] = json!(reference);
         }
     }
+    if let Some(native) = native {
+        response["nativeObservation"] = native_json(native);
+    }
     response
+}
+
+fn native_json(observation: &BootstrapNativeObservation) -> Value {
+    let mut value = json!({
+        "source": "pod_journal",
+        "requestDigest": observation.request_digest(),
+    });
+    match observation.stage() {
+        BootstrapNativeStage::ClaimedUnobserved => {
+            value["stage"] = json!("claimed_unobserved");
+        }
+        BootstrapNativeStage::ThreadCreateUncertain => {
+            value["stage"] = json!("thread_create_uncertain");
+        }
+        BootstrapNativeStage::ThreadCreated {
+            native_thread_id,
+            native_session_id,
+        } => {
+            value["stage"] = json!("thread_created");
+            value["nativeThreadId"] = json!(native_thread_id);
+            value["nativeSessionId"] = json!(native_session_id);
+        }
+        BootstrapNativeStage::BootstrapUncertain {
+            native_thread_id,
+            native_session_id,
+        } => {
+            value["stage"] = json!("bootstrap_uncertain");
+            value["nativeThreadId"] = json!(native_thread_id);
+            value["nativeSessionId"] = json!(native_session_id);
+        }
+        BootstrapNativeStage::Submitted {
+            native_thread_id,
+            native_session_id,
+            native_turn_id,
+        } => {
+            value["stage"] = json!("submitted");
+            value["nativeThreadId"] = json!(native_thread_id);
+            value["nativeSessionId"] = json!(native_session_id);
+            value["nativeTurnId"] = json!(native_turn_id);
+        }
+    }
+    value
 }
 
 fn refusal(code: RuntimeErrorCode, message: &str) -> RuntimeError {
@@ -211,14 +260,14 @@ mod tests {
 
     #[test]
     fn uncertain_and_host_accepted_are_never_projected_as_settled() {
-        let uncertain = inspection_json(inspection(EffectState::ClaimedUncertain, None));
+        let uncertain = inspection_json(inspection(EffectState::ClaimedUncertain, None), None);
         assert_eq!(uncertain["state"], "uncertain");
         assert_eq!(uncertain["effectState"], "claimed_uncertain");
         assert_eq!(uncertain["receipt"]["eventSequence"], "7");
-        let accepted = inspection_json(inspection(
-            EffectState::Observed,
-            Some(ObservedStage::HostAccepted),
-        ));
+        let accepted = inspection_json(
+            inspection(EffectState::Observed, Some(ObservedStage::HostAccepted)),
+            None,
+        );
         assert_eq!(accepted["state"], "host_accepted");
         assert_eq!(accepted["observedStage"], "host_accepted");
         assert_eq!(accepted["observationEventSequence"], "11");
@@ -236,7 +285,7 @@ mod tests {
                 stage,
                 receipt_ref: Some("host.receipt.one".into()),
             });
-            let response = inspection_json(fact);
+            let response = inspection_json(fact, None);
             assert_eq!(response["state"], "host_accepted");
             assert_eq!(response["effectState"], label);
             assert_eq!(response["launchStage"], label);
