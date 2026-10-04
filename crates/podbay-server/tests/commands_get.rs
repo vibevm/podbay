@@ -15,6 +15,7 @@ use podbay_core::{ActorId, ScopeId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, CredentialGeneration, DurableAuthority,
+    DurableAuthorityError,
     HostDispatchPort, HostError, PortDispatchError, PortDispatchOutcome,
 };
 use podbay_server::{
@@ -185,6 +186,15 @@ fn read_request(request_id: &str, scope: &str, selector: Value) -> ReadEnvelope 
     .unwrap()
 }
 
+fn snapshot_request(request_id: &str, scope: &str) -> ReadEnvelope {
+    ReadEnvelope::new_json(
+        request_id,
+        Target::Scope { scope_id: scope.into() },
+        ReadOperation::SnapshotGet,
+        json!({}),
+    ).unwrap()
+}
+
 fn send_read(mut stream: impl Read + Write, request: &ReadEnvelope) -> Value {
     let bytes = request.encode_json().unwrap();
     stream
@@ -303,6 +313,74 @@ fn real_authenticated_commands_get_returns_receipt_and_truthful_status() {
     assert_eq!(wrong_scope_response["requestId"], "request.commands.scope");
     assert_eq!(fixture.counts(), counts);
     assert_eq!(authority.owner_epoch().get(), 2);
+}
+
+#[test]
+fn real_authenticated_snapshot_get_is_current_scoped_and_read_only() {
+    let fixture = Fixture::new();
+    let (server, client) = fixture.pair();
+    let observed = LinuxAcceptedPeerEvidence::from_accepted(&server).unwrap();
+    let signer = KeyPair::from_seed(Seed::new([7; 32]));
+    let (mut authority, actor, _, _) =
+        prepared_authority(&fixture, observed.subject().clone(), *signer.pk);
+    let counts = fixture.counts();
+    let actor_name = actor.as_str().to_owned();
+    let worker = thread::spawn(move || {
+        let signer = KeyPair::from_seed(Seed::new([7; 32]));
+        let stream = authenticate_existing_linux_stream(client, &actor_name, |challenge| {
+            let signature = signer.sk.sign(challenge.bytes, None);
+            let mut bytes = [0_u8; 64];
+            bytes.copy_from_slice(signature.as_ref());
+            Some(bytes)
+        }).unwrap();
+        send_read(stream, &snapshot_request("request.snapshot.own", "scope.auth.one"))
+    });
+    serve_authenticated_linux_commands_get_one(server, &mut authority).unwrap();
+    let response = worker.join().unwrap();
+    assert_eq!(response["requestId"], "request.snapshot.own");
+    assert_eq!(response["ok"]["kind"], "current_scope_snapshot");
+    assert_eq!(response["ok"]["cursor"]["scopeId"], "scope.auth.one");
+    assert_eq!(response["ok"]["cursor"]["sequence"], counts.2.to_string());
+    assert_eq!(response["ok"]["ownerEpoch"], counts.3.to_string());
+    assert_eq!(response["ok"]["sessions"].as_array().unwrap().len(), 0);
+    assert!(response["ok"].get("receipts").is_none());
+    assert!(response["ok"].get("effects").is_none());
+    assert_eq!(fixture.counts(), counts);
+
+    let foreign = exchange(&fixture, &mut authority, &actor,
+        snapshot_request("request.snapshot.foreign", "scope.foreign"));
+    assert_eq!(foreign["error"]["code"], "forbidden");
+    assert_eq!(foreign["error"]["message"], "scope unavailable");
+    let subscribe = exchange(&fixture, &mut authority, &actor,
+        ReadEnvelope::new_json(
+            "request.snapshot.subscribe",
+            Target::Scope { scope_id: "scope.auth.one".into() },
+            ReadOperation::EventsSubscribe,
+            json!({"after": response["ok"]["cursor"]}),
+        ).unwrap());
+    assert_eq!(subscribe["error"]["code"], "unsupported");
+    assert_eq!(fixture.counts(), counts);
+}
+
+#[test]
+fn current_snapshot_host_refuses_stale_owner_and_actor_without_port_call() {
+    let fixture = Fixture::new();
+    let (server, _) = fixture.pair();
+    let process = LinuxAcceptedPeerEvidence::from_accepted(&server).unwrap().subject().clone();
+    let signer = KeyPair::from_seed(Seed::new([7; 32]));
+    let (mut authority, _, _, _) = prepared_authority(&fixture, process.clone(), *signer.pk);
+    let scope = ScopeId::try_from("scope.auth.one").unwrap();
+    let peer = AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        process.clone(), CredentialGeneration::new(1).unwrap());
+    let transport = FakeTransport(peer);
+    assert!(authority.current_scope_snapshot(&transport, &scope).is_ok());
+    let wrong_generation = FakeTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        process, CredentialGeneration::new(2).unwrap()));
+    assert!(matches!(authority.current_scope_snapshot(&wrong_generation, &scope),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))));
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.advance_owner_epoch(2, 3).unwrap();
+    assert!(authority.current_scope_snapshot(&transport, &scope).is_err());
 }
 
 #[test]

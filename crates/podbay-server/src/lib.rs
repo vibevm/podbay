@@ -59,7 +59,7 @@ pub fn serve_authenticated_linux_one<P: podbay_host::HostDispatchPort, H: Handle
     serve_one(&mut authenticated, handler).map_err(LinuxServeOneFault::Exchange)
 }
 
-/// Authenticate and perform one `commands.get` using the same manager owner
+/// Authenticate and perform one `commands.get` or `snapshot.get` using the same manager owner
 /// for proof and read authority. Other reads and every mutation are refused
 /// by the handler without calling a host port. No listener loop lives here.
 #[cfg(target_os = "linux")]

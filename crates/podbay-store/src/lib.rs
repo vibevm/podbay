@@ -4,6 +4,7 @@
 mod authority;
 mod bootstrap_send;
 mod bound_launch;
+mod current_snapshot;
 mod launch;
 mod manager_peer;
 mod model;
@@ -21,12 +22,15 @@ pub use bound_launch::{
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
     CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot, RunChildBudget,
 };
+pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
     AuthoritySnapshot, CommandInspection, CommandLookupSelector, CommandRequest, CommittedEvent,
-    EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
+    CurrentAttemptSnapshot, CurrentObservation, CurrentPodSnapshot, CurrentResourceSnapshot,
+    CurrentRunSnapshot, CurrentScopeSnapshot, CurrentSessionSnapshot, EffectClaim,
+    EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
     HostObservedPriorCheckpoint, LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding,
     LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
     NativeWriterLease, NativeWriterTarget, ObservedStage, OwnerActorRotationReceipt,

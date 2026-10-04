@@ -14,8 +14,12 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const MAX_BYTES: usize = 1_048_576;
+const CURRENT_SCOPE_SESSIONS_INDEX_V19: &str = "CREATE INDEX runtime_sessions_open_scope_v19
+  ON runtime_sessions(scope_id,session_id) WHERE state='open'";
+const CURRENT_SCOPE_RESOURCES_INDEX_V19: &str = "CREATE INDEX authority_resources_pod_v19
+  ON authority_resources(pod_id,resource_id)";
 
 // Version eight records immutable launch identities. A binding is absent for
 // every historical v7 launch; no migration guesses a Session, Run or resource.
@@ -301,6 +305,7 @@ impl PodBayStore {
         verify_prior_observation_schema(&transaction)?;
         verify_actor_verifier_schema(&transaction)?;
         verify_owner_rotation_schema(&transaction)?;
+        verify_current_scope_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -738,6 +743,36 @@ impl PodBayStore {
             }
             transaction.execute_batch(&format!("{CODEX_BOOTSTRAP_SENDS_V18};"))?;
         }
+        if version < 19 {
+            verify_runtime_schema(&transaction)?;
+            for (name, expected) in [
+                (
+                    "runtime_sessions_open_scope_v19",
+                    CURRENT_SCOPE_SESSIONS_INDEX_V19,
+                ),
+                (
+                    "authority_resources_pod_v19",
+                    CURRENT_SCOPE_RESOURCES_INDEX_V19,
+                ),
+            ] {
+                let existing: Option<(String, Option<String>)> = transaction
+                    .query_row(
+                        "SELECT type,sql FROM sqlite_master WHERE name=?1",
+                        [name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                match existing {
+                    None => transaction.execute_batch(&format!("{expected};"))?,
+                    Some((kind, Some(sql))) if kind == "index" && sql == expected => {}
+                    Some(_) => {
+                        return Err(StoreError::Conflict(
+                            "v19 current scope index name already exists",
+                        ));
+                    }
+                }
+            }
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
@@ -748,6 +783,7 @@ impl PodBayStore {
         verify_prior_observation_schema(&transaction)?;
         verify_actor_verifier_schema(&transaction)?;
         verify_owner_rotation_schema(&transaction)?;
+        verify_current_scope_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -2492,6 +2528,31 @@ fn verify_runtime_schema_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(
             .optional()?;
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v8 runtime schema differs"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_current_scope_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (name, expected) in [
+        (
+            "runtime_sessions_open_scope_v19",
+            CURRENT_SCOPE_SESSIONS_INDEX_V19,
+        ),
+        (
+            "authority_resources_pod_v19",
+            CURRENT_SCOPE_RESOURCES_INDEX_V19,
+        ),
+    ] {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v19 current scope index differs"));
         }
     }
     Ok(())

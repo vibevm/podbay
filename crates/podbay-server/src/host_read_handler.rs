@@ -7,8 +7,8 @@ use podbay_host::{
     TrustedBootstrapSendPolicy,
 };
 use podbay_store::{
-    CommandInspection, CommandLookupSelector, EffectState, LaunchDispatchStage, ObservedStage,
-    StoreError,
+    CommandInspection, CommandLookupSelector, CurrentObservation, CurrentScopeSnapshot,
+    EffectState, LaunchDispatchStage, ObservedStage, StoreError,
 };
 use podbay_wire::{
     CommandEnvelope, CommandSelector, CommandStage, ReadBody, ReadEnvelope, Receipt, RuntimeError,
@@ -59,12 +59,6 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
         transport: &T,
         request: ReadEnvelope,
     ) -> Result<Value, RuntimeError> {
-        let ReadBody::CommandsGet(body) = request.body else {
-            return Err(refusal(
-                RuntimeErrorCode::Unsupported,
-                "read operation is unavailable",
-            ));
-        };
         let Target::Scope { scope_id } = request.target else {
             return Err(refusal(
                 RuntimeErrorCode::InvalidInput,
@@ -73,31 +67,114 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
         };
         let scope = ScopeId::try_from(scope_id.as_str())
             .map_err(|_| refusal(RuntimeErrorCode::InvalidInput, "invalid scope target"))?;
-        let selector = match body.selector {
-            CommandSelector::Id { command_id } => CommandLookupSelector::Id { command_id },
-            CommandSelector::Key { key } => CommandLookupSelector::Key { key },
-        };
-        let (inspected, native) = self
-            .authority
-            .lookup_command_with_native_observation(transport, &scope, &selector)
-            .map_err(authority_error)?;
-        let guard = if inspected.launch_dispatch_status.is_some() {
-            self.bootstrap_policy.and_then(|policy| {
-                let command_id = CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
-                self.authority
-                    .read_current_initial_bootstrap_guard_for_launch(
-                        transport,
-                        &scope,
-                        &command_id,
-                        policy,
-                    )
-                    .ok()
-                    .flatten()
+        match request.body {
+            ReadBody::SnapshotGet(_) => self
+                .authority
+                .current_scope_snapshot(transport, &scope)
+                .map(snapshot_json)
+                .map_err(snapshot_authority_error),
+            ReadBody::CommandsGet(body) => {
+                let selector = match body.selector {
+                    CommandSelector::Id { command_id } => CommandLookupSelector::Id { command_id },
+                    CommandSelector::Key { key } => CommandLookupSelector::Key { key },
+                };
+                let (inspected, native) = self
+                    .authority
+                    .lookup_command_with_native_observation(transport, &scope, &selector)
+                    .map_err(authority_error)?;
+                let guard = if inspected.launch_dispatch_status.is_some() {
+                    self.bootstrap_policy.and_then(|policy| {
+                        let command_id =
+                            CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
+                        self.authority
+                            .read_current_initial_bootstrap_guard_for_launch(
+                                transport,
+                                &scope,
+                                &command_id,
+                                policy,
+                            )
+                            .ok()
+                            .flatten()
+                    })
+                } else {
+                    None
+                };
+                Ok(inspection_json(inspected, native.as_ref(), guard.as_ref()))
+            }
+            _ => Err(refusal(
+                RuntimeErrorCode::Unsupported,
+                "read operation is unavailable",
+            )),
+        }
+    }
+}
+
+fn snapshot_json(snapshot: CurrentScopeSnapshot) -> Value {
+    let sessions = snapshot
+        .sessions
+        .into_iter()
+        .map(|session| {
+            let run = session.run.map(|run| {
+                let attempt = run.attempt.map(|attempt| {
+                    let pod = attempt.pod;
+                    json!({
+                        "attemptId": attempt.attempt_id,
+                        "ordinal": attempt.ordinal.to_string(),
+                        "epoch": attempt.epoch.to_string(),
+                        "observation": observation_json(attempt.observation),
+                        "pod": {
+                            "podId": pod.pod_id,
+                            "incarnation": pod.incarnation.to_string(),
+                            "observation": observation_json(pod.observation),
+                            "resources": pod.resources.into_iter().map(|resource| json!({
+                                "resourceId": resource.resource_id,
+                                "kind": resource.kind,
+                                "epoch": resource.epoch.to_string(),
+                                "inputEpoch": resource.input_epoch.to_string(),
+                                "observation": observation_json(resource.observation),
+                            })).collect::<Vec<_>>(),
+                        },
+                    })
+                });
+                json!({
+                    "runId": run.run_id,
+                    "role": run.role,
+                    "workKind": run.work_kind,
+                    "parentRunId": run.parent_run_id,
+                    "revision": run.revision.to_string(),
+                    "admissionState": run.admission_state,
+                    "desiredMode": run.desired_mode,
+                    "executionState": run.execution_state,
+                    "observation": observation_json(run.observation),
+                    "attempt": attempt,
+                })
+            });
+            json!({
+                "sessionId": session.session_id,
+                "actorId": session.actor_id,
+                "revision": session.revision.to_string(),
+                "state": session.state,
+                "run": run,
             })
-        } else {
-            None
-        };
-        Ok(inspection_json(inspected, native.as_ref(), guard.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "kind": "current_scope_snapshot",
+        "cursor": {
+            "storeLineage": snapshot.cursor.store_lineage,
+            "scopeId": snapshot.cursor.scope_id,
+            "sequence": snapshot.cursor.sequence.to_string(),
+        },
+        "ownerEpoch": snapshot.owner_epoch.to_string(),
+        "managerCredentialEpoch": snapshot.manager_credential_epoch.to_string(),
+        "authorityRevision": snapshot.authority_revision.to_string(),
+        "sessions": sessions,
+    })
+}
+
+fn observation_json(value: CurrentObservation) -> &'static str {
+    match value {
+        CurrentObservation::Unavailable => "unavailable",
     }
 }
 
@@ -241,6 +318,10 @@ fn authority_error(error: DurableAuthorityError) -> RuntimeError {
         DurableAuthorityError::Store(StoreError::NotFound) => {
             (RuntimeErrorCode::Forbidden, "command unavailable")
         }
+        DurableAuthorityError::Store(StoreError::CurrentSnapshotLimitExceeded { .. }) => (
+            RuntimeErrorCode::Unavailable,
+            "current scope snapshot limit exceeded; pagination is unavailable",
+        ),
         DurableAuthorityError::Store(StoreError::InvalidInput(_)) => (
             RuntimeErrorCode::InvalidInput,
             "command selector is invalid",
@@ -273,9 +354,96 @@ fn authority_error(error: DurableAuthorityError) -> RuntimeError {
     refusal(code, message)
 }
 
+fn snapshot_authority_error(error: DurableAuthorityError) -> RuntimeError {
+    match error {
+        DurableAuthorityError::Store(StoreError::NotFound) => {
+            refusal(RuntimeErrorCode::Forbidden, "scope unavailable")
+        }
+        DurableAuthorityError::Store(StoreError::CurrentSnapshotLimitExceeded { .. }) => refusal(
+            RuntimeErrorCode::Unavailable,
+            "current scope snapshot limit exceeded; pagination is unavailable",
+        ),
+        other => authority_error(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use podbay_store::{
+        CurrentAttemptSnapshot, CurrentPodSnapshot, CurrentResourceSnapshot, CurrentRunSnapshot,
+        CurrentSessionSnapshot, EventCursor as StoreEventCursor,
+    };
+
+    #[test]
+    fn current_snapshot_projection_keeps_all_identities_and_unavailable_observation() {
+        let unavailable = CurrentObservation::Unavailable;
+        let value = snapshot_json(CurrentScopeSnapshot {
+            cursor: StoreEventCursor {
+                store_lineage: "lineage.fixture".into(),
+                scope_id: "scope.fixture".into(),
+                sequence: 17,
+            },
+            owner_epoch: 2,
+            manager_credential_epoch: 2,
+            authority_revision: 7,
+            sessions: vec![CurrentSessionSnapshot {
+                session_id: "session.fixture".into(),
+                actor_id: "actor.fixture".into(),
+                revision: 3,
+                state: "open".into(),
+                run: Some(CurrentRunSnapshot {
+                    run_id: "run.fixture".into(),
+                    role: "coordinator".into(),
+                    work_kind: "service".into(),
+                    parent_run_id: None,
+                    revision: 4,
+                    admission_state: "admitted".into(),
+                    desired_mode: "run".into(),
+                    execution_state: "starting".into(),
+                    observation: unavailable,
+                    attempt: Some(CurrentAttemptSnapshot {
+                        attempt_id: "attempt.fixture".into(),
+                        ordinal: 1,
+                        epoch: 1,
+                        observation: unavailable,
+                        pod: CurrentPodSnapshot {
+                            pod_id: "pod.fixture".into(),
+                            incarnation: 1,
+                            observation: unavailable,
+                            resources: vec![CurrentResourceSnapshot {
+                                resource_id: "resource.fixture".into(),
+                                kind: "structured_provider".into(),
+                                epoch: 1,
+                                input_epoch: 2,
+                                observation: unavailable,
+                            }],
+                        },
+                    }),
+                }),
+            }],
+        });
+        assert_eq!(value["cursor"]["sequence"], "17");
+        assert_eq!(value["authorityRevision"], "7");
+        assert_eq!(value["sessions"][0]["run"]["runId"], "run.fixture");
+        assert_eq!(value["sessions"][0]["run"]["desiredMode"], "run");
+        assert_eq!(value["sessions"][0]["run"]["executionState"], "starting");
+        assert_eq!(value["sessions"][0]["run"]["observation"], "unavailable");
+        assert_eq!(
+            value["sessions"][0]["run"]["attempt"]["attemptId"],
+            "attempt.fixture"
+        );
+        assert_eq!(
+            value["sessions"][0]["run"]["attempt"]["pod"]["podId"],
+            "pod.fixture"
+        );
+        assert_eq!(
+            value["sessions"][0]["run"]["attempt"]["pod"]["resources"][0]["resourceId"],
+            "resource.fixture"
+        );
+        assert!(value.get("completion").is_none());
+        assert!(value.get("receipts").is_none());
+    }
 
     fn inspection(state: EffectState, observed_stage: Option<ObservedStage>) -> CommandInspection {
         CommandInspection {

@@ -20,10 +20,10 @@ use podbay_store::{
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BootstrapSendSelector,
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
-    CommandLookupSelector, EffectClaim, EffectState, LaunchDispatchStage, LaunchDispatchStatus,
-    LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
-    NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness, StoreError,
-    TrustedBootstrapSendRequest, TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
+    CommandLookupSelector, CurrentScopeSnapshot, EffectClaim, EffectState, LaunchDispatchStage,
+    LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
+    ManagerCredentialClaim, NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness,
+    StoreError, TrustedBootstrapSendRequest, TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -3300,6 +3300,61 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
             let live = self.host.authenticate(transport)?;
             if durable_actor(live) != expected {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            found.map_err(Into::into)
+        }
+    }
+
+    /// A bounded, read-only current runtime graph for the authenticated
+    /// actor's exact scope. The transport supplies identity; the request may
+    /// select only that scope. Both the SQLite projection and its event cursor
+    /// come from one snapshot, then the live manager/actor are rechecked.
+    pub fn current_scope_snapshot<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+    ) -> Result<CurrentScopeSnapshot, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (transport, scope);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.recheck_actor_resolution_manager()?;
+            let actor = self.host.authenticate(transport)?.clone();
+            if actor.scope_id != *scope {
+                return Err(StoreError::NotFound.into());
+            }
+            let expected = durable_actor(&actor);
+            let mut matching = self
+                .recorded
+                .actors
+                .iter()
+                .filter(|record| record.actor_id == actor.actor_id.as_str());
+            if self.recorded.owner_epoch != self.manager_claim.owner_epoch()
+                || matching.next() != Some(&expected)
+                || matching.next().is_some()
+            {
+                return Err(HostError::Unauthenticated.into());
+            }
+            let found = self.store.current_scope_snapshot(
+                scope.as_str(),
+                &expected,
+                self.manager_claim.owner_epoch(),
+                self.manager_claim.credential_epoch(),
+                self.recorded.revision,
+            );
+            self.recheck_actor_resolution_manager()?;
+            self.store.current_scope_actor_fence(
+                &expected,
+                self.manager_claim.owner_epoch(),
+                self.manager_claim.credential_epoch(),
+                self.recorded.revision,
+            )?;
+            if durable_actor(self.host.authenticate(transport)?) != expected {
                 return Err(HostError::Unauthenticated.into());
             }
             self.recheck_actor_resolution_manager()?;

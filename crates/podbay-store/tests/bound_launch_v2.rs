@@ -1685,7 +1685,7 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
 }
 
 #[test]

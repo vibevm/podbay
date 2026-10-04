@@ -172,6 +172,72 @@ pub struct ScopeSnapshot {
     pub source_anomalies: Vec<SourceAnomaly>,
 }
 
+/// Current durable runtime projection. It contains no command, event, effect,
+/// prompt, or provider payload. Process/provider observations are unavailable
+/// until a separate current-observation projection is persisted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentScopeSnapshot {
+    pub cursor: EventCursor,
+    pub owner_epoch: u64,
+    pub manager_credential_epoch: u64,
+    pub authority_revision: u64,
+    pub sessions: Vec<CurrentSessionSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentSessionSnapshot {
+    pub session_id: String,
+    pub actor_id: String,
+    pub revision: u64,
+    pub state: String,
+    pub run: Option<CurrentRunSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentRunSnapshot {
+    pub run_id: String,
+    pub role: String,
+    pub work_kind: String,
+    pub parent_run_id: Option<String>,
+    pub revision: u64,
+    pub admission_state: String,
+    pub desired_mode: String,
+    pub execution_state: String,
+    pub observation: CurrentObservation,
+    pub attempt: Option<CurrentAttemptSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentAttemptSnapshot {
+    pub attempt_id: String,
+    pub ordinal: u64,
+    pub epoch: u64,
+    pub observation: CurrentObservation,
+    pub pod: CurrentPodSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentPodSnapshot {
+    pub pod_id: String,
+    pub incarnation: u64,
+    pub observation: CurrentObservation,
+    pub resources: Vec<CurrentResourceSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentResourceSnapshot {
+    pub resource_id: String,
+    pub kind: String,
+    pub epoch: u64,
+    pub input_epoch: u64,
+    pub observation: CurrentObservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CurrentObservation {
+    Unavailable,
+}
+
 /// An event position is valid only for the store and scope that produced it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventCursor {
@@ -626,6 +692,7 @@ pub enum StoreError {
     UnsupportedEffectKind,
     SourceIdentityQuarantined,
     NotFound,
+    CurrentSnapshotLimitExceeded { limit: usize },
     UnsupportedSchema(i64),
     Storage(rusqlite::Error),
     Io(std::io::Error),
@@ -652,6 +719,9 @@ impl fmt::Display for StoreError {
                 write!(formatter, "conflicting source event was quarantined")
             }
             Self::NotFound => write!(formatter, "durable record was not found"),
+            Self::CurrentSnapshotLimitExceeded { limit } => {
+                write!(formatter, "current scope snapshot exceeds {limit} entities")
+            }
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported store schema {version}")
             }
