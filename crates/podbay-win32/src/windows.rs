@@ -21,7 +21,9 @@ use windows_sys::Win32::System::Threading::{
     ResumeThread, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::{PossibleProcess, ProcessIdentity, ResumeFence, Win32Error};
+use crate::{
+    PossibleProcess, ProcessIdentity, ResumeFence, Win32Error, require_independent_pod_owner,
+};
 
 pub(super) struct OwnedHandle(HANDLE);
 // SAFETY: OwnedHandle uniquely owns a real kernel HANDLE. Moving that sole
@@ -164,12 +166,9 @@ impl PodJob {
     pub fn new_in_pod(expected_pod: ProcessIdentity) -> Result<Self, Win32Error> {
         // SAFETY: these pseudo-handle/ID queries do not transfer ownership.
         let current_pid = unsafe { GetCurrentProcessId() };
-        let current = identity_of(unsafe { GetCurrentProcess() }, current_pid)?;
-        if current != expected_pod {
-            return Err(Win32Error::Unsupported(
-                "Job Object owner is not the attested pod",
-            ));
-        }
+        let current_process = unsafe { GetCurrentProcess() };
+        let current = identity_of(current_process, current_pid)?;
+        require_independent_pod_owner(expected_pod, current, in_job(current_process, null_mut())?)?;
         // SAFETY: null security attributes and name create an unnamed job;
         // the returned handle is owned only by this pod process.
         let job = OwnedHandle::new(unsafe { CreateJobObjectW(null(), null()) })?;
@@ -198,6 +197,14 @@ impl PodJob {
         self.owner
     }
 
+    fn recheck_owner_independent(&self) -> Result<(), Win32Error> {
+        // SAFETY: both calls only observe the current process pseudo handle/ID.
+        let current_pid = unsafe { GetCurrentProcessId() };
+        let current_process = unsafe { GetCurrentProcess() };
+        let current = identity_of(current_process, current_pid)?;
+        require_independent_pod_owner(self.owner, current, in_job(current_process, null_mut())?)
+    }
+
     /// Create suspended, assign to the pod-owned job, verify, then resume.
     pub fn spawn_child(
         &self,
@@ -215,6 +222,7 @@ impl PodJob {
         cwd: &Path,
         startup: Option<&STARTUPINFOEXW>,
     ) -> Result<RunningProcess, Win32Error> {
+        self.recheck_owner_independent()?;
         let mut child = create_suspended_with_startup(
             application,
             exact_command_line,
@@ -238,6 +246,10 @@ impl PodJob {
             return Err(Win32Error::Uncertain(
                 "child Job membership could not be attested",
             ));
+        }
+        if let Err(error) = self.recheck_owner_independent() {
+            child.abort_suspended()?;
+            return Err(error);
         }
         child.fence = ResumeFence::AssignedChild;
         child.resume(ResumeFence::AssignedChild)

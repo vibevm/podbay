@@ -66,6 +66,23 @@ impl ResumeFence {
     }
 }
 
+#[cfg(any(windows, test))]
+fn require_independent_pod_owner(
+    expected: ProcessIdentity,
+    current: ProcessIdentity,
+    in_any_job: bool,
+) -> Result<(), Win32Error> {
+    if current != expected {
+        return Err(Win32Error::Unsupported(
+            "Job Object owner is not the attested pod",
+        ));
+    }
+    if in_any_job {
+        return Err(Win32Error::Unsupported("pod remains inside a parent Job"));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod conpty;
 #[cfg(any(windows, test))]
@@ -147,6 +164,32 @@ mod tests {
             creation_100ns: 2,
         };
         assert_ne!(old, reused);
+    }
+
+    #[test]
+    fn pod_job_owner_requires_exact_birth_and_no_parent_job() {
+        let expected = ProcessIdentity {
+            pid: 42,
+            creation_100ns: 7,
+        };
+        assert!(require_independent_pod_owner(expected, expected, false).is_ok());
+        assert!(matches!(
+            require_independent_pod_owner(expected, expected, true),
+            Err(Win32Error::Unsupported("pod remains inside a parent Job"))
+        ));
+        assert!(matches!(
+            require_independent_pod_owner(
+                expected,
+                ProcessIdentity {
+                    pid: 42,
+                    creation_100ns: 8,
+                },
+                false,
+            ),
+            Err(Win32Error::Unsupported(
+                "Job Object owner is not the attested pod"
+            ))
+        ));
     }
 
     #[test]
