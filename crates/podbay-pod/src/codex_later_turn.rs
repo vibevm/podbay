@@ -233,9 +233,8 @@ mod tests {
 
     use super::*;
     use crate::linux_peer::LinuxPeerEvidence;
-    use crate::native_events::{NativeEventIdentity, NativeEventKind, NativeEventStatus};
+    use crate::native_events::{NativeEventIdentity, NativeEventKind, NativeEventSpool, NativeEventStatus};
     use crate::runtime::LinuxBackend;
-    use crate::segmented_native_events::SegmentedNativeEventSpool;
 
     #[derive(Default)]
     struct FakeState {
@@ -377,7 +376,7 @@ mod tests {
         resource: CodexResource<FakeTransport>,
         bootstrap: CodexCommandJournal,
         later: CodexLaterTurnJournal,
-        events: SegmentedNativeEventSpool,
+        events: NativeEventSpool,
         owner: LinuxPeerEvidence,
         guard_child: Child,
         guard_birth: (u32, u64, String, String),
@@ -520,7 +519,9 @@ mod tests {
                 &mut bootstrap,
             )
             .unwrap();
-            let events = SegmentedNativeEventSpool::open(root.clone(), event_identity()).unwrap();
+            let events = NativeEventSpool::open(
+                &LinuxBackend, &root.join("codex.native-events.log"), event_identity(),
+            ).unwrap();
             let owner = LinuxPeerEvidence::for_current_process().unwrap();
             let guard_child = Command::new("/usr/bin/sleep")
                 .arg("40")
@@ -622,7 +623,7 @@ mod tests {
                 },
                 &mut |resource| {
                     while resource.has_unspooled_native_notifications() {
-                        let sequence = events.reserve_native_take()?;
+                        let sequence = events.next_source_sequence()?;
                         let observed = resource.take_applied_native_notification().ok_or(
                             PodError::Uncertain(
                                 "fixture native frame disappeared after reservation",
@@ -727,8 +728,9 @@ mod tests {
                 .watermark
                 >= 4
         );
-        let reopened_events =
-            SegmentedNativeEventSpool::open(fixture.root.clone(), event_identity()).unwrap();
+        let reopened_events = NativeEventSpool::open(
+            &LinuxBackend, &fixture.root.join("codex.native-events.log"), event_identity(),
+        ).unwrap();
         assert_eq!(
             reopened_events
                 .read_after(None, 16)

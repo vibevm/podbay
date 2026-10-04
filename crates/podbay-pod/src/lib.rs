@@ -29,8 +29,6 @@ mod rebind_recovery_protocol;
 #[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
-mod segmented_native_events;
-#[cfg(target_os = "linux")]
 mod spool;
 #[cfg(target_os = "linux")]
 mod terminal;
@@ -79,12 +77,6 @@ pub use peer_checkpoint::{
     PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint,
     peer_checkpoint_observation_digest,
 };
-#[cfg(target_os = "linux")]
-pub use native_segment_checkpoint::{
-    IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint, NativeSegmentMeta,
-    NativeSegmentOffset,
-};
-#[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
     DurableAppendLog, DurableFileIdentity, DurableFiles, LocalConnection, LocalControlTransport,
@@ -93,8 +85,8 @@ pub use ports::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
-    launch_bound, serve,
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
+    launch, launch_bound, serve,
 };
 #[cfg(target_os = "linux")]
 pub use rebind_recovery_protocol::{PendingRecoveryInspection, RECOVER_INSPECT_PROTOCOL};
