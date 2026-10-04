@@ -680,6 +680,71 @@ pub struct ResolvedNativeLaunch {
     resource_input_epochs: BTreeMap<String, u64>,
 }
 
+/// Read-only, host-created proof for the exact current committed Codex V2
+/// root launch. It neither claims the outbox effect nor authorises a port call.
+/// A future port must recheck the manager and path evidence at effect time.
+pub struct ResolvedNativeCodexLaunch {
+    record: BoundLaunchRecord,
+    effective: EffectiveLaunchContractV2,
+    descriptor: ImmutableLaunchDescriptorV2,
+    paths: ResolvedNativePaths,
+    store_path: PathBuf,
+    store_lineage: String,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    authority_revision: u64,
+    manager_peer: AttestedPeer,
+    resource_input_epochs: BTreeMap<String, u64>,
+}
+
+impl ResolvedNativeCodexLaunch {
+    pub fn effective(&self) -> &EffectiveLaunchContractV2 {
+        &self.effective
+    }
+    pub fn descriptor(&self) -> &ImmutableLaunchDescriptorV2 {
+        &self.descriptor
+    }
+    pub fn effective_spec_bytes(&self) -> &[u8] {
+        &self.record.effective_spec
+    }
+    pub fn descriptor_bytes(&self) -> &[u8] {
+        &self.record.descriptor
+    }
+    pub fn outbox_id(&self) -> i64 {
+        self.record.receipt.outbox_id
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    pub fn store_lineage(&self) -> &str {
+        &self.store_lineage
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn manager_peer(&self) -> &AttestedPeer {
+        &self.manager_peer
+    }
+    pub fn resource_input_epochs(&self) -> &BTreeMap<String, u64> {
+        &self.resource_input_epochs
+    }
+    pub fn cwd(&self) -> &Path {
+        &self.paths.cwd
+    }
+    pub fn executable(&self) -> &Path {
+        &self.paths.executable
+    }
+    pub fn executable_sha256(&self) -> &str {
+        &self.paths.executable_sha256
+    }
+}
+
 impl ResolvedNativeLaunch {
     pub fn store_path(&self) -> &Path {
         &self.store_path
@@ -2024,6 +2089,79 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 peer,
             })
         }
+    }
+
+    /// Inspects only the current committed root launch selected by scope and
+    /// PodId. The store supplies the exact bytes; today's opted-in profile and
+    /// native host must still reproduce their complete effective meaning.
+    /// This method does not claim, dispatch, or advance any effect.
+    pub fn inspect_committed_root_codex_v2(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<ResolvedNativeCodexLaunch, RebindContextError> {
+        let initial = self.rebind_context(scope, pod)?;
+        let record = initial.launch().clone();
+        drop(initial);
+        if record.format != BoundLaunchFormat::CodexV2 {
+            return Err(HostError::Unsupported.into());
+        }
+        let effective = EffectiveLaunchContractV2::decode(&record.effective_spec)
+            .map_err(|_| HostError::StaleGuard)?;
+        let descriptor = ImmutableLaunchDescriptorV2::decode_json(&record.descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        effective
+            .compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        if descriptor.scope_id() != record.scope_id
+            || descriptor.session_id() != record.session_id
+            || descriptor.run_id() != record.run_id
+            || descriptor.attempt_id() != record.attempt_id
+            || descriptor.pod_id() != record.pod_id
+            || descriptor.pod_incarnation() != record.pod_incarnation
+            || descriptor.parent_run_id().is_some()
+            || descriptor.resources_len() != record.resources.len()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        for (index, bound) in record.resources.iter().enumerate() {
+            let native = descriptor.resource(index).ok_or(HostError::StaleGuard)?;
+            if native.resource_id != bound.id || native.epoch != bound.epoch {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        let profile = self
+            .launch_profiles
+            .get(effective.base().profile_ref())
+            .cloned()
+            .ok_or(HostError::StaleGuard)?;
+        let host = self.native_host.clone().ok_or(HostError::StaleGuard)?;
+        let mut current = self.rebind_context(scope, pod)?;
+        if current.launch() != &record {
+            return Err(HostError::StaleGuard.into());
+        }
+        let paths = profile
+            .revalidate_committed_codex_v2(&host, &effective, &descriptor)
+            .map_err(RebindContextError::Host)?;
+        let resource_input_epochs = current
+            .resource_input_epochs()
+            .iter()
+            .map(|(id, epoch)| (id.as_str().to_owned(), epoch.get()))
+            .collect();
+        current.recheck_current()?;
+        Ok(ResolvedNativeCodexLaunch {
+            record,
+            effective,
+            descriptor,
+            paths,
+            store_path: current.store_path().to_path_buf(),
+            store_lineage: current.store_lineage().to_owned(),
+            owner_epoch: current.owner_epoch(),
+            credential_epoch: current.credential_epoch(),
+            authority_revision: current.authority_revision(),
+            manager_peer: current.manager_peer().clone(),
+            resource_input_epochs,
+        })
     }
 
     pub fn port(&self) -> &P {

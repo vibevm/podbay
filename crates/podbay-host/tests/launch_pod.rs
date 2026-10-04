@@ -18,9 +18,9 @@ use podbay_host::{
     CredentialGeneration, CredentialRef, DurableAuthority, DurableAuthorityError, ExecutionMode,
     GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
     LaunchPodError, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedNativeLaunch, Right,
-    Target, TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
-    WorkspaceAccess, WorkspaceSelection,
+    PortDispatchOutcome, PortReceiptRef, RebindContextError, RegisteredLaunchProfile,
+    ResolvedNativeLaunch, Right, Target, TrustedDriverTemplate, TrustedLaunchProfileInput,
+    TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
     BoundLaunchFormat, EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore,
@@ -752,6 +752,251 @@ fn codex_v2_root_accepts_explicit_nondefault_trusted_model_and_effort() {
     let effective = podbay_wire::EffectiveLaunchContractV2::decode(&record.effective_spec).unwrap();
     assert_eq!(effective.base().model_id(), "gpt-6-astra");
     assert_eq!(effective.base().reasoning_effort(), "high");
+    let proof = host
+        .inspect_committed_root_codex_v2(&who.scope, &who.pod)
+        .unwrap();
+    assert_eq!(proof.effective().base().model_id(), "gpt-6-astra");
+    assert_eq!(proof.effective().base().reasoning_effort(), "high");
+}
+
+#[test]
+fn committed_codex_v2_root_inspection_returns_exact_readback_without_effect() {
+    for role in [Role::Coordinator, Role::Worker] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+        let (mut host, _) = initial_authority(&fixture.database, port, &who);
+        let grant = install_codex_root_policy(&mut host, &who);
+        host.admit_bound_root_codex_v2(
+            &who.transport,
+            codex_root_request(&who, grant, role, b"canonical.inspect-v2"),
+        )
+        .unwrap();
+        let before = host.recorded_snapshot().clone();
+        let proof = host
+            .inspect_committed_root_codex_v2(&who.scope, &who.pod)
+            .unwrap();
+        let mut store = PodBayStore::open(&fixture.database).unwrap();
+        let snapshot = store
+            .current_bound_pod_snapshot(who.scope.as_str(), who.pod.as_str())
+            .unwrap();
+        assert_eq!(
+            store
+                .launch_dispatch_status(proof.outbox_id(), who.scope.as_str(), who.pod.as_str())
+                .unwrap()
+                .stage,
+            LaunchDispatchStage::Prepared
+        );
+        assert_eq!(
+            proof.effective_spec_bytes(),
+            snapshot.launch().effective_spec
+        );
+        assert_eq!(proof.descriptor_bytes(), snapshot.launch().descriptor);
+        assert_eq!(proof.descriptor().role(), NativeRole::from(role));
+        assert_eq!(proof.effective().codex_policy(), &codex_policy(&who));
+        assert_eq!(proof.cwd(), who.workspace_root.join("src"));
+        assert_eq!(proof.executable(), who.executable);
+        assert_eq!(proof.executable_sha256(), who.executable_sha256);
+        assert_eq!(proof.owner_epoch(), 1);
+        assert_eq!(proof.authority_revision(), before.revision);
+        assert_eq!(proof.resource_input_epochs().len(), 1);
+        assert_eq!(host.recorded_snapshot(), &before);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn committed_codex_v2_root_inspection_rechecks_reopened_manager_generation() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, first_calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, _) = initial_authority(&fixture.database, port, &who);
+    let grant = install_codex_root_policy(&mut first, &who);
+    first
+        .admit_bound_root_codex_v2(
+            &who.transport,
+            codex_root_request(&who, grant, Role::Coordinator, b"canonical.inspect-reopen"),
+        )
+        .unwrap();
+    drop(first);
+    let (port, later_calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut reopened = DurableAuthority::open(&fixture.database, port).unwrap();
+    reopened
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                .unwrap(),
+        )
+        .unwrap();
+    reopened
+        .register_native_host_from_trusted_policy(native_host_config())
+        .unwrap();
+    let proof = reopened
+        .inspect_committed_root_codex_v2(&who.scope, &who.pod)
+        .unwrap();
+    assert_eq!(proof.owner_epoch(), 2);
+    assert_eq!(
+        proof.authority_revision(),
+        reopened.recorded_snapshot().revision
+    );
+    assert_eq!(proof.descriptor().model_id(), "gpt-6-sol");
+    assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn committed_codex_v2_inspection_refuses_v1_profile_driver_and_binary_drift() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    host.admit_bound_pod(
+        &who.transport,
+        launch_request(&who, grant, 1, 1, b"canonical.inspect-v1"),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.inspect_committed_root_codex_v2(&who.scope, &who.pod),
+        Err(RebindContextError::Host(HostError::Unsupported))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    for drift in ["profile", "driver", "binary"] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let (mut host, _) = initial_authority(&fixture.database, port, &who);
+        let grant = install_codex_root_policy(&mut host, &who);
+        host.admit_bound_root_codex_v2(
+            &who.transport,
+            codex_root_request(&who, grant, Role::Coordinator, b"canonical.inspect-drift"),
+        )
+        .unwrap();
+        match drift {
+            "profile" => {
+                let mut input = codex_profile_input(&who);
+                input.profile_generation = 3;
+                let changed = RegisteredLaunchProfile::from_trusted_policy(input)
+                    .unwrap()
+                    .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                    .unwrap();
+                host.register_launch_profile_from_trusted_policy(changed)
+                    .unwrap();
+            }
+            "driver" => host
+                .register_native_host_from_trusted_policy(
+                    TrustedNativeHostConfig::for_compiled_backend("host.fixture".into()).unwrap(),
+                )
+                .unwrap(),
+            "binary" => std::fs::write(&who.executable, b"#!/bin/sh\nexit 1\n").unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            host.inspect_committed_root_codex_v2(&who.scope, &who.pod),
+            Err(RebindContextError::Host(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn committed_codex_v2_inspection_rejects_changed_model_effort_and_credential_policy() {
+    for drift in ["model", "effort", "credential"] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let (mut first, _) = initial_authority(&fixture.database, port, &who);
+        let grant = install_codex_root_policy(&mut first, &who);
+        first
+            .admit_bound_root_codex_v2(
+                &who.transport,
+                codex_root_request(&who, grant, Role::Coordinator, b"canonical.inspect-policy"),
+            )
+            .unwrap();
+        drop(first);
+        let (port, later_calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let mut reopened = DurableAuthority::open(&fixture.database, port).unwrap();
+        let mut input = codex_profile_input(&who);
+        let mut policy = codex_policy(&who);
+        match drift {
+            "model" => {
+                input.default_model = "model.other".into();
+                input.allowed_models = BTreeSet::from(["model.other".into()]);
+            }
+            "effort" => {
+                input.default_effort = "high".into();
+                input.allowed_efforts = BTreeSet::from(["high".into()]);
+            }
+            "credential" => {
+                input.credential_refs = vec![
+                    CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.two")
+                        .unwrap(),
+                ];
+                policy = CodexAppServerPolicyV2::new(
+                    &who.scope,
+                    "vault.allowed.two".into(),
+                    "driver.fixture".into(),
+                    "protocol.fixture".into(),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        reopened
+            .register_launch_profile_from_trusted_policy(
+                RegisteredLaunchProfile::from_trusted_policy(input)
+                    .unwrap()
+                    .with_codex_policy_from_trusted_policy(policy)
+                    .unwrap(),
+            )
+            .unwrap();
+        reopened
+            .register_native_host_from_trusted_policy(native_host_config())
+            .unwrap();
+        assert!(matches!(
+            reopened.inspect_committed_root_codex_v2(&who.scope, &who.pod),
+            Err(RebindContextError::Host(HostError::StaleGuard))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn committed_codex_v2_inspection_refuses_external_authority_revision() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    let grant = install_codex_root_policy(&mut host, &who);
+    host.admit_bound_root_codex_v2(
+        &who.transport,
+        codex_root_request(
+            &who,
+            grant,
+            Role::Coordinator,
+            b"canonical.inspect-revision",
+        ),
+    )
+    .unwrap();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    let mut resource = snapshot.resources[0].clone();
+    resource.input_epoch += 1;
+    store
+        .apply_authority_mutation(
+            snapshot.owner_epoch,
+            snapshot.revision,
+            podbay_store::AuthorityMutation::PutResource(resource),
+        )
+        .unwrap();
+    assert!(matches!(
+        host.inspect_committed_root_codex_v2(&who.scope, &who.pod),
+        Err(RebindContextError::Host(HostError::StaleGuard))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
