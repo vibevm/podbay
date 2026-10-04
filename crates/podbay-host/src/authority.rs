@@ -17,9 +17,9 @@ use podbay_store::{
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
     BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection, CommandLookupSelector,
-    EffectClaim, LaunchDispatchStatus, LaunchLookupRequest, LaunchPortResult,
-    ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness, StoreError,
-    VerifiedPrincipal,
+    EffectClaim, LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest,
+    LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness,
+    StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{
     EffectiveLaunchContract, EffectiveLaunchContractV2, ImmutableLaunchDescriptor,
@@ -2639,6 +2639,41 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             self.hydrate_new_bound(&record)?;
         }
         self.bound_receipt(record, duplicate)
+    }
+
+    /// Authenticate a high-level caller and inspect an existing Codex V2
+    /// root before allocating any new IDs. This returns the original bound
+    /// record, not a current-pod or dispatch proof. A changed key payload
+    /// conflicts; absence alone permits a separate reviewed planning step.
+    pub fn lookup_bound_root_codex_v2_by_key<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope_id: &ScopeId,
+        command_key: &str,
+        canonical_intent: &[u8],
+    ) -> Result<Option<BoundLaunchRecord>, LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let actor = self.host.authenticate(transport)?;
+        if &actor.scope_id != scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let record = self
+            .store
+            .lookup_bound_launch_by_key(&LaunchKeyLookupRequest {
+                principal,
+                command_key: command_key.to_owned(),
+                scope_id: scope_id.as_str().to_owned(),
+                canonical_intent: canonical_intent.to_vec(),
+            })?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.format != BoundLaunchFormat::CodexV2)
+        {
+            return Err(HostError::Unauthorised.into());
+        }
+        Ok(record)
     }
 
     /// Dispatches only an already committed, still-Prepared Codex V2 root.

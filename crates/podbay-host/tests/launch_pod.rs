@@ -732,9 +732,49 @@ fn codex_v2_root_coordinator_and_root_worker_commit_without_port_effect() {
         assert_eq!(descriptor.resources_len(), 1);
         assert_eq!(descriptor.role(), NativeRole::from(role));
 
+        assert_eq!(
+            host.lookup_bound_root_codex_v2_by_key(
+                &who.transport,
+                &who.scope,
+                &request.host_request.command_key,
+                &request.canonical_request,
+            )
+            .unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            host.lookup_bound_root_codex_v2_by_key(
+                &who.transport,
+                &who.scope,
+                "key.absent",
+                b"new.intent",
+            )
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            host.lookup_bound_root_codex_v2_by_key(
+                &who.transport,
+                &who.scope,
+                &request.host_request.command_key,
+                b"changed.intent",
+            ),
+            Err(LaunchPodError::Store(StoreError::Conflict(_)))
+        ));
+
         // The same authenticated caller can inspect the exact original after
         // profile/grant changes, without re-running native review or the port.
         host.revoke_grant_from_trusted_policy(grant).unwrap();
+        assert_eq!(
+            host.lookup_bound_root_codex_v2_by_key(
+                &who.transport,
+                &who.scope,
+                &request.host_request.command_key,
+                &request.canonical_request,
+            )
+            .unwrap(),
+            Some(record.clone())
+        );
         let mut duplicate = request.clone();
         duplicate.proposal = None;
         let retried = host
