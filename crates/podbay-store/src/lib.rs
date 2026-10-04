@@ -10,6 +10,7 @@ mod peer_witness;
 mod rebind;
 mod store;
 
+pub use authority::SqliteActorVerifierWitness;
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
     BoundLaunchResource, CurrentBoundPodSnapshot, CurrentBoundResource,

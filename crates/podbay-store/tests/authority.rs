@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityRightRecord, PodBayStore, StoreError,
+    AuthorityRightRecord, PodBayStore, SqliteActorVerifierWitness, StoreError,
 };
 
 struct Fixture {
@@ -637,4 +637,141 @@ fn concurrent_actor_verifier_registration_never_substitutes_a_key() {
         reopened.register_actor_verifier_from_trusted_host(1, revision + 1, &record, other),
         Err(StoreError::Conflict(_))
     ));
+}
+
+#[test]
+fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut store);
+    let revision = store
+        .register_actor_verifier_from_trusted_host(1, revision, &record, [7; 32])
+        .unwrap();
+    let lineage = store.initial_cursor("scope.main").unwrap().store_lineage;
+    let old = SqliteActorVerifierWitness::for_actor(
+        &fixture.database,
+        &lineage,
+        1,
+        revision,
+        record.clone(),
+        [7; 32],
+    )
+    .unwrap();
+    assert!(old.is_current());
+
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            revision,
+            AuthorityMutation::PutPod(AuthorityPodRecord {
+                scope_id: "scope.main".into(),
+                pod_id: "pod.worker".into(),
+                incarnation: 1,
+            }),
+        )
+        .unwrap();
+    assert!(!old.is_current());
+    let current = SqliteActorVerifierWitness::for_actor(
+        &fixture.database,
+        &lineage,
+        1,
+        revision,
+        record.clone(),
+        [7; 32],
+    )
+    .unwrap();
+    assert!(current.is_current());
+
+    let replay = store.begin_authority_replay(1, 2).unwrap();
+    assert!(!current.is_current());
+    let surviving = SqliteActorVerifierWitness::for_actor(
+        &fixture.database,
+        &lineage,
+        2,
+        replay.revision,
+        record.clone(),
+        [7; 32],
+    )
+    .unwrap();
+    assert!(surviving.is_current());
+
+    let mut rotated = record;
+    rotated.credential_generation = 2;
+    rotated.process_identity = "linux.pid.124".into();
+    rotated.start_identity = 457;
+    let revision = store
+        .apply_authority_mutation(
+            2,
+            replay.revision,
+            AuthorityMutation::PutActor(rotated.clone()),
+        )
+        .unwrap();
+    assert!(!surviving.is_current());
+    let revision = store
+        .register_actor_verifier_from_trusted_host(2, revision, &rotated, [9; 32])
+        .unwrap();
+    let renewed = SqliteActorVerifierWitness::for_actor(
+        &fixture.database,
+        &lineage,
+        2,
+        revision,
+        rotated.clone(),
+        [9; 32],
+    )
+    .unwrap();
+    assert!(renewed.is_current());
+    store
+        .revoke_actor_verifier_from_trusted_host(2, revision, &rotated)
+        .unwrap();
+    assert!(!renewed.is_current());
+}
+
+#[test]
+fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (record, revision) = seed_actor(&mut store);
+    let revision = store
+        .register_actor_verifier_from_trusted_host(1, revision, &record, [3; 32])
+        .unwrap();
+    let lineage = store.initial_cursor("scope.main").unwrap().store_lineage;
+    let witness =
+        |database: &std::path::Path, lineage: &str, actor: AuthorityActorRecord, key: [u8; 32]| {
+            SqliteActorVerifierWitness::for_actor(database, lineage, 1, revision, actor, key)
+                .unwrap()
+        };
+    assert!(witness(&fixture.database, &lineage, record.clone(), [3; 32]).is_current());
+    assert!(
+        !witness(
+            &fixture.database,
+            "foreign.lineage",
+            record.clone(),
+            [3; 32]
+        )
+        .is_current()
+    );
+    let mut foreign_scope = record.clone();
+    foreign_scope.scope_id = "scope.foreign".into();
+    assert!(!witness(&fixture.database, &lineage, foreign_scope, [3; 32]).is_current());
+    let mut changed_birth = record.clone();
+    changed_birth.start_identity += 1;
+    assert!(!witness(&fixture.database, &lineage, changed_birth, [3; 32]).is_current());
+    assert!(!witness(&fixture.database, &lineage, record.clone(), [4; 32]).is_current());
+
+    let missing = fixture.directory.join("missing.sqlite");
+    assert!(!witness(&missing, &lineage, record.clone(), [3; 32]).is_current());
+    assert!(!missing.exists());
+    let corrupt = fixture.directory.join("corrupt.sqlite");
+    std::fs::write(&corrupt, b"not a SQLite database").unwrap();
+    assert!(!witness(&corrupt, &lineage, record.clone(), [3; 32]).is_current());
+
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE actor_verifiers SET binding_digest=zeroblob(32)
+             WHERE actor_id='actor.worker'",
+            [],
+        )
+        .unwrap();
+    assert!(!witness(&fixture.database, &lineage, record, [3; 32]).is_current());
 }

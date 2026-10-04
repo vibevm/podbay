@@ -1,5 +1,7 @@
 //! Durable authority facts. Transport attestations are deliberately not restored as live grants.
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::model::{
@@ -10,6 +12,89 @@ use crate::model::{
 use crate::store::PodBayStore;
 
 const ACTOR_VERIFIER_VERSION: &str = "podbay.ed25519/1";
+
+/// Fresh SQLite evidence that one trusted actor binding still names the same
+/// public verifier. This is not a peer identity or a signature proof. The
+/// caller must derive the actor/process birth from trusted policy and kernel
+/// attestation, never from request JSON, and separately verify the challenge.
+pub struct SqliteActorVerifierWitness {
+    database: PathBuf,
+    store_lineage: String,
+    owner_epoch: u64,
+    authority_revision: u64,
+    actor: AuthorityActorRecord,
+    public_key: [u8; 32],
+}
+
+impl SqliteActorVerifierWitness {
+    /// Capture an expected binding from trusted manager state. All fields are
+    /// private so a request envelope cannot itself become a witness value.
+    pub fn for_actor(
+        database: impl AsRef<Path>,
+        store_lineage: &str,
+        owner_epoch: u64,
+        authority_revision: u64,
+        actor: AuthorityActorRecord,
+        public_key: [u8; 32],
+    ) -> Result<Self, StoreError> {
+        let database = database.as_ref();
+        if database.as_os_str().is_empty()
+            || store_lineage.is_empty()
+            || owner_epoch == 0
+            || actor.credential_generation == 0
+            || actor.start_identity == 0
+            || public_key == [0; 32]
+        {
+            return Err(StoreError::InvalidInput(
+                "actor witness binding is incomplete",
+            ));
+        }
+        valid_identity(store_lineage)?;
+        valid_identity(&actor.actor_id)?;
+        valid_identity(&actor.scope_id)?;
+        Ok(Self {
+            database: database.to_path_buf(),
+            store_lineage: store_lineage.to_owned(),
+            owner_epoch,
+            authority_revision,
+            actor,
+            public_key,
+        })
+    }
+
+    /// Opens the existing database read-only on every call. Any missing,
+    /// stale, foreign or corrupt state refuses. True only means the trusted
+    /// public verifier is still current in this store snapshot.
+    pub fn is_current(&self) -> bool {
+        self.check_current().unwrap_or(false)
+    }
+
+    fn check_current(&self) -> Result<bool, StoreError> {
+        let mut connection =
+            Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let lineage: String = transaction.query_row(
+            "SELECT lineage FROM store_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if lineage != self.store_lineage {
+            return Ok(false);
+        }
+        require_current_actor(
+            &transaction,
+            self.owner_epoch,
+            self.authority_revision,
+            &self.actor,
+        )?;
+        let verifier = require_matching_verifier(&transaction, &self.actor)?;
+        if verifier.revoked || verifier.public_key != self.public_key {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+}
 
 impl PodBayStore {
     /// Reads only a current v10 manager claim. A migrated v9 owner has no row
