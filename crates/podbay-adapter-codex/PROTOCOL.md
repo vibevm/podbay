@@ -86,6 +86,18 @@ deduplicate an older key after later submissions or across process restart.
 PodBay's durable command ledger must provide caller-scoped idempotency before
 turn control is exposed to a live provider.
 
+`send_turn_after_checkpoint_checked` is an idle-only later-turn primitive. It
+requires a local writer permit, the exact checkpointed native thread and
+native Session IDs, a fresh metadata-only idle read, and a trusted read-only
+preflight immediately before one `turn/start`. It returns the exact in-progress
+turn ID or an uncertain attempted submission; an ambiguous reply poisons this
+adapter instance. The separate pod-local `CodexLaterTurnJournal` anchors to a
+fsynced BootstrapCompleted record and records multiple command keys, intents,
+turn receipts, reported terminal notifications and fresh-idle settlement as
+distinct facts. Neither primitive grants manager admission. A later store
+version and authenticated pod control bridge are required before exposing
+subsequent `session.send` to clients.
+
 The pod-local `CodexCommandJournal` storage slice now records a fsynced
 thread-create intent, exact native thread/session checkpoint, and separate
 bootstrap intent, uncertain, submitted and completed facts. It uses bounded,

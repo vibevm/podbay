@@ -1525,6 +1525,158 @@ fn idle_native_thread_starts_one_pinned_turn_after_reconciliation() {
 }
 
 #[test]
+fn checked_later_turns_use_one_thread_and_two_exact_native_receipts() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.one"),
+        completed("turn.one", "completed"),
+        status("idle", &[]),
+        read_response(6, "idle", None),
+        work_turn_response(7, "turn.two"),
+    ]);
+    let mut checked = 0;
+    let first = adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |resource| {
+                assert!(resource.bootstrap_ready());
+                checked += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(first.mode, TurnMode::Start);
+    assert_eq!(
+        first.stage,
+        TurnSubmissionStage::Accepted {
+            turn_id: "turn.one".into()
+        }
+    );
+    assert_eq!(checked, 1);
+    let before = adapter.transport().writes.len();
+    assert_eq!(
+        adapter.send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        ),
+        Err(CodexError::Blocked(BlockReason::DuplicateMessageKey))
+    );
+    assert_eq!(adapter.transport().writes.len(), before);
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    let second = adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "Second",
+            "message.two",
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        second.stage,
+        TurnSubmissionStage::Accepted {
+            turn_id: "turn.two".into()
+        }
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        3
+    );
+    assert_eq!(
+        adapter.transport().writes[5]["params"]["threadId"],
+        "thread.one"
+    );
+    assert_eq!(
+        adapter.transport().writes[7]["params"]["threadId"],
+        "thread.one"
+    );
+}
+
+#[test]
+fn checked_later_turn_lost_reply_or_changed_thread_never_resends() {
+    let mut adapter = bootstrapped([read_response(4, "idle", None)]);
+    let uncertain = adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(uncertain.stage, TurnSubmissionStage::Uncertain);
+    assert_eq!(
+        adapter.send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        ),
+        Err(CodexError::Blocked(BlockReason::DuplicateMessageKey))
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        2
+    );
+
+    let mut other = bootstrapped([read_response(4, "idle", None)]);
+    assert_eq!(
+        other.send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "native.session.other",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        ),
+        Err(CodexError::Mismatch(
+            "later-turn native thread or Session changed"
+        ))
+    );
+    assert_eq!(
+        other
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn exact_owned_active_turn_steers_with_expected_turn_id() {
     let mut adapter = bootstrapped([
         read_response(4, "idle", None),

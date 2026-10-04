@@ -10,20 +10,21 @@ mod codex_journal;
 mod codex_launch;
 #[cfg(target_os = "linux")]
 mod codex_resource;
+mod codex_turn_journal;
 #[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
 mod native_events;
 #[cfg(target_os = "linux")]
 mod native_segment_checkpoint;
-#[cfg(target_os = "linux")]
-mod segmented_native_events;
 mod peer_checkpoint;
 mod ports;
 #[cfg(target_os = "linux")]
 mod rebind_protocol;
 #[cfg(target_os = "linux")]
 mod runtime;
+#[cfg(target_os = "linux")]
+mod segmented_native_events;
 #[cfg(target_os = "linux")]
 mod spool;
 #[cfg(target_os = "linux")]
@@ -50,6 +51,9 @@ pub use codex_journal::{
 pub use codex_launch::launch_bound_codex_v2;
 #[cfg(target_os = "linux")]
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
+pub use codex_turn_journal::{
+    CodexLaterTurnJournal, LaterTurnIntentResult, LaterTurnStage, LaterTurnTerminal, LaterTurnView,
+};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
@@ -68,8 +72,8 @@ pub use native_events::{
 };
 #[cfg(target_os = "linux")]
 pub use native_segment_checkpoint::{
-    IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint,
-    NativeSegmentMeta, NativeSegmentOffset,
+    IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint, NativeSegmentMeta,
+    NativeSegmentOffset,
 };
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
 #[cfg(target_os = "linux")]
@@ -81,8 +85,8 @@ pub use ports::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
-    launch, launch_bound, serve,
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
+    launch_bound, serve,
 };
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
