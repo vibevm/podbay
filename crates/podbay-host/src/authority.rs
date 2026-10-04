@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
-    ActorId, AttestedPeer, LaunchBinding, PodId, ResourceId, Role, Run, ScopeId, Session,
-    StoreLineageId,
+    ActorId, AttestedPeer, LaunchBinding, PlannedRootBinding, PodId, ResourceId, Role, Run,
+    ScopeId, Session, StoreLineageId,
 };
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
@@ -2600,6 +2600,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .host
             .authorise_proposed_launch(transport, &request.host_request)?;
         let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let planned = PlannedRootBinding::from_queued_snapshot(
+            &proposal.session,
+            &proposal.run,
+            &proposal.binding,
+        )
+        .map_err(|_| HostError::Unauthorised)?;
         let (effective, descriptor) =
             self.review_bound_root_codex_v2(&authorised, request.host_request.grant_id, proposal)?;
         let admission = self
@@ -2613,7 +2619,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 proposal: Some(BoundRootLaunchProposalV2 {
                     session: &proposal.session,
                     run: &proposal.run,
-                    binding: &proposal.binding,
+                    binding: &planned,
                     effective_spec: &effective,
                     descriptor: &descriptor,
                     expected_owner_epoch: self.host.manager_epoch.get(),
@@ -3324,6 +3330,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         grant_id: GrantId,
         proposal: &BoundHostLaunchProposal,
     ) -> Result<(EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2), HostError> {
+        let planned = PlannedRootBinding::from_queued_snapshot(
+            &proposal.session,
+            &proposal.run,
+            &proposal.binding,
+        )
+        .map_err(|_| HostError::Unauthorised)?;
         let HostAction::LaunchPod {
             pod_id,
             role,
@@ -3368,7 +3380,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             effective.digest(),
         )?;
         let descriptor =
-            ImmutableLaunchDescriptorV2::from_binding(&proposal.binding, native, policy.clone())
+            ImmutableLaunchDescriptorV2::from_planned_root(&planned, native, policy.clone())
                 .map_err(|_| HostError::Unauthorised)?;
         effective
             .compare_with_descriptor(&descriptor)

@@ -6,14 +6,17 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::{
-    ActorId, AdmissionState, Attempt, AttemptId, Epoch, Pod, PodId, Resource, ResourceId,
-    ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, SessionState, WorkKind,
+    ActorId, AdmissionState, Attempt, AttemptId, DesiredMode, Epoch, ExecutionState, Pod, PodId,
+    Resource, ResourceId, ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId,
+    SessionState, WorkKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchBindingError {
     SessionUnavailable,
     RunNotAdmitted,
+    RunNotQueued,
+    WrongPhase,
     WrongSessionRun,
     MissingCurrentAttempt,
     WrongRunAttempt,
@@ -31,6 +34,8 @@ impl Display for LaunchBindingError {
         f.write_str(match self {
             Self::SessionUnavailable => "session is closed or has no current run",
             Self::RunNotAdmitted => "run has no admitted launch state",
+            Self::RunNotQueued => "planned root run is not queued and unadmitted",
+            Self::WrongPhase => "planned and admitted launch binding phases differ",
             Self::WrongSessionRun => "run differs from the session actor, scope or current writer",
             Self::MissingCurrentAttempt => "run has no current attempt",
             Self::WrongRunAttempt => "attempt is not the run's current attempt",
@@ -67,6 +72,7 @@ impl BoundResource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchBinding {
+    phase: BindingPhase,
     scope_id: ScopeId,
     actor_id: ActorId,
     session_id: SessionId,
@@ -80,6 +86,119 @@ pub struct LaunchBinding {
     pod_id: PodId,
     pod_incarnation: Epoch,
     resources: Vec<BoundResource>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingPhase {
+    Planned,
+    Admitted,
+}
+
+/// Identity-only first-root plan. Its Run has not been admitted; only the
+/// store transaction may turn it into a current LaunchBinding after inserting
+/// the command row. Holding this value grants no launch authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedRootBinding {
+    identity: LaunchBinding,
+}
+
+impl PlannedRootBinding {
+    /// The returned snapshot retains its private planned phase. V1 and
+    /// admitted-binding APIs must reject it; it is never an admission proof.
+    pub fn identity(&self) -> &LaunchBinding {
+        &self.identity
+    }
+
+    /// Recheck a copied identity at the V2 store boundary. The identity was
+    /// produced by a core constructor; a queued Run cannot claim admission.
+    pub fn from_queued_snapshot(
+        session: &Session,
+        run: &Run,
+        identity: &LaunchBinding,
+    ) -> Result<Self, LaunchBindingError> {
+        require_queued_root(run)?;
+        if identity.phase != BindingPhase::Planned {
+            return Err(LaunchBindingError::WrongPhase);
+        }
+        if session.state() != SessionState::Open || session.current_run_id() != Some(run.id()) {
+            return Err(LaunchBindingError::SessionUnavailable);
+        }
+        if identity.session_id() != session.id()
+            || identity.actor_id() != session.actor_id()
+            || identity.scope_id() != session.scope_id()
+            || identity.run_id() != run.id()
+            || run.session_id() != session.id()
+            || run.actor_id() != session.actor_id()
+            || run.scope_id() != session.scope_id()
+            || identity.role() != run.role()
+            || identity.work_kind() != run.work_kind()
+            || identity.parent_run_id().is_some()
+            || identity.attempt_ordinal() != 1
+        {
+            return Err(LaunchBindingError::WrongSessionRun);
+        }
+        Ok(Self {
+            identity: identity.clone(),
+        })
+    }
+
+    /// Rebuild the strict post-command binding from the transitioned Run and
+    /// the already-checked planned identities. This never supplies a command
+    /// witness; the store must call it only after its inserted-row proof.
+    pub fn confirm_after_admission(
+        &self,
+        session: &Session,
+        run: &Run,
+    ) -> Result<LaunchBinding, LaunchBindingError> {
+        let identity = &self.identity;
+        let mut attempt = Attempt::new(
+            identity.attempt_id.clone(),
+            identity.run_id.clone(),
+            identity.attempt_ordinal,
+            identity.attempt_epoch,
+        )
+        .map_err(|_| LaunchBindingError::WrongRunAttempt)?;
+        let mut pod = Pod::new(
+            identity.pod_id.clone(),
+            identity.attempt_id.clone(),
+            identity.pod_incarnation,
+        );
+        attempt
+            .attach_pod(attempt.revision(), &pod)
+            .map_err(|_| LaunchBindingError::WrongAttemptPod)?;
+        let mut resources = Vec::with_capacity(identity.resources.len());
+        for bound in &identity.resources {
+            let resource = Resource::new(
+                bound.id.clone(),
+                identity.pod_id.clone(),
+                bound.kind,
+                bound.epoch,
+            );
+            pod.attach_resource(pod.revision(), &resource)
+                .map_err(|_| LaunchBindingError::ResourceSetMismatch)?;
+            resources.push(resource);
+        }
+        let strict = LaunchBinding::from_aggregates(session, run, &attempt, &pod, &resources)?;
+        let mut expected = identity.clone();
+        expected.phase = BindingPhase::Admitted;
+        if strict != expected {
+            return Err(LaunchBindingError::WrongPhase);
+        }
+        Ok(strict)
+    }
+}
+
+fn require_queued_root(run: &Run) -> Result<(), LaunchBindingError> {
+    if run.admission() != AdmissionState::Queued
+        || run.execution() != ExecutionState::Queued
+        || run.desired() != DesiredMode::Run
+        || run.current_attempt_id().is_some()
+        || run.last_attempt_ordinal() != 0
+        || run.parent_run_id().is_some()
+    {
+        return Err(LaunchBindingError::RunNotQueued);
+    }
+    Ok(())
 }
 
 impl LaunchBinding {
@@ -115,6 +234,54 @@ impl LaunchBinding {
             || attempt.ordinal() != run.last_attempt_ordinal()
         {
             return Err(LaunchBindingError::WrongRunAttempt);
+        }
+        Self::copy_associations(
+            session,
+            run,
+            attempt,
+            pod,
+            resources,
+            BindingPhase::Admitted,
+        )
+    }
+
+    /// Capture the same identity bytes before first-root admission. The Run
+    /// remains queued; no fake `CommandAdmission` witness is needed to review
+    /// native policy or form a V2 descriptor.
+    pub fn plan_first_root(
+        session: &Session,
+        run: &Run,
+        attempt: &Attempt,
+        pod: &Pod,
+        resources: &[Resource],
+    ) -> Result<PlannedRootBinding, LaunchBindingError> {
+        require_queued_root(run)?;
+        if attempt.run_id() != run.id() || attempt.ordinal() != 1 {
+            return Err(LaunchBindingError::WrongRunAttempt);
+        }
+        let identity =
+            Self::copy_associations(session, run, attempt, pod, resources, BindingPhase::Planned)?;
+        Ok(PlannedRootBinding { identity })
+    }
+
+    fn copy_associations(
+        session: &Session,
+        run: &Run,
+        attempt: &Attempt,
+        pod: &Pod,
+        resources: &[Resource],
+        phase: BindingPhase,
+    ) -> Result<Self, LaunchBindingError> {
+        if session.state() != SessionState::Open || session.current_run_id().is_none() {
+            return Err(LaunchBindingError::SessionUnavailable);
+        }
+        if session.current_run_id() != Some(run.id())
+            || run.session_id() != session.id()
+            || run.actor_id() != session.actor_id()
+            || run.scope_id() != session.scope_id()
+            || attempt.run_id() != run.id()
+        {
+            return Err(LaunchBindingError::WrongSessionRun);
         }
         let attached_pod = attempt
             .pod_id()
@@ -153,6 +320,7 @@ impl LaunchBinding {
             });
         }
         Ok(Self {
+            phase,
             scope_id: session.scope_id().clone(),
             actor_id: session.actor_id().clone(),
             session_id: session.id().clone(),
@@ -167,6 +335,14 @@ impl LaunchBinding {
             pod_incarnation: pod.epoch(),
             resources: bound,
         })
+    }
+
+    pub fn is_admitted(&self) -> bool {
+        self.phase == BindingPhase::Admitted
+    }
+
+    pub fn is_planned(&self) -> bool {
+        self.phase == BindingPhase::Planned
     }
 
     pub fn scope_id(&self) -> &ScopeId {

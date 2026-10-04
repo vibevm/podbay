@@ -529,6 +529,7 @@ fn bound_proposal(
         role,
         selection,
         &[ResourceKind::Pty, ResourceKind::StructuredProvider],
+        false,
     )
 }
 
@@ -544,6 +545,7 @@ fn bound_codex_root_proposal(
         role,
         selection,
         &[ResourceKind::StructuredProvider],
+        true,
     )
 }
 
@@ -553,6 +555,7 @@ fn bound_proposal_with_resources(
     role: Role,
     selection: LaunchSelection,
     resource_kinds: &[ResourceKind],
+    planned_root: bool,
 ) -> BoundHostLaunchProposal {
     let mut session = Session::new(
         SessionId::try_from(format!("session.{}", pod_id.as_str())).unwrap(),
@@ -570,12 +573,14 @@ fn bound_proposal_with_resources(
         },
         None,
     );
-    run.admit(
-        run.revision(),
-        &CommandId::try_from("command.fixture").unwrap(),
-        &Admitted,
-    )
-    .unwrap();
+    if !planned_root {
+        run.admit(
+            run.revision(),
+            &CommandId::try_from("command.fixture").unwrap(),
+            &Admitted,
+        )
+        .unwrap();
+    }
     session.bind_run(session.revision(), &run).unwrap();
     let mut attempt = Attempt::new(
         AttemptId::try_from(format!("attempt.{}", pod_id.as_str())).unwrap(),
@@ -584,7 +589,9 @@ fn bound_proposal_with_resources(
         Epoch::new(1).unwrap(),
     )
     .unwrap();
-    run.start_attempt(run.revision(), &attempt).unwrap();
+    if !planned_root {
+        run.start_attempt(run.revision(), &attempt).unwrap();
+    }
     let mut pod = Pod::new(pod_id.clone(), attempt.id().clone(), Epoch::new(1).unwrap());
     attempt.attach_pod(attempt.revision(), &pod).unwrap();
     let resources = resource_kinds
@@ -606,8 +613,14 @@ fn bound_proposal_with_resources(
     for resource in &resources {
         pod.attach_resource(pod.revision(), resource).unwrap();
     }
-    let binding =
-        LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &resources).unwrap();
+    let binding = if planned_root {
+        LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &resources)
+            .unwrap()
+            .identity()
+            .clone()
+    } else {
+        LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &resources).unwrap()
+    };
     BoundHostLaunchProposal {
         session,
         run,

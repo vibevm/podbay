@@ -12,9 +12,8 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
-    Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
-    SessionId, WorkKind,
+    ActorId, Attempt, AttemptId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
+    ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
@@ -129,14 +128,6 @@ struct Transport(AuthenticatedPeer);
 impl AuthenticatedTransport for Transport {
     fn verified_peer(&self) -> Result<AuthenticatedPeer, HostError> {
         Ok(self.0.clone())
-    }
-}
-
-struct Admitted;
-
-impl CommandAdmission for Admitted {
-    fn admits_run(&self, _: &CommandId, _: &RunId, kind: RunCommandKind) -> bool {
-        kind == RunCommandKind::Launch
     }
 }
 
@@ -270,7 +261,7 @@ fn setup_with_port<P: HostDispatchPort>(
         actor,
         fixture.scope.clone(),
     );
-    let mut run = Run::new(
+    let run = Run::new(
         RunId::try_from("run.codex.preflight").unwrap(),
         &session,
         role,
@@ -281,12 +272,6 @@ fn setup_with_port<P: HostDispatchPort>(
         },
         None,
     );
-    run.admit(
-        run.revision(),
-        &CommandId::try_from("command.codex.preflight").unwrap(),
-        &Admitted,
-    )
-    .unwrap();
     session.bind_run(session.revision(), &run).unwrap();
     let mut attempt = Attempt::new(
         AttemptId::try_from("attempt.codex.preflight").unwrap(),
@@ -295,7 +280,6 @@ fn setup_with_port<P: HostDispatchPort>(
         Epoch::new(1).unwrap(),
     )
     .unwrap();
-    run.start_attempt(run.revision(), &attempt).unwrap();
     let mut pod = Pod::new(
         fixture.pod.clone(),
         attempt.id().clone(),
@@ -309,8 +293,10 @@ fn setup_with_port<P: HostDispatchPort>(
         Epoch::new(1).unwrap(),
     );
     pod.attach_resource(pod.revision(), &resource).unwrap();
-    let binding =
-        LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource]).unwrap();
+    let binding = LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource])
+        .unwrap()
+        .identity()
+        .clone();
     let request = BoundLaunchPodRequest {
         host_request: HostRequest {
             scope_id: fixture.scope.clone(),

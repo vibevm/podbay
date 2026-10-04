@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
-    Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
-    SessionId, WorkKind,
+    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding,
+    PlannedRootBinding, Pod, PodId, Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind,
+    RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_store::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
@@ -142,12 +142,21 @@ struct ProposalFixture {
     session: Session,
     run: Run,
     binding: LaunchBinding,
+    planned: Option<PlannedRootBinding>,
     effective: EffectiveLaunchContractV2,
     descriptor: ImmutableLaunchDescriptorV2,
 }
 
 impl ProposalFixture {
     fn new(role: Role, work: WorkKind) -> Self {
+        Self::with_state(role, work, false)
+    }
+
+    fn legacy(role: Role, work: WorkKind) -> Self {
+        Self::with_state(role, work, true)
+    }
+
+    fn with_state(role: Role, work: WorkKind, preadmitted: bool) -> Self {
         let mut session = Session::new(
             SessionId::try_from("session.codex.fixture").unwrap(),
             ActorId::try_from("actor.codex.fixture").unwrap(),
@@ -160,12 +169,14 @@ impl ProposalFixture {
             work,
             None,
         );
-        run.admit(
-            run.revision(),
-            &CommandId::try_from("command.codex.fixture").unwrap(),
-            &Admitted,
-        )
-        .unwrap();
+        if preadmitted {
+            run.admit(
+                run.revision(),
+                &CommandId::try_from("command.legacy.fixture").unwrap(),
+                &Admitted,
+            )
+            .unwrap();
+        }
         session.bind_run(session.revision(), &run).unwrap();
         let mut attempt = Attempt::new(
             AttemptId::try_from("attempt.codex.fixture").unwrap(),
@@ -174,7 +185,9 @@ impl ProposalFixture {
             Epoch::new(1).unwrap(),
         )
         .unwrap();
-        run.start_attempt(run.revision(), &attempt).unwrap();
+        if preadmitted {
+            run.start_attempt(run.revision(), &attempt).unwrap();
+        }
         let mut pod = Pod::new(
             PodId::try_from("pod.launch").unwrap(),
             attempt.id().clone(),
@@ -188,8 +201,19 @@ impl ProposalFixture {
             Epoch::new(1).unwrap(),
         );
         pod.attach_resource(pod.revision(), &resource).unwrap();
-        let binding =
-            LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource]).unwrap();
+        let planned = if preadmitted {
+            None
+        } else {
+            Some(
+                LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource.clone()])
+                    .unwrap(),
+            )
+        };
+        let binding = if let Some(plan) = &planned {
+            plan.identity().clone()
+        } else {
+            LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource]).unwrap()
+        };
         let effective = v2_effective(role);
         let descriptor = if role == Role::Coordinator {
             ImmutableLaunchDescriptorV2::decode_json(
@@ -199,19 +223,33 @@ impl ProposalFixture {
             )
             .unwrap()
         } else {
-            ImmutableLaunchDescriptorV2::from_binding(
-                &binding,
-                reviewed_policy(&binding, effective.digest()),
-                codex_policy(),
-            )
-            .unwrap()
+            if let Some(plan) = &planned {
+                ImmutableLaunchDescriptorV2::from_planned_root(
+                    plan,
+                    reviewed_policy(&binding, effective.digest()),
+                    codex_policy(),
+                )
+                .unwrap()
+            } else {
+                ImmutableLaunchDescriptorV2::from_binding(
+                    &binding,
+                    reviewed_policy(&binding, effective.digest()),
+                    codex_policy(),
+                )
+                .unwrap()
+            }
         };
         effective.compare_with_descriptor(&descriptor).unwrap();
-        descriptor.validate_against_binding(&binding).unwrap();
+        if let Some(plan) = &planned {
+            descriptor.validate_against_planned_root(plan).unwrap();
+        } else {
+            descriptor.validate_against_binding(&binding).unwrap();
+        }
         Self {
             session,
             run,
             binding,
+            planned,
             effective,
             descriptor,
         }
@@ -227,7 +265,7 @@ impl ProposalFixture {
             proposal: Some(BoundRootLaunchProposalV2 {
                 session: &self.session,
                 run: &self.run,
-                binding: &self.binding,
+                binding: self.planned.as_ref().expect("new V2 proposal is planned"),
                 effective_spec: &self.effective,
                 descriptor: &self.descriptor,
                 expected_owner_epoch: 1,
@@ -386,7 +424,7 @@ fn changed_key_intent_and_v1_v2_cross_format_replay_refuse() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store.advance_owner_epoch(0, 1).unwrap();
-    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let proposal = ProposalFixture::legacy(Role::Coordinator, WorkKind::Service);
     let base = proposal.effective.base();
     let legacy = ImmutableLaunchDescriptor::from_binding(
         &proposal.binding,
@@ -440,8 +478,8 @@ fn changed_v2_effective_digest_or_version_pair_refuses_without_new_slot() {
     let mut store = fixture.open();
     store.advance_owner_epoch(0, 1).unwrap();
     let mut proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
-    proposal.descriptor = ImmutableLaunchDescriptorV2::from_binding(
-        &proposal.binding,
+    proposal.descriptor = ImmutableLaunchDescriptorV2::from_planned_root(
+        proposal.planned.as_ref().unwrap(),
         reviewed_policy(&proposal.binding, &"a".repeat(64)),
         codex_policy(),
     )
@@ -495,5 +533,159 @@ fn changed_v2_effective_digest_or_version_pair_refuses_without_new_slot() {
     assert!(matches!(
         store.current_bound_pod_snapshot("scope.launch", "pod.launch"),
         Err(StoreError::Conflict("bound launch version pair differs"))
+    ));
+}
+
+#[test]
+fn caller_preadmitted_v2_run_cannot_create_a_command_or_launch_slot() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let mut proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    proposal
+        .run
+        .admit(
+            proposal.run.revision(),
+            &CommandId::try_from("command.forged.fixture").unwrap(),
+            &Admitted,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.admit_bound_root_launch_v2(proposal.request("key.forged.v2", b"intent.forged.v2")),
+        Err(StoreError::Conflict("V2 root Run is not a queued plan"))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    for table in [
+        "commands",
+        "runtime_sessions",
+        "runtime_runs",
+        "launch_slots",
+        "outbox",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} persisted after forged preadmission");
+    }
+}
+
+#[test]
+fn planned_identity_cannot_enter_v1_admitted_binding_paths() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let mut proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    assert!(proposal.binding.is_planned());
+    assert!(
+        ImmutableLaunchDescriptorV2::from_binding(
+            &proposal.binding,
+            reviewed_policy(&proposal.binding, proposal.effective.digest()),
+            codex_policy(),
+        )
+        .is_err()
+    );
+    proposal
+        .run
+        .admit(
+            proposal.run.revision(),
+            &CommandId::try_from("command.v1.fake").unwrap(),
+            &Admitted,
+        )
+        .unwrap();
+    let attempt = Attempt::new(
+        proposal.binding.attempt_id().clone(),
+        proposal.run.id().clone(),
+        1,
+        Epoch::new(1).unwrap(),
+    )
+    .unwrap();
+    proposal
+        .run
+        .start_attempt(proposal.run.revision(), &attempt)
+        .unwrap();
+    let legacy = ProposalFixture::legacy(Role::Coordinator, WorkKind::Service);
+    let base = proposal.effective.base();
+    let descriptor = ImmutableLaunchDescriptor::from_binding(
+        &legacy.binding,
+        reviewed_policy(&legacy.binding, base.digest()),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.admit_bound_launch(BoundLaunchRequest {
+            principal: principal(),
+            command_key: "key.planned.v1",
+            canonical_intent: b"intent.planned.v1",
+            scope_id: "scope.launch",
+            pod_id: "pod.launch",
+            proposal: Some(BoundLaunchProposal {
+                session: &proposal.session,
+                run: &proposal.run,
+                binding: &proposal.binding,
+                effective_spec: base.canonical_bytes(),
+                descriptor: &descriptor,
+                expected_owner_epoch: 1,
+                expected_authority_revision: 0,
+            }),
+        }),
+        Err(StoreError::Conflict("launch binding is not admitted"))
+    ));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn failure_after_command_insert_rolls_back_every_v2_admission_row() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_launch_slot BEFORE INSERT ON launch_slots
+             BEGIN SELECT RAISE(ABORT, 'fixture after command insert'); END;",
+        )
+        .unwrap();
+    let proposal = ProposalFixture::new(Role::Worker, WorkKind::Task);
+    assert!(
+        store
+            .admit_bound_root_launch_v2(proposal.request("key.rollback.v2", b"intent.rollback.v2"))
+            .is_err()
+    );
+    drop(store);
+    let reopened = fixture.open();
+    assert_eq!(reopened.owner_epoch().unwrap(), 1);
+    for table in [
+        "commands",
+        "runtime_sessions",
+        "runtime_runs",
+        "authority_pods",
+        "target_epochs",
+        "launch_slots",
+        "launch_bindings",
+        "launch_resources",
+        "events",
+        "outbox",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} escaped the failed transaction");
+    }
+    drop(reopened);
+    connection
+        .execute_batch("DROP TRIGGER fail_launch_slot")
+        .unwrap();
+    let mut store = fixture.open();
+    assert!(matches!(
+        store
+            .admit_bound_root_launch_v2(proposal.request("key.rollback.v2", b"intent.rollback.v2")),
+        Ok(BoundLaunchAdmission::Committed(_))
     ));
 }

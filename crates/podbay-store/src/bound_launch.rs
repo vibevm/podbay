@@ -1,9 +1,10 @@
 //! Initial root-run admission. Every row, including authority and the outbox,
 //! commits under one SQLite writer transaction. This module performs no OS effect.
 use podbay_core::{
-    AdmissionState, AttemptId, DesiredMode, Epoch, ExecutionState, InputEpoch, LaunchBinding,
-    OwnerEpoch, PodId, ResourceId, ResourceKind, Revision, Role, Run, ScopeId, Session,
-    SessionState, StoreLineageId, WorkKind,
+    AdmissionState, Attempt, AttemptId, CommandAdmission, CommandId, DesiredMode, Epoch,
+    ExecutionState, InputEpoch, LaunchBinding, OwnerEpoch, PlannedRootBinding, PodId, ResourceId,
+    ResourceKind, Revision, Role, Run, RunCommandKind, RunId, ScopeId, Session, SessionState,
+    StoreLineageId, WorkKind,
 };
 use podbay_wire::{
     EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract,
@@ -63,7 +64,7 @@ pub struct BoundLaunchProposal<'a> {
 pub struct BoundRootLaunchProposalV2<'a> {
     pub session: &'a Session,
     pub run: &'a Run,
-    pub binding: &'a LaunchBinding,
+    pub binding: &'a PlannedRootBinding,
     pub effective_spec: &'a EffectiveLaunchContractV2,
     pub descriptor: &'a ImmutableLaunchDescriptorV2,
     pub expected_owner_epoch: u64,
@@ -122,6 +123,7 @@ struct CheckedProposal<'a> {
     session: &'a Session,
     run: &'a Run,
     binding: &'a LaunchBinding,
+    planned_binding: Option<&'a PlannedRootBinding>,
     effective_spec: &'a [u8],
     descriptor: Vec<u8>,
     spec_digest: String,
@@ -129,6 +131,72 @@ struct CheckedProposal<'a> {
     format: BoundLaunchFormat,
     expected_owner_epoch: u64,
     expected_authority_revision: u64,
+}
+
+/// This witness exists only while the same SQLite writer transaction contains
+/// the exact command row. It cannot be constructed by a proposal or returned
+/// to a caller as a substitute for durable admission.
+struct InsertedRootCommand<'a, 'connection> {
+    transaction: &'a Transaction<'connection>,
+    rowid: i64,
+    command_id: CommandId,
+    run_id: RunId,
+    principal: String,
+    command_key: String,
+    scope_id: String,
+    pod_id: String,
+    request_digest: String,
+    canonical_intent: Vec<u8>,
+    owner_epoch: i64,
+    target_epoch: i64,
+}
+
+impl CommandAdmission for InsertedRootCommand<'_, '_> {
+    fn admits_run(&self, command_id: &CommandId, run_id: &RunId, kind: RunCommandKind) -> bool {
+        if kind != RunCommandKind::Launch
+            || command_id != &self.command_id
+            || run_id != &self.run_id
+        {
+            return false;
+        }
+        self.transaction
+            .query_row(
+                "SELECT command_id,principal,namespace,command_key,scope_id,target_id,
+                        digest_version,request_digest,canonical_request,owner_epoch,target_epoch
+                 FROM commands WHERE command_rowid=?1",
+                [self.rowid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .is_ok_and(|row| {
+                row == (
+                    self.command_id.as_str().to_owned(),
+                    self.principal.clone(),
+                    NAMESPACE.into(),
+                    self.command_key.clone(),
+                    self.scope_id.clone(),
+                    self.pod_id.clone(),
+                    DIGEST_VERSION.into(),
+                    self.request_digest.clone(),
+                    self.canonical_intent.clone(),
+                    self.owner_epoch,
+                    self.target_epoch,
+                )
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -695,6 +763,68 @@ impl PodBayStore {
         if prior_session.is_some() {
             return Err(StoreError::Conflict("session writer already exists"));
         }
+        let digest = digest_request(&command);
+        let command_id = stable_command_id(&command);
+        // V2 needs a real row before Run::admit. V1 keeps its original SQL
+        // ordering; both formats still commit all rows in one transaction.
+        let early_command_rowid = (checked.format == BoundLaunchFormat::CodexV2)
+            .then(|| {
+                insert_launch_command(
+                    &transaction,
+                    &command,
+                    &command_id,
+                    &digest,
+                    owner,
+                    pod_incarnation,
+                )
+            })
+            .transpose()?;
+        let admitted_run = if checked.format == BoundLaunchFormat::CodexV2 {
+            let command_identity = CommandId::try_from(command_id.as_str())
+                .map_err(|_| StoreError::Conflict("V2 command identity is invalid"))?;
+            let witness = InsertedRootCommand {
+                transaction: &transaction,
+                rowid: early_command_rowid.expect("V2 inserted command before admission"),
+                command_id: command_identity.clone(),
+                run_id: binding.run_id().clone(),
+                principal: command.principal.as_str().to_owned(),
+                command_key: request.command_key.to_owned(),
+                scope_id: request.scope_id.to_owned(),
+                pod_id: request.pod_id.to_owned(),
+                request_digest: digest.clone(),
+                canonical_intent: request.canonical_intent.to_vec(),
+                owner_epoch: owner,
+                target_epoch: pod_incarnation,
+            };
+            let mut run = checked.run.clone();
+            run.admit(run.revision(), &command_identity, &witness)
+                .map_err(|_| StoreError::Conflict("V2 Run lacks inserted launch command"))?;
+            let attempt = Attempt::new(
+                binding.attempt_id().clone(),
+                binding.run_id().clone(),
+                binding.attempt_ordinal(),
+                binding.attempt_epoch(),
+            )
+            .map_err(|_| StoreError::Conflict("V2 planned Attempt is invalid"))?;
+            run.start_attempt(run.revision(), &attempt)
+                .map_err(|_| StoreError::Conflict("V2 planned Attempt cannot start"))?;
+            let strict = checked
+                .planned_binding
+                .ok_or(StoreError::Conflict("V2 planned binding is missing"))?
+                .confirm_after_admission(checked.session, &run)
+                .map_err(|_| StoreError::Conflict("V2 post-command binding differs"))?;
+            validate_initial(
+                request.scope_id,
+                request.pod_id,
+                checked.session,
+                &run,
+                &strict,
+            )?;
+            Some(run)
+        } else {
+            None
+        };
+        let committed_run = admitted_run.as_ref().unwrap_or(checked.run);
         transaction.execute(
             "INSERT INTO runtime_sessions(
                session_id,scope_id,actor_id,revision,state,current_run_id)
@@ -718,7 +848,7 @@ impl PodBayStore {
                 binding.scope_id().as_str(),
                 role_text(binding.role()),
                 work_kind_text(binding.work_kind()),
-                integer(checked.run.revision().get())?,
+                integer(committed_run.revision().get())?,
                 binding.attempt_id().as_str(),
             ],
         )?;
@@ -738,27 +868,17 @@ impl PodBayStore {
                 pod_incarnation
             ],
         )?;
-        let digest = digest_request(&command);
-        let command_id = stable_command_id(&command);
-        transaction.execute(
-            "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
-               digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![
-                command_id,
-                command.principal.as_str(),
-                command.namespace,
-                command.command_key,
-                command.scope_id,
-                command.target_id,
-                DIGEST_VERSION,
-                digest,
-                command.canonical_request,
+        let command_rowid = match early_command_rowid {
+            Some(rowid) => rowid,
+            None => insert_launch_command(
+                &transaction,
+                &command,
+                &command_id,
+                &digest,
                 owner,
                 pod_incarnation,
-            ],
-        )?;
-        let command_rowid = transaction.last_insert_rowid();
+            )?,
+        };
         transaction.execute(
             "INSERT INTO launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)
              VALUES(?1,?2,?3,?4)",
@@ -870,13 +990,48 @@ impl PodBayStore {
     }
 }
 
+fn insert_launch_command(
+    transaction: &Transaction<'_>,
+    command: &CommandRequest,
+    command_id: &str,
+    digest: &str,
+    owner: i64,
+    pod_incarnation: i64,
+) -> Result<i64, StoreError> {
+    transaction.execute(
+        "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
+           digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            command_id,
+            command.principal.as_str(),
+            command.namespace,
+            command.command_key,
+            command.scope_id,
+            command.target_id,
+            DIGEST_VERSION,
+            digest,
+            command.canonical_request,
+            owner,
+            pod_incarnation,
+        ],
+    )?;
+    Ok(transaction.last_insert_rowid())
+}
+
 fn check_proposal<'a>(
     request: &AdmissionRequest<'a>,
     proposal: &ProposalKind<'a>,
 ) -> Result<CheckedProposal<'a>, StoreError> {
     match proposal {
         ProposalKind::V1(proposal) => {
-            validate_initial(request, proposal.session, proposal.run, proposal.binding)?;
+            validate_initial(
+                request.scope_id,
+                request.pod_id,
+                proposal.session,
+                proposal.run,
+                proposal.binding,
+            )?;
             proposal
                 .descriptor
                 .validate_against_binding(proposal.binding)
@@ -906,6 +1061,7 @@ fn check_proposal<'a>(
                 session: proposal.session,
                 run: proposal.run,
                 binding: proposal.binding,
+                planned_binding: None,
                 effective_spec: proposal.effective_spec,
                 descriptor,
                 spec_digest: effective.digest().to_owned(),
@@ -916,12 +1072,13 @@ fn check_proposal<'a>(
             })
         }
         ProposalKind::CodexV2(proposal) => {
-            validate_initial(request, proposal.session, proposal.run, proposal.binding)?;
+            let binding = proposal.binding.identity();
+            validate_planned_initial(request, proposal.session, proposal.run, binding)?;
             proposal
                 .descriptor
-                .validate_against_binding(proposal.binding)
+                .validate_against_planned_root(proposal.binding)
                 .map_err(|_| StoreError::Conflict("V2 descriptor differs from launch binding"))?;
-            for (index, resource) in proposal.binding.resources().iter().enumerate() {
+            for (index, resource) in binding.resources().iter().enumerate() {
                 let native = proposal
                     .descriptor
                     .resource(index)
@@ -954,7 +1111,8 @@ fn check_proposal<'a>(
             Ok(CheckedProposal {
                 session: proposal.session,
                 run: proposal.run,
-                binding: proposal.binding,
+                binding,
+                planned_binding: Some(proposal.binding),
                 effective_spec,
                 descriptor,
                 spec_digest: effective.digest().to_owned(),
@@ -967,12 +1125,44 @@ fn check_proposal<'a>(
     }
 }
 
-fn validate_initial(
+fn validate_planned_initial(
     request: &AdmissionRequest<'_>,
     session: &Session,
     run: &Run,
     binding: &LaunchBinding,
 ) -> Result<(), StoreError> {
+    PlannedRootBinding::from_queued_snapshot(session, run, binding)
+        .map_err(|_| StoreError::Conflict("V2 root Run is not a queued plan"))?;
+    let first_session_revision = Revision::INITIAL
+        .checked_next()
+        .map_err(|_| StoreError::InvalidInput("initial revision exhausted"))?;
+    if session.revision() != first_session_revision
+        || run.revision() != Revision::INITIAL
+        || binding.attempt_ordinal() != 1
+        || binding.attempt_epoch().get() != 1
+        || binding.pod_incarnation().get() != 1
+        || binding
+            .resources()
+            .iter()
+            .any(|resource| resource.epoch().get() != 1)
+        || binding.scope_id().as_str() != request.scope_id
+        || binding.pod_id().as_str() != request.pod_id
+    {
+        return Err(StoreError::Conflict("V2 first-root plan differs"));
+    }
+    Ok(())
+}
+
+fn validate_initial(
+    scope_id: &str,
+    pod_id: &str,
+    session: &Session,
+    run: &Run,
+    binding: &LaunchBinding,
+) -> Result<(), StoreError> {
+    if !binding.is_admitted() {
+        return Err(StoreError::Conflict("launch binding is not admitted"));
+    }
     if binding.parent_run_id().is_some()
         || binding.attempt_ordinal() != 1
         || binding.attempt_epoch().get() != 1
@@ -1011,8 +1201,8 @@ fn validate_initial(
         || run.scope_id() != binding.scope_id()
         || run.role() != binding.role()
         || run.work_kind() != binding.work_kind()
-        || binding.scope_id().as_str() != request.scope_id
-        || binding.pod_id().as_str() != request.pod_id
+        || binding.scope_id().as_str() != scope_id
+        || binding.pod_id().as_str() != pod_id
     {
         return Err(StoreError::Conflict(
             "initial aggregates differ from launch binding",

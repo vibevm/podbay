@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use podbay_core::{LaunchBinding, ResourceId, ResourceKind, Role, WorkKind};
+use podbay_core::{LaunchBinding, PlannedRootBinding, ResourceId, ResourceKind, Role, WorkKind};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
@@ -253,6 +253,16 @@ impl ImmutableLaunchDescriptor {
         binding: &LaunchBinding,
         policy: ReviewedNativePolicy,
     ) -> Result<Self, LaunchDescriptorError> {
+        if !binding.is_admitted() {
+            return Err(LaunchDescriptorError::BindingMismatch);
+        }
+        Self::from_identity(binding, policy)
+    }
+
+    fn from_identity(
+        binding: &LaunchBinding,
+        policy: ReviewedNativePolicy,
+    ) -> Result<Self, LaunchDescriptorError> {
         if binding.resources().len() != policy.resources.len() {
             return Err(LaunchDescriptorError::ResourceMismatch);
         }
@@ -354,6 +364,16 @@ impl ImmutableLaunchDescriptor {
     /// Recheck a decoded descriptor against the authoritative durable
     /// aggregate snapshot before using any of its native launch fields.
     pub fn validate_against_binding(
+        &self,
+        binding: &LaunchBinding,
+    ) -> Result<(), LaunchDescriptorError> {
+        if !binding.is_admitted() {
+            return Err(LaunchDescriptorError::BindingMismatch);
+        }
+        self.validate_against_identity(binding)
+    }
+
+    fn validate_against_identity(
         &self,
         binding: &LaunchBinding,
     ) -> Result<(), LaunchDescriptorError> {
@@ -743,12 +763,30 @@ pub struct ImmutableLaunchDescriptorV2 {
 }
 
 impl ImmutableLaunchDescriptorV2 {
+    /// Review a first-root identity before its Run is admitted. This produces
+    /// the exact V2 descriptor bytes; it does not itself admit a command.
+    pub fn from_planned_root(
+        planned: &PlannedRootBinding,
+        policy: ReviewedNativePolicy,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, LaunchDescriptorError> {
+        let base = ImmutableLaunchDescriptor::from_identity(planned.identity(), policy)?;
+        Self::from_base(base, codex_policy)
+    }
+
     pub fn from_binding(
         binding: &LaunchBinding,
         policy: ReviewedNativePolicy,
         codex_policy: CodexAppServerPolicyV2,
     ) -> Result<Self, LaunchDescriptorError> {
         let base = ImmutableLaunchDescriptor::from_binding(binding, policy)?;
+        Self::from_base(base, codex_policy)
+    }
+
+    fn from_base(
+        base: ImmutableLaunchDescriptor,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, LaunchDescriptorError> {
         let body = DescriptorBodyV2 {
             base: base.body,
             codex_policy,
@@ -809,6 +847,17 @@ impl ImmutableLaunchDescriptorV2 {
             body: self.body.base.clone(),
         };
         base.validate_against_binding(binding)
+    }
+
+    pub fn validate_against_planned_root(
+        &self,
+        planned: &PlannedRootBinding,
+    ) -> Result<(), LaunchDescriptorError> {
+        let base = ImmutableLaunchDescriptor {
+            digest: digest_body(&self.body.base)?,
+            body: self.body.base.clone(),
+        };
+        base.validate_against_identity(planned.identity())
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, LaunchDescriptorError> {
