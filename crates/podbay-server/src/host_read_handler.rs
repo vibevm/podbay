@@ -1,6 +1,6 @@
 //! Narrow host-backed `commands.get` projection. No mutation reaches a port.
 
-use podbay_core::{CommandId, ScopeId};
+use podbay_core::{CommandId, ResourceId, ScopeId, SessionId};
 use podbay_host::{
     AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage,
     CommandNativeObservation, CurrentLaterSendGuard, DurableAuthority, DurableAuthorityError,
@@ -9,11 +9,11 @@ use podbay_host::{
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, CurrentObservation, CurrentScopeSnapshot,
-    EffectState, LaunchDispatchStage, ObservedStage, StoreError,
+    EffectState, LaunchDispatchStage, NativeEvidencePage, ObservedStage, StoreError,
 };
 use podbay_wire::{
-    CommandEnvelope, CommandSelector, CommandStage, ReadBody, ReadEnvelope, Receipt, RuntimeError,
-    RuntimeErrorCode, Target,
+    CommandEnvelope, CommandSelector, CommandStage, DecimalString, NativeEventCursor,
+    NativeEventIdentity, ReadBody, ReadEnvelope, Receipt, RuntimeError, RuntimeErrorCode, Target,
 };
 use serde_json::{Value, json};
 
@@ -110,12 +110,109 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                     later_guard.as_ref(),
                 ))
             }
+            ReadBody::NativeEventsRead(body) => {
+                let session = SessionId::try_from(body.session_id.as_str()).map_err(|_| {
+                    refusal(
+                        RuntimeErrorCode::InvalidInput,
+                        "invalid native Session selector",
+                    )
+                })?;
+                let resource = ResourceId::try_from(body.resource_id.as_str()).map_err(|_| {
+                    refusal(
+                        RuntimeErrorCode::InvalidInput,
+                        "invalid native Resource selector",
+                    )
+                })?;
+                let page = self
+                    .authority
+                    .read_current_codex_native_events(
+                        transport,
+                        &scope,
+                        &session,
+                        &resource,
+                        body.after.as_ref(),
+                        body.limit.get() as usize,
+                    )
+                    .map_err(native_authority_error)?;
+                let value = native_events_json(page)?;
+                if serde_json::to_vec(&value).map_or(true, |bytes| {
+                    bytes.len() > podbay_wire::MAX_FRAME_BYTES - 4096
+                }) {
+                    return Err(refusal(
+                        RuntimeErrorCode::LimitExceeded,
+                        "native event page exceeds wire frame",
+                    ));
+                }
+                Ok(value)
+            }
             _ => Err(refusal(
                 RuntimeErrorCode::Unsupported,
                 "read operation is unavailable",
             )),
         }
     }
+}
+
+/// Only this authenticated owner read route serializes private JSONL. The
+/// generic event and snapshot projections never receive these bytes.
+fn native_events_json(page: NativeEvidencePage) -> Result<Value, RuntimeError> {
+    let identity = NativeEventIdentity {
+        store_lineage: page.snapshot.identity.store_lineage.clone(),
+        scope_id: page.snapshot.identity.scope_id.clone(),
+        session_id: page.snapshot.identity.session_id.clone(),
+        run_id: page.snapshot.identity.run_id.clone(),
+        attempt_id: page.snapshot.identity.attempt_id.clone(),
+        pod_id: page.snapshot.identity.pod_id.clone(),
+        pod_incarnation: DecimalString::new(page.snapshot.identity.pod_incarnation),
+        resource_id: page.snapshot.identity.resource_id.clone(),
+        resource_epoch: DecimalString::new(page.snapshot.identity.resource_epoch),
+    };
+    let cursor = NativeEventCursor {
+        identity,
+        source_sequence: DecimalString::new(page.next_source_sequence),
+    };
+    let mut events = Vec::with_capacity(page.events.len());
+    for event in page.events {
+        let raw_jsonl = String::from_utf8(event.raw_jsonl).map_err(|_| {
+            refusal(
+                RuntimeErrorCode::InvalidInput,
+                "private native JSONL is not UTF-8",
+            )
+        })?;
+        events.push(json!({
+            "eventId": event.event_id,
+            "sourceSequence": event.source_sequence.to_string(),
+            "kind": event.kind,
+            "status": event.status,
+            "recordedAtUnixMillis": event.recorded_at_unix_millis.to_string(),
+            "provenance": event.provenance,
+            "externalConflict": event.external_conflict,
+            "contentDigest": event.content_digest,
+            "rawJsonl": raw_jsonl,
+        }));
+    }
+    Ok(json!({
+        "kind": "native_events_page",
+        "nextCursor": cursor,
+        "snapshot": {
+            "watermark": page.snapshot.watermark.to_string(),
+            "earliestRetained": page.snapshot.earliest_retained.to_string(),
+            "lastStatus": page.snapshot.last_status,
+            "outputEvents": page.snapshot.output_events.to_string(),
+            "questionEvents": page.snapshot.question_events.to_string(),
+            "permissionEvents": page.snapshot.permission_events.to_string(),
+            "opaqueEvents": page.snapshot.opaque_events.to_string(),
+            "externalConflict": page.snapshot.external_conflict,
+            "fidelity": page.snapshot.fidelity,
+            "quarantined": page.snapshot.quarantined,
+        },
+        "gap": page.gap.map(|gap| json!({
+            "missingFrom": gap.missing_from.to_string(),
+            "missingThrough": gap.missing_through.to_string(),
+            "earliestAvailable": gap.earliest_available.to_string(),
+        })),
+        "events": events,
+    }))
 }
 
 fn snapshot_json(snapshot: CurrentScopeSnapshot) -> Value {
@@ -322,18 +419,28 @@ fn later_turn_native_json(observation: &LaterTurnNativeObservation) -> Value {
         LaterTurnNativeStage::IntentUncertain => value["stage"] = json!("intent_uncertain"),
         LaterTurnNativeStage::SubmissionUncertain => value["stage"] = json!("submission_uncertain"),
         LaterTurnNativeStage::StorageUncertain => value["stage"] = json!("storage_uncertain"),
-        LaterTurnNativeStage::Submitted { native_thread_id, native_session_id, native_turn_id } => {
+        LaterTurnNativeStage::Submitted {
+            native_thread_id,
+            native_session_id,
+            native_turn_id,
+        } => {
             value["stage"] = json!("submitted");
             value["nativeThreadId"] = json!(native_thread_id);
             value["nativeSessionId"] = json!(native_session_id);
             value["nativeTurnId"] = json!(native_turn_id);
         }
-        LaterTurnNativeStage::CompletionObservedPendingIdleProof { native_turn_id, terminal: status } => {
+        LaterTurnNativeStage::CompletionObservedPendingIdleProof {
+            native_turn_id,
+            terminal: status,
+        } => {
             value["stage"] = json!("completion_observed_pending_idle_proof");
             value["nativeTurnId"] = json!(native_turn_id);
             value["terminal"] = json!(terminal(*status));
         }
-        LaterTurnNativeStage::Settled { native_turn_id, terminal: status } => {
+        LaterTurnNativeStage::Settled {
+            native_turn_id,
+            terminal: status,
+        } => {
             value["stage"] = json!("native_settled");
             value["nativeTurnId"] = json!(native_turn_id);
             value["terminal"] = json!(terminal(*status));
@@ -434,6 +541,23 @@ fn authority_error(error: DurableAuthorityError) -> RuntimeError {
     refusal(code, message)
 }
 
+fn native_authority_error(error: DurableAuthorityError) -> RuntimeError {
+    match error {
+        DurableAuthorityError::Store(StoreError::NotFound)
+        | DurableAuthorityError::Host(HostError::Unauthorised | HostError::Unauthenticated) => {
+            refusal(RuntimeErrorCode::Forbidden, "native resource unavailable")
+        }
+        DurableAuthorityError::Store(StoreError::WrongCursor) => {
+            refusal(RuntimeErrorCode::StaleGuard, "native cursor is not current")
+        }
+        DurableAuthorityError::Store(StoreError::SourceIdentityQuarantined) => refusal(
+            RuntimeErrorCode::Conflict,
+            "native source continuity quarantined",
+        ),
+        other => authority_error(other),
+    }
+}
+
 fn snapshot_authority_error(error: DurableAuthorityError) -> RuntimeError {
     match error {
         DurableAuthorityError::Store(StoreError::NotFound) => {
@@ -458,8 +582,67 @@ mod tests {
     use super::*;
     use podbay_store::{
         CurrentAttemptSnapshot, CurrentPodSnapshot, CurrentResourceSnapshot, CurrentRunSnapshot,
-        CurrentSessionSnapshot, EventCursor as StoreEventCursor,
+        CurrentSessionSnapshot, EventCursor as StoreEventCursor, NativeEvidenceEvent,
+        NativeEvidenceIdentity, NativeEvidenceSnapshot,
     };
+
+    #[test]
+    fn native_projection_exposes_private_jsonl_only_in_the_explicit_owner_page() {
+        let raw =
+            b"{\"method\":\"item/agentMessage/delta\",\"delta\":\"private fixture output\"}\n"
+                .to_vec();
+        let event = NativeEvidenceEvent {
+            event_id: "event.native.fixture".into(),
+            source_sequence: 1,
+            kind: "output".into(),
+            status: None,
+            recorded_at_unix_millis: 123,
+            provenance: "codex.app-server.pod-observed/1".into(),
+            external_conflict: false,
+            content_digest: "a".repeat(64),
+            raw_jsonl: raw,
+        };
+        assert!(!format!("{event:?}").contains("private fixture output"));
+        let page = NativeEvidencePage {
+            snapshot: NativeEvidenceSnapshot {
+                identity: NativeEvidenceIdentity {
+                    store_lineage: "lineage.fixture".into(),
+                    scope_id: "scope.fixture".into(),
+                    session_id: "session.fixture".into(),
+                    run_id: "run.fixture".into(),
+                    attempt_id: "attempt.fixture".into(),
+                    pod_id: "pod.fixture".into(),
+                    pod_incarnation: 1,
+                    resource_id: "resource.fixture".into(),
+                    resource_epoch: 1,
+                },
+                watermark: 1,
+                earliest_retained: 1,
+                last_status: None,
+                output_events: 1,
+                question_events: 0,
+                permission_events: 0,
+                opaque_events: 0,
+                external_conflict: false,
+                fidelity: "exact".into(),
+                quarantined: false,
+            },
+            events: vec![event],
+            next_source_sequence: 1,
+            gap: None,
+        };
+        let value = native_events_json(page).unwrap();
+        assert_eq!(value["kind"], "native_events_page");
+        assert_eq!(value["snapshot"]["quarantined"], false);
+        assert_eq!(value["events"][0]["kind"], "output");
+        assert!(
+            value["events"][0]["rawJsonl"]
+                .as_str()
+                .unwrap()
+                .contains("private fixture output")
+        );
+        assert!(serde_json::to_vec(&value).unwrap().len() < podbay_wire::MAX_FRAME_BYTES - 4096);
+    }
 
     #[test]
     fn current_snapshot_projection_keeps_all_identities_and_unavailable_observation() {
@@ -549,8 +732,12 @@ mod tests {
 
     #[test]
     fn uncertain_and_host_accepted_are_never_projected_as_settled() {
-        let uncertain =
-            inspection_json(inspection(EffectState::ClaimedUncertain, None), None, None, None);
+        let uncertain = inspection_json(
+            inspection(EffectState::ClaimedUncertain, None),
+            None,
+            None,
+            None,
+        );
         assert_eq!(uncertain["state"], "uncertain");
         assert_eq!(uncertain["effectState"], "claimed_uncertain");
         assert_eq!(uncertain["receipt"]["eventSequence"], "7");
@@ -617,25 +804,39 @@ mod tests {
             native_target: target,
         };
         let observed = LaterTurnNativeObservation::from_attested_pod(
-            "podbay.codex-turn.inspect/1", selector.clone(), 2, "a".repeat(64),
+            "podbay.codex-turn.inspect/1",
+            selector.clone(),
+            2,
+            "a".repeat(64),
             LaterTurnNativeStage::Settled {
                 native_turn_id: "turn.native.fixture".into(),
                 terminal: LaterTurnNativeTerminal::Completed,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let native = CommandNativeObservation::LaterTurn(observed);
         let projected = inspection_json(
-            inspection(EffectState::ClaimedUncertain, None), Some(&native), None, None,
+            inspection(EffectState::ClaimedUncertain, None),
+            Some(&native),
+            None,
+            None,
         );
         assert_eq!(projected["state"], "uncertain");
         assert_eq!(projected["effectState"], "claimed_uncertain");
         assert_eq!(projected["nativeObservation"]["stage"], "native_settled");
         assert_eq!(projected["nativeObservation"]["terminal"], "completed");
-        assert_eq!(projected["nativeObservation"]["nativeTurnId"], "turn.native.fixture");
+        assert_eq!(
+            projected["nativeObservation"]["nativeTurnId"],
+            "turn.native.fixture"
+        );
         let uncertain = LaterTurnNativeObservation::from_attested_pod(
-            "podbay.codex-turn.inspect/1", selector, 2, "a".repeat(64),
+            "podbay.codex-turn.inspect/1",
+            selector,
+            2,
+            "a".repeat(64),
             LaterTurnNativeStage::SubmissionUncertain,
-        ).unwrap();
+        )
+        .unwrap();
         let redacted = native_json(&CommandNativeObservation::LaterTurn(uncertain));
         assert_eq!(redacted["stage"], "submission_uncertain");
         assert!(redacted.get("nativeTurnId").is_none());

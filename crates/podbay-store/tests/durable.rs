@@ -313,7 +313,7 @@ fn fresh_schema_twenty_two_has_empty_runtime_rebind_manager_and_verifier_tables(
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     for table in [
         "runtime_sessions",
         "runtime_runs",

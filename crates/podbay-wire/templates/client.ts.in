@@ -124,6 +124,7 @@ export type ReadBody =
   | { selector: { kind: "id"; commandId: string } | { kind: "key"; key: string } }
   | { after: EventCursor }
   | { after: EventCursor; limit: DecimalString }
+  | { sessionId: string; resourceId: string; after?: NativeEventCursor; limit: DecimalString }
   | { after: DecimalString }
   | { after?: DecimalString };
 export interface ReadEnvelope {
@@ -137,6 +138,21 @@ export interface EventCursor {
   storeLineage: string;
   scopeId: string;
   sequence: DecimalString;
+}
+export interface NativeEventIdentity {
+  storeLineage: string;
+  scopeId: string;
+  sessionId: string;
+  runId: string;
+  attemptId: string;
+  podId: string;
+  podIncarnation: DecimalString;
+  resourceId: string;
+  resourceEpoch: DecimalString;
+}
+export interface NativeEventCursor {
+  identity: NativeEventIdentity;
+  sourceSequence: DecimalString;
 }
 export interface Receipt<T> {
   protocol: typeof PROTOCOL;
@@ -550,7 +566,7 @@ function validateRead(value: unknown): ReadEnvelope {
   const checkedTarget = target(item.target);
   const operation = item.operation as ReadOperation;
   const expectedKind =
-    ["capabilities.get", "commands.get", "snapshot.get", "event.subscribe", "history.read"].includes(operation) ? "scope"
+    ["capabilities.get", "commands.get", "snapshot.get", "event.subscribe", "history.read", "native.events.read"].includes(operation) ? "scope"
     : operation === "run.get" ? "run"
     : operation === "session.get" ? "session"
     : operation === "delivery.get" ? "delivery"
@@ -571,6 +587,25 @@ function validateRead(value: unknown): ReadEnvelope {
     if (operation === "history.read") {
       const limit = BigInt(decimal(body.limit, "limit", true));
       if (limit > 1024n) throw new RangeError("history limit exceeds bound");
+    }
+  } else if (operation === "native.events.read") {
+    exact(body, ["sessionId", "resourceId", "limit"], ["after"]);
+    identity(body.sessionId, "native.sessionId");
+    identity(body.resourceId, "native.resourceId");
+    const limit = BigInt(decimal(body.limit, "native.limit", true));
+    if (limit > 2n) throw new RangeError("native page limit exceeds bound");
+    if (body.after !== undefined) {
+      const cursor = record(body.after, "native.after");
+      exact(cursor, ["identity", "sourceSequence"]);
+      if (BigInt(decimal(cursor.sourceSequence, "native.after.sourceSequence")) > MAX_I64) throw new RangeError("native source cursor exceeds store range");
+      const source = record(cursor.identity, "native.after.identity");
+      exact(source, ["storeLineage", "scopeId", "sessionId", "runId", "attemptId", "podId", "podIncarnation", "resourceId", "resourceEpoch"]);
+      for (const name of ["storeLineage", "scopeId", "sessionId", "runId", "attemptId", "podId", "resourceId"]) identity(source[name], `native.after.${name}`);
+      const incarnation = BigInt(decimal(source.podIncarnation, "native.after.podIncarnation", true));
+      const resourceEpoch = BigInt(decimal(source.resourceEpoch, "native.after.resourceEpoch", true));
+      if (incarnation === 0n || resourceEpoch === 0n || incarnation > MAX_I64 || resourceEpoch > MAX_I64) throw new TypeError("native cursor epoch is outside store range");
+      if (source.scopeId !== (checkedTarget as Extract<Target, { kind: "scope" }>).scopeId ||
+          source.sessionId !== body.sessionId || source.resourceId !== body.resourceId) throw new TypeError("native cursor target mismatch");
     }
   } else if (operation === "terminal.attach") {
     exact(body, [], ["after"]);

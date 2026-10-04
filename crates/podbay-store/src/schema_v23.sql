@@ -1,4 +1,4 @@
--- Canonical fresh schema for PodBay user_version 22. No historical rows are
+-- Canonical fresh schema for PodBay user_version 23. No historical rows are
 -- copied or inferred. Keep exact DDL aligned with store.rs schema verifiers.
 -- table metadata
 CREATE TABLE metadata (
@@ -432,6 +432,54 @@ CREATE TABLE codex_later_turns (
   wire_payload_digest TEXT NOT NULL CHECK(length(wire_payload_digest)=64),
   prompt_digest TEXT NOT NULL CHECK(length(prompt_digest)=64),
   binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64)
+) STRICT;
+-- Private Codex native observations are independent of command/outbox rows.
+-- The raw JSONL is never selected by generic event/history/snapshot queries.
+-- table codex_native_sources
+CREATE TABLE codex_native_sources (
+  resource_id TEXT PRIMARY KEY CHECK(length(resource_id)>0),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL REFERENCES runtime_sessions(session_id),
+  run_id TEXT NOT NULL CHECK(length(run_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  watermark INTEGER NOT NULL CHECK(watermark>=0),
+  earliest_retained INTEGER NOT NULL CHECK(earliest_retained>=0),
+  last_status TEXT CHECK(last_status IS NULL OR last_status IN
+    ('idle','active','waiting','completed','failed','interrupted','system_error')),
+  output_events INTEGER NOT NULL CHECK(output_events>=0),
+  question_events INTEGER NOT NULL CHECK(question_events>=0),
+  permission_events INTEGER NOT NULL CHECK(permission_events>=0),
+  opaque_events INTEGER NOT NULL CHECK(opaque_events>=0),
+  external_conflict INTEGER NOT NULL CHECK(external_conflict IN (0,1)),
+  fidelity TEXT NOT NULL CHECK(fidelity IN ('exact','partial','unknown')),
+  quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1))
+) STRICT;
+-- table codex_native_evidence
+CREATE TABLE codex_native_evidence (
+  resource_id TEXT NOT NULL REFERENCES codex_native_sources(resource_id),
+  source_sequence INTEGER NOT NULL CHECK(source_sequence>=1),
+  event_id TEXT NOT NULL UNIQUE CHECK(length(event_id)>0),
+  kind TEXT NOT NULL CHECK(kind IN ('status','output','question','permission','opaque')),
+  status TEXT CHECK(status IS NULL OR status IN
+    ('idle','active','waiting','completed','failed','interrupted','system_error')),
+  recorded_at_unix_millis INTEGER NOT NULL CHECK(recorded_at_unix_millis>=0),
+  provenance TEXT NOT NULL CHECK(provenance='codex.app-server.pod-observed/1'),
+  external_conflict INTEGER NOT NULL CHECK(external_conflict IN (0,1)),
+  content_digest TEXT NOT NULL CHECK(length(content_digest)=64),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 65536),
+  PRIMARY KEY(resource_id,source_sequence)
+) STRICT;
+-- table codex_native_conflicts
+CREATE TABLE codex_native_conflicts (
+  resource_id TEXT NOT NULL REFERENCES codex_native_sources(resource_id),
+  source_sequence INTEGER NOT NULL CHECK(source_sequence>=1),
+  incoming_digest TEXT NOT NULL CHECK(length(incoming_digest)=64),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 65536),
+  PRIMARY KEY(resource_id,source_sequence,incoming_digest)
 ) STRICT;
 -- index events_scope_sequence
 CREATE INDEX events_scope_sequence ON events(scope_id,sequence);

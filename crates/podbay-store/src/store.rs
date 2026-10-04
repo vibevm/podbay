@@ -18,8 +18,51 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const MAX_BYTES: usize = 1_048_576;
+const CODEX_NATIVE_SOURCES_V23: &str = "CREATE TABLE codex_native_sources (
+  resource_id TEXT PRIMARY KEY CHECK(length(resource_id)>0),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL REFERENCES runtime_sessions(session_id),
+  run_id TEXT NOT NULL CHECK(length(run_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  watermark INTEGER NOT NULL CHECK(watermark>=0),
+  earliest_retained INTEGER NOT NULL CHECK(earliest_retained>=0),
+  last_status TEXT CHECK(last_status IS NULL OR last_status IN
+    ('idle','active','waiting','completed','failed','interrupted','system_error')),
+  output_events INTEGER NOT NULL CHECK(output_events>=0),
+  question_events INTEGER NOT NULL CHECK(question_events>=0),
+  permission_events INTEGER NOT NULL CHECK(permission_events>=0),
+  opaque_events INTEGER NOT NULL CHECK(opaque_events>=0),
+  external_conflict INTEGER NOT NULL CHECK(external_conflict IN (0,1)),
+  fidelity TEXT NOT NULL CHECK(fidelity IN ('exact','partial','unknown')),
+  quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1))
+) STRICT";
+const CODEX_NATIVE_EVIDENCE_V23: &str = "CREATE TABLE codex_native_evidence (
+  resource_id TEXT NOT NULL REFERENCES codex_native_sources(resource_id),
+  source_sequence INTEGER NOT NULL CHECK(source_sequence>=1),
+  event_id TEXT NOT NULL UNIQUE CHECK(length(event_id)>0),
+  kind TEXT NOT NULL CHECK(kind IN ('status','output','question','permission','opaque')),
+  status TEXT CHECK(status IS NULL OR status IN
+    ('idle','active','waiting','completed','failed','interrupted','system_error')),
+  recorded_at_unix_millis INTEGER NOT NULL CHECK(recorded_at_unix_millis>=0),
+  provenance TEXT NOT NULL CHECK(provenance='codex.app-server.pod-observed/1'),
+  external_conflict INTEGER NOT NULL CHECK(external_conflict IN (0,1)),
+  content_digest TEXT NOT NULL CHECK(length(content_digest)=64),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 65536),
+  PRIMARY KEY(resource_id,source_sequence)
+) STRICT";
+const CODEX_NATIVE_CONFLICTS_V23: &str = "CREATE TABLE codex_native_conflicts (
+  resource_id TEXT NOT NULL REFERENCES codex_native_sources(resource_id),
+  source_sequence INTEGER NOT NULL CHECK(source_sequence>=1),
+  incoming_digest TEXT NOT NULL CHECK(length(incoming_digest)=64),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 65536),
+  PRIMARY KEY(resource_id,source_sequence,incoming_digest)
+) STRICT";
 // Schema creation records no native thread anchor, command, or provider input.
 const CODEX_LATER_TURNS_V22: &str = "CREATE TABLE codex_later_turns (
   command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
@@ -459,6 +502,7 @@ impl PodBayStore {
         verify_policy_fence_schema(&transaction)?;
         verify_supersession_schema(&transaction)?;
         verify_codex_later_turn_schema(&transaction)?;
+        verify_codex_native_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -554,7 +598,7 @@ impl PodBayStore {
             return Err(StoreError::UnsupportedSchema(version));
         }
         if fresh {
-            transaction.execute_batch(include_str!("schema_v22.sql"))?;
+            transaction.execute_batch(include_str!("schema_v23.sql"))?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         verify_authority_schema(&transaction)?;
@@ -571,6 +615,7 @@ impl PodBayStore {
         verify_policy_fence_schema(&transaction)?;
         verify_supersession_schema(&transaction)?;
         verify_codex_later_turn_schema(&transaction)?;
+        verify_codex_native_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -2431,6 +2476,26 @@ fn verify_codex_later_turn_schema(
             .optional()?;
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v22 later turn schema differs"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_codex_native_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (name, expected) in [
+        ("codex_native_sources", CODEX_NATIVE_SOURCES_V23),
+        ("codex_native_evidence", CODEX_NATIVE_EVIDENCE_V23),
+        ("codex_native_conflicts", CODEX_NATIVE_CONFLICTS_V23),
+    ] {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v23 Codex native evidence schema differs"));
         }
     }
     Ok(())

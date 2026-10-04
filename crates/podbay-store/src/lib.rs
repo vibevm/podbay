@@ -9,6 +9,7 @@ mod launch;
 mod later_turn;
 mod manager_peer;
 mod model;
+mod native_evidence;
 mod peer_witness;
 mod rebind;
 mod store;
@@ -41,6 +42,10 @@ pub use model::{
     NativeWriterLease, NativeWriterTarget, ObservedStage, OwnerActorRotationReceipt,
     QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError,
     StoredEffect, TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
+};
+pub use native_evidence::{
+    NativeEvidenceEvent, NativeEvidenceGap, NativeEvidenceIdentity, NativeEvidencePage,
+    NativeEvidenceSnapshot, TrustedNativeEvidenceAdmission,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{

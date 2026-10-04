@@ -3124,6 +3124,34 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
             .unwrap()
             .contains("private manager evidence")
     );
+    let native_session = SessionId::try_from(proof.descriptor().session_id()).unwrap();
+    let native_resource = ResourceId::try_from(
+        proof.descriptor().resource(0).unwrap().resource_id,
+    ).unwrap();
+    let sibling = Transport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+            1000, 9999, 777, "/user.slice/preflight.scope",
+        ).unwrap(),
+        CredentialGeneration::new(1).unwrap(),
+    ));
+    assert!(host.read_current_codex_native_events(
+        &sibling, &fixture.scope, &native_session, &native_resource, None, 2,
+    ).is_err(), "same-UID sibling cannot read private native output");
+    let admitted = host.read_current_codex_native_events(
+        &transport, &fixture.scope, &native_session, &native_resource, None, 2,
+    ).unwrap();
+    assert_eq!(admitted.events.len(), 1);
+    assert_eq!(admitted.events[0].kind, "output");
+    assert!(String::from_utf8_lossy(&admitted.events[0].raw_jsonl)
+        .contains("private manager evidence"));
+    let replay = host.read_current_codex_native_events(
+        &transport, &fixture.scope, &native_session, &native_resource, None, 2,
+    ).unwrap();
+    assert_eq!(replay, admitted, "store replay changed private native output");
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+    let mut persisted = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert!(persisted.scope_snapshot(fixture.scope.as_str()).unwrap()
+        .receipts.iter().all(|receipt| receipt.command_id != admitted.events[0].event_id));
     let mut foreign = cursor.clone();
     foreign.identity.scope_id = "scope.other".into();
     assert!(

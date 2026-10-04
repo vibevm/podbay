@@ -8,12 +8,18 @@ use std::sync::Mutex;
 
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId};
 use podbay_host::ResolvedNativeCodexLaunch;
+use podbay_store::{
+    NativeEvidenceEvent, NativeEvidenceGap, NativeEvidenceIdentity, NativeEvidencePage,
+    NativeEvidenceSnapshot,
+};
 use podbay_pod::{
     CODEX_V2_CAPABILITY, LinuxNativeSegmentDirectory, LinuxPeerEvidence,
-    NativeEventCursor, NativeEventIdentity, NativeEventRead, NativeSegmentCheckpoint, PodClient,
+    NativeEventCursor, NativeEventFidelity, NativeEventIdentity, NativeEventKind,
+    NativeEventRead, NativeEventStatus, NativeSegmentCheckpoint, PodClient,
     PodError, PrivateNativeEvidence, codex_private_slot_directory,
     manifest_path_for_identity,
 };
+use sha2::{Digest, Sha256};
 
 use crate::codex_v2::{
     ExecutableDigestWitness, TrustedCodexCredentialSource,
@@ -93,6 +99,117 @@ impl ManagerNativeEvidenceRead {
     }
     pub fn private_evidence(&self) -> &[PrivateNativeEvidence] {
         &self.private
+    }
+}
+
+/// Convert an attested private page into the command-independent store DTO.
+/// The store validates/deduplicates it again inside the current owner CAS.
+pub(crate) fn read_committed_codex_native_page(
+    launch: &ResolvedNativeCodexLaunch,
+    credential: &TrustedCodexCredentialSource,
+    directory: &TrustedNativeEventDirectory,
+    identity: &NativeEvidenceIdentity,
+    after: Option<u64>,
+    limit: usize,
+) -> Result<NativeEvidencePage, PodError> {
+    let expected = NativeEventIdentity {
+        store_lineage: identity.store_lineage.clone(),
+        scope_id: identity.scope_id.clone(),
+        session_id: identity.session_id.clone(),
+        run_id: identity.run_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        pod_id: identity.pod_id.clone(),
+        pod_incarnation: identity.pod_incarnation,
+        resource_id: identity.resource_id.clone(),
+        resource_epoch: identity.resource_epoch,
+    };
+    // The first owner read starts at source sequence zero. A pod's None
+    // cursor means snapshot-only, so the manager must pass the exact saved
+    // source identity even for the initial page.
+    let cursor = NativeEventCursor {
+        identity: expected.clone(), sequence: after.unwrap_or(0),
+    };
+    let page = read_committed_codex_native_evidence(
+        launch, credential, directory, Some(&cursor), limit,
+    )?;
+    let read = page.redacted();
+    if read.snapshot.identity != expected || read.events.len() != page.private_evidence().len() {
+        return Err(PodError::Refused("native evidence identity or private count differs"));
+    }
+    let events = read.events.iter().zip(page.private_evidence()).map(|(event, private)| {
+        if event.source_sequence != private.source_sequence()
+            || event.event_id != private.event_id()
+        {
+            return Err(PodError::Refused("private native EventId differs"));
+        }
+        let raw = private.private_jsonl();
+        if raw.is_empty() || raw.len() > 65_536 || std::str::from_utf8(raw).is_err() {
+            return Err(PodError::Refused("private native JSONL is malformed"));
+        }
+        let content_digest: String = Sha256::digest(raw)
+            .iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(NativeEvidenceEvent {
+            event_id: event.event_id.clone(), source_sequence: event.source_sequence,
+            kind: kind_name(event.kind).into(),
+            status: event.status.map(|status| status_name(status).into()),
+            recorded_at_unix_millis: event.recorded_at_unix_millis,
+            provenance: event.provenance.clone(),
+            external_conflict: event.external_conflict,
+            content_digest, raw_jsonl: raw.to_vec(),
+        })
+    }).collect::<Result<Vec<_>, _>>()?;
+    let source = &read.snapshot;
+    Ok(NativeEvidencePage {
+        snapshot: NativeEvidenceSnapshot {
+            identity: identity.clone(), watermark: source.watermark,
+            earliest_retained: source.earliest_retained,
+            last_status: source.last_status.map(|status| status_name(status).into()),
+            output_events: source.output_events,
+            question_events: source.question_events,
+            permission_events: source.permission_events,
+            opaque_events: source.opaque_events,
+            external_conflict: source.external_conflict,
+            fidelity: fidelity_name(source.fidelity).into(),
+            quarantined: source.quarantined,
+        },
+        events,
+        // The pod's snapshot-only empty gap keeps its cursor at `after`.
+        // The manager advances across the explicitly declared missing range
+        // so a client never loops forever on the same retained empty page.
+        next_source_sequence: if read.events.is_empty() {
+            read.gap.as_ref().map_or(read.next_cursor.sequence, |gap| gap.missing_through)
+        } else {
+            read.next_cursor.sequence
+        },
+        gap: read.gap.as_ref().map(|gap| NativeEvidenceGap {
+            missing_from: gap.missing_from,
+            missing_through: gap.missing_through,
+            earliest_available: gap.earliest_available,
+        }),
+    })
+}
+
+fn kind_name(value: NativeEventKind) -> &'static str {
+    match value {
+        NativeEventKind::Status => "status", NativeEventKind::Output => "output",
+        NativeEventKind::Question => "question", NativeEventKind::Permission => "permission",
+        NativeEventKind::Opaque => "opaque",
+    }
+}
+
+fn status_name(value: NativeEventStatus) -> &'static str {
+    match value {
+        NativeEventStatus::Idle => "idle", NativeEventStatus::Active => "active",
+        NativeEventStatus::Waiting => "waiting", NativeEventStatus::Completed => "completed",
+        NativeEventStatus::Failed => "failed", NativeEventStatus::Interrupted => "interrupted",
+        NativeEventStatus::SystemError => "system_error",
+    }
+}
+
+fn fidelity_name(value: NativeEventFidelity) -> &'static str {
+    match value {
+        NativeEventFidelity::Exact => "exact", NativeEventFidelity::Partial => "partial",
+        NativeEventFidelity::Unknown => "unknown",
     }
 }
 

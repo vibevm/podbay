@@ -39,7 +39,7 @@ fn read_only(path: &PathBuf) -> Connection {
 }
 
 #[test]
-fn fresh_open_creates_current_v22_directly_and_reopen_preserves_identity() {
+fn fresh_open_creates_current_v23_directly_and_reopen_preserves_identity() {
     let fixture = Fixture::new();
     let path = fixture.database();
     assert!(!path.exists());
@@ -49,13 +49,13 @@ fn fresh_open_creates_current_v22_directly_and_reopen_preserves_identity() {
     drop(first);
     let header = fs::read(&path).unwrap();
     assert_eq!(&header[..16], b"SQLite format 3\0");
-    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 22);
+    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 23);
 
     let connection = read_only(&path);
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     let lineage: String = connection
         .query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
@@ -69,6 +69,9 @@ fn fresh_open_creates_current_v22_directly_and_reopen_preserves_identity() {
         "launch_policy_fences",
         "rebind_supersession_attempts",
         "codex_later_turns",
+        "codex_native_sources",
+        "codex_native_evidence",
+        "codex_native_conflicts",
     ] {
         let count: i64 = connection
             .query_row(
@@ -146,7 +149,7 @@ fn existing_v19_refuses_before_file_or_directory_mutation() {
 #[test]
 fn every_retired_schema_version_refuses_without_repair() {
     let fixture = Fixture::new();
-    for version in [0, 1, 18, 20, 21] {
+    for version in [0, 1, 18, 20, 21, 22] {
         let path = fixture.0.join(format!("old-{version}.sqlite"));
         let connection = Connection::open(&path).unwrap();
         connection
@@ -237,7 +240,7 @@ fn v19_visible_only_in_wal_refuses_without_changing_durable_bytes() {
     // Keep the writer open so the retired version remains in WAL while the
     // main database header still says 22.
     let header = fs::read(&path).unwrap();
-    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 22);
+    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 23);
     let wal = PathBuf::from(format!("{}-wal", path.display()));
     let before = [fs::read(&path).unwrap(), fs::read(&wal).unwrap()];
     assert!(matches!(

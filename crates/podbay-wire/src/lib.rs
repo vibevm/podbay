@@ -52,7 +52,8 @@ pub use observation::{
 };
 pub use read::{
     CommandSelector, CommandsGetBody, EmptyReadBody, EventsSubscribeBody, HistoryReadBody,
-    ReadBody, ReadEnvelope, ReadOperation, TerminalAttachBody, TerminalObserveBody,
+    NativeEventCursor, NativeEventIdentity, NativeEventsReadBody, ReadBody, ReadEnvelope,
+    ReadOperation, TerminalAttachBody, TerminalObserveBody,
     decode_read_json,
 };
 pub use schema::contract_manifest;

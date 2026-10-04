@@ -1,0 +1,14 @@
+{
+  "body": {
+    "sessionId": "session.fixture",
+    "resourceId": "resource.fixture",
+    "limit": "2"
+  },
+  "operation": "native.events.read",
+  "protocol": "podbay/1",
+  "requestId": "request.native.events.read.1",
+  "target": {
+    "kind": "scope",
+    "scopeId": "scope.fixture"
+  }
+}

@@ -29,6 +29,7 @@ use podbay_store::{
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     LaterCodexSendSelector, ManagerCredentialClaim, NativeWriterLease,
+    NativeEvidenceIdentity, NativeEvidencePage, TrustedNativeEvidenceAdmission,
     OwnerActorRotationReceipt, PodBayStore, PriorPlannedRecovery, Receipt,
     SqliteActorVerifierWitness, StoreError, SupersessionReceipt, SupersessionStage,
     TrustedBootstrapSendRequest, TrustedLaterCodexSendRequest,
@@ -37,7 +38,7 @@ use podbay_store::{
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
     FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole, SendPolicy,
-    OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
+    NativeEventCursor, OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
     SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
     WorkspaceAccess as WireWorkspaceAccess,
 };
@@ -1709,6 +1710,19 @@ pub trait HostDispatchPort {
     /// leaves the durable outbox Prepared and calls no external effect.
     fn accepts_resolved_codex_v2(&self) -> bool {
         false
+    }
+
+    /// Private, read-only pod evidence. A port must attest the current pod,
+    /// index held private frames and return only this exact launch's source.
+    /// The host admits the page durably after fresh actor/store fences.
+    fn read_committed_codex_native_events(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+        _identity: &NativeEvidenceIdentity,
+        _after: Option<u64>,
+        _limit: usize,
+    ) -> Result<NativeEvidencePage, HostError> {
+        Err(HostError::Unsupported)
     }
 
     /// Distinct V3 capability. A V2-only port cannot receive a V3 launch.
@@ -5969,6 +5983,174 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
             self.recheck_actor_resolution_manager()?;
             found.map_err(Into::into)
+        }
+    }
+
+    /// One owner-only private Codex V2 native evidence page. Request selectors
+    /// cannot supply a Pod binding: the current Session graph and committed
+    /// launch do. The pod read happens outside the SQLite write transaction;
+    /// the store then rechecks owner, actor and launch digests atomically.
+    pub fn read_current_codex_native_events<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        session_id: &SessionId,
+        resource_id: &ResourceId,
+        after: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<NativeEvidencePage, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (transport, scope, session_id, resource_id, after, limit);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !(1..=2).contains(&limit) {
+                return Err(HostError::InvalidInput.into());
+            }
+            let snapshot = self.current_scope_snapshot(transport, scope)?;
+            let actor = self.host.authenticate(transport)?.clone();
+            if actor.origin != PeerOrigin::OwnerCli || actor.scope_id != *scope {
+                return Err(HostError::Unauthorised.into());
+            }
+            let right = Right::new(Operation::SendSession, Target::Scope(scope.clone()));
+            if !self.host.grants.keys().any(|grant_id| {
+                self.host.check_grant(&actor, *grant_id, scope, &right).is_ok()
+            }) {
+                return Err(HostError::Unauthorised.into());
+            }
+            let session = snapshot.sessions.iter().find(|session| {
+                session.session_id == session_id.as_str()
+                    && session.actor_id == actor.actor_id.as_str()
+            }).ok_or(HostError::Unauthorised)?;
+            let run = session.run.as_ref().ok_or(HostError::StaleGuard)?;
+            let attempt = run.attempt.as_ref().ok_or(HostError::StaleGuard)?;
+            let resource = attempt.pod.resources.iter().find(|resource| {
+                resource.resource_id == resource_id.as_str()
+            }).ok_or(HostError::StaleGuard)?;
+            if resource.kind != "structured_provider" {
+                return Err(HostError::Unsupported.into());
+            }
+            let pod = PodId::try_from(attempt.pod.pod_id.as_str())
+                .map_err(|_| HostError::StaleGuard)?;
+            let launch = self.inspect_committed_root_codex_v2(scope, &pod)
+                .map_err(|_| HostError::StaleGuard)?;
+            let descriptor = launch.descriptor();
+            let native = descriptor.resource(0).ok_or(HostError::StaleGuard)?;
+            if descriptor.session_id() != session_id.as_str()
+                || descriptor.run_id() != run.run_id
+                || descriptor.attempt_id() != attempt.attempt_id
+                || descriptor.pod_id() != attempt.pod.pod_id
+                || descriptor.pod_incarnation() != attempt.pod.incarnation
+                || native.resource_id != resource_id.as_str()
+                || native.epoch != resource.epoch
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let identity = NativeEvidenceIdentity {
+                store_lineage: launch.store_lineage().to_owned(),
+                scope_id: scope.as_str().into(),
+                session_id: session_id.as_str().into(),
+                run_id: run.run_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                pod_id: attempt.pod.pod_id.clone(),
+                pod_incarnation: attempt.pod.incarnation,
+                resource_id: resource_id.as_str().into(),
+                resource_epoch: resource.epoch,
+            };
+            let expected_wire = podbay_wire::NativeEventIdentity {
+                store_lineage: identity.store_lineage.clone(),
+                scope_id: identity.scope_id.clone(),
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                attempt_id: identity.attempt_id.clone(),
+                pod_id: identity.pod_id.clone(),
+                pod_incarnation: podbay_wire::DecimalString::new(identity.pod_incarnation),
+                resource_id: identity.resource_id.clone(),
+                resource_epoch: podbay_wire::DecimalString::new(identity.resource_epoch),
+            };
+            if after.is_some_and(|cursor| cursor.identity != expected_wire) {
+                return Err(StoreError::WrongCursor.into());
+            }
+            let after_sequence = after.map_or(0, |cursor| cursor.source_sequence.get());
+            let actor_record = durable_actor(&actor);
+            let replay = self.store.native_evidence_after(
+                &actor_record, snapshot.owner_epoch, snapshot.manager_credential_epoch,
+                snapshot.authority_revision, &identity, launch.effective().digest(),
+                launch.descriptor().digest(), after_sequence, limit,
+            )?;
+            if replay.as_ref().is_some_and(|page| page.events.len() == limit) {
+                let replay = replay.expect("full native page is present");
+                self.recheck_actor_resolution_manager()?;
+                if durable_actor(self.host.authenticate(transport)?) != actor_record {
+                    return Err(HostError::Unauthenticated.into());
+                }
+                let confirmed = self.store.native_evidence_after(
+                    &actor_record, snapshot.owner_epoch, snapshot.manager_credential_epoch,
+                    snapshot.authority_revision, &identity, launch.effective().digest(),
+                    launch.descriptor().digest(), after_sequence, limit,
+                )?;
+                if confirmed.as_ref() != Some(&replay) {
+                    return Err(HostError::StaleGuard.into());
+                }
+                return Ok(replay);
+            }
+            // A partial durable replay must not mask fresh pod output. Fetch
+            // only the suffix after its last admitted source sequence, then
+            // return the original cursor's bounded durable page.
+            let fetch_after = replay.as_ref().map_or(after_sequence, |page| page.next_source_sequence);
+            let fetch_limit = limit - replay.as_ref().map_or(0, |page| page.events.len());
+            let observed = self.host.port.read_committed_codex_native_events(
+                &launch, &identity, Some(fetch_after), fetch_limit,
+            )?;
+            if observed.snapshot.identity != identity {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let fresh = self.inspect_committed_root_codex_v2(scope, &pod)
+                .map_err(|_| HostError::StaleGuard)?;
+            if fresh.store_file_identity() != launch.store_file_identity()
+                || fresh.owner_epoch() != launch.owner_epoch()
+                || fresh.credential_epoch() != launch.credential_epoch()
+                || fresh.authority_revision() != launch.authority_revision()
+                || fresh.descriptor().digest() != launch.descriptor().digest()
+                || fresh.effective().digest() != launch.effective().digest()
+                || durable_actor(self.host.authenticate(transport)?) != actor_record
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let admitted = self.store.admit_native_evidence_page(TrustedNativeEvidenceAdmission {
+                actor: &actor_record,
+                expected_owner_epoch: snapshot.owner_epoch,
+                expected_manager_credential_epoch: snapshot.manager_credential_epoch,
+                expected_authority_revision: snapshot.authority_revision,
+                effective_digest: launch.effective().digest(),
+                descriptor_digest: launch.descriptor().digest(),
+                after: fetch_after,
+                limit: fetch_limit,
+                page: &observed,
+            })?;
+            let result = self.store.native_evidence_after(
+                &actor_record, snapshot.owner_epoch, snapshot.manager_credential_epoch,
+                snapshot.authority_revision, &identity, launch.effective().digest(),
+                launch.descriptor().digest(), after_sequence, limit,
+            )?.unwrap_or(admitted);
+            self.recheck_actor_resolution_manager()?;
+            if durable_actor(self.host.authenticate(transport)?) != actor_record {
+                return Err(HostError::Unauthenticated.into());
+            }
+            if !result.events.is_empty() {
+                let confirmed = self.store.native_evidence_after(
+                    &actor_record, snapshot.owner_epoch, snapshot.manager_credential_epoch,
+                    snapshot.authority_revision, &identity, launch.effective().digest(),
+                    launch.descriptor().digest(), after_sequence, limit,
+                )?;
+                if confirmed.as_ref() != Some(&result) {
+                    return Err(HostError::StaleGuard.into());
+                }
+            }
+            Ok(result)
         }
     }
 

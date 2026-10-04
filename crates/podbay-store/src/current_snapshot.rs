@@ -131,7 +131,7 @@ impl PodBayStore {
     }
 }
 
-fn check_fence(
+pub(crate) fn check_fence(
     transaction: &Transaction<'_>,
     expected_lineage: &str,
     actor: &AuthorityActorRecord,

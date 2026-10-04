@@ -23,6 +23,8 @@ pub enum ReadOperation {
     EventsSubscribe,
     #[serde(rename = "history.read")]
     HistoryRead,
+    #[serde(rename = "native.events.read")]
+    NativeEventsRead,
     #[serde(rename = "terminal.snapshot")]
     TerminalSnapshot,
     #[serde(rename = "terminal.attach")]
@@ -32,7 +34,7 @@ pub enum ReadOperation {
 }
 
 impl ReadOperation {
-    pub const SUPPORTED: [Self; 11] = [
+    pub const SUPPORTED: [Self; 12] = [
         Self::CapabilitiesGet,
         Self::CommandsGet,
         Self::RunGet,
@@ -41,6 +43,7 @@ impl ReadOperation {
         Self::SnapshotGet,
         Self::EventsSubscribe,
         Self::HistoryRead,
+        Self::NativeEventsRead,
         Self::TerminalSnapshot,
         Self::TerminalAttach,
         Self::TerminalObserve,
@@ -56,6 +59,7 @@ impl ReadOperation {
             Self::SnapshotGet => "snapshot.get",
             Self::EventsSubscribe => "event.subscribe",
             Self::HistoryRead => "history.read",
+            Self::NativeEventsRead => "native.events.read",
             Self::TerminalSnapshot => "terminal.snapshot",
             Self::TerminalAttach => "terminal.attach",
             Self::TerminalObserve => "terminal.observe",
@@ -106,6 +110,39 @@ pub struct HistoryReadBody {
     pub limit: DecimalString,
 }
 
+/// The full immutable native source identity. A cursor from another launch,
+/// Pod incarnation, or Resource epoch cannot select a nearby source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeEventIdentity {
+    pub store_lineage: String,
+    pub scope_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub pod_id: String,
+    pub pod_incarnation: DecimalString,
+    pub resource_id: String,
+    pub resource_epoch: DecimalString,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeEventCursor {
+    pub identity: NativeEventIdentity,
+    pub source_sequence: DecimalString,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeEventsReadBody {
+    pub session_id: String,
+    pub resource_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<NativeEventCursor>,
+    pub limit: DecimalString,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalObserveBody {
@@ -129,6 +166,7 @@ pub enum ReadBody {
     SnapshotGet(EmptyReadBody),
     EventsSubscribe(EventsSubscribeBody),
     HistoryRead(HistoryReadBody),
+    NativeEventsRead(NativeEventsReadBody),
     TerminalSnapshot(EmptyReadBody),
     TerminalAttach(TerminalAttachBody),
     TerminalObserve(TerminalObserveBody),
@@ -145,6 +183,7 @@ impl ReadBody {
             Self::SnapshotGet(_) => ReadOperation::SnapshotGet,
             Self::EventsSubscribe(_) => ReadOperation::EventsSubscribe,
             Self::HistoryRead(_) => ReadOperation::HistoryRead,
+            Self::NativeEventsRead(_) => ReadOperation::NativeEventsRead,
             Self::TerminalSnapshot(_) => ReadOperation::TerminalSnapshot,
             Self::TerminalAttach(_) => ReadOperation::TerminalAttach,
             Self::TerminalObserve(_) => ReadOperation::TerminalObserve,
@@ -162,6 +201,7 @@ impl ReadBody {
             Self::CommandsGet(value) => serde_json::to_value(value)?,
             Self::EventsSubscribe(value) => serde_json::to_value(value)?,
             Self::HistoryRead(value) => serde_json::to_value(value)?,
+            Self::NativeEventsRead(value) => serde_json::to_value(value)?,
             Self::TerminalAttach(value) => serde_json::to_value(value)?,
             Self::TerminalObserve(value) => serde_json::to_value(value)?,
         })
@@ -177,6 +217,9 @@ impl ReadBody {
             ReadOperation::SnapshotGet => Self::SnapshotGet(serde_json::from_value(value)?),
             ReadOperation::EventsSubscribe => Self::EventsSubscribe(serde_json::from_value(value)?),
             ReadOperation::HistoryRead => Self::HistoryRead(serde_json::from_value(value)?),
+            ReadOperation::NativeEventsRead => {
+                Self::NativeEventsRead(serde_json::from_value(value)?)
+            }
             ReadOperation::TerminalSnapshot => {
                 Self::TerminalSnapshot(serde_json::from_value(value)?)
             }
@@ -253,7 +296,8 @@ impl ReadEnvelope {
                     | ReadOperation::CommandsGet
                     | ReadOperation::SnapshotGet
                     | ReadOperation::EventsSubscribe
-                    | ReadOperation::HistoryRead,
+                    | ReadOperation::HistoryRead
+                    | ReadOperation::NativeEventsRead,
                 Target::Scope { .. }
             ) | (ReadOperation::RunGet, Target::Run { .. })
                 | (ReadOperation::SessionGet, Target::Session { .. })
@@ -281,6 +325,44 @@ impl ReadEnvelope {
                 validate_cursor_scope(&body.after, &self.target)?;
                 if !(1..=1024).contains(&body.limit.get()) {
                     return Err(WireError::InvalidField("body.limit"));
+                }
+            }
+            ReadBody::NativeEventsRead(body) => {
+                valid_identity(&body.session_id)
+                    .map_err(|_| WireError::InvalidField("body.sessionId"))?;
+                valid_identity(&body.resource_id)
+                    .map_err(|_| WireError::InvalidField("body.resourceId"))?;
+                if !(1..=2).contains(&body.limit.get()) {
+                    return Err(WireError::InvalidField("body.limit"));
+                }
+                if let Some(cursor) = &body.after {
+                    cursor.source_sequence.try_i64()?;
+                    let identity = &cursor.identity;
+                    identity.pod_incarnation.try_i64()?;
+                    identity.resource_epoch.try_i64()?;
+                    for value in [
+                        &identity.store_lineage,
+                        &identity.scope_id,
+                        &identity.session_id,
+                        &identity.run_id,
+                        &identity.attempt_id,
+                        &identity.pod_id,
+                        &identity.resource_id,
+                    ] {
+                        valid_identity(value)
+                            .map_err(|_| WireError::InvalidField("body.after.identity"))?;
+                    }
+                    let Target::Scope { scope_id } = &self.target else {
+                        return Err(WireError::InvalidField("target"));
+                    };
+                    if identity.scope_id != *scope_id
+                        || identity.session_id != body.session_id
+                        || identity.resource_id != body.resource_id
+                        || identity.pod_incarnation.get() == 0
+                        || identity.resource_epoch.get() == 0
+                    {
+                        return Err(WireError::ForeignScope);
+                    }
                 }
             }
             ReadBody::TerminalObserve(body) => {

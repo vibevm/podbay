@@ -39,6 +39,7 @@ pub fn typescript_source() -> String {
         "snapshot.get",
         "event.subscribe",
         "history.read",
+        "native.events.read",
         "terminal.snapshot",
         "terminal.attach",
         "terminal.observe",

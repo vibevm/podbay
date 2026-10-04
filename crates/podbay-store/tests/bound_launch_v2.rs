@@ -15,9 +15,12 @@ use podbay_store::{
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
     LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     LaterCodexSendSelector, NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
+    NativeEvidenceEvent, NativeEvidenceIdentity, NativeEvidencePage, NativeEvidenceSnapshot,
+    TrustedNativeEvidenceAdmission,
     TrustedLaterCodexSendRequest,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
+use sha2::{Digest, Sha256};
 use podbay_wire::{
     CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
     EffectiveLaunchContract, EffectiveLaunchContractV2, Guard, ImmutableLaunchDescriptor,
@@ -2431,4 +2434,218 @@ fn v22_schema_tamper_refuses_both_open_modes() {
         Err(StoreError::Conflict("v22 later turn schema differs"))));
     assert!(matches!(PodBayStore::open(&fixture.database),
         Err(StoreError::Conflict("v22 later turn schema differs"))));
+}
+
+fn native_fixture_page(target: &NativeWriterTarget, raw: &[u8]) -> NativeEvidencePage {
+    let mut raw = raw.to_vec();
+    raw.push(b'\n');
+    let identity = NativeEvidenceIdentity {
+        store_lineage: target.store_lineage.as_str().into(),
+        scope_id: target.scope_id.as_str().into(),
+        session_id: target.session_id.as_str().into(),
+        run_id: target.run_id.as_str().into(),
+        attempt_id: target.attempt_id.as_str().into(),
+        pod_id: target.pod_id.as_str().into(),
+        pod_incarnation: target.pod_incarnation,
+        resource_id: target.resource_id.as_str().into(),
+        resource_epoch: target.resource_epoch,
+    };
+    let content_digest = Sha256::digest(&raw).iter()
+        .map(|byte| format!("{byte:02x}")).collect();
+    NativeEvidencePage {
+        snapshot: NativeEvidenceSnapshot {
+            identity, watermark: 1, earliest_retained: 1, last_status: None,
+            output_events: 1, question_events: 0, permission_events: 0,
+            opaque_events: 0, external_conflict: false,
+            fidelity: "exact".into(), quarantined: false,
+        },
+        events: vec![NativeEvidenceEvent {
+            event_id: "event.native.fixture.1".into(), source_sequence: 1,
+            kind: "output".into(), status: None, recorded_at_unix_millis: 123,
+            provenance: "codex.app-server.pod-observed/1".into(),
+            external_conflict: false, content_digest, raw_jsonl: raw,
+        }],
+        next_source_sequence: 1, gap: None,
+    }
+}
+
+fn native_input<'a>(
+    actor: &'a AuthorityActorRecord,
+    owner: u64,
+    credential: u64,
+    revision: u64,
+    effective_digest: &'a str,
+    descriptor_digest: &'a str,
+    page: &'a NativeEvidencePage,
+) -> TrustedNativeEvidenceAdmission<'a> {
+    TrustedNativeEvidenceAdmission {
+        actor, expected_owner_epoch: owner,
+        expected_manager_credential_epoch: credential,
+        expected_authority_revision: revision,
+        effective_digest, descriptor_digest, after: 0, limit: 2, page,
+    }
+}
+
+#[test]
+fn v23_native_evidence_is_exact_once_private_and_reopen_replays() {
+    let fixture = Fixture::new();
+    let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);
+    let actor = writer_actor("actor.codex.fixture");
+    let revision = store.authority_snapshot().unwrap().revision;
+    let bound = store.current_bound_pod_snapshot("scope.launch", "pod.launch").unwrap();
+    let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
+    let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
+    let raw = br#"{"method":"item/completed","params":{"text":"private fixture output"}}"#;
+    let page = native_fixture_page(&target, raw);
+    let make_input = |page| native_input(&actor, 1, credential_epoch, revision,
+        effective.digest(), descriptor.digest(), page);
+    let before_generic: i64 = rusqlite::Connection::open(&fixture.database).unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap();
+    assert_eq!(store.admit_native_evidence_page(make_input(&page)).unwrap(), page);
+    assert_eq!(store.admit_native_evidence_page(make_input(&page)).unwrap(), page);
+    drop(store);
+    let mut reopened = fixture.open();
+    assert_eq!(reopened.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &page.snapshot.identity, effective.digest(), descriptor.digest(), 0, 2)
+        .unwrap(), Some(page.clone()));
+    let after_generic: i64 = rusqlite::Connection::open(&fixture.database).unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0)).unwrap();
+    assert_eq!(after_generic, before_generic, "raw native output entered generic history");
+    let mut changed = page.clone();
+    changed.events[0].raw_jsonl = b"{\"method\":\"changed\"}\n".to_vec();
+    changed.events[0].content_digest = Sha256::digest(&changed.events[0].raw_jsonl)
+        .iter().map(|byte| format!("{byte:02x}")).collect();
+    assert!(matches!(reopened.admit_native_evidence_page(make_input(&changed)),
+        Err(StoreError::SourceIdentityQuarantined)));
+    assert!(matches!(reopened.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &page.snapshot.identity, effective.digest(), descriptor.digest(), 0, 2),
+        Err(StoreError::SourceIdentityQuarantined)));
+}
+
+#[test]
+fn v23_native_evidence_refuses_foreign_actor_stale_owner_and_wrong_resource() {
+    let fixture = Fixture::new();
+    let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);
+    let actor = writer_actor("actor.codex.fixture");
+    let revision = store.authority_snapshot().unwrap().revision;
+    let bound = store.current_bound_pod_snapshot("scope.launch", "pod.launch").unwrap();
+    let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
+    let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
+    let page = native_fixture_page(&target, br#"{"method":"turn/completed"}"#);
+    let mut foreign = writer_actor("actor.codex.other");
+    foreign.scope_id = "scope.other".into();
+    assert!(store.admit_native_evidence_page(native_input(&foreign, 1, credential_epoch,
+        revision, effective.digest(), descriptor.digest(), &page)).is_err());
+    assert!(matches!(store.admit_native_evidence_page(native_input(&actor, 2,
+        credential_epoch, revision, effective.digest(), descriptor.digest(), &page)),
+        Err(StoreError::StaleEpoch)));
+    let mut wrong = page.clone();
+    wrong.snapshot.identity.resource_id = "resource.other".into();
+    assert!(matches!(store.admit_native_evidence_page(native_input(&actor, 1,
+        credential_epoch, revision, effective.digest(), descriptor.digest(), &wrong)),
+        Err(StoreError::NotFound)));
+    let count: i64 = rusqlite::Connection::open(&fixture.database).unwrap()
+        .query_row("SELECT COUNT(*) FROM codex_native_evidence", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn v23_native_evidence_failed_insert_rolls_back_source_and_rejects_schema_tamper() {
+    let fixture = Fixture::new();
+    let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);
+    let actor = writer_actor("actor.codex.fixture");
+    let revision = store.authority_snapshot().unwrap().revision;
+    let bound = store.current_bound_pod_snapshot("scope.launch", "pod.launch").unwrap();
+    let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
+    let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
+    let page = native_fixture_page(&target, br#"{"method":"item/completed"}"#);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER fail_native_event AFTER INSERT ON codex_native_evidence
+         BEGIN SELECT RAISE(ABORT,'injected native event failure'); END;",
+    ).unwrap();
+    let input = || native_input(&actor, 1, credential_epoch, revision,
+        effective.digest(), descriptor.digest(), &page);
+    assert!(matches!(store.admit_native_evidence_page(input()), Err(StoreError::Storage(_))));
+    for table in ["codex_native_sources", "codex_native_evidence"] {
+        let count: i64 = connection.query_row(&format!("SELECT COUNT(*) FROM {table}"),
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "{table} partially committed");
+    }
+    connection.execute_batch("DROP TRIGGER fail_native_event").unwrap();
+    assert_eq!(store.admit_native_evidence_page(input()).unwrap(), page);
+    drop(store);
+    connection.execute_batch("DROP TABLE codex_native_conflicts").unwrap();
+    drop(connection);
+    assert!(matches!(PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::Conflict("v23 Codex native evidence schema differs"))));
+}
+
+#[test]
+fn v23_native_gap_only_advances_cursor_and_partial_replay_grows() {
+    let fixture = Fixture::new();
+    let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);
+    let actor = writer_actor("actor.codex.fixture");
+    let revision = store.authority_snapshot().unwrap().revision;
+    let bound = store.current_bound_pod_snapshot("scope.launch", "pod.launch").unwrap();
+    let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
+    let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
+    let mut empty = native_fixture_page(&target, b"{\"method\":\"fixture\"}");
+    empty.events.clear();
+    empty.snapshot.watermark = 5;
+    empty.snapshot.earliest_retained = 6;
+    empty.snapshot.output_events = 5;
+    empty.snapshot.fidelity = "partial".into();
+    empty.next_source_sequence = 5;
+    empty.gap = Some(podbay_store::NativeEvidenceGap {
+        missing_from: 1, missing_through: 5, earliest_available: 6,
+    });
+    let admitted = store.admit_native_evidence_page(native_input(&actor, 1,
+        credential_epoch, revision, effective.digest(), descriptor.digest(), &empty)).unwrap();
+    assert!(admitted.events.is_empty());
+    assert_eq!(admitted.next_source_sequence, 5);
+    assert_eq!(admitted.gap, empty.gap);
+
+    let mut sixth = native_fixture_page(&target, br#"{"method":"item/agentMessage/delta","delta":"six"}"#);
+    sixth.events[0].source_sequence = 6;
+    sixth.events[0].event_id = "event.native.fixture.6".into();
+    sixth.snapshot.watermark = 6;
+    sixth.snapshot.earliest_retained = 6;
+    sixth.snapshot.output_events = 6;
+    sixth.snapshot.fidelity = "partial".into();
+    sixth.next_source_sequence = 6;
+    sixth.gap = None;
+    let admitted = store.admit_native_evidence_page(TrustedNativeEvidenceAdmission {
+        actor: &actor, expected_owner_epoch: 1,
+        expected_manager_credential_epoch: credential_epoch,
+        expected_authority_revision: revision,
+        effective_digest: effective.digest(), descriptor_digest: descriptor.digest(),
+        after: 5, limit: 2, page: &sixth,
+    }).unwrap();
+    assert_eq!(admitted.events.len(), 1);
+    let first = store.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &sixth.snapshot.identity, effective.digest(), descriptor.digest(), 0, 2)
+        .unwrap().unwrap();
+    assert_eq!(first.events[0].source_sequence, 6);
+    assert_eq!(first.gap.unwrap().missing_through, 5);
+    assert_eq!(first.next_source_sequence, 6);
+
+    let mut seventh = sixth.clone();
+    seventh.events[0].source_sequence = 7;
+    seventh.events[0].event_id = "event.native.fixture.7".into();
+    seventh.snapshot.watermark = 7;
+    seventh.snapshot.earliest_retained = 6;
+    seventh.snapshot.output_events = 7;
+    seventh.next_source_sequence = 7;
+    store.admit_native_evidence_page(TrustedNativeEvidenceAdmission {
+        actor: &actor, expected_owner_epoch: 1,
+        expected_manager_credential_epoch: credential_epoch,
+        expected_authority_revision: revision,
+        effective_digest: effective.digest(), descriptor_digest: descriptor.digest(),
+        after: 6, limit: 2, page: &seventh,
+    }).unwrap();
+    let grown = store.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &seventh.snapshot.identity, effective.digest(), descriptor.digest(), 0, 2)
+        .unwrap().unwrap();
+    assert_eq!(grown.events.iter().map(|event| event.source_sequence).collect::<Vec<_>>(), [6, 7]);
 }

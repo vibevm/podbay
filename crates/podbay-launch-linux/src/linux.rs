@@ -4,6 +4,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use podbay_core::{
@@ -191,6 +192,7 @@ pub struct LinuxLaunchPort {
     config: TrustedLinuxLaunchConfig,
     codex_credentials: BTreeMap<CredentialRef, TrustedCodexCredentialSource>,
     operator_process: Option<TrustedOperatorProcessProfile>,
+    native_events: Mutex<Option<crate::native_ingest::TrustedNativeEventDirectory>>,
 }
 
 impl LinuxLaunchPort {
@@ -199,6 +201,7 @@ impl LinuxLaunchPort {
             config,
             codex_credentials: BTreeMap::new(),
             operator_process: None,
+            native_events: Mutex::new(None),
         }
     }
 
@@ -1148,6 +1151,35 @@ impl HostDispatchPort for LinuxLaunchPort {
 
     fn accepts_resolved_codex_v2(&self) -> bool {
         !self.codex_credentials.is_empty() && self.config.recheck().is_ok()
+    }
+
+    fn read_committed_codex_native_events(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+        identity: &podbay_store::NativeEvidenceIdentity,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<podbay_store::NativeEvidencePage, podbay_host::HostError> {
+        self.config.recheck().map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let scope = ScopeId::try_from(launch.descriptor().scope_id())
+            .map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let credential = CredentialRef::from_trusted_vault(
+            scope, launch.effective().codex_policy().credential_ref(),
+        ).map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let source = self.codex_credentials.get(&credential)
+            .ok_or(podbay_host::HostError::StaleGuard)?;
+        let mut held = self.native_events.lock()
+            .map_err(|_| podbay_host::HostError::AuthorityStoreUnavailable)?;
+        if held.is_none() {
+            *held = Some(crate::native_ingest::TrustedNativeEventDirectory::from_trusted_policy(
+                self.config.directory.clone(),
+            ).map_err(|_| podbay_host::HostError::StaleGuard)?);
+        }
+        crate::native_ingest::read_committed_codex_native_page(
+            launch, source,
+            held.as_ref().ok_or(podbay_host::HostError::StaleGuard)?,
+            identity, after, limit,
+        ).map_err(|_| podbay_host::HostError::StaleGuard)
     }
 
     fn launch_resolved_codex_v2(
