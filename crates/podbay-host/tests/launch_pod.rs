@@ -1190,6 +1190,219 @@ fn prepared_bootstrap_host(
 }
 
 #[test]
+fn current_later_guard_reads_exact_advanced_lease_without_port_effect() {
+    let fixture = Fixture::new();
+    let (who, mut host, policy, _, send_grant, calls) =
+        prepared_bootstrap_host(&fixture, false);
+    let pod = host.recorded_snapshot().pods[0].pod_id.clone();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let bound = store
+        .current_bound_pod_snapshot(who.scope.as_str(), &pod)
+        .unwrap();
+    let command_id = CommandId::try_from(bound.launch().receipt.command_id.as_str()).unwrap();
+    let session = SessionId::try_from(bound.launch().session_id.as_str()).unwrap();
+    let (target, revision) = store
+        .current_native_writer_target_for_session(&who.scope, &session)
+        .unwrap();
+    let first = host
+        .read_current_later_send_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.target(), &target);
+    assert_eq!(first.session_revision(), revision);
+    assert_eq!(first.writer_epoch(), 1);
+    assert_eq!(first.policy_fence_epoch(), None);
+    assert!(host
+        .read_current_initial_bootstrap_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .is_some());
+
+    let snapshot = store.authority_snapshot().unwrap();
+    let manager = store
+        .current_manager_credential_claim(snapshot.owner_epoch)
+        .unwrap();
+    let second = store
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target: target.clone(),
+            holder_actor_id: who.actor.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: snapshot.owner_epoch,
+            expected_manager_credential_epoch: manager.credential_epoch(),
+            expected_authority_revision: snapshot.revision,
+            expected_writer_epoch: Some(1),
+            ttl_seconds: 90,
+        })
+        .unwrap();
+    assert_eq!(second.writer_epoch(), 2);
+    let durable_before_reads = store.scope_snapshot(who.scope.as_str()).unwrap();
+    let later = host
+        .read_current_later_send_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.writer_epoch(), 2);
+    assert_eq!(later.target(), &target);
+    assert_eq!(later.expires_at_unix_seconds(), second.expires_at_unix_seconds());
+    assert!(host
+        .read_current_initial_bootstrap_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .is_none());
+    assert!(host
+        .read_current_later_send_guard_for_launch(
+            &who.transport,
+            &ScopeId::try_from("scope.foreign").unwrap(),
+            &command_id,
+            &policy,
+        )
+        .is_err());
+    let wrong_process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000, 99_992, 444_555, "/user.slice/foreign.scope",
+    )
+    .unwrap();
+    let wrong_actor = FakeTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        wrong_process,
+        CredentialGeneration::new(1).unwrap(),
+    ));
+    assert!(host
+        .read_current_later_send_guard_for_launch(
+            &wrong_actor, &who.scope, &command_id, &policy,
+        )
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.scope_snapshot(who.scope.as_str()).unwrap(),
+        durable_before_reads
+    );
+    rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE native_writer_leases SET expires_at_unix_seconds=1 WHERE resource_id=?1",
+            [target.resource_id.as_str()],
+        )
+        .unwrap();
+    assert!(host
+        .read_current_later_send_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .is_none());
+    host.revoke_grant_from_trusted_policy(send_grant).unwrap();
+    assert!(host
+        .read_current_later_send_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn current_later_guard_reads_writer_epoch_two_after_a_to_b_rebind() {
+    let fixture = Fixture::new();
+    let (who, first_host, _, _, send_grant, _) = prepared_bootstrap_host(&fixture, false);
+    let pod = first_host.recorded_snapshot().pods[0].pod_id.clone();
+    let original = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .current_bound_pod_snapshot(who.scope.as_str(), &pod)
+        .unwrap()
+        .launch()
+        .clone();
+    let command_id = CommandId::try_from(original.receipt.command_id.as_str()).unwrap();
+    drop(first_host);
+
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let mut second_host = DurableAuthority::open(&fixture.database, port.codex_v2()).unwrap();
+    second_host
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                .unwrap(),
+        )
+        .unwrap();
+    second_host
+        .register_native_host_from_trusted_policy(native_host_config())
+        .unwrap();
+    second_host
+        .reattest_actor_from_trusted_replay(
+            &who.transport,
+            ActorRegistration::owner_cli_from_trusted_policy(
+                who.actor.clone(),
+                who.scope.clone(),
+                who.process.clone(),
+                CredentialGeneration::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+    let replayed_send_grant = second_host
+        .activate_recorded_grant_for_actor_from_trusted_replay(
+            &who.actor, &who.scope, send_grant.get(),
+        )
+        .unwrap();
+    let key = "rebind.later.guard.a-to-b";
+    assert_eq!(
+        second_host
+            .complete_current_codex_v2_rebind(
+                &who.scope, &PodId::try_from(pod.as_str()).unwrap(), key,
+            )
+            .unwrap()
+            .stage,
+        RebindCompletionStage::PodActive
+    );
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let session = SessionId::try_from(original.session_id.as_str()).unwrap();
+    let (target, session_revision) = store
+        .current_native_writer_target_for_session(&who.scope, &session)
+        .unwrap();
+    let owner = store.owner_epoch().unwrap();
+    let claim = store.current_manager_credential_claim(owner).unwrap();
+    let lease = store
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target: target.clone(),
+            holder_actor_id: who.actor.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: owner,
+            expected_manager_credential_epoch: claim.credential_epoch(),
+            expected_authority_revision: second_host.recorded_snapshot().revision,
+            expected_writer_epoch: Some(1),
+            ttl_seconds: 90,
+        })
+        .unwrap();
+    assert_eq!(lease.writer_epoch(), 2);
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        replayed_send_grant,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let before_calls = calls.load(Ordering::SeqCst);
+    let later = second_host
+        .read_current_later_send_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.target(), &target);
+    assert_eq!(later.owner_epoch(), owner);
+    assert_eq!(later.manager_credential_epoch(), claim.credential_epoch());
+    assert_eq!(later.session_revision(), session_revision);
+    assert_eq!(later.writer_epoch(), 2);
+    assert!(second_host
+        .read_current_initial_bootstrap_guard_for_launch(
+            &who.transport, &who.scope, &command_id, &policy,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), before_calls);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn v3_initial_send_keeps_older_lease_after_additive_root_then_refuses_revocation() {
     let fixture = Fixture::new();
     let who = identity(&fixture);
@@ -1267,6 +1480,18 @@ fn v3_initial_send_keeps_older_lease_after_additive_root_then_refuses_revocation
         .unwrap();
     assert_eq!(guard.target(), &target);
     assert_eq!(guard.writer_epoch(), lease.writer_epoch());
+    let later = host
+        .read_current_later_send_guard_for_launch(
+            &who.transport,
+            &who.scope,
+            &CommandId::try_from(first.receipt.command_id.as_str()).unwrap(),
+            &send_policy,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(later.target(), &target);
+    assert_eq!(later.policy_fence_epoch(), Some(epoch_before));
+    assert_eq!(later.session_revision(), session_revision);
     let same_lease = host
         .acquire_initial_bootstrap_writer_lease(&who.transport, &session_id, &send_policy, 60)
         .unwrap();
@@ -1305,6 +1530,15 @@ fn v3_initial_send_keeps_older_lease_after_additive_root_then_refuses_revocation
 
     host.revoke_grant_from_trusted_policy(launch_grant).unwrap();
     assert!(store.policy_fence_epoch().unwrap() > epoch_before);
+    assert!(host
+        .read_current_later_send_guard_for_launch(
+            &who.transport,
+            &who.scope,
+            &CommandId::try_from(first.receipt.command_id.as_str()).unwrap(),
+            &send_policy,
+        )
+        .unwrap()
+        .is_none());
     assert!(
         host.read_current_initial_bootstrap_guard_for_launch(
             &who.transport,

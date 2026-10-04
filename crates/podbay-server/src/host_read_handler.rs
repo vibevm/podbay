@@ -2,9 +2,9 @@
 
 use podbay_core::{CommandId, ScopeId};
 use podbay_host::{
-    AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage, DurableAuthority,
-    DurableAuthorityError, HostDispatchPort, HostError, InitialBootstrapGuard,
-    TrustedBootstrapSendPolicy,
+    AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage,
+    CurrentLaterSendGuard, DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError,
+    InitialBootstrapGuard, TrustedBootstrapSendPolicy,
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, CurrentObservation, CurrentScopeSnapshot,
@@ -82,12 +82,12 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                     .authority
                     .lookup_command_with_native_observation(transport, &scope, &selector)
                     .map_err(authority_error)?;
-                let guard = if inspected.launch_dispatch_status.is_some() {
+                let later_guard = if inspected.launch_dispatch_status.is_some() {
                     self.bootstrap_policy.and_then(|policy| {
                         let command_id =
                             CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
                         self.authority
-                            .read_current_initial_bootstrap_guard_for_launch(
+                            .read_current_later_send_guard_for_launch(
                                 transport,
                                 &scope,
                                 &command_id,
@@ -99,7 +99,15 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                 } else {
                     None
                 };
-                Ok(inspection_json(inspected, native.as_ref(), guard.as_ref()))
+                let bootstrap_guard = later_guard
+                    .as_ref()
+                    .and_then(CurrentLaterSendGuard::as_initial_bootstrap_guard);
+                Ok(inspection_json(
+                    inspected,
+                    native.as_ref(),
+                    bootstrap_guard.as_ref(),
+                    later_guard.as_ref(),
+                ))
             }
             _ => Err(refusal(
                 RuntimeErrorCode::Unsupported,
@@ -182,6 +190,7 @@ fn inspection_json(
     inspected: CommandInspection,
     native: Option<&BootstrapNativeObservation>,
     guard: Option<&InitialBootstrapGuard>,
+    later_guard: Option<&CurrentLaterSendGuard>,
 ) -> Value {
     // These are the facts established by the store. A claimed effect remains
     // uncertain; host acceptance does not imply provider consumption.
@@ -252,6 +261,9 @@ fn inspection_json(
         response["bootstrapGuard"] = guard
             .map(bootstrap_guard_json)
             .unwrap_or_else(|| json!({"available": false}));
+        response["currentLaterSendGuard"] = later_guard
+            .map(current_later_send_guard_json)
+            .unwrap_or_else(|| json!({"available": false}));
         if let Some(reference) = launch.and_then(|status| status.receipt_ref.as_deref()) {
             response["portReceiptRef"] = json!(reference);
         }
@@ -260,6 +272,30 @@ fn inspection_json(
         response["nativeObservation"] = native_json(native);
     }
     response
+}
+
+fn current_later_send_guard_json(guard: &CurrentLaterSendGuard) -> Value {
+    let target = guard.target();
+    json!({
+        "available": true,
+        "scopeId": target.scope_id.as_str(),
+        "sessionId": target.session_id.as_str(),
+        "runId": target.run_id.as_str(),
+        "attemptId": target.attempt_id.as_str(),
+        "podId": target.pod_id.as_str(),
+        "resourceId": target.resource_id.as_str(),
+        "resourceInputEpoch": target.resource_input_epoch.to_string(),
+        "managerCredentialEpoch": guard.manager_credential_epoch().to_string(),
+        "leaseExpiresAtUnixSeconds": guard.expires_at_unix_seconds().to_string(),
+        "policyFenceEpoch": guard.policy_fence_epoch().map(|value| value.to_string()),
+        "guard": {
+            "managerEpoch": guard.owner_epoch().to_string(),
+            "podEpoch": target.pod_incarnation.to_string(),
+            "resourceEpoch": target.resource_epoch.to_string(),
+            "writerEpoch": guard.writer_epoch().to_string(),
+            "targetRevision": guard.session_revision().to_string(),
+        },
+    })
 }
 
 fn native_json(observation: &BootstrapNativeObservation) -> Value {

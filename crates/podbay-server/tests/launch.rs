@@ -1030,10 +1030,26 @@ fn indexed_guard_readback_keeps_two_roots_isolated_and_refuses_stale_lease() {
     // The second root advanced global authority revision; the first root's
     // writer lease is now stale. Its guard cannot be borrowed from root two.
     assert_eq!(reads[0]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(reads[0]["ok"]["currentLaterSendGuard"]["available"], false);
     assert_eq!(
         reads[1]["ok"]["bootstrapGuard"],
         second["value"]["bootstrapGuard"]
     );
+    let later = &reads[1]["ok"]["currentLaterSendGuard"];
+    assert_eq!(later["available"], true);
+    assert_eq!(later["sessionId"], second["value"]["sessionId"]);
+    assert_eq!(later["podId"], second["value"]["podId"]);
+    assert_eq!(later["guard"], second["value"]["bootstrapGuard"]["guard"]);
+    assert!(
+        later["managerCredentialEpoch"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    assert!(later["policyFenceEpoch"].is_null());
+    assert!(later["leaseExpiresAtUnixSeconds"].as_str().is_some());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     let wrong_process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
@@ -1103,8 +1119,14 @@ fn indexed_guard_readback_keeps_two_roots_isolated_and_refuses_stale_lease() {
     );
     assert_eq!(stale[0]["ok"]["state"], "host_accepted");
     assert_eq!(stale[0]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(stale[0]["ok"]["currentLaterSendGuard"]["available"], false);
     assert_eq!(stale[1]["ok"]["state"], "host_accepted");
     assert_eq!(stale[1]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(stale[1]["ok"]["currentLaterSendGuard"]["available"], true);
+    assert_eq!(
+        stale[1]["ok"]["currentLaterSendGuard"]["guard"]["writerEpoch"],
+        "2"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         PodBayStore::open(&fixture.database)

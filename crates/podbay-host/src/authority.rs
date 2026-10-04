@@ -1971,6 +1971,54 @@ impl InitialBootstrapGuard {
     }
 }
 
+/// Read-only current later-send guard for a Codex root. This is a projection
+/// of an existing, unexpired lease and current Session target, not permission
+/// to claim a command or proof that the provider accepted input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentLaterSendGuard {
+    target: podbay_store::NativeWriterTarget,
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    session_revision: u64,
+    writer_epoch: u64,
+    expires_at_unix_seconds: u64,
+    policy_fence_epoch: Option<u64>,
+}
+
+impl CurrentLaterSendGuard {
+    pub fn target(&self) -> &podbay_store::NativeWriterTarget {
+        &self.target
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn manager_credential_epoch(&self) -> u64 {
+        self.manager_credential_epoch
+    }
+    pub fn session_revision(&self) -> u64 {
+        self.session_revision
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
+    }
+    pub fn policy_fence_epoch(&self) -> Option<u64> {
+        self.policy_fence_epoch
+    }
+
+    pub fn as_initial_bootstrap_guard(&self) -> Option<InitialBootstrapGuard> {
+        (self.writer_epoch == 1).then(|| InitialBootstrapGuard {
+            target: self.target.clone(),
+            owner_epoch: self.owner_epoch,
+            session_revision: self.session_revision,
+            writer_epoch: self.writer_epoch,
+            expires_at_unix_seconds: self.expires_at_unix_seconds,
+        })
+    }
+}
+
 /// Private, claim-backed selector for a pod port. Constructed only after a
 /// durable claim and fresh host checks. It is not a pod or native effect proof.
 pub struct ResolvedClaimedBootstrap {
@@ -5832,11 +5880,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
     }
 
-    /// Read back an existing initial writer guard for one exact authenticated
-    /// V2 or V3 launch CommandId. Every lookup is indexed by CommandId/principal and
-    /// then verified against today's Session→Run→Pod→Resource and lease. A
-    /// proof-bearing V2 manager rebind may have advanced the writer epoch. This
-    /// method never mints, renews or takes over a writer lease.
+    /// Read back the first-send guard only while writer epoch is one.
+    /// Later turns use the separate current guard below.
     pub fn read_current_initial_bootstrap_guard_for_launch<T: AuthenticatedTransport>(
         &mut self,
         transport: &T,
@@ -5844,6 +5889,24 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         command_id: &CommandId,
         policy: &TrustedBootstrapSendPolicy,
     ) -> Result<Option<InitialBootstrapGuard>, DurableAuthorityError> {
+        let Some(current) =
+            self.read_current_later_send_guard_for_launch(transport, scope, command_id, policy)?
+        else {
+            return Ok(None);
+        };
+        Ok(current.as_initial_bootstrap_guard())
+    }
+
+    /// Indexed, authenticated projection of the exact current later-send
+    /// target and writer lease for an original V2/V3 root launch CommandId.
+    /// It never mints, renews, claims, sends, or asks a port for native input.
+    pub fn read_current_later_send_guard_for_launch<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        command_id: &CommandId,
+        policy: &TrustedBootstrapSendPolicy,
+    ) -> Result<Option<CurrentLaterSendGuard>, DurableAuthorityError> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (transport, scope, command_id, policy);
@@ -5953,17 +6016,38 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 } else {
                     lease.authority_revision() != self.recorded.revision
                 })
-                || (record.format == BoundLaunchFormat::CodexV3 && lease.writer_epoch() != 1)
             {
                 return Ok(None);
             }
             self.recheck_actor_resolution_manager()?;
             let fresh_actor = self.host.authenticate(transport)?;
             if durable_actor(fresh_actor) != durable_actor(&actor)
+                || self
+                    .host
+                    .check_grant(
+                        &actor,
+                        policy.grant_id,
+                        scope,
+                        &Right::new(Operation::SendSession, Target::Scope(scope.clone())),
+                    )
+                    .is_err()
                 || !self
                     .store
                     .current_bound_pod_snapshot(scope.as_str(), &record.pod_id)
-                    .is_ok_and(|snapshot| snapshot.launch() == &record)
+                    .is_ok_and(|snapshot| {
+                        snapshot.launch() == &record
+                            && snapshot.owner_epoch().get() == self.manager_claim.owner_epoch()
+                            && snapshot.authority_revision() == self.recorded.revision
+                            && snapshot.resources().len() == 1
+                            && snapshot.resources()[0].id() == current.resources()[0].id()
+                            && snapshot.resources()[0].epoch() == current.resources()[0].epoch()
+                            && snapshot.resources()[0].input_epoch()
+                                == current.resources()[0].input_epoch()
+                    })
+                || !self
+                    .store
+                    .current_native_writer_target_for_session(scope, &session)
+                    .is_ok_and(|fresh| fresh == (target.clone(), session_revision))
                 || self
                     .store
                     .inspect_native_writer_lease(&target)
@@ -5988,12 +6072,14 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             if policy.deadline <= Instant::now() {
                 return Ok(None);
             }
-            Ok(Some(InitialBootstrapGuard {
+            Ok(Some(CurrentLaterSendGuard {
                 target,
                 owner_epoch: lease.owner_epoch(),
+                manager_credential_epoch: lease.manager_credential_epoch(),
                 session_revision,
                 writer_epoch: lease.writer_epoch(),
                 expires_at_unix_seconds: lease.expires_at_unix_seconds(),
+                policy_fence_epoch: v3_policy.map(|fence| fence.policy_fence_epoch),
             }))
         }
     }
