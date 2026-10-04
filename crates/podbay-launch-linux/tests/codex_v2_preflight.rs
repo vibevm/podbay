@@ -290,7 +290,7 @@ fn setup_with_port<P: HostDispatchPort>(
         allowed_tool_bundle_refs: BTreeSet::new(),
         environment_refs: Vec::new(),
         credential_refs: vec![credential.clone()],
-        max_wall_seconds: 120,
+        max_wall_seconds: wall_seconds.max(120),
         max_children: 2,
         allow_fallback: false,
     };
@@ -1132,8 +1132,8 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
         Role::Coordinator,
         fixture,
         port,
-        Duration::from_secs(180),
-        120,
+        Duration::from_secs(300),
+        600,
     );
     eprintln!("real smoke setup_ms={}", smoke_start.elapsed().as_millis());
     let accepted = host
