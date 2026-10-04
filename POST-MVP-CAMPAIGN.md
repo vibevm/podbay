@@ -11,7 +11,8 @@ start now.
 The active MVP is local to this Linux machine. It must run Zap itself as a
 PodBay-owned service process, run Zap's coordinator through PodBay, preserve
 both across the tested manager/CLI rebind, show native output, support truthful
-chat readiness and later-turn settlement, stop the exact service, and allow a
+chat readiness and later-turn settlement, promote only an explicitly proved
+final answer into chat, stop the exact service, and allow a
 trusted service to live without the former one-hour wall limit. It uses fresh
 current PodBay stores. Old preproduction PodBay schemas have zero clients:
 reject them; do not design migrations for hypothetical users.
