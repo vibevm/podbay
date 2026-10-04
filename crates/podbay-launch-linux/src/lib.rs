@@ -1,5 +1,5 @@
-//! Linux native launch boundaries. Codex V2 is preflight-only here;
-//! neither path infers provider readiness from process transport.
+//! Linux native launch boundaries for synthetic V1 and committed Codex V2.
+//! Process and transport evidence does not establish provider readiness.
 #![forbid(unsafe_code)]
 #[cfg(target_os = "linux")]
 mod codex_v2;

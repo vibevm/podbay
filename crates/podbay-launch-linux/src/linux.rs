@@ -1,19 +1,25 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use podbay_core::ScopeId;
 use podbay_host::{
-    AuthorisedBoundLaunch, AuthorisedDispatch, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, ResolvedNativeLaunch,
+    AuthorisedBoundLaunch, AuthorisedDispatch, CredentialRef, HostDispatchPort, PortDispatchError,
+    PortDispatchOutcome, PortReceiptRef, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
 };
-use podbay_pod::{BoundPodStatus, LinuxPeerEvidence, PodError, PodPeerBootstrap};
+use podbay_pod::{
+    BoundPodStatus, CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodError, PodPeerBootstrap,
+};
 use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, PodBayStore};
 use podbay_wire::{NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver, TargetOs};
 use sha2::{Digest, Sha256};
 
-/// Trusted host configuration. This adapter supports only the explicit local
-/// synthetic sleep fixture; pinning is cooperative, not same-UID isolation.
+use crate::codex_v2::{TrustedCodexCredentialSource, preflight_committed_codex_v2};
+
+/// Trusted host configuration for local Linux pod admission. Pinning is
+/// cooperative and does not provide hostile same-UID isolation.
 pub struct TrustedLinuxLaunchConfig {
     pod_binary: PathBuf,
     pod_sha256: String,
@@ -74,11 +80,33 @@ impl TrustedLinuxLaunchConfig {
 
 pub struct LinuxLaunchPort {
     config: TrustedLinuxLaunchConfig,
+    codex_credentials: BTreeMap<CredentialRef, TrustedCodexCredentialSource>,
 }
 
 impl LinuxLaunchPort {
     pub fn new(config: TrustedLinuxLaunchConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            codex_credentials: BTreeMap::new(),
+        }
+    }
+
+    /// Register a private source under a trusted scope and vault locator.
+    /// The resolved launch may select only this already-registered mapping.
+    pub fn register_codex_credential_source_from_trusted_policy(
+        &mut self,
+        source: TrustedCodexCredentialSource,
+    ) -> Result<(), PodError> {
+        self.config.recheck()?;
+        source.recheck()?;
+        let reference = source.reference().clone();
+        if self.codex_credentials.contains_key(&reference) {
+            return Err(PodError::Conflict(
+                "Codex credential source is already registered",
+            ));
+        }
+        self.codex_credentials.insert(reference, source);
+        Ok(())
     }
 
     fn preflight(&self, launch: &ResolvedNativeLaunch) -> Result<PodPeerBootstrap, PodError> {
@@ -242,6 +270,100 @@ impl LinuxLaunchPort {
         }
         Ok(PortDispatchOutcome::Accepted(receipt))
     }
+
+    fn launch_codex_v2(
+        &mut self,
+        launch: ResolvedNativeCodexLaunch,
+    ) -> Result<PortDispatchOutcome<PortReceiptRef>, PortDispatchError> {
+        self.config
+            .recheck()
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let wire = launch.descriptor();
+        let policy = launch.effective().codex_policy();
+        if policy.credential_scope() != wire.scope_id() {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let scope = ScopeId::try_from(wire.scope_id())
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let reference = CredentialRef::from_trusted_vault(scope, policy.credential_ref())
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let source = self
+            .codex_credentials
+            .get(&reference)
+            .ok_or(PortDispatchError::RefusedBeforeEffect)?;
+        let reviewed = preflight_committed_codex_v2(&launch, source)
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        self.config
+            .recheck()
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let receipt = PortReceiptRef::from_port(&format!("podbay.launch.{}", wire.digest()))
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let expected_resource = wire
+            .resource(0)
+            .ok_or(PortDispatchError::RefusedBeforeEffect)?;
+        let expected_digest = launch.effective().digest();
+        let expected_peer = launch.manager_peer().clone();
+        // The pod adapter can find an existing manifest or create one. Every
+        // failure after entry therefore preserves uncertain admission.
+        let client = podbay_pod::launch_bound_codex_v2(
+            launch.committed_record().clone(),
+            reviewed.bootstrap().clone(),
+            launch.authority_revision(),
+            launch.store_file_identity(),
+            &self.config.directory,
+            &self.config.pod_binary,
+            reviewed.credential_source(),
+            reviewed.credential_source_identity(),
+        )
+        .map_err(|_| PortDispatchError::UncertainAfterPossibleEffect {
+            receipt_ref: Some(receipt.clone()),
+        })?;
+        let observed = client.attested_status().map_err(|_| {
+            PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt.clone()),
+            }
+        })?;
+        let final_observed = client.attested_status().map_err(|_| {
+            PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt.clone()),
+            }
+        })?;
+        let bound = observed.bound.as_ref().ok_or_else(|| {
+            PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt.clone()),
+            }
+        })?;
+        if !observed.child_running
+            || !final_observed.child_running
+            || final_observed.bound.as_ref() != Some(bound)
+            || observed.supervisor_pid != final_observed.supervisor_pid
+            || observed.supervisor_start_ticks != final_observed.supervisor_start_ticks
+            || observed.child_pid != final_observed.child_pid
+            || observed.child_start_ticks != final_observed.child_start_ticks
+            || observed.boot_id != final_observed.boot_id
+            || observed.cgroup_path != final_observed.cgroup_path
+            || observed.unit_name != final_observed.unit_name
+            || bound.capability != CODEX_V2_CAPABILITY
+            || bound.descriptor_digest != wire.digest()
+            || bound.effective_digest != expected_digest
+            || bound.resource_id != expected_resource.resource_id
+            || bound.resource_epoch != expected_resource.epoch
+            || bound.scope_id != wire.scope_id()
+            || bound.store_lineage != launch.store_lineage()
+            || bound.owner_epoch != launch.owner_epoch()
+            || bound.credential_epoch != launch.credential_epoch()
+            || bound.manager_os_identity != expected_peer.os_identity()
+            || bound.manager_process_id != expected_peer.native_process_id()
+            || bound.manager_boot_identity != expected_peer.boot_identity()
+            || bound.manager_birth_identity != expected_peer.birth_identity()
+            || bound.manager_containment != expected_peer.containment_identity()
+        {
+            return Err(PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt),
+            });
+        }
+        Ok(PortDispatchOutcome::Accepted(receipt))
+    }
 }
 
 impl HostDispatchPort for LinuxLaunchPort {
@@ -269,6 +391,17 @@ impl HostDispatchPort for LinuxLaunchPort {
             let client = podbay_pod::launch_bound(record, bootstrap, directory, binary)?;
             client.bound_status()
         })
+    }
+
+    fn accepts_resolved_codex_v2(&self) -> bool {
+        !self.codex_credentials.is_empty() && self.config.recheck().is_ok()
+    }
+
+    fn launch_resolved_codex_v2(
+        &mut self,
+        launch: ResolvedNativeCodexLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        self.launch_codex_v2(launch)
     }
 }
 

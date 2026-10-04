@@ -41,7 +41,11 @@ impl TrustedCodexCredentialSource {
         })
     }
 
-    fn recheck(&self) -> Result<(), PodError> {
+    pub(crate) fn reference(&self) -> &CredentialRef {
+        &self.reference
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), PodError> {
         let (source_identity, directory_identity) = validate_private_source(&self.source)?;
         if source_identity != self.source_identity || directory_identity != self.directory_identity
         {

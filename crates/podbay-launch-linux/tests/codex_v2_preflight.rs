@@ -26,9 +26,10 @@ use podbay_host::{
     TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
-    CodexV2Preflight, TrustedCodexCredentialSource, preflight_committed_codex_v2,
+    CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
+    preflight_committed_codex_v2,
 };
-use podbay_pod::{CODEX_V2_CAPABILITY, PodError, launch_bound_codex_v2};
+use podbay_pod::{CODEX_V2_CAPABILITY, PodClient, PodError, launch_bound_codex_v2};
 use podbay_store::{EffectClaim, LaunchDispatchStage, PodBayStore};
 use podbay_wire::{CodexAppServerPolicyV2, ResourceDriver};
 use sha2::{Digest, Sha256};
@@ -368,6 +369,58 @@ fn launch_from_review(
     )
 }
 
+fn port_for(fixture: &Fixture, binary: &Path) -> LinuxLaunchPort {
+    let binary = fs::canonicalize(binary).unwrap();
+    let digest = Sha256::digest(fs::read(&binary).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    LinuxLaunchPort::new(
+        TrustedLinuxLaunchConfig::from_trusted_policy(
+            binary,
+            digest,
+            fs::canonicalize(&fixture.directory).unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
+fn claim_for_port(fixture: &Fixture, proof: &ResolvedNativeCodexLaunch) {
+    let record = proof.committed_record();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        store
+            .claim_effect(
+                proof.outbox_id(),
+                &record.scope_id,
+                &record.pod_id,
+                proof.owner_epoch(),
+                record.pod_incarnation,
+                proof.authority_revision(),
+                &format!("claim.{}", record.receipt.command_id),
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+}
+
+fn slot_manifest(fixture: &Fixture) -> Option<PathBuf> {
+    fs::read_dir(&fixture.directory)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| {
+                        stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+        })
+}
+
 #[test]
 fn preflight_returns_exact_bootstrap_and_private_source_without_port_effect() {
     for role in [Role::Coordinator, Role::Worker] {
@@ -499,6 +552,88 @@ fn private_source_has_finite_size_and_parent_boundary() {
 }
 
 #[test]
+fn v2_port_requires_registered_current_scoped_source_before_manifest() {
+    let binary = fs::canonicalize("/bin/true").unwrap();
+    let (fixture, _host, proof, _source, calls) = setup(Role::Coordinator);
+    let mut port = port_for(&fixture, &binary);
+    let outbox_id = proof.outbox_id();
+    assert!(!port.accepts_resolved_codex_v2());
+    let store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        store
+            .launch_dispatch_status(outbox_id, fixture.scope.as_str(), fixture.pod.as_str())
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::Prepared
+    );
+    assert!(matches!(
+        port.launch_resolved_codex_v2(proof),
+        Err(PortDispatchError::RefusedBeforeEffect)
+    ));
+    assert_eq!(
+        store
+            .launch_dispatch_status(outbox_id, fixture.scope.as_str(), fixture.pod.as_str())
+            .unwrap()
+            .stage,
+        LaunchDispatchStage::Prepared
+    );
+    assert!(slot_manifest(&fixture).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (fixture, _host, proof, _source, calls) = setup(Role::Coordinator);
+    let mut port = port_for(&fixture, &binary);
+    let wrong_scope = TrustedCodexCredentialSource::from_trusted_policy(
+        CredentialRef::from_trusted_vault(
+            ScopeId::try_from("scope.other").unwrap(),
+            "vault.codex.preflight",
+        )
+        .unwrap(),
+        fixture.source.clone(),
+    )
+    .unwrap();
+    port.register_codex_credential_source_from_trusted_policy(wrong_scope)
+        .unwrap();
+    assert!(matches!(
+        port.launch_resolved_codex_v2(proof),
+        Err(PortDispatchError::RefusedBeforeEffect)
+    ));
+    assert!(slot_manifest(&fixture).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (fixture, _host, proof, source, calls) = setup(Role::Worker);
+    claim_for_port(&fixture, &proof);
+    let mut port = port_for(&fixture, &binary);
+    port.register_codex_credential_source_from_trusted_policy(source)
+        .unwrap();
+    assert!(port.accepts_resolved_codex_v2());
+    fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        port.launch_resolved_codex_v2(proof),
+        Err(PortDispatchError::RefusedBeforeEffect)
+    ));
+    assert!(slot_manifest(&fixture).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn v2_port_rejects_duplicate_credential_registration() {
+    let binary = fs::canonicalize("/bin/true").unwrap();
+    let (fixture, _host, _proof, source, _) = setup(Role::Coordinator);
+    let mut port = port_for(&fixture, &binary);
+    port.register_codex_credential_source_from_trusted_policy(source)
+        .unwrap();
+    let duplicate = TrustedCodexCredentialSource::from_trusted_policy(
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap(),
+        fixture.source.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        port.register_codex_credential_source_from_trusted_policy(duplicate),
+        Err(PodError::Conflict(_))
+    ));
+}
+
+#[test]
 fn launch_entry_refuses_revision_store_and_credential_syntax_drift_before_manifest() {
     let binary = fs::canonicalize("/bin/true").unwrap();
     let (fixture, _host, proof, source, calls) = setup(Role::Coordinator);
@@ -604,6 +739,43 @@ fn disposable_codex_v2_launch_serve_status_stop_without_model_turn() {
     );
     let frames = fixture.directory.join("home/codex/frames.log");
     assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2);
+    assert!(!client.stop().unwrap().child_running);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_v2_port_admits_and_reattaches_without_duplicate_child() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let (fixture, mut host, proof, source, calls) = setup(Role::Coordinator);
+    claim_for_port(&fixture, &proof);
+    let mut port = port_for(&fixture, &binary);
+    port.register_codex_credential_source_from_trusted_policy(source)
+        .unwrap();
+    assert!(matches!(
+        port.launch_resolved_codex_v2(proof),
+        Ok(PortDispatchOutcome::Accepted(_))
+    ));
+    let manifest = slot_manifest(&fixture).expect("port wrote one immutable manifest");
+    let client = PodClient::connect(&manifest).unwrap();
+    let attested = client.attested_status().unwrap();
+    assert!(attested.child_running);
+    assert_eq!(attested.bound.unwrap().capability, CODEX_V2_CAPABILITY);
+    let duplicate = host
+        .inspect_committed_root_codex_v2(&fixture.scope, &fixture.pod)
+        .unwrap();
+    assert!(matches!(
+        port.launch_resolved_codex_v2(duplicate),
+        Ok(PortDispatchOutcome::Accepted(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("home/codex/frames.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(client.attested_status().unwrap().child_running);
     assert!(!client.stop().unwrap().child_running);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
