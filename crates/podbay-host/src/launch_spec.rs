@@ -4,8 +4,9 @@ use std::path::{Component, Path, PathBuf};
 
 use podbay_core::{LaunchBinding, PodId, ResourceKind, Role, ScopeId};
 use podbay_wire::{
-    EffectiveLaunchContract, EffectiveWorkspaceAccess, ImmutableLaunchDescriptor,
-    NativeResourceKind, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
+    CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveWorkspaceAccess,
+    ImmutableLaunchDescriptor, NativeResourceKind, ResourceDriver, ReviewedNativePolicy,
+    ReviewedResource, TargetOs,
 };
 use sha2::{Digest, Sha256};
 
@@ -159,6 +160,7 @@ pub struct TrustedLaunchProfileInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredLaunchProfile {
     input: TrustedLaunchProfileInput,
+    codex_policy: Option<CodexAppServerPolicyV2>,
 }
 
 impl RegisteredLaunchProfile {
@@ -229,7 +231,57 @@ impl RegisteredLaunchProfile {
         {
             return Err(HostError::Unauthorised);
         }
-        Ok(Self { input })
+        Ok(Self {
+            input,
+            codex_policy: None,
+        })
+    }
+
+    /// Explicit trusted-policy opt-in for the internal Codex V2 launch shape.
+    /// Legacy profiles never infer this policy from a driver name or argv.
+    /// Existing V1 launch resolution refuses an opted-in profile until a
+    /// separately reviewed V2 admission path exists.
+    pub fn with_codex_policy_from_trusted_policy(
+        mut self,
+        policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, HostError> {
+        if self.codex_policy.is_some() {
+            return Err(HostError::InvalidInput);
+        }
+        let input = &self.input;
+        let canonical = CodexAppServerPolicyV2::new(
+            &input.workspace_scope,
+            policy.credential_ref().to_owned(),
+            policy.driver_ref().to_owned(),
+            policy.protocol_ref().to_owned(),
+        )
+        .map_err(|_| HostError::InvalidInput)?;
+        if canonical != policy
+            || !input.allow_write
+            || input.resource_layout.len() != 1
+            || input.credential_refs.len() != 1
+            || input.credential_refs[0].scope_id() != &input.workspace_scope
+            || input.credential_refs[0].as_str() != policy.credential_ref()
+        {
+            return Err(HostError::Unauthorised);
+        }
+        let template = &input.resource_layout[0];
+        match (template.kind, &template.driver) {
+            (
+                ResourceKind::StructuredProvider,
+                ResourceDriver::Structured {
+                    driver_ref,
+                    protocol_ref,
+                },
+            ) if driver_ref == policy.driver_ref() && protocol_ref == policy.protocol_ref() => {}
+            _ => return Err(HostError::Unauthorised),
+        }
+        self.codex_policy = Some(policy);
+        Ok(self)
+    }
+
+    pub fn codex_policy(&self) -> Option<&CodexAppServerPolicyV2> {
+        self.codex_policy.as_ref()
     }
 
     pub fn profile_ref(&self) -> &str {
@@ -251,6 +303,9 @@ impl RegisteredLaunchProfile {
         binding: &LaunchBinding,
         effective_digest: &str,
     ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
+        if self.codex_policy.is_some() {
+            return Err(HostError::Unsupported);
+        }
         if host.target_os != TargetOs::Linux
             || self.input.execution_mode != ExecutionMode::LinuxCooperative
             || spec.profile_ref != self.input.profile_ref
@@ -310,6 +365,9 @@ impl RegisteredLaunchProfile {
         effective: &EffectiveLaunchContract,
         descriptor: &ImmutableLaunchDescriptor,
     ) -> Result<ResolvedNativePaths, HostError> {
+        if self.codex_policy.is_some() {
+            return Err(HostError::Unsupported);
+        }
         if host.target_os != TargetOs::Linux
             || descriptor.target_os() != host.target_os
             || descriptor.host_id() != host.host_id
@@ -363,6 +421,9 @@ impl RegisteredLaunchProfile {
         selected_credential: Option<&CredentialRef>,
         selection: &LaunchSelection,
     ) -> Result<EffectiveLaunchSpec, HostError> {
+        if self.codex_policy.is_some() {
+            return Err(HostError::Unsupported);
+        }
         let profile = &self.input;
         if selection.profile_ref != profile.profile_ref
             || selection.profile_generation != profile.profile_generation

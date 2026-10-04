@@ -26,7 +26,9 @@ use podbay_store::{
     EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore, StoreError,
     VerifiedPrincipal,
 };
-use podbay_wire::{ImmutableLaunchDescriptor, NativeRole, ResourceDriver, TargetOs};
+use podbay_wire::{
+    CodexAppServerPolicyV2, ImmutableLaunchDescriptor, NativeRole, ResourceDriver, TargetOs,
+};
 use sha2::{Digest, Sha256};
 
 struct Fixture {
@@ -324,6 +326,24 @@ fn profile_input(who: &Identity) -> TrustedLaunchProfileInput {
         max_children: 4,
         allow_fallback: false,
     }
+}
+
+fn codex_profile_input(who: &Identity) -> TrustedLaunchProfileInput {
+    let mut input = profile_input(who);
+    input.profile_generation = 2;
+    input.resource_layout.remove(0);
+    input.credential_refs.truncate(1);
+    input
+}
+
+fn codex_policy(who: &Identity) -> CodexAppServerPolicyV2 {
+    CodexAppServerPolicyV2::new(
+        &who.scope,
+        "vault.allowed.one".into(),
+        "driver.fixture".into(),
+        "protocol.fixture".into(),
+    )
+    .unwrap()
 }
 
 fn profile(who: &Identity) -> RegisteredLaunchProfile {
@@ -1339,6 +1359,106 @@ fn profile_workspace_and_path_mismatch_refuse_before_admission() {
         RegisteredLaunchProfile::from_trusted_policy(relative_executable),
         Err(HostError::InvalidInput)
     ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn codex_policy_opt_in_requires_exact_reviewed_profile_shape() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let policy = codex_policy(&who);
+    let legacy = RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who)).unwrap();
+    assert!(legacy.codex_policy().is_none());
+    let opted = legacy
+        .with_codex_policy_from_trusted_policy(policy.clone())
+        .unwrap();
+    assert_eq!(opted.codex_policy(), Some(&policy));
+    assert_eq!(
+        opted.with_codex_policy_from_trusted_policy(policy.clone()),
+        Err(HostError::InvalidInput)
+    );
+
+    let mut invalid = Vec::new();
+    let mut extra_resource = codex_profile_input(&who);
+    extra_resource
+        .resource_layout
+        .insert(0, profile_input(&who).resource_layout[0].clone());
+    invalid.push(extra_resource);
+    let mut wrong_kind = codex_profile_input(&who);
+    wrong_kind.resource_layout[0] = profile_input(&who).resource_layout[0].clone();
+    invalid.push(wrong_kind);
+    let mut wrong_driver = codex_profile_input(&who);
+    wrong_driver.resource_layout[0].driver = ResourceDriver::Structured {
+        driver_ref: "driver.other".into(),
+        protocol_ref: "protocol.fixture".into(),
+    };
+    invalid.push(wrong_driver);
+    let mut wrong_protocol = codex_profile_input(&who);
+    wrong_protocol.resource_layout[0].driver = ResourceDriver::Structured {
+        driver_ref: "driver.fixture".into(),
+        protocol_ref: "protocol.other".into(),
+    };
+    invalid.push(wrong_protocol);
+    let mut no_credential = codex_profile_input(&who);
+    no_credential.credential_refs.clear();
+    invalid.push(no_credential);
+    let mut extra_credential = codex_profile_input(&who);
+    extra_credential
+        .credential_refs
+        .push(CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.two").unwrap());
+    invalid.push(extra_credential);
+    let mut no_write = codex_profile_input(&who);
+    no_write.allow_write = false;
+    invalid.push(no_write);
+    for input in invalid {
+        assert_eq!(
+            RegisteredLaunchProfile::from_trusted_policy(input)
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(policy.clone()),
+            Err(HostError::Unauthorised)
+        );
+    }
+    let foreign = CodexAppServerPolicyV2::new(
+        &ScopeId::try_from("scope.other").unwrap(),
+        "vault.allowed.one".into(),
+        "driver.fixture".into(),
+        "protocol.fixture".into(),
+    )
+    .unwrap();
+    assert_eq!(
+        RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+            .unwrap()
+            .with_codex_policy_from_trusted_policy(foreign),
+        Err(HostError::Unauthorised)
+    );
+}
+
+#[test]
+fn codex_opted_profile_refuses_existing_v1_launch_before_admission() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port, &who);
+    let codex = RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+        .unwrap()
+        .with_codex_policy_from_trusted_policy(codex_policy(&who))
+        .unwrap();
+    host.register_launch_profile_from_trusted_policy(codex)
+        .unwrap();
+
+    let mut request = launch_request(&who, grant, 1, 1, b"canonical.codex-v1-refused");
+    request.host_request.command_key = "launch.codex.v1.refused".into();
+    request
+        .proposal
+        .as_mut()
+        .unwrap()
+        .selection
+        .profile_generation = 2;
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, request),
+        Err(LaunchPodError::Host(HostError::Unsupported))
+    ));
+    assert!(host.recorded_snapshot().pods.is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
