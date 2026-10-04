@@ -128,6 +128,10 @@ pub const PEER_BINDING_V2_PROTOCOL: &str = "podbay.peer-binding/2";
 #[cfg(target_os = "linux")]
 pub const SYNTHETIC_CAPABILITY: &str = "synthetic_fixture_only";
 #[cfg(target_os = "linux")]
+pub const OPERATOR_PROCESS_CAPABILITY: &str = "operator_process_v1";
+#[cfg(target_os = "linux")]
+pub const OPERATOR_PROCESS_PROFILE_REF: &str = "podbay.operator.process.exec.v1";
+#[cfg(target_os = "linux")]
 pub const CODEX_V2_CAPABILITY: &str = "codex_app_server_v2";
 
 /// Host-reviewed inputs that cannot be inferred from a PB05 descriptor.
@@ -204,8 +208,9 @@ impl BoundPeerManifest {
         if self.protocol == PEER_BINDING_V2_PROTOCOL || self.capability == CODEX_V2_CAPABILITY {
             return self.validate_codex_v2(legacy, directory);
         }
+        let operator_process = self.capability == OPERATOR_PROCESS_CAPABILITY;
         if self.protocol != PEER_BINDING_PROTOCOL
-            || self.capability != SYNTHETIC_CAPABILITY
+            || (!operator_process && self.capability != SYNTHETIC_CAPABILITY)
             || self.binding_digest != self.digest()?
             || !self.store_path.is_absolute()
             || self.owner_epoch == 0
@@ -233,17 +238,17 @@ impl BoundPeerManifest {
             || !matches!(resource.driver,ResourceDriver::Auxiliary{driver_ref}
                 if driver_ref=="process.exec")
             || wire.target_os() != TargetOs::Linux
-            || wire.role() != NativeRole::Worker
-            || wire.work_kind() != NativeWorkKind::Task
+            || wire.role() != if operator_process { NativeRole::Coordinator } else { NativeRole::Worker }
+            || wire.work_kind() != if operator_process { NativeWorkKind::Service } else { NativeWorkKind::Task }
             || wire.model_id() != "none"
             || wire.reasoning_effort() != "none"
-            || wire.profile_ref() != "podbay.fixture.process.exec"
+            || wire.profile_ref() != if operator_process { OPERATOR_PROCESS_PROFILE_REF } else { "podbay.fixture.process.exec" }
             || !wire.environment_refs().is_empty()
             || !wire.credential_refs().is_empty()
             || !effective.tool_bundle_refs().is_empty()
             || wire.max_children() != 0
-            || wire.wall_seconds() != 60
-            || wire.arguments() != ["60"]
+            || (operator_process && !(30..=3_600).contains(&wire.wall_seconds()))
+            || (!operator_process && (wire.wall_seconds() != 60 || wire.arguments() != ["60"]))
             || self
                 .resource_input_epochs
                 .get(resource.resource_id)
@@ -264,13 +269,16 @@ impl BoundPeerManifest {
             || wire.cwd() != legacy.cwd.to_string_lossy()
             || wire.arguments() != legacy.args
             || legacy.pty.is_some()
-            || legacy.role != PodRole::Worker
-            || legacy.cwd != directory
+            || legacy.role != if operator_process { PodRole::Coordinator } else { PodRole::Worker }
+            || (!operator_process && legacy.cwd != directory)
             || !directory.is_absolute()
         {
             return Err(PodError::Unsupported(
-                "descriptor is outside synthetic process.exec subset",
+                "descriptor is outside bound process.exec subset",
             ));
+        }
+        if operator_process && fs::canonicalize(&legacy.cwd)? != legacy.cwd {
+            return Err(PodError::Refused("operator process cwd changed"));
         }
         let resolved = fs::canonicalize(&legacy.executable)?;
         if resolved != legacy.executable
@@ -282,7 +290,7 @@ impl BoundPeerManifest {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || wire.executable_generation() != format!("sha256:{}", self.executable_sha256)
         {
-            return Err(PodError::Unsupported("sleep executable generation differs"));
+            return Err(PodError::Unsupported("process executable generation differs"));
         }
         let mut file = OpenOptions::new()
             .read(true)

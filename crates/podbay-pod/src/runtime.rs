@@ -19,7 +19,7 @@ use podbay_store::{
     NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
     SqlitePriorObservedPendingLedger,
 };
-use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole};
+use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole, NativeWorkKind};
 use serde::{Deserialize, Serialize};
 
 use crate::codex_credential::prepare_codex_home_from_systemd_credential;
@@ -31,6 +31,7 @@ use crate::codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
     BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, LaunchDescriptor,
+    OPERATOR_PROCESS_CAPABILITY, OPERATOR_PROCESS_PROFILE_REF,
     PEER_BINDING_PROTOCOL, PEER_BINDING_V2_PROTOCOL, PROTOCOL, PodError, PodManifest,
     PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
     private_directory, read_manifest, unit_name, write_manifest,
@@ -1507,10 +1508,10 @@ pub fn launch_bound(
         session_id: wire.session_id().into(),
         run_id: wire.run_id().into(),
         scope_id: wire.scope_id().into(),
-        role: if wire.role() == NativeRole::Worker {
-            PodRole::Worker
-        } else {
-            PodRole::Advisor
+        role: match (wire.role(), wire.work_kind()) {
+            (NativeRole::Worker, NativeWorkKind::Task) => PodRole::Worker,
+            (NativeRole::Coordinator, NativeWorkKind::Service) => PodRole::Coordinator,
+            _ => return Err(PodError::Unsupported("bound process role is unavailable")),
         },
         incarnation: wire.pod_incarnation(),
         resource_id: record.resources[0].id.clone(),
@@ -1530,7 +1531,11 @@ pub fn launch_bound(
     }
     let mut bound = BoundPeerManifest {
         protocol: PEER_BINDING_PROTOCOL.into(),
-        capability: SYNTHETIC_CAPABILITY.into(),
+        capability: if wire.profile_ref() == OPERATOR_PROCESS_PROFILE_REF {
+            OPERATOR_PROCESS_CAPABILITY.into()
+        } else {
+            SYNTHETIC_CAPABILITY.into()
+        },
         wire_descriptor: record.descriptor,
         effective_spec: record.effective_spec,
         descriptor_digest: wire.digest().into(),
@@ -1591,6 +1596,10 @@ pub fn launch_bound(
         ));
     }
     write_manifest(&path, &manifest)?;
+    let operator_process = manifest.peer_binding.as_ref()
+        .is_some_and(|binding| binding.capability == OPERATOR_PROCESS_CAPABILITY);
+    let runtime_max = format!("--property=RuntimeMaxSec={}s", wire.wall_seconds());
+    let tasks_max = if operator_process { "--property=TasksMax=128" } else { "--property=TasksMax=2" };
     let started = Command::new("systemd-run")
         .args([
             "--user",
@@ -1599,9 +1608,9 @@ pub fn launch_bound(
             "--service-type=exec",
             "--property=KillMode=control-group",
             "--property=NoNewPrivileges=yes",
-            "--property=RuntimeMaxSec=60s",
-            "--property=TasksMax=2",
         ])
+        .arg(runtime_max)
+        .arg(tasks_max)
         .arg(format!("--unit={}", manifest.unit_name))
         .arg(pod_binary.as_ref())
         .arg("serve")
@@ -1807,6 +1816,61 @@ fn renew_and_authorize_manager_pod_control(
     fence.authorize(peer, request, owner_witness, now_ms)
 }
 
+/// Capture a bounded private startup receipt without turning stdout into a
+/// public terminal stream. The pod continues draining after the bound so a
+/// chatty child cannot block on its pipe. This file is evidence for the local
+/// process fixture, not a durable event cursor or provider acknowledgement.
+fn spawn_operator_process(
+    descriptor: &LaunchDescriptor,
+    manifest_path: &Path,
+) -> Result<Child, PodError> {
+    fn private_output(path: &Path) -> Result<File, PodError> {
+        Ok(OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?)
+    }
+    fn drain_bounded(mut reader: impl Read + Send + 'static, mut file: File) {
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            let mut remaining = 1_048_576usize;
+            while let Ok(count) = reader.read(&mut chunk) {
+                if count == 0 { break; }
+                if remaining > 0 {
+                    let retained = count.min(remaining);
+                    if file.write_all(&chunk[..retained]).is_ok() {
+                        let _ = file.sync_data();
+                        remaining -= retained;
+                    } else {
+                        remaining = 0;
+                    }
+                }
+            }
+        });
+    }
+    let stdout_file = private_output(&manifest_path.with_extension("process-output"))?;
+    let stderr_file = private_output(&manifest_path.with_extension("process-error"))?;
+    let mut child = Command::new(&descriptor.executable)
+        .args(&descriptor.args)
+        .current_dir(&descriptor.cwd)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or(PodError::Uncertain(
+        "operator process stdout pipe is unavailable after spawn",
+    ))?;
+    let stderr = child.stderr.take().ok_or(PodError::Uncertain(
+        "operator process stderr pipe is unavailable after spawn",
+    ))?;
+    drain_bounded(stdout, stdout_file);
+    drain_bounded(stderr, stderr_file);
+    Ok(child)
+}
+
 /// Internal systemd service entry. The authenticated socket binds before any child is spawned.
 pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let manifest = read_manifest(manifest_path.as_ref())?;
@@ -1815,6 +1879,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     ))?;
     let codex_launch = match (binding.protocol.as_str(), binding.capability.as_str()) {
         (PEER_BINDING_PROTOCOL, SYNTHETIC_CAPABILITY) => None,
+        (PEER_BINDING_PROTOCOL, OPERATOR_PROCESS_CAPABILITY) => None,
         (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => {
             Some(ValidatedCodexResourceLaunch::from_peer_binding(
                 binding,
@@ -1920,6 +1985,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let listener = UnixListener::bind(&manifest.socket_path)?;
     fs::set_permissions(&manifest.socket_path, fs::Permissions::from_mode(0o600))?;
     let descriptor = &manifest.descriptor;
+    let operator_process = binding.protocol == PEER_BINDING_PROTOCOL
+        && binding.capability == OPERATOR_PROCESS_CAPABILITY;
     let mut child = if let Some(reviewed) = codex_launch {
         current_codex_v2_binding(binding, descriptor)?;
         if !manager_witness.matches_current(
@@ -1948,6 +2015,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             Some(spec) => {
                 ChildResource::Pty(LinuxBackend.spawn(descriptor, spec, manifest_path.as_ref())?)
             }
+            None if operator_process => ChildResource::Pipe(spawn_operator_process(
+                descriptor, manifest_path.as_ref(),
+            )?),
             None => ChildResource::Pipe(
                 Command::new(&descriptor.executable)
                     .args(&descriptor.args)

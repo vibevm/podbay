@@ -1,4 +1,4 @@
-//! Linux native launch boundaries for synthetic V1 and committed Codex V2.
+//! Linux native launch boundaries for bound process resources and Codex V2.
 //! Process and transport evidence does not establish provider readiness.
 #![forbid(unsafe_code)]
 #[cfg(target_os = "linux")]
@@ -13,7 +13,10 @@ pub use codex_v2::{
     preflight_committed_codex_v2_read_only,
 };
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig, VerifiedRebindInspection};
+pub use linux::{
+    LinuxLaunchPort, TrustedLinuxLaunchConfig, TrustedOperatorProcessProfile,
+    VerifiedRebindInspection,
+};
 #[cfg(target_os = "linux")]
 pub use native_ingest::{
     ManagerNativeEvidenceRead, TrustedNativeEventDirectory, read_committed_codex_native_evidence,

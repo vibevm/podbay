@@ -60,8 +60,8 @@ pub use codex_turn_journal::{
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
 pub use manifest::{
-    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, PodManifest, PodPeerBootstrap,
-    PodStatus,
+    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, OPERATOR_PROCESS_CAPABILITY,
+    OPERATOR_PROCESS_PROFILE_REF, PodManifest, PodPeerBootstrap, PodStatus,
 };
 pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,

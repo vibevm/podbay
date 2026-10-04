@@ -19,8 +19,9 @@ use podbay_host::{
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
-    CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodClient, PodError, PodManifest, PodPeerBootstrap,
-    PodStatus, RebindInspection,
+    CODEX_V2_CAPABILITY, LinuxPeerEvidence, OPERATOR_PROCESS_CAPABILITY,
+    OPERATOR_PROCESS_PROFILE_REF, PodClient, PodError, PodManifest, PodPeerBootstrap, PodStatus,
+    RebindInspection,
 };
 use podbay_store::{
     BootstrapSendSelector, BoundLaunchRecord, DurableRebindPhase, EffectState,
@@ -97,9 +98,88 @@ impl TrustedLinuxLaunchConfig {
     }
 }
 
+/// One operator-installed generic process profile. The public V1 descriptor
+/// carries these fixed bytes for review; the port rechecks their provenance
+/// and filesystem identity before entering the pod adapter. This is local
+/// cooperative pathname pinning, not isolation from a hostile same-UID peer.
+pub struct TrustedOperatorProcessProfile {
+    profile_generation: u64,
+    executable: PathBuf,
+    executable_sha256: String,
+    cwd: PathBuf,
+    arguments: Vec<String>,
+    private_data_dir: PathBuf,
+    wall_seconds: u64,
+    cwd_identity: (u64, u64),
+    data_identity: (u64, u64),
+    executable_identity: (u64, u64),
+}
+
+impl TrustedOperatorProcessProfile {
+    pub fn from_trusted_policy(
+        profile_generation: u64,
+        executable: PathBuf,
+        executable_sha256: String,
+        cwd: PathBuf,
+        arguments: Vec<String>,
+        private_data_dir: PathBuf,
+        wall_seconds: u64,
+    ) -> Result<Self, PodError> {
+        let cwd_meta = fs::symlink_metadata(&cwd)?;
+        let data_meta = fs::symlink_metadata(&private_data_dir)?;
+        let executable_meta = fs::symlink_metadata(&executable)?;
+        let result = Self {
+            profile_generation, executable, executable_sha256, cwd, arguments, private_data_dir,
+            wall_seconds,
+            cwd_identity: (cwd_meta.dev(), cwd_meta.ino()),
+            data_identity: (data_meta.dev(), data_meta.ino()),
+            executable_identity: (executable_meta.dev(), executable_meta.ino()),
+        };
+        result.recheck()?;
+        Ok(result)
+    }
+
+    fn recheck(&self) -> Result<(), PodError> {
+        let uid = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("operator process manager identity unavailable"))?
+            .uid();
+        let cwd = fs::symlink_metadata(&self.cwd)?;
+        let data = fs::symlink_metadata(&self.private_data_dir)?;
+        let executable = fs::symlink_metadata(&self.executable)?;
+        if self.profile_generation == 0
+            || !self.cwd.is_absolute()
+            || fs::canonicalize(&self.cwd)? != self.cwd
+            || !cwd.is_dir()
+            || cwd.uid() != uid
+            || (cwd.dev(), cwd.ino()) != self.cwd_identity
+            || !self.private_data_dir.is_absolute()
+            || fs::canonicalize(&self.private_data_dir)? != self.private_data_dir
+            || !data.is_dir()
+            || data.uid() != uid
+            || data.mode() & 0o7777 != 0o700
+            || (data.dev(), data.ino()) != self.data_identity
+            || !self.executable.is_absolute()
+            || fs::canonicalize(&self.executable)? != self.executable
+            || !executable.is_file()
+            || executable.mode() & 0o111 == 0
+            || (executable.dev(), executable.ino()) != self.executable_identity
+            || sha256_file(&self.executable)? != self.executable_sha256
+            || !(30..=3_600).contains(&self.wall_seconds)
+            || self.arguments.is_empty()
+            || self.arguments.len() > 64
+            || self.arguments.iter().any(|arg| arg.is_empty()
+                || arg.len() > 16_384 || arg.chars().any(char::is_control))
+        {
+            return Err(PodError::Refused("trusted operator process profile changed"));
+        }
+        Ok(())
+    }
+}
+
 pub struct LinuxLaunchPort {
     config: TrustedLinuxLaunchConfig,
     codex_credentials: BTreeMap<CredentialRef, TrustedCodexCredentialSource>,
+    operator_process: Option<TrustedOperatorProcessProfile>,
 }
 
 impl LinuxLaunchPort {
@@ -107,7 +187,23 @@ impl LinuxLaunchPort {
         Self {
             config,
             codex_credentials: BTreeMap::new(),
+            operator_process: None,
         }
+    }
+
+    /// Only trusted host setup may install the exact executable, argv, cwd
+    /// and private data directory. No wire field can construct this value.
+    pub fn register_operator_process_from_trusted_policy(
+        &mut self,
+        profile: TrustedOperatorProcessProfile,
+    ) -> Result<(), PodError> {
+        self.config.recheck()?;
+        profile.recheck()?;
+        if self.operator_process.is_some() {
+            return Err(PodError::Conflict("operator process profile is already registered"));
+        }
+        self.operator_process = Some(profile);
+        Ok(())
     }
 
     /// Register a private source under a trusted scope and vault locator.
@@ -137,13 +233,16 @@ impl LinuxLaunchPort {
         let resource = wire
             .resource(0)
             .ok_or(PodError::Unsupported("missing process resource"))?;
-        if launch.cwd() != self.config.directory
-            || wire.cwd() != self.config.directory.to_string_lossy()
-            || wire.target_os() != TargetOs::Linux
-            || wire.role() != NativeRole::Worker
-            || wire.work_kind() != NativeWorkKind::Task
+        let synthetic = wire.profile_ref() == "podbay.fixture.process.exec";
+        let operator = if wire.profile_ref() == OPERATOR_PROCESS_PROFILE_REF {
+            Some(self.operator_process.as_ref().ok_or(PodError::Unsupported(
+                "trusted operator process profile is not installed",
+            ))?)
+        } else {
+            None
+        };
+        if wire.target_os() != TargetOs::Linux
             || wire.parent_run_id().is_some()
-            || wire.profile_ref() != "podbay.fixture.process.exec"
             || wire.model_id() != "none"
             || wire.reasoning_effort() != "none"
             || wire.resources_len() != 1
@@ -154,8 +253,6 @@ impl LinuxLaunchPort {
             || !wire.credential_refs().is_empty()
             || !effective.tool_bundle_refs().is_empty()
             || wire.max_children() != 0
-            || wire.wall_seconds() != 60
-            || wire.arguments() != ["60"]
             || launch.resource_input_epochs().len() != 1
             || launch.resource_input_epochs().get(resource.resource_id) != Some(&1)
             || launch.executable() != Path::new(wire.executable())
@@ -165,9 +262,35 @@ impl LinuxLaunchPort {
             || !launch.store_path().is_absolute()
             || fs::canonicalize(launch.store_path())? != launch.store_path()
         {
-            return Err(PodError::Unsupported(
-                "launch is outside synthetic process.exec policy",
-            ));
+            return Err(PodError::Unsupported("launch is outside process.exec policy"));
+        }
+        if synthetic {
+            if launch.cwd() != self.config.directory
+                || wire.cwd() != self.config.directory.to_string_lossy()
+                || wire.role() != NativeRole::Worker
+                || wire.work_kind() != NativeWorkKind::Task
+                || wire.wall_seconds() != 60
+                || wire.arguments() != ["60"]
+            {
+                return Err(PodError::Unsupported("synthetic process.exec profile differs"));
+            }
+        } else if let Some(profile) = operator {
+            profile.recheck()?;
+            // Coordinator/Service is the existing root shape; an Auxiliary
+            // process.exec resource has no provider turn or session.send API.
+            if wire.role() != NativeRole::Coordinator
+                || wire.work_kind() != NativeWorkKind::Service
+                || wire.profile_generation() != profile.profile_generation
+                || launch.cwd() != profile.cwd
+                || wire.cwd() != profile.cwd.to_string_lossy()
+                || launch.executable() != profile.executable
+                || wire.arguments() != profile.arguments
+                || wire.wall_seconds() != profile.wall_seconds
+            {
+                return Err(PodError::Unsupported("operator process profile differs"));
+            }
+        } else {
+            return Err(PodError::Unsupported("unregistered process.exec profile"));
         }
         let peer = LinuxPeerEvidence::for_current_process()
             .map_err(|_| PodError::Refused("manager identity unavailable"))?;
@@ -268,7 +391,12 @@ impl LinuxLaunchPort {
             receipt_ref: Some(receipt.clone()),
         })?;
         let peer = launch.manager_peer();
-        if status.capability != "synthetic_fixture_only"
+        let expected_capability = if wire.profile_ref() == OPERATOR_PROCESS_PROFILE_REF {
+            OPERATOR_PROCESS_CAPABILITY
+        } else {
+            "synthetic_fixture_only"
+        };
+        if status.capability != expected_capability
             || status.descriptor_digest != wire.digest()
             || status.effective_digest != wire.effective_spec_digest()
             || status.resource_id != wire.resource_id(0).unwrap_or("")
@@ -759,7 +887,9 @@ impl HostDispatchPort for LinuxLaunchPort {
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
         self.launch_with(launch, |record, bootstrap, directory, binary| {
             let client = podbay_pod::launch_bound(record, bootstrap, directory, binary)?;
-            client.bound_status()
+            let status = client.attested_status()?;
+            attest_new_process_child(&status)?;
+            status.bound.ok_or(PodError::Refused("bound launch status is absent"))
         })
     }
 
@@ -1072,6 +1202,39 @@ fn read_rebind_process(pid: u32) -> Result<RebindProcessEvidence, PodError> {
         uid: status.0,
         gid: status.1,
     })
+}
+
+/// An accepted generic launch proves a live direct child in the exact pod
+/// unit. This is process evidence only; it says nothing about HTTP readiness
+/// or application-level work.
+fn attest_new_process_child(status: &PodStatus) -> Result<(), PodError> {
+    let manager = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| PodError::Refused("manager identity unavailable at launch readback"))?;
+    if !status.child_running
+        || read_bounded_proc(Path::new("/proc/sys/kernel/random/boot_id"))?.trim()
+            != status.boot_id
+    {
+        return Err(PodError::Refused("launch child is not running on this boot"));
+    }
+    let supervisor = read_rebind_process(status.supervisor_pid)?;
+    let child = read_rebind_process(status.child_pid)?;
+    if supervisor.start_ticks != status.supervisor_start_ticks
+        || child.start_ticks != status.child_start_ticks
+        || child.ppid != status.supervisor_pid
+        || supervisor.cgroup != status.cgroup_path
+        || child.cgroup != status.cgroup_path
+        || supervisor.uid != manager.uid()
+        || supervisor.gid != manager.gid()
+        || child.uid != manager.uid()
+        || child.gid != manager.gid()
+    {
+        return Err(PodError::Refused("launched child PID, birth, parent or cgroup differs"));
+    }
+    attest_rebind_systemd_unit(&status.unit_name, status.supervisor_pid, &status.cgroup_path)?;
+    if read_rebind_process(status.child_pid)? != child {
+        return Err(PodError::Refused("launched child changed during acceptance"));
+    }
+    Ok(())
 }
 
 fn attest_rebind_process_pair(
