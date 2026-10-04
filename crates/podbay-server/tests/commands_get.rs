@@ -1,12 +1,13 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
@@ -389,5 +390,90 @@ fn lost_read_reply_reports_transport_loss_without_replay() {
             ..
         }))
     ));
+    assert_eq!(fixture.counts(), counts);
+}
+
+#[test]
+#[ignore = "requires Node 24 for the real generated TypeScript binding"]
+fn node_binding_authenticates_to_real_rust_commands_get() {
+    let fixture = Fixture::new();
+    let binding = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bindings/typescript/src")
+        .canonicalize()
+        .unwrap();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/node_auth_read.mjs");
+    let mut child = Command::new("node")
+        .arg(script)
+        .arg(&fixture.socket_path)
+        .arg(binding)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    output.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "ready\n");
+
+    // Probe the actual Node process before installing an actor for that exact
+    // kernel subject. The real auth exchange opens a second socket from it.
+    let (probe, _) = fixture.listener.accept().unwrap();
+    let process = LinuxAcceptedPeerEvidence::from_accepted(&probe)
+        .unwrap()
+        .subject()
+        .clone();
+    drop(probe);
+    let signer = KeyPair::from_seed(Seed::new([7; 32]));
+    let (mut authority, actor, own, _) = prepared_authority(&fixture, process.clone(), *signer.pk);
+    let counts = fixture.counts();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let lineage = store
+        .current_manager_credential_claim(authority.owner_epoch().get())
+        .unwrap()
+        .store_lineage()
+        .to_owned();
+    drop(store);
+    let expected = json!({
+        "actorId": actor.as_str(),
+        "storeLineage": lineage,
+        "scopeId": "scope.auth.one",
+        "credentialGeneration": "1",
+        "osIdentity": process.os_identity(),
+        "processIdentity": process.process_identity(),
+        "startIdentity": process.start_identity().to_string(),
+        "containmentIdentity": process.containment_identity(),
+    });
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{expected}").unwrap();
+    drop(input);
+
+    fixture.listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (server, _) = loop {
+        match fixture.listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "Node auth socket did not connect"
+                );
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "Node exited before auth"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("Node auth accept failed: {error}"),
+        }
+    };
+    serve_authenticated_linux_commands_get_one(server, &mut authority).unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["receipt"]["commandId"], own.command_id);
+    assert_eq!(response["state"], "persisted");
+    assert_eq!(response["effectState"], "prepared");
+    assert!(child.wait().unwrap().success());
     assert_eq!(fixture.counts(), counts);
 }
