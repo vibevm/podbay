@@ -2,12 +2,14 @@
 //! This adapter observes the kernel and procfs; it grants no pod authority.
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use podbay_core::{AttestedPeer, ManagerLiveness};
+
+const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug)]
 pub enum LinuxPeerError {
@@ -141,11 +143,17 @@ impl LinuxPeerEvidence {
         let uid = credentials.uid();
         let gid = credentials.gid();
         let boot_id = read_boot_id()?;
-        let start_ticks = read_start_ticks(pid)?;
+        let first = read_process_stat(pid)?;
+        require_live_state(first.state)?;
+        let status = read_process_status(pid)?;
+        require_current_credentials(&status, uid, gid)?;
         let cgroup = read_cgroup(pid)?;
-        if read_start_ticks(pid)? != start_ticks {
+        let second = read_process_stat(pid)?;
+        require_live_state(second.state)?;
+        if second.start_ticks != first.start_ticks {
             return Err(LinuxPeerError::EvidenceChanged);
         }
+        let start_ticks = first.start_ticks;
         let peer = AttestedPeer::from_port(
             &format!("linux.uid.{uid}"),
             &format!("linux.pid.{pid}"),
@@ -242,11 +250,6 @@ fn valid_boot_id(value: &str) -> bool {
         })
 }
 
-fn read_start_ticks(pid: i32) -> Result<u64, LinuxPeerError> {
-    let text = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat"))?;
-    parse_start_ticks(&text, pid)
-}
-
 fn classify_process_read_error(error: &LinuxPeerError) -> ManagerLiveness {
     match error {
         LinuxPeerError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -256,6 +259,7 @@ fn classify_process_read_error(error: &LinuxPeerError) -> ManagerLiveness {
     }
 }
 
+#[cfg(test)]
 fn parse_start_ticks(text: &str, expected_pid: i32) -> Result<u64, LinuxPeerError> {
     Ok(parse_process_stat(text, expected_pid)?.start_ticks)
 }
@@ -327,6 +331,113 @@ fn read_effective_uid(pid: i32) -> Result<u32, LinuxPeerError> {
     fields[1]
         .parse()
         .map_err(|_| LinuxPeerError::InvalidEvidence("effective process Uid"))
+}
+
+struct ProcessStatus {
+    state: char,
+    effective_uid: u32,
+    effective_gid: u32,
+}
+
+fn read_process_status(pid: i32) -> Result<ProcessStatus, LinuxPeerError> {
+    let file = fs::File::open(Path::new("/proc").join(pid.to_string()).join("status"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROC_STATUS_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROC_STATUS_BYTES {
+        return Err(LinuxPeerError::InvalidEvidence("process status byte bound"));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| LinuxPeerError::InvalidEvidence("process status encoding"))?;
+    parse_process_status(text)
+}
+
+fn parse_process_status(text: &str) -> Result<ProcessStatus, LinuxPeerError> {
+    if text.len() as u64 > MAX_PROC_STATUS_BYTES {
+        return Err(LinuxPeerError::InvalidEvidence("process status byte bound"));
+    }
+    let mut state = None;
+    let mut uid = None;
+    let mut gid = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("State:") {
+            if state.is_some() {
+                return Err(LinuxPeerError::InvalidEvidence("duplicate process State"));
+            }
+            let token = value
+                .split_whitespace()
+                .next()
+                .ok_or(LinuxPeerError::InvalidEvidence("process State missing"))?;
+            let mut chars = token.chars();
+            let candidate = chars
+                .next()
+                .ok_or(LinuxPeerError::InvalidEvidence("process State missing"))?;
+            if chars.next().is_some()
+                || !matches!(
+                    candidate,
+                    'R' | 'S' | 'D' | 'Z' | 'T' | 't' | 'X' | 'x' | 'K' | 'W' | 'P' | 'I'
+                )
+            {
+                return Err(LinuxPeerError::InvalidEvidence("process State malformed"));
+            }
+            state = Some(candidate);
+        } else if let Some(value) = line.strip_prefix("Uid:") {
+            if uid.is_some() {
+                return Err(LinuxPeerError::InvalidEvidence("duplicate process Uid"));
+            }
+            uid = Some(parse_effective_id(value, "process Uid fields")?);
+        } else if let Some(value) = line.strip_prefix("Gid:") {
+            if gid.is_some() {
+                return Err(LinuxPeerError::InvalidEvidence("duplicate process Gid"));
+            }
+            gid = Some(parse_effective_id(value, "process Gid fields")?);
+        }
+    }
+    Ok(ProcessStatus {
+        state: state.ok_or(LinuxPeerError::InvalidEvidence("process State missing"))?,
+        effective_uid: uid.ok_or(LinuxPeerError::InvalidEvidence("process Uid missing"))?,
+        effective_gid: gid.ok_or(LinuxPeerError::InvalidEvidence("process Gid missing"))?,
+    })
+}
+
+fn parse_effective_id(value: &str, malformed: &'static str) -> Result<u32, LinuxPeerError> {
+    let fields = value.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 4
+        || fields
+            .iter()
+            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(LinuxPeerError::InvalidEvidence(malformed));
+    }
+    let values = fields
+        .iter()
+        .map(|field| field.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(LinuxPeerError::InvalidEvidence(malformed))?;
+    // /proc/pid/status orders real, effective, saved-set, filesystem IDs.
+    Ok(values[1])
+}
+
+fn require_live_state(state: char) -> Result<(), LinuxPeerError> {
+    if matches!(state, 'Z' | 'X' | 'x') {
+        Err(LinuxPeerError::InvalidEvidence(
+            "peer process is zombie or dead",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_current_credentials(
+    status: &ProcessStatus,
+    socket_uid: u32,
+    socket_gid: u32,
+) -> Result<(), LinuxPeerError> {
+    require_live_state(status.state)?;
+    if status.effective_uid != socket_uid || status.effective_gid != socket_gid {
+        return Err(LinuxPeerError::EvidenceChanged);
+    }
+    Ok(())
 }
 
 struct PinnedLinuxPeer {
@@ -425,6 +536,43 @@ mod tests {
         assert_eq!(parse_start_ticks(&stat, 42).unwrap(), 777);
         assert!(parse_start_ticks(&stat, 43).is_err());
         assert!(parse_start_ticks("42 no delimiters", 42).is_err());
+    }
+
+    #[test]
+    fn status_parser_uses_effective_ids_and_refuses_changed_or_dead_peer() {
+        let text = "State:\tS (sleeping)\nUid:\t12\t34\t56\t78\nGid:\t90\t91\t92\t93\n";
+        let status = parse_process_status(text).unwrap();
+        assert_eq!(status.effective_uid, 34);
+        assert_eq!(status.effective_gid, 91);
+        require_current_credentials(&status, 34, 91).unwrap();
+        assert!(matches!(
+            require_current_credentials(&status, 12, 91),
+            Err(LinuxPeerError::EvidenceChanged)
+        ));
+        assert!(matches!(
+            require_current_credentials(&status, 34, 90),
+            Err(LinuxPeerError::EvidenceChanged)
+        ));
+        for state in ['Z', 'X', 'x'] {
+            let zombie_text = text.replacen("State:\tS", &format!("State:\t{state}"), 1);
+            let zombie = parse_process_status(&zombie_text).unwrap();
+            assert!(require_current_credentials(&zombie, 34, 91).is_err());
+        }
+    }
+
+    #[test]
+    fn status_parser_fails_closed_on_missing_duplicate_or_malformed_fields() {
+        let good = "State:\tR (running)\nUid:\t1 2 3 4\nGid:\t5 6 7 8\n";
+        for bad in [
+            good.replace("Gid:\t5 6 7 8\n", ""),
+            format!("{good}Uid:\t1 2 3 4\n"),
+            good.replace("Uid:\t1 2 3 4", "Uid:\t1 2 3"),
+            good.replace("Gid:\t5 6 7 8", "Gid:\t5 six 7 8"),
+            good.replace("State:\tR", "State:\tunknown"),
+            "x".repeat(MAX_PROC_STATUS_BYTES as usize + 1),
+        ] {
+            assert!(parse_process_status(&bad).is_err());
+        }
     }
 
     #[test]
