@@ -14,8 +14,9 @@ use podbay_core::AttestedPeer;
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId};
 #[cfg(target_os = "linux")]
 use podbay_wire::{
-    EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeResourceKind, NativeRole,
-    NativeWorkKind, ResourceDriver, TargetOs,
+    EffectiveLaunchContract, EffectiveLaunchContractV2, ImmutableLaunchDescriptor,
+    ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
+    TargetOs,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,7 +124,11 @@ pub struct PodManifest {
 #[cfg(target_os = "linux")]
 pub const PEER_BINDING_PROTOCOL: &str = "podbay.peer-binding/1";
 #[cfg(target_os = "linux")]
+pub const PEER_BINDING_V2_PROTOCOL: &str = "podbay.peer-binding/2";
+#[cfg(target_os = "linux")]
 pub const SYNTHETIC_CAPABILITY: &str = "synthetic_fixture_only";
+#[cfg(target_os = "linux")]
+pub const CODEX_V2_CAPABILITY: &str = "codex_app_server_v2";
 
 /// Host-reviewed inputs that cannot be inferred from a PB05 descriptor.
 /// The manager peer itself is observed from the launcher process, never passed
@@ -184,12 +189,19 @@ impl BoundPeerManifest {
         let mut copy = self.clone();
         copy.binding_digest.clear();
         let mut hash = Sha256::new();
-        hash.update(b"podbay.peer-binding/1\0");
+        match self.protocol.as_str() {
+            PEER_BINDING_PROTOCOL => hash.update(b"podbay.peer-binding/1\0"),
+            PEER_BINDING_V2_PROTOCOL => hash.update(b"podbay.peer-binding/2\0"),
+            _ => return Err(PodError::Invalid("unknown peer binding version")),
+        }
         hash.update(serde_json::to_vec(&copy)?);
         Ok(hex(&hash.finalize()))
     }
 
     pub fn validate(&self, legacy: &LaunchDescriptor, directory: &Path) -> Result<(), PodError> {
+        if self.protocol == PEER_BINDING_V2_PROTOCOL || self.capability == CODEX_V2_CAPABILITY {
+            return self.validate_codex_v2(legacy, directory);
+        }
         if self.protocol != PEER_BINDING_PROTOCOL
             || self.capability != SYNTHETIC_CAPABILITY
             || self.binding_digest != self.digest()?
@@ -284,6 +296,100 @@ impl BoundPeerManifest {
         }
         if hex(&hash.finalize()) != self.executable_sha256 {
             return Err(PodError::Unsupported("sleep executable SHA differs"));
+        }
+        Ok(())
+    }
+
+    fn validate_codex_v2(
+        &self,
+        launch: &LaunchDescriptor,
+        directory: &Path,
+    ) -> Result<(), PodError> {
+        if self.protocol != PEER_BINDING_V2_PROTOCOL
+            || self.capability != CODEX_V2_CAPABILITY
+            || self.binding_digest != self.digest()?
+            || !self.store_path.is_absolute()
+            || self.owner_epoch == 0
+            || self.credential_epoch == 0
+            || self.resource_input_epochs.len() != 1
+            || !directory.is_absolute()
+        {
+            return Err(PodError::Invalid("Codex V2 peer binding changed"));
+        }
+        self.manager_peer()?;
+        let wire = ImmutableLaunchDescriptorV2::decode_json(&self.wire_descriptor)
+            .map_err(|_| PodError::Invalid("Codex V2 descriptor is malformed"))?;
+        let effective = EffectiveLaunchContractV2::decode(&self.effective_spec)
+            .map_err(|_| PodError::Invalid("Codex V2 effective launch is malformed"))?;
+        effective
+            .compare_with_descriptor(&wire)
+            .map_err(|_| PodError::Invalid("Codex V2 effective launch differs"))?;
+        let role = match (wire.role(), wire.work_kind()) {
+            (NativeRole::Coordinator, NativeWorkKind::Service) => PodRole::Coordinator,
+            (NativeRole::Worker, NativeWorkKind::Task) => PodRole::Worker,
+            _ => return Err(PodError::Unsupported("Codex V2 pod role is unavailable")),
+        };
+        let resource = wire
+            .resource(0)
+            .ok_or(PodError::Invalid("Codex V2 resource is missing"))?;
+        if wire.resources_len() != 1
+            || resource.kind != NativeResourceKind::StructuredProvider
+            || wire.target_os() != TargetOs::Linux
+            || wire.arguments() != ["app-server", "--listen", "stdio://"]
+            || wire.scope_id() != launch.scope_id
+            || wire.pod_id() != launch.pod_id
+            || wire.attempt_id() != launch.attempt_id
+            || wire.pod_incarnation() != launch.incarnation
+            || wire.session_id() != launch.session_id
+            || wire.run_id() != launch.run_id
+            || resource.resource_id != launch.resource_id
+            || resource.epoch != self.resource_epoch
+            || resource.epoch != 1
+            || self
+                .resource_input_epochs
+                .get(resource.resource_id)
+                .copied()
+                != Some(1)
+            || wire.executable() != launch.executable.to_string_lossy()
+            || wire.cwd() != launch.cwd.to_string_lossy()
+            || wire.arguments() != launch.args
+            || launch.pty.is_some()
+            || launch.role != role
+            || self.descriptor_digest != wire.digest()
+            || self.effective_digest != effective.digest()
+        {
+            return Err(PodError::Unsupported("Codex V2 pod launch binding differs"));
+        }
+        if fs::canonicalize(&launch.cwd)? != launch.cwd {
+            return Err(PodError::Refused("Codex workspace path changed"));
+        }
+        let executable = fs::canonicalize(&launch.executable)?;
+        if executable != launch.executable
+            || executable != self.canonical_executable
+            || self.executable_sha256.len() != 64
+            || !self
+                .executable_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || wire.executable_generation() != format!("sha256:{}", self.executable_sha256)
+        {
+            return Err(PodError::Refused("Codex executable generation differs"));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&executable)?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; 8192];
+        loop {
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&bytes[..count]);
+        }
+        if hex(&hash.finalize()) != self.executable_sha256 {
+            return Err(PodError::Refused("Codex executable SHA differs"));
         }
         Ok(())
     }

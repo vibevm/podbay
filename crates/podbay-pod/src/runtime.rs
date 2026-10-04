@@ -829,6 +829,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
         "unbound bearer-only pod service is retired",
     ))?;
+    if binding.protocol != PEER_BINDING_PROTOCOL || binding.capability != SYNTHETIC_CAPABILITY {
+        return Err(PodError::Unsupported(
+            "Codex V2 structured resource runtime is not wired",
+        ));
+    }
     let identity = bound_identity(&manifest.descriptor, binding)?;
     let manager_peer = binding.manager_peer()?;
     let owner_epoch =

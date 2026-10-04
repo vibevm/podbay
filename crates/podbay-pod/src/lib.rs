@@ -20,11 +20,11 @@ mod unsupported;
 
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
+#[cfg(target_os = "linux")]
+pub use manifest::{BoundPeerManifest, BoundPodStatus, PodManifest, PodPeerBootstrap, PodStatus};
 pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
 };
-#[cfg(target_os = "linux")]
-pub use manifest::{BoundPodStatus, PodManifest, PodPeerBootstrap, PodStatus};
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
 #[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
@@ -34,7 +34,9 @@ pub use ports::{
     TerminalViewerPort,
 };
 #[cfg(target_os = "linux")]
-pub use runtime::{LinuxBackend, PodClient, RebindInspection, TerminalViewer, launch, launch_bound, serve};
+pub use runtime::{
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, launch, launch_bound, serve,
+};
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
     TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,
