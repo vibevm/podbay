@@ -1,9 +1,8 @@
 //! Read-only manager bridge for one current committed Codex V2 Resource.
 //! Native JSONL never enters the public server response or a command effect.
 
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -11,9 +10,8 @@ use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId
 use podbay_host::ResolvedNativeCodexLaunch;
 use podbay_pod::{
     CODEX_V2_CAPABILITY, LinuxNativeSegmentDirectory, LinuxPeerEvidence,
-    MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES, NativeEventCursor, NativeEventIdentity, NativeEventRead,
-    NativeSegmentCheckpoint, PodClient, PodError, PrivateNativeEvidence,
-    codex_private_slot_directory, decode_private_native_evidence_for_trusted_reader,
+    NativeEventCursor, NativeEventIdentity, NativeEventRead, NativeSegmentCheckpoint, PodClient,
+    PodError, PrivateNativeEvidence, codex_private_slot_directory,
     manifest_path_for_identity,
 };
 
@@ -100,10 +98,9 @@ impl ManagerNativeEvidenceRead {
 
 /// Requires a host-minted committed proof, today's trusted credential source,
 /// the same manager OS process, exact store inode/revision and an attested pod
-/// socket around private evidence readback. New V2 slots use an indexed,
-/// incrementally verified segment reader; historical v1 slots retain one
-/// bounded full-copy diagnostic read. A concurrent change refuses for a
-/// read-only retry.
+/// socket around private evidence readback. Current slots use an indexed,
+/// incrementally verified segment reader. A concurrent change refuses for a
+/// read-only retry; the former single-file format is unsupported.
 pub fn read_committed_codex_native_evidence(
     launch: &ResolvedNativeCodexLaunch,
     credential: &TrustedCodexCredentialSource,
@@ -172,21 +169,12 @@ pub fn read_committed_codex_native_evidence(
         return Err(PodError::Refused("current Codex pod status differs"));
     }
     let checkpoint = private_slot.join("native-events.checkpoint");
-    let historical = private_slot.join("codex.native-events.log");
-    let segmented_present = path_entry_exists(&checkpoint)?;
-    let historical_present = path_entry_exists(&historical)?;
-    if historical_present && segment_file_present(&private_slot)? {
-        return Err(PodError::Refused(
-            "historical and segmented native evidence coexist",
-        ));
+    let old_format = private_slot.join("codex.native-events.log");
+    if path_entry_exists(&old_format)? {
+        return Err(PodError::Unsupported("old native event format"));
     }
-    if !matches!(
-        (segmented_present, historical_present),
-        (true, false) | (false, true)
-    ) {
-        return Err(PodError::Refused(
-            "native evidence format is missing or ambiguous",
-        ));
+    if !path_entry_exists(&checkpoint)? {
+        return Err(PodError::Refused("native event checkpoint is missing"));
     }
     let mut snapshot_race_attempts = 0;
     let (redacted, private) = loop {
@@ -196,30 +184,23 @@ pub fn read_committed_codex_native_evidence(
                 "native event snapshot belongs to another Resource",
             ));
         }
-        let private = if segmented_present {
-            match directory.read_segmented_page(
-                &private_slot,
-                &expected,
-                &redacted,
-                cursor,
-                limit,
-            )? {
-                Some(private) => private,
-                None if snapshot_race_attempts < 2 => {
-                    snapshot_race_attempts += 1;
-                    continue;
-                }
-                None => {
-                    return Err(PodError::Uncertain(
-                        "pod snapshot kept moving during bounded private read",
-                    ));
-                }
+        let private = match directory.read_segmented_page(
+            &private_slot,
+            &expected,
+            &redacted,
+            cursor,
+            limit,
+        )? {
+            Some(private) => private,
+            None if snapshot_race_attempts < 2 => {
+                snapshot_race_attempts += 1;
+                continue;
             }
-        } else if redacted.events.is_empty() {
-            Vec::new()
-        } else {
-            let raw = read_private_log_copy(&historical, peer.uid())?;
-            decode_private_native_evidence_for_trusted_reader(&raw, &expected, &redacted.events)?
+            None => {
+                return Err(PodError::Uncertain(
+                    "pod snapshot kept moving during bounded private read",
+                ));
+            }
         };
         break (redacted, private);
     };
@@ -227,9 +208,8 @@ pub fn read_committed_codex_native_evidence(
     directory.recheck(peer.uid())?;
     directory.preflight_cached(launch, credential)?;
     if checked_store_file(launch.store_path(), peer.uid())? != store_identity
-        || path_entry_exists(&checkpoint)? != segmented_present
-        || path_entry_exists(&historical)? != historical_present
-        || (historical_present && segment_file_present(&private_slot)?)
+        || !path_entry_exists(&checkpoint)?
+        || path_entry_exists(&old_format)?
         || !LinuxPeerEvidence::for_current_process()
             .is_ok_and(|current| current.attested_peer() == peer.attested_peer())
         || !status_matches(&after, launch, &expected, resource.epoch)
@@ -322,18 +302,6 @@ fn path_entry_exists(path: &Path) -> Result<bool, PodError> {
     }
 }
 
-fn segment_file_present(slot: &Path) -> Result<bool, PodError> {
-    let mut found = false;
-    for entry in fs::read_dir(slot)? {
-        let name = entry?.file_name();
-        let name = name
-            .to_str()
-            .ok_or(PodError::Refused("native slot filename is invalid"))?;
-        found |= name.starts_with("native-events-") && name.ends_with(".segment");
-    }
-    Ok(found)
-}
-
 fn status_matches(
     status: &podbay_pod::PodStatus,
     launch: &ResolvedNativeCodexLaunch,
@@ -387,92 +355,4 @@ fn checked_store_file(path: &Path, uid: u32) -> Result<(u64, u64), PodError> {
         return Err(PodError::Refused("native evidence store file differs"));
     }
     Ok((metadata.dev(), metadata.ino()))
-}
-
-fn read_private_log_copy(path: &Path, uid: u32) -> Result<Vec<u8>, PodError> {
-    let before = fs::symlink_metadata(path)?;
-    if !path.is_absolute()
-        || !before.is_file()
-        || before.nlink() != 1
-        || before.uid() != uid
-        || before.mode() & 0o7777 != 0o600
-        || before.len() > MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES
-        || fs::canonicalize(path)? != path
-    {
-        return Err(PodError::Refused("private native event log changed"));
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let held = file.metadata()?;
-    if (held.dev(), held.ino()) != (before.dev(), before.ino()) {
-        return Err(PodError::Refused("private native event log inode changed"));
-    }
-    let mut raw = Vec::new();
-    (&mut file)
-        .take(MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES + 1)
-        .read_to_end(&mut raw)?;
-    let after = fs::symlink_metadata(path)?;
-    let held_after = file.metadata()?;
-    if raw.len() as u64 > MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES
-        || before.len() != raw.len() as u64
-        || after.len() != before.len()
-        || held_after.len() != before.len()
-        || (after.dev(), after.ino()) != (before.dev(), before.ino())
-        || (held_after.dev(), held_after.ino()) != (before.dev(), before.ino())
-        || after.uid() != uid
-        || after.mode() & 0o7777 != 0o600
-        || after.nlink() != 1
-        || fs::canonicalize(path)? != path
-    {
-        return Err(PodError::Refused(
-            "private native event log changed during read",
-        ));
-    }
-    Ok(raw)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::*;
-
-    #[test]
-    fn held_private_evidence_read_refuses_symlink_and_insecure_mode() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "podbay-native-reader-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let path = root.join("codex.native-events.log");
-        fs::write(&path, b"private fixture evidence").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let uid = LinuxPeerEvidence::for_current_process().unwrap().uid();
-        assert_eq!(
-            read_private_log_copy(&path, uid).unwrap(),
-            b"private fixture evidence"
-        );
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            read_private_log_copy(&path, uid),
-            Err(PodError::Refused(_))
-        ));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let real = root.join("real.log");
-        fs::rename(&path, &real).unwrap();
-        symlink(&real, &path).unwrap();
-        assert!(matches!(
-            read_private_log_copy(&path, uid),
-            Err(PodError::Refused(_))
-        ));
-        fs::remove_dir_all(root).unwrap();
-    }
 }

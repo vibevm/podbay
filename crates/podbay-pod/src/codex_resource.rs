@@ -31,7 +31,7 @@ use crate::codex_turn_journal::{CodexLaterTurnJournal, LaterTurnStage, LaterTurn
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::native_events::{
     NativeEventAppend, NativeEventCursor, NativeEventIdentity, NativeEventKind, NativeEventRead,
-    NativeEventSpool, NativeEventStatus,
+    NativeEventStatus,
 };
 use crate::segmented_native_events::SegmentedNativeEventSpool;
 use crate::manifest::{
@@ -105,77 +105,24 @@ pub struct PodCodexResource {
     later_journal_path: PathBuf,
     later_identity: Option<CodexJournalIdentity>,
     pending_later_proof: Option<LaterCodexSendRecord>,
-    native_events: CodexNativeEventSource,
+    native_events: SegmentedNativeEventSpool,
     child_birth: KernelChildBirthObservation,
     pod_boot_id: String,
     pod_cgroup: String,
 }
 
-enum CodexNativeEventSource {
-    HistoricalLog(NativeEventSpool),
-    Segmented(SegmentedNativeEventSpool),
-}
-
-impl CodexNativeEventSource {
-    fn open(private_slot: &Path, identity: NativeEventIdentity) -> Result<Self, PodError> {
-        let historical = private_slot.join("codex.native-events.log");
-        let checkpoint = private_slot.join("native-events.checkpoint");
-        let has_historical = path_entry_exists(&historical)?;
-        let has_checkpoint = path_entry_exists(&checkpoint)?;
-        let mut has_segment = false;
-        for entry in fs::read_dir(private_slot)? {
-            let name = entry?.file_name();
-            let name = name.to_str().ok_or(PodError::Refused("native event slot filename is invalid"))?;
-            has_segment |= name.starts_with("native-events-") && name.ends_with(".segment");
-        }
-        if has_historical && (has_checkpoint || has_segment) {
-            return Err(PodError::Conflict("historical and segmented native event formats coexist"));
-        }
-        if has_historical {
-            Ok(Self::HistoricalLog(NativeEventSpool::open(&LinuxBackend, &historical, identity)?))
-        } else {
-            Ok(Self::Segmented(SegmentedNativeEventSpool::open(private_slot.to_path_buf(), identity)?))
-        }
+fn open_current_native_events(
+    private_slot: &Path,
+    identity: NativeEventIdentity,
+) -> Result<SegmentedNativeEventSpool, PodError> {
+    // There are no deployed clients of the former single-file format. Reject
+    // an old slot instead of silently migrating or mixing event histories.
+    match fs::symlink_metadata(private_slot.join("codex.native-events.log")) {
+        Ok(_) => return Err(PodError::Unsupported("old native event format")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-
-    fn reserve_before_take(&mut self) -> Result<u64, PodError> {
-        match self {
-            Self::HistoricalLog(source) => source.next_source_sequence(),
-            Self::Segmented(source) => source.reserve_native_take(),
-        }
-    }
-
-    fn append_applied(
-        &mut self, sequence: u64, raw: &[u8], kind: NativeEventKind,
-        status: Option<NativeEventStatus>, conflict: bool,
-    ) -> Result<NativeEventAppend, PodError> {
-        match self {
-            Self::HistoricalLog(source) => source.append_applied(sequence, raw, kind, status, conflict),
-            Self::Segmented(source) => source.append_applied(sequence, raw, kind, status, conflict),
-        }
-    }
-
-    fn mark_continuity_unknown(&mut self) -> Result<(), PodError> {
-        match self {
-            Self::HistoricalLog(source) => source.mark_continuity_unknown(),
-            Self::Segmented(source) => source.mark_continuity_unknown(),
-        }
-    }
-
-    fn read_after(&self, cursor: Option<&NativeEventCursor>, limit: usize) -> Result<NativeEventRead, PodError> {
-        match self {
-            Self::HistoricalLog(source) => source.read_after(cursor, limit),
-            Self::Segmented(source) => source.read_after(cursor, limit),
-        }
-    }
-}
-
-fn path_entry_exists(path: &Path) -> Result<bool, PodError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
+    SegmentedNativeEventSpool::open(private_slot.to_path_buf(), identity)
 }
 
 impl PodCodexResource {
@@ -267,7 +214,7 @@ impl PodCodexResource {
             &identity.resource_id,
             identity.resource_epoch,
         );
-        let native_events = CodexNativeEventSource::open(&private_slot, event_identity)?;
+        let native_events = open_current_native_events(&private_slot, event_identity)?;
         let config = PinnedCodexConfig::new(
             descriptor.model_id(),
             descriptor.reasoning_effort(),
@@ -1039,12 +986,12 @@ impl PodCodexResource {
 
 fn flush_native_events_from(
     resource: &mut CodexResource<ProcessJsonlTransport>,
-    events: &mut CodexNativeEventSource,
+    events: &mut SegmentedNativeEventSpool,
 ) -> Result<(), PodError> {
     while resource.has_unspooled_native_notifications() {
         // Segmented output reserves its next durable source position before
         // the adapter notification can be taken from memory.
-        let sequence = events.reserve_before_take()?;
+        let sequence = events.reserve_native_take()?;
         let observed = match resource.take_applied_native_notification() {
             Some(observed) => observed,
             None => {
@@ -1268,7 +1215,7 @@ mod native_format_tests {
     }
 
     #[test]
-    fn historical_native_log_is_preserved_and_mixed_format_refuses() {
+    fn old_native_log_is_refused_without_creating_a_checkpoint() {
         let root = std::env::temp_dir().join(format!(
             "podbay-native-format-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
         ));
@@ -1277,11 +1224,8 @@ mod native_format_tests {
         let old = root.join("codex.native-events.log");
         fs::write(&old, []).unwrap();
         fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(CodexNativeEventSource::open(&root, identity()).unwrap(), CodexNativeEventSource::HistoricalLog(_)));
-        let segment = root.join("native-events-0000000000000001.segment");
-        fs::write(&segment, []).unwrap();
-        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(CodexNativeEventSource::open(&root, identity()), Err(PodError::Conflict(_))));
+        assert!(matches!(open_current_native_events(&root, identity()), Err(PodError::Unsupported(_))));
+        assert!(!root.join("native-events.checkpoint").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
