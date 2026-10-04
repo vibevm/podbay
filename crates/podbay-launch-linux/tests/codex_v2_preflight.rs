@@ -128,6 +128,29 @@ impl Drop for Fixture {
     }
 }
 
+/// A real provider test can fail after launch while the pod still owns a
+/// credentialed child. Stop that exact disposable unit before the fixture
+/// directory is removed, including during panic unwinding.
+struct DisposableUnitGuard(String);
+
+impl DisposableUnitGuard {
+    fn for_manifest(path: &Path) -> Self {
+        let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
+        assert!(stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        Self(format!("podbay-pod-{stem}.service"))
+    }
+}
+
+impl Drop for DisposableUnitGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &self.0])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 struct NoPort(Arc<AtomicUsize>);
 
 impl HostDispatchPort for NoPort {
@@ -1141,6 +1164,7 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
         );
     }
     let manifest = slot_manifest(&fixture).expect("one committed V2 pod manifest");
+    let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);
     let client = PodClient::connect(&manifest).unwrap();
     assert!(client.attested_status().unwrap().child_running);
 
