@@ -121,6 +121,72 @@ impl LinuxPeerEvidence {
         Self::from_accepted(&first)
     }
 
+    /// Pin the process that actually launched this manager. The parent PID
+    /// comes from this process's procfs stat, never argv, env or a setup
+    /// request. A changed parent, birth, boot, effective IDs or cgroup refuses.
+    pub fn for_launcher_parent() -> Result<Self, LinuxPeerError> {
+        let self_pid = i32::try_from(std::process::id())
+            .map_err(|_| LinuxPeerError::InvalidEvidence("self PID overflows"))?;
+        let self_first = read_process_stat(self_pid)?;
+        let pid = self_first.ppid;
+        if pid <= 1 || pid == self_pid {
+            return Err(LinuxPeerError::InvalidEvidence(
+                "launcher parent PID is absent",
+            ));
+        }
+        let boot_id = read_boot_id()?;
+        let first = read_process_stat(pid)?;
+        require_live_state(first.state)?;
+        let status_first = read_process_status(pid)?;
+        require_live_state(status_first.state)?;
+        let cgroup_first = read_cgroup(pid)?;
+        let second = read_process_stat(pid)?;
+        require_live_state(second.state)?;
+        let status_second = read_process_status(pid)?;
+        require_live_state(status_second.state)?;
+        let cgroup_second = read_cgroup(pid)?;
+        let self_second = read_process_stat(self_pid)?;
+        if first.start_ticks != second.start_ticks
+            || status_first.effective_uid != status_second.effective_uid
+            || status_first.effective_gid != status_second.effective_gid
+            || cgroup_first != cgroup_second
+            || self_first.start_ticks != self_second.start_ticks
+            || self_second.ppid != pid
+            || read_boot_id()? != boot_id
+        {
+            return Err(LinuxPeerError::EvidenceChanged);
+        }
+        let uid = status_second.effective_uid;
+        let gid = status_second.effective_gid;
+        let start_ticks = second.start_ticks;
+        let cgroup = cgroup_second;
+        let peer = AttestedPeer::from_port(
+            &format!("linux.uid.{uid}"),
+            &format!("linux.pid.{pid}"),
+            &format!("linux.boot.{boot_id}"),
+            &format!("linux.start.{start_ticks}"),
+            &format!("linux.cgroup.{cgroup}"),
+        )
+        .map_err(|_| LinuxPeerError::InvalidEvidence("parent peer shape refused"))?;
+        Ok(Self {
+            pid,
+            uid,
+            gid,
+            boot_id,
+            start_ticks,
+            cgroup,
+            peer,
+        })
+    }
+
+    pub fn recheck_launcher_parent(&self) -> Result<(), LinuxPeerError> {
+        if Self::for_launcher_parent()? == *self {
+            Ok(())
+        } else {
+            Err(LinuxPeerError::EvidenceChanged)
+        }
+    }
+
     /// `socket` must be the accepted connection, not an outgoing client socket.
     /// Failure to read any component refuses before a control effect.
     pub fn from_accepted(socket: &UnixStream) -> Result<Self, LinuxPeerError> {
@@ -266,6 +332,7 @@ fn parse_start_ticks(text: &str, expected_pid: i32) -> Result<u64, LinuxPeerErro
 
 struct ProcessStat {
     state: char,
+    ppid: i32,
     start_ticks: u64,
 }
 
@@ -299,6 +366,12 @@ fn parse_process_stat(text: &str, expected_pid: i32) -> Result<ProcessStat, Linu
             .then_some(state)
         })
         .ok_or(LinuxPeerError::InvalidEvidence("process state"))?;
+    let ppid = tail
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .ok_or(LinuxPeerError::InvalidEvidence("process parent PID"))?;
     let ticks = tail
         .split_whitespace()
         .nth(19)
@@ -311,6 +384,7 @@ fn parse_process_stat(text: &str, expected_pid: i32) -> Result<ProcessStat, Linu
     }
     Ok(ProcessStat {
         state,
+        ppid,
         start_ticks: ticks,
     })
 }
@@ -529,8 +603,22 @@ mod tests {
     }
 
     #[test]
+    fn launcher_parent_capture_rejects_changed_birth() {
+        let parent = LinuxPeerEvidence::for_launcher_parent().unwrap();
+        assert!(parent.pid() > 1);
+        parent.recheck_launcher_parent().unwrap();
+        let mut wrong_birth = parent;
+        wrong_birth.start_ticks += 1;
+        assert!(matches!(
+            wrong_birth.recheck_launcher_parent(),
+            Err(LinuxPeerError::EvidenceChanged)
+        ));
+    }
+
+    #[test]
     fn stat_parser_uses_field_22_after_parenthesized_process_name() {
         let mut fields = vec!["S".to_owned(); 20];
+        fields[1] = "7".into();
         fields[19] = "777".into();
         let stat = format!("42 (weird ) process name) {}", fields.join(" "));
         assert_eq!(parse_start_ticks(&stat, 42).unwrap(), 777);

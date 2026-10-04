@@ -305,11 +305,16 @@ dependencies = [
 name = "podbay-cli"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
+ "podbay-client",
+ "podbay-core",
  "podbay-host",
  "podbay-launch-linux",
  "podbay-pod",
  "podbay-server",
  "podbay-store",
+ "podbay-wire",
+ "serde_json",
  "sha2",
  "signal-hook",
 ]

@@ -18,16 +18,28 @@ mod linux {
         atomic::{AtomicBool, Ordering},
     };
 
-    use podbay_host::{DurableAuthority, DurableAuthorityError};
+    use podbay_core::{ActorId, ScopeId};
+    use podbay_host::{
+        CredentialRef, DurableAuthority, DurableAuthorityError, TrustedInitialOwnerPolicy,
+    };
     use podbay_launch_linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig};
     use podbay_pod::LinuxPeerEvidence;
-    use podbay_server::{LinuxListenerError, LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME};
+    use podbay_server::{
+        InitialOwnerSetupError, LinuxInitialOwnerSetupListener, LinuxListenerError,
+        LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME,
+    };
     use signal_hook::{
         consts::signal::{SIGINT, SIGTERM},
         flag,
     };
 
-    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX\nThis command serves authenticated reads only at DIR/manager.sock.";
+    const USAGE: &str = "usage: podbay manager serve --state-dir DIR --database FILE --pod-dir DIR --pod-binary FILE --pod-sha256 HEX [--initial-owner-actor ID --initial-owner-scope ID --initial-owner-credential REF]\nA fresh initial owner setup uses DIR/owner-setup.sock before authenticated reads at DIR/manager.sock. Mutation routes remain disabled.";
+
+    struct InitialOwnerConfig {
+        actor_id: String,
+        scope_id: String,
+        credential_ref: String,
+    }
 
     struct ServeConfig {
         state_dir: PathBuf,
@@ -35,6 +47,7 @@ mod linux {
         pod_dir: PathBuf,
         pod_binary: PathBuf,
         pod_sha256: String,
+        initial_owner: Option<InitialOwnerConfig>,
     }
 
     pub fn main() -> ExitCode {
@@ -49,8 +62,21 @@ mod linux {
 
     fn run() -> Result<(), String> {
         let config = parse_args(env::args_os())?;
+        let parent = if config.initial_owner.is_some() {
+            Some(
+                LinuxPeerEvidence::for_launcher_parent()
+                    .map_err(|error| format!("launcher parent evidence unavailable: {error}"))?,
+            )
+        } else {
+            None
+        };
         let self_peer = LinuxPeerEvidence::for_current_process()
             .map_err(|error| format!("manager process evidence unavailable: {error}"))?;
+        if parent.as_ref().is_some_and(|parent| {
+            parent.uid() != self_peer.uid() || parent.gid() != self_peer.gid()
+        }) {
+            return Err("launcher parent effective UID/GID differs from manager".into());
+        }
         validate_private_directory(&config.state_dir, self_peer.uid())?;
         validate_private_directory(&config.pod_dir, self_peer.uid())?;
         validate_database_path(&config.database, &config.state_dir, self_peer.uid())?;
@@ -72,9 +98,13 @@ mod linux {
             return Ok(());
         }
         let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
+        let setup_path = config.state_dir.join(OWNER_SETUP_SOCKET_NAME);
         // A stale pathname must not advance the durable owner epoch. Probe it
         // before opening the manager; the later check still catches races.
         check_manager_socket_path(&socket_path)?;
+        if config.initial_owner.is_some() {
+            check_owner_setup_socket_path(&setup_path)?;
+        }
         ensure_private_database(&config.database, &config.state_dir, self_peer.uid())?;
         // One lock and manager OS identity live for this entire serve loop.
         let mut authority = DurableAuthority::open(
@@ -86,6 +116,45 @@ mod linux {
             other => format!("durable manager open failed: {other:?}"),
         })?;
         check_manager_socket_path(&socket_path)?;
+        if let Some(initial) = config.initial_owner {
+            check_owner_setup_socket_path(&setup_path)?;
+            let actor_id = ActorId::try_from(initial.actor_id.as_str())
+                .map_err(|_| "initial owner actor ID is invalid".to_owned())?;
+            let scope_id = ScopeId::try_from(initial.scope_id.as_str())
+                .map_err(|_| "initial owner scope ID is invalid".to_owned())?;
+            let credential =
+                CredentialRef::from_trusted_vault(scope_id.clone(), &initial.credential_ref)
+                    .map_err(|_| "initial owner credential reference is invalid".to_owned())?;
+            let policy = TrustedInitialOwnerPolicy::from_trusted_manager_policy(
+                actor_id, scope_id, credential,
+            )
+            .map_err(|_| "initial owner policy is invalid".to_owned())?;
+            let mut setup = LinuxInitialOwnerSetupListener::bind(
+                &config.state_dir,
+                parent.expect("setup requires captured launcher parent"),
+            )
+            .map_err(|error| format!("owner setup bind failed: {error}"))?;
+            eprintln!("podbay owner setup socket: {}", setup.path().display());
+            let enrolled = setup.serve(&mut authority, policy, &stop);
+            let cleanup = setup.shutdown();
+            match (enrolled, cleanup) {
+                (Ok(receipt), Ok(())) => eprintln!(
+                    "podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                    receipt.actor_id.as_str(),
+                    receipt.scope_id.as_str(),
+                    receipt.grant_id.get(),
+                    receipt.owner_epoch,
+                ),
+                (Err(InitialOwnerSetupError::Stopped), Ok(())) => return Ok(()),
+                (Err(error), Ok(())) => return Err(format!("owner setup failed: {error}")),
+                (Ok(_), Err(error)) => return Err(format!("owner setup cleanup failed: {error}")),
+                (Err(setup_error), Err(cleanup_error)) => {
+                    return Err(format!(
+                        "owner setup failed: {setup_error}; cleanup failed: {cleanup_error}"
+                    ));
+                }
+            }
+        }
         let mut listener = LinuxManagerCommandsGetListener::bind(&config.state_dir).map_err(
             |error| match error {
                 LinuxListenerError::Io(ref io_error)
@@ -140,7 +209,14 @@ mod linux {
                 .map_err(|_| format!("flag names must be UTF-8; {USAGE}"))?;
             if !matches!(
                 flag.as_str(),
-                "--state-dir" | "--database" | "--pod-dir" | "--pod-binary" | "--pod-sha256"
+                "--state-dir"
+                    | "--database"
+                    | "--pod-dir"
+                    | "--pod-binary"
+                    | "--pod-sha256"
+                    | "--initial-owner-actor"
+                    | "--initial-owner-scope"
+                    | "--initial-owner-credential"
             ) {
                 return Err(format!("unknown flag {flag}; {USAGE}"));
             }
@@ -151,6 +227,28 @@ mod linux {
                 return Err(format!("duplicate flag {flag}; {USAGE}"));
             }
         }
+        let actor = flags.remove("--initial-owner-actor");
+        let scope = flags.remove("--initial-owner-scope");
+        let credential = flags.remove("--initial-owner-credential");
+        let initial_owner = match (actor, scope, credential) {
+            (None, None, None) => None,
+            (Some(actor), Some(scope), Some(credential)) => Some(InitialOwnerConfig {
+                actor_id: actor
+                    .into_string()
+                    .map_err(|_| "initial owner actor ID is not UTF-8")?,
+                scope_id: scope
+                    .into_string()
+                    .map_err(|_| "initial owner scope ID is not UTF-8")?,
+                credential_ref: credential
+                    .into_string()
+                    .map_err(|_| "initial owner credential ref is not UTF-8")?,
+            }),
+            _ => {
+                return Err(format!(
+                    "all three initial owner policy flags are required; {USAGE}"
+                ));
+            }
+        };
         let mut take = |name: &str| {
             flags
                 .remove(name)
@@ -164,6 +262,7 @@ mod linux {
             pod_sha256: take("--pod-sha256")?
                 .into_string()
                 .map_err(|_| "pod SHA-256 must be ASCII hex".to_owned())?,
+            initial_owner,
         })
     }
 
@@ -198,6 +297,19 @@ mod linux {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("manager socket path inspection failed: {error}")),
+        }
+    }
+
+    fn check_owner_setup_socket_path(path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Err(format!(
+                "existing owner setup socket path {}; inspect the prior owner and reconcile it manually",
+                path.display()
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "owner setup socket path inspection failed: {error}"
+            )),
         }
     }
 

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+podbay-core = { path = "../podbay-core" }
 podbay-host = { path = "../podbay-host" }
 podbay-launch-linux = { path = "../podbay-launch-linux" }
 podbay-pod = { path = "../podbay-pod" }
@@ -12,7 +13,11 @@ podbay-server = { path = "../podbay-server" }
 signal-hook = "0.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+ed25519-compact = { version = "2", default-features = false }
+podbay-client = { path = "../podbay-client" }
 podbay-store = { path = "../podbay-store" }
+podbay-wire = { path = "../podbay-wire" }
+serde_json = "1.0"
 sha2 = "0.11"
 
 [[bin]]

@@ -1,15 +1,19 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ed25519_compact::{KeyPair, Seed};
+use podbay_client::authenticate_existing_linux_stream;
 use podbay_store::PodBayStore;
+use podbay_wire::{ReadEnvelope, ReadOperation, Target};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 struct Fixture {
@@ -75,8 +79,24 @@ impl Fixture {
         command
     }
 
+    fn setup_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .arg("--initial-owner-actor")
+            .arg("actor.zap.test")
+            .arg("--initial-owner-scope")
+            .arg("scope.zap.test")
+            .arg("--initial-owner-credential")
+            .arg("vault.zap.test");
+        command
+    }
+
     fn socket(&self) -> PathBuf {
         self.state.join("manager.sock")
+    }
+
+    fn setup_socket(&self) -> PathBuf {
+        self.state.join("owner-setup.sock")
     }
 
     fn owner_epoch(&self) -> u64 {
@@ -128,6 +148,37 @@ impl Running {
         }
     }
 
+    fn wait_setup_ready(&mut self, fixture: &Fixture) {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                let log = fs::read_to_string(fixture.root.join("manager.log")).unwrap_or_default();
+                panic!("manager exited before setup socket: {status}; {log}");
+            }
+            if fs::symlink_metadata(fixture.setup_socket()).is_ok_and(|metadata| {
+                metadata.file_type().is_socket() && metadata.mode() & 0o7777 == 0o600
+            }) {
+                return;
+            }
+            assert!(Instant::now() < until, "owner setup socket did not appear");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_exit(&mut self) -> ExitStatus {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < until,
+                "manager did not exit after setup refusal"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn stop_with(&mut self, signal: &str) -> ExitStatus {
         let sent = Command::new("kill")
             .arg(format!("-{signal}"))
@@ -144,6 +195,88 @@ impl Running {
             thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+fn spawn_setup(fixture: &Fixture) -> Running {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fixture.root.join("manager.log"))
+        .unwrap();
+    Running(
+        fixture
+            .setup_command()
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn write_frame(stream: &mut UnixStream, bytes: &[u8]) {
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(bytes).unwrap();
+}
+
+fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let len = u32::from_be_bytes(prefix) as usize;
+    assert!(len <= 8192);
+    let mut bytes = vec![0_u8; len];
+    stream.read_exact(&mut bytes).unwrap();
+    bytes
+}
+
+fn setup_attempt(
+    fixture: &Fixture,
+    key: &KeyPair,
+    signer: &KeyPair,
+    acknowledge: bool,
+) -> Option<Value> {
+    let mut socket = UnixStream::connect(fixture.setup_socket()).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write_frame(&mut socket, key.pk.as_ref());
+    let challenge = read_frame(&mut socket);
+    assert!(challenge.starts_with(b"podbay.owner-initial-enrollment/1\0"));
+    let signature = signer.sk.sign(&challenge, None);
+    write_frame(&mut socket, signature.as_ref());
+    if !acknowledge {
+        socket.shutdown(std::net::Shutdown::Read).unwrap();
+        return None;
+    }
+    let receipt: Value = serde_json::from_slice(&read_frame(&mut socket)).unwrap();
+    write_frame(&mut socket, b"ack");
+    Some(receipt)
+}
+
+fn authenticated_missing_read(fixture: &Fixture, signer: &KeyPair) -> Value {
+    let socket = UnixStream::connect(fixture.socket()).unwrap();
+    let mut stream = authenticate_existing_linux_stream(socket, "actor.zap.test", |challenge| {
+        let signature = signer.sk.sign(challenge.bytes, None);
+        let mut bytes = [0_u8; 64];
+        bytes.copy_from_slice(signature.as_ref());
+        Some(bytes)
+    })
+    .unwrap();
+    let request = ReadEnvelope::new_json(
+        "request.setup.read",
+        Target::Scope {
+            scope_id: "scope.zap.test".into(),
+        },
+        ReadOperation::CommandsGet,
+        json!({"selector":{"kind":"key","key":"key.missing"}}),
+    )
+    .unwrap();
+    write_frame(&mut stream, &request.encode_json().unwrap());
+    serde_json::from_slice(&read_frame(&mut stream)).unwrap()
 }
 
 impl Drop for Running {
@@ -232,4 +365,153 @@ fn nonprivate_state_directory_refuses_before_database_creation() {
     assert!(error.contains("mode 0700"));
     assert!(!fixture.database.exists());
     fs::set_permissions(&fixture.state, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn launcher_parent_enrolls_once_then_authenticates_on_normal_manager_socket() {
+    let fixture = Fixture::new();
+    let mut manager = spawn_setup(&fixture);
+    manager.wait_setup_ready(&fixture);
+    assert!(!fixture.socket().exists());
+    let signer = KeyPair::from_seed(Seed::new([7; 32]));
+    let receipt = setup_attempt(&fixture, &signer, &signer, true).unwrap();
+    assert_eq!(receipt["protocol"], "podbay.owner-initial-enrollment/1");
+    assert_eq!(receipt["actorId"], "actor.zap.test");
+    assert_eq!(receipt["scopeId"], "scope.zap.test");
+    assert_eq!(receipt["grantRef"], "grant.1");
+    assert_eq!(receipt["duplicate"], false);
+    manager.wait_ready(&fixture);
+    assert!(!fixture.setup_socket().exists());
+    let read = authenticated_missing_read(&fixture, &signer);
+    assert_eq!(read["requestId"], "request.setup.read");
+    assert_eq!(read["error"]["code"], "forbidden");
+    assert!(manager.stop_with("TERM").success());
+    assert!(!fixture.socket().exists());
+    assert!(!fixture.setup_socket().exists());
+}
+
+#[test]
+fn helper_sibling_connects() {
+    let Ok(path) = std::env::var("PODAY_TEST_OWNER_SETUP_SOCKET") else {
+        return;
+    };
+    let _socket = UnixStream::connect(path).unwrap();
+    thread::sleep(Duration::from_millis(500));
+}
+
+#[test]
+fn same_uid_sibling_cannot_take_launcher_parent_setup_socket() {
+    let fixture = Fixture::new();
+    let mut manager = spawn_setup(&fixture);
+    manager.wait_setup_ready(&fixture);
+    let helper = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("helper_sibling_connects")
+        .env("PODAY_TEST_OWNER_SETUP_SOCKET", fixture.setup_socket())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(helper.success());
+    assert!(!manager.wait_exit().success());
+    assert!(!fixture.socket().exists());
+    assert!(!fixture.setup_socket().exists());
+    assert!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .authority_snapshot()
+            .unwrap()
+            .actors
+            .is_empty()
+    );
+}
+
+#[test]
+fn wrong_key_and_partial_frame_refuse_before_enrollment() {
+    let fixture = Fixture::new();
+    let mut manager = spawn_setup(&fixture);
+    manager.wait_setup_ready(&fixture);
+    let key = KeyPair::from_seed(Seed::new([7; 32]));
+    let wrong_signer = KeyPair::from_seed(Seed::new([8; 32]));
+    setup_attempt(&fixture, &key, &wrong_signer, false);
+    assert!(!manager.wait_exit().success());
+    assert!(!fixture.socket().exists());
+    assert!(!fixture.setup_socket().exists());
+    assert!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .authority_snapshot()
+            .unwrap()
+            .actors
+            .is_empty()
+    );
+
+    let fixture = Fixture::new();
+    let mut manager = spawn_setup(&fixture);
+    manager.wait_setup_ready(&fixture);
+    let mut socket = UnixStream::connect(fixture.setup_socket()).unwrap();
+    socket.write_all(&32_u32.to_be_bytes()).unwrap();
+    socket.write_all(&[1_u8; 4]).unwrap();
+    drop(socket);
+    assert!(!manager.wait_exit().success());
+    assert!(!fixture.socket().exists());
+    assert!(!fixture.setup_socket().exists());
+    assert!(
+        PodBayStore::open(&fixture.database)
+            .unwrap()
+            .authority_snapshot()
+            .unwrap()
+            .actors
+            .is_empty()
+    );
+}
+
+#[test]
+fn lost_receipt_reconciles_same_parent_key_without_second_enrollment() {
+    let fixture = Fixture::new();
+    let mut manager = spawn_setup(&fixture);
+    manager.wait_setup_ready(&fixture);
+    let key = KeyPair::from_seed(Seed::new([9; 32]));
+    setup_attempt(&fixture, &key, &key, false);
+    assert!(!fixture.socket().exists());
+    let receipt = setup_attempt(&fixture, &key, &key, true).unwrap();
+    assert_eq!(receipt["duplicate"], true);
+    manager.wait_ready(&fixture);
+    let snapshot = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .authority_snapshot()
+        .unwrap();
+    assert_eq!(snapshot.actors.len(), 1);
+    assert_eq!(snapshot.grants.len(), 1);
+    assert_eq!(snapshot.revision.to_string(), receipt["authorityRevision"]);
+    assert_eq!(
+        authenticated_missing_read(&fixture, &key)["error"]["code"],
+        "forbidden"
+    );
+    assert!(manager.stop_with("TERM").success());
+}
+
+#[test]
+fn stale_owner_setup_path_is_preserved_and_never_adopted() {
+    let fixture = Fixture::new();
+    let path = fixture.setup_socket();
+    let stale = UnixListener::bind(&path).unwrap();
+    let identity = fs::symlink_metadata(&path).unwrap();
+    drop(stale);
+    let mut child = Running(
+        fixture
+            .setup_command()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!child.wait_exit().success());
+    let preserved = fs::symlink_metadata(&path).unwrap();
+    assert_eq!(
+        (preserved.dev(), preserved.ino()),
+        (identity.dev(), identity.ino())
+    );
+    assert!(!fixture.database.exists());
+    fs::remove_file(path).unwrap();
 }

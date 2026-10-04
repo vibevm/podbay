@@ -10,6 +10,8 @@ mod host_launch_handler;
 #[cfg(target_os = "linux")]
 mod host_read_handler;
 #[cfg(target_os = "linux")]
+mod initial_owner_setup;
+#[cfg(target_os = "linux")]
 mod linux_listener;
 #[cfg(target_os = "linux")]
 mod linux_peer;
@@ -29,6 +31,10 @@ use serde_json::Value;
 pub use auth_prelude::{
     AUTH_PRELUDE_PROTOCOL, LinuxAuthPreludeError, LinuxAuthPreludeLimits, LinuxAuthenticatedStream,
     authenticate_accepted_linux_stream, authenticate_accepted_linux_stream_with_limits,
+};
+#[cfg(target_os = "linux")]
+pub use initial_owner_setup::{
+    InitialOwnerSetupError, LinuxInitialOwnerSetupListener, OWNER_SETUP_SOCKET_NAME,
 };
 #[cfg(target_os = "linux")]
 pub use linux_listener::{
