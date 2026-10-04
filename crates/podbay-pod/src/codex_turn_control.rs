@@ -15,9 +15,17 @@ pub enum LaterTurnControlStage {
     ClaimedUnobserved,
     IntentUncertain,
     SubmissionUncertain,
-    Submitted { native_turn_id: String },
-    CompletionObservedPendingIdleProof { terminal: LaterTurnTerminal },
-    Settled { terminal: LaterTurnTerminal },
+    Submitted {
+        native_turn_id: String,
+    },
+    CompletionObservedPendingIdleProof {
+        native_turn_id: String,
+        terminal: LaterTurnTerminal,
+    },
+    Settled {
+        native_turn_id: String,
+        terminal: LaterTurnTerminal,
+    },
     StorageUncertain,
 }
 
@@ -74,9 +82,21 @@ impl LaterTurnControlReceipt {
                     },
                 ),
                 LaterTurnStage::CompletionObservedPendingIdleProof(terminal) => {
-                    LaterTurnControlStage::CompletionObservedPendingIdleProof { terminal }
+                    view.native_turn_id.as_ref().map_or(
+                        LaterTurnControlStage::SubmissionUncertain,
+                        |id| LaterTurnControlStage::CompletionObservedPendingIdleProof {
+                            native_turn_id: id.clone(),
+                            terminal,
+                        },
+                    )
                 }
-                LaterTurnStage::Settled(terminal) => LaterTurnControlStage::Settled { terminal },
+                LaterTurnStage::Settled(terminal) => view.native_turn_id.as_ref().map_or(
+                    LaterTurnControlStage::SubmissionUncertain,
+                    |id| LaterTurnControlStage::Settled {
+                        native_turn_id: id.clone(),
+                        terminal,
+                    },
+                ),
                 LaterTurnStage::StorageUncertain => LaterTurnControlStage::StorageUncertain,
             },
         };

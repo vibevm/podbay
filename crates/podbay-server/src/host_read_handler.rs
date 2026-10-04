@@ -3,8 +3,9 @@
 use podbay_core::{CommandId, ScopeId};
 use podbay_host::{
     AuthenticatedTransport, BootstrapNativeObservation, BootstrapNativeStage,
-    CurrentLaterSendGuard, DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError,
-    InitialBootstrapGuard, TrustedBootstrapSendPolicy,
+    CommandNativeObservation, CurrentLaterSendGuard, DurableAuthority, DurableAuthorityError,
+    HostDispatchPort, HostError, InitialBootstrapGuard, LaterTurnNativeObservation,
+    LaterTurnNativeStage, LaterTurnNativeTerminal, TrustedBootstrapSendPolicy,
 };
 use podbay_store::{
     CommandInspection, CommandLookupSelector, CurrentObservation, CurrentScopeSnapshot,
@@ -80,7 +81,7 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                 };
                 let (inspected, native) = self
                     .authority
-                    .lookup_command_with_native_observation(transport, &scope, &selector)
+                    .lookup_command_with_any_native_observation(transport, &scope, &selector)
                     .map_err(authority_error)?;
                 let later_guard = if inspected.launch_dispatch_status.is_some() {
                     self.bootstrap_policy.and_then(|policy| {
@@ -188,7 +189,7 @@ fn observation_json(value: CurrentObservation) -> &'static str {
 
 fn inspection_json(
     inspected: CommandInspection,
-    native: Option<&BootstrapNativeObservation>,
+    native: Option<&CommandNativeObservation>,
     guard: Option<&InitialBootstrapGuard>,
     later_guard: Option<&CurrentLaterSendGuard>,
 ) -> Value {
@@ -298,7 +299,50 @@ fn current_later_send_guard_json(guard: &CurrentLaterSendGuard) -> Value {
     })
 }
 
-fn native_json(observation: &BootstrapNativeObservation) -> Value {
+fn native_json(observation: &CommandNativeObservation) -> Value {
+    match observation {
+        CommandNativeObservation::Bootstrap(value) => bootstrap_native_json(value),
+        CommandNativeObservation::LaterTurn(value) => later_turn_native_json(value),
+    }
+}
+
+fn later_turn_native_json(observation: &LaterTurnNativeObservation) -> Value {
+    let mut value = json!({
+        "source": "pod_journal",
+        "kind": "codex_turn",
+        "requestDigest": observation.request_digest(),
+    });
+    let terminal = |value| match value {
+        LaterTurnNativeTerminal::Completed => "completed",
+        LaterTurnNativeTerminal::Failed => "failed",
+        LaterTurnNativeTerminal::Interrupted => "interrupted",
+    };
+    match observation.stage() {
+        LaterTurnNativeStage::ClaimedUnobserved => value["stage"] = json!("claimed_unobserved"),
+        LaterTurnNativeStage::IntentUncertain => value["stage"] = json!("intent_uncertain"),
+        LaterTurnNativeStage::SubmissionUncertain => value["stage"] = json!("submission_uncertain"),
+        LaterTurnNativeStage::StorageUncertain => value["stage"] = json!("storage_uncertain"),
+        LaterTurnNativeStage::Submitted { native_thread_id, native_session_id, native_turn_id } => {
+            value["stage"] = json!("submitted");
+            value["nativeThreadId"] = json!(native_thread_id);
+            value["nativeSessionId"] = json!(native_session_id);
+            value["nativeTurnId"] = json!(native_turn_id);
+        }
+        LaterTurnNativeStage::CompletionObservedPendingIdleProof { native_turn_id, terminal: status } => {
+            value["stage"] = json!("completion_observed_pending_idle_proof");
+            value["nativeTurnId"] = json!(native_turn_id);
+            value["terminal"] = json!(terminal(*status));
+        }
+        LaterTurnNativeStage::Settled { native_turn_id, terminal: status } => {
+            value["stage"] = json!("native_settled");
+            value["nativeTurnId"] = json!(native_turn_id);
+            value["terminal"] = json!(terminal(*status));
+        }
+    }
+    value
+}
+
+fn bootstrap_native_json(observation: &BootstrapNativeObservation) -> Value {
     let mut value = json!({
         "source": "pod_journal",
         "requestDigest": observation.request_digest(),
@@ -548,5 +592,51 @@ mod tests {
         ));
         assert_eq!(error.code, RuntimeErrorCode::LimitExceeded);
         assert!(error.message.contains("256"));
+    }
+
+    #[test]
+    fn later_turn_native_projection_never_settles_the_store_command() {
+        use podbay_core::{AttemptId, PodId, ResourceId, RunId, SessionId, StoreLineageId};
+        use podbay_store::{LaterCodexSendSelector, NativeWriterTarget};
+        let target = NativeWriterTarget {
+            store_lineage: StoreLineageId::try_from("lineage.fixture").unwrap(),
+            scope_id: ScopeId::try_from("scope.fixture").unwrap(),
+            session_id: SessionId::try_from("session.fixture").unwrap(),
+            run_id: RunId::try_from("run.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.fixture").unwrap(),
+            pod_incarnation: 1,
+            resource_id: ResourceId::try_from("resource.fixture").unwrap(),
+            resource_epoch: 1,
+            resource_input_epoch: 1,
+        };
+        let selector = LaterCodexSendSelector {
+            scope_id: target.scope_id.clone(),
+            command_id: CommandId::try_from("command.fixture").unwrap(),
+            native_target: target,
+        };
+        let observed = LaterTurnNativeObservation::from_attested_pod(
+            "podbay.codex-turn.inspect/1", selector.clone(), 2, "a".repeat(64),
+            LaterTurnNativeStage::Settled {
+                native_turn_id: "turn.native.fixture".into(),
+                terminal: LaterTurnNativeTerminal::Completed,
+            },
+        ).unwrap();
+        let native = CommandNativeObservation::LaterTurn(observed);
+        let projected = inspection_json(
+            inspection(EffectState::ClaimedUncertain, None), Some(&native), None,
+        );
+        assert_eq!(projected["state"], "uncertain");
+        assert_eq!(projected["effectState"], "claimed_uncertain");
+        assert_eq!(projected["nativeObservation"]["stage"], "native_settled");
+        assert_eq!(projected["nativeObservation"]["terminal"], "completed");
+        assert_eq!(projected["nativeObservation"]["nativeTurnId"], "turn.native.fixture");
+        let uncertain = LaterTurnNativeObservation::from_attested_pod(
+            "podbay.codex-turn.inspect/1", selector, 2, "a".repeat(64),
+            LaterTurnNativeStage::SubmissionUncertain,
+        ).unwrap();
+        let redacted = native_json(&CommandNativeObservation::LaterTurn(uncertain));
+        assert_eq!(redacted["stage"], "submission_uncertain");
+        assert!(redacted.get("nativeTurnId").is_none());
     }
 }

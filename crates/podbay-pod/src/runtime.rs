@@ -1350,7 +1350,9 @@ impl PodClient {
             || response.native_thread_id.as_deref().is_some_and(|id| id != expected_thread_id)
             || response.native_session_id.as_deref().is_some_and(|id| !valid_native(id))
         { return Err(PodError::Uncertain("later-turn reply identity differs")); }
-        if let LaterTurnControlStage::Submitted { native_turn_id } = &response.stage {
+        if let LaterTurnControlStage::Submitted { native_turn_id }
+            | LaterTurnControlStage::CompletionObservedPendingIdleProof { native_turn_id, .. }
+            | LaterTurnControlStage::Settled { native_turn_id, .. } = &response.stage {
             if !valid_native(native_turn_id)
                 || response.native_thread_id.as_deref() != Some(expected_thread_id)
                 || response.native_session_id.is_none()

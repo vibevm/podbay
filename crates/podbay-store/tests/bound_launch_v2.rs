@@ -2486,8 +2486,14 @@ fn v22_later_turn_claim_once_survives_lost_reply_and_reopen() {
         command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
         native_target: target.clone(),
     };
+    assert!(store.claimed_later_turn_selector_for_command(
+        &request.principal, &target.scope_id, &selector.command_id,
+    ).unwrap().is_none());
     assert!(matches!(store.inspect_claimed_later_codex_send(&selector), Err(StoreError::Conflict(_))));
     assert_eq!(store.claim_later_codex_send(&selector).unwrap(), EffectClaim::NewClaim);
+    assert_eq!(store.claimed_later_turn_selector_for_command(
+        &request.principal, &target.scope_id, &selector.command_id,
+    ).unwrap(), Some((selector.clone(), writer_epoch)));
     let claimed = store.inspect_claimed_later_codex_send(&selector).unwrap();
     assert_eq!(claimed.receipt(), &receipt);
     assert_eq!(claimed.prompt_text(), "Second turn");

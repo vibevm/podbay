@@ -300,6 +300,51 @@ fn binding_digest(
 }
 
 impl PodBayStore {
+    /// Authenticated caller's exact claimed later-turn selector. This lookup
+    /// reads durable history only; the host rechecks today's pod and lease.
+    pub fn claimed_later_turn_selector_for_command(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope_id: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<(LaterCodexSendSelector, u64)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM commands WHERE command_id=?1 AND principal=?2
+             AND scope_id=?3 AND namespace=?4",
+                params![
+                    command_id.as_str(),
+                    principal.as_str(),
+                    scope_id.as_str(),
+                    NAMESPACE
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let result = if let Some(rowid) = rowid {
+            let record = read_later_record(&transaction, rowid)?;
+            if record.effect_state() == EffectState::ClaimedUncertain {
+                Some((
+                    LaterCodexSendSelector {
+                        scope_id: scope_id.clone(),
+                        command_id: command_id.clone(),
+                        native_target: record.native_target().clone(),
+                    },
+                    record.writer_epoch(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Principal/scope/key lookup before the current writer exists. Compare
     /// only immutable wire input; return the old native anchor from readback.
     /// The host authenticates `principal` and `scope_id` before calling.

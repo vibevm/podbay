@@ -21,6 +21,8 @@ use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialGeneration, CredentialRef, DurableAuthority,
+    CurrentCodexAnchorObservation, LaterTurnNativeObservation, LaterTurnNativeStage,
+    LaterTurnNativeTerminal, ResolvedClaimedLaterTurn, ResolvedCurrentCodexAnchorInspection,
     DurableAuthorityError, ExecutionMode, GrantMode, GrantSpec, HostDispatchPort, HostError,
     Operation, PortDispatchError, PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile,
     ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, Right,
@@ -213,6 +215,96 @@ impl HostDispatchPort for FakePort {
             inspection.writer_epoch(),
             digest,
             stage,
+        )
+    }
+
+    fn inspect_current_codex_anchor(
+        &self,
+        inspection: ResolvedCurrentCodexAnchorInspection,
+    ) -> Result<CurrentCodexAnchorObservation, HostError> {
+        let metadata = fs::metadata(inspection.store_path()).map_err(|_| HostError::StaleGuard)?;
+        if (metadata.dev(), metadata.ino()) != inspection.store_file_identity() {
+            return Err(HostError::StaleGuard);
+        }
+        let mut store = PodBayStore::open_existing_read_only(inspection.store_path())
+            .map_err(|_| HostError::StaleGuard)?;
+        let prior = store.claimed_bootstrap_lineage_for_session(
+            &inspection.target().scope_id, &inspection.target().session_id,
+        ).map_err(|_| HostError::StaleGuard)?;
+        if prior.receipt().command_id != inspection.bootstrap_command_id().as_str()
+            || prior.receipt().request_digest != inspection.bootstrap_request_digest()
+            || store.inspect_native_writer_lease(inspection.target())
+                .map_err(|_| HostError::StaleGuard)?.writer_epoch() != inspection.writer_epoch()
+        { return Err(HostError::StaleGuard); }
+        CurrentCodexAnchorObservation::from_attested_pod(
+            "podbay.codex-anchor.inspect/1", inspection.target().clone(),
+            inspection.bootstrap_command_id().clone(), inspection.bootstrap_request_digest().into(),
+            inspection.writer_epoch(), "thread.native.one".into(), "session.native.one".into(),
+        )
+    }
+
+    fn accepts_claimed_codex_turn(&self) -> bool { true }
+
+    fn send_claimed_codex_turn(
+        &mut self,
+        claimed: ResolvedClaimedLaterTurn,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        let mut store = PodBayStore::open_existing_read_only(claimed.store_path())
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        let proof = store.inspect_claimed_later_codex_send(claimed.selector())
+            .map_err(|_| PortDispatchError::RefusedBeforeEffect)?;
+        if proof.receipt().request_digest != claimed.expected_request_digest()
+            || proof.native_thread_id() != claimed.native_thread_id()
+        { return Err(PortDispatchError::RefusedBeforeEffect); }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let receipt = PortReceiptRef::from_port("receipt.fake.later").unwrap();
+        if matches!(self.mode, PortMode::SendLostReply) {
+            Err(PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt),
+            })
+        } else {
+            Ok(PortDispatchOutcome::Accepted(receipt))
+        }
+    }
+
+    fn inspect_claimed_codex_turn(
+        &self,
+        claimed: ResolvedClaimedLaterTurn,
+    ) -> Result<LaterTurnNativeObservation, HostError> {
+        self.inspect_calls.fetch_add(1, Ordering::SeqCst);
+        let metadata = fs::metadata(claimed.store_path()).map_err(|_| HostError::StaleGuard)?;
+        if (metadata.dev(), metadata.ino()) != claimed.store_file_identity() {
+            return Err(HostError::StaleGuard);
+        }
+        let mut store = PodBayStore::open_existing_read_only(claimed.store_path())
+            .map_err(|_| HostError::StaleGuard)?;
+        let proof = store.inspect_claimed_later_codex_send(claimed.selector())
+            .map_err(|_| HostError::StaleGuard)?;
+        if proof.receipt().request_digest != claimed.expected_request_digest()
+            || proof.native_thread_id() != claimed.native_thread_id()
+            || proof.writer_epoch() != claimed.writer_epoch()
+        { return Err(HostError::StaleGuard); }
+        let stage = match self.observe_stage.load(Ordering::SeqCst) {
+            5 => LaterTurnNativeStage::Submitted {
+                native_thread_id: "thread.native.one".into(),
+                native_session_id: "session.native.one".into(),
+                native_turn_id: "turn.native.two".into(),
+            },
+            6 => LaterTurnNativeStage::SubmissionUncertain,
+            7 => LaterTurnNativeStage::Settled {
+                native_turn_id: "turn.native.two".into(),
+                terminal: LaterTurnNativeTerminal::Completed,
+            },
+            8 => LaterTurnNativeStage::Submitted {
+                native_thread_id: "thread.wrong".into(),
+                native_session_id: "session.native.one".into(),
+                native_turn_id: "turn.native.two".into(),
+            },
+            _ => return Err(HostError::Unsupported),
+        };
+        LaterTurnNativeObservation::from_attested_pod(
+            "podbay.codex-turn.inspect/1", claimed.selector().clone(), claimed.writer_epoch(),
+            claimed.expected_request_digest().into(), stage,
         )
     }
 }
@@ -1631,4 +1723,134 @@ fn external_authority_revision_drift_refuses_before_port_effect() {
             .receipts
             .is_empty()
     );
+}
+
+#[test]
+fn claimed_later_turn_commands_get_is_read_only_and_keeps_uncertain_receipt() {
+    let fixture = Fixture::new();
+    let (mut authority, actor, grant, calls, transport) =
+        prepared_authority(&fixture, PortMode::SendLostReply);
+    let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+    let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+        grant, Duration::from_secs(30), "result.none",
+    ).unwrap();
+    let send_template = TrustedBootstrapSendTemplate::from_trusted_policy(
+        grant, Duration::from_secs(30),
+    ).unwrap().with_initial_writer_lease_seconds(120).unwrap();
+    let launched = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![launch_request("request.later.launch", "key.later.launch", grant, "gpt-6-sol")
+            .encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(launched[0]["ok"]["state"], "host_accepted");
+    let session = SessionId::try_from(
+        launched[0]["ok"]["value"]["sessionId"].as_str().unwrap(),
+    ).unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant, Instant::now() + Duration::from_secs(30),
+    ).unwrap();
+    let lease = authority.acquire_initial_bootstrap_writer_lease(
+        &transport, &session, &policy, 120,
+    ).unwrap();
+    let (target, revision) = PodBayStore::open(&fixture.database).unwrap()
+        .current_native_writer_target_for_session(
+            &ScopeId::try_from("scope.server.launch").unwrap(), &session,
+        ).unwrap();
+    let guard = Guard {
+        manager_epoch: Some(podbay_wire::DecimalString::new(lease.owner_epoch())),
+        pod_epoch: Some(podbay_wire::DecimalString::new(target.pod_incarnation)),
+        resource_epoch: Some(podbay_wire::DecimalString::new(target.resource_epoch)),
+        writer_epoch: Some(podbay_wire::DecimalString::new(lease.writer_epoch())),
+        lease_epoch: None,
+        target_revision: Some(podbay_wire::DecimalString::new(revision)),
+    };
+    let send = |request_id: &str, key: &str, text: &str| {
+        CommandEnvelope::new_json(
+            request_id, key,
+            WireTarget::Session { session_id: session.as_str().into() },
+            Some(guard.clone()), None, MutationOperation::SessionSend,
+            json!({"content":[{"kind":"text","text":text}], "policy":{"kind":"when_idle"}}),
+        ).unwrap()
+    };
+    let first = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![send("request.later.first", "key.later.first", "first turn").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(first[0]["ok"]["state"], "uncertain");
+    let second = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![
+            send("request.later.second", "key.later.second", "second turn")
+                .encode_json().unwrap(),
+            read_by_key("request.later.get", "key.later.second").encode_json().unwrap(),
+        ],
+        Some(&launch_template), Some(&send_template),
+    );
+    let second_id = second[0]["ok"]["commandId"].as_str().unwrap().to_owned();
+    assert_eq!(second[0]["ok"]["state"], "uncertain");
+    assert_eq!(second[0]["ok"]["value"]["portObservation"]["kind"],
+        "uncertain_after_possible_effect");
+    assert_eq!(second[1]["ok"]["receipt"]["commandId"], second_id);
+    assert_eq!(second[1]["ok"]["effectState"], "claimed_uncertain");
+    assert!(second[1]["ok"].get("nativeObservation").is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    let observe_stage = authority.port().observe_stage.clone();
+    observe_stage.store(5, Ordering::SeqCst);
+    for (request_id, read) in [
+        ("request.later.read.key", read_by_key("request.later.read.key", "key.later.second")),
+        ("request.later.read.id", ReadEnvelope::new_json(
+            "request.later.read.id", WireTarget::Scope { scope_id: "scope.server.launch".into() },
+            ReadOperation::CommandsGet,
+            json!({"selector":{"kind":"id","commandId":second_id}}),
+        ).unwrap()),
+    ] {
+        let result = serve_batch(
+            &mut listener, &mut authority, &actor, vec![read.encode_json().unwrap()],
+            Some(&launch_template), Some(&send_template),
+        );
+        let value = &result[0]["ok"];
+        assert_eq!(value["receipt"]["commandId"], second_id, "{request_id}");
+        assert_eq!(value["state"], "uncertain");
+        assert_eq!(value["effectState"], "claimed_uncertain");
+        assert_eq!(value["nativeObservation"]["kind"], "codex_turn");
+        assert_eq!(value["nativeObservation"]["stage"], "submitted");
+        assert_eq!(value["nativeObservation"]["nativeTurnId"], "turn.native.two");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    observe_stage.store(6, Ordering::SeqCst);
+    let uncertain = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![read_by_key("request.later.uncertain", "key.later.second").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(uncertain[0]["ok"]["nativeObservation"]["stage"], "submission_uncertain");
+    assert!(uncertain[0]["ok"]["nativeObservation"].get("nativeTurnId").is_none());
+    observe_stage.store(7, Ordering::SeqCst);
+    let settled = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![read_by_key("request.later.settled", "key.later.second").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(settled[0]["ok"]["state"], "uncertain");
+    assert_eq!(settled[0]["ok"]["nativeObservation"]["stage"], "native_settled");
+    assert_eq!(settled[0]["ok"]["nativeObservation"]["terminal"], "completed");
+    observe_stage.store(8, Ordering::SeqCst);
+    let wrong_thread = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![read_by_key("request.later.wrong.thread", "key.later.second").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert!(wrong_thread[0]["ok"].get("nativeObservation").is_none());
+    let retry = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![send("request.later.retry", "key.later.second", "second turn")
+            .encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(retry[0]["ok"]["commandId"], second_id);
+    assert_eq!(retry[0]["ok"]["value"]["duplicate"], true);
+    assert_eq!(retry[0]["ok"]["value"]["portCalled"], false);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }

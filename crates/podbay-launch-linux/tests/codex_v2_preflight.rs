@@ -19,6 +19,7 @@ use podbay_core::{
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeStage, BootstrapPortObservation,
+    CommandNativeObservation, LaterTurnNativeStage,
     BootstrapSendError,
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
     DurableAuthority, ExecutionMode, GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
@@ -3396,6 +3397,23 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
         assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { ref native_turn_id }
             if native_turn_id == "turn.later.fixture"));
     }
+    let command_selector = CommandLookupSelector::Key { key: "key.v22.second".into() };
+    for _ in 0..2 {
+        let (durable, native) = host.lookup_command_with_any_native_observation(
+            &transport, &fixture.scope, &command_selector,
+        ).unwrap();
+        assert_eq!(durable.receipt, second_receipt.receipt);
+        assert_eq!(durable.effect_state, podbay_store::EffectState::ClaimedUncertain);
+        let native = native.expect("current pod journal later-turn observation");
+        match native {
+            CommandNativeObservation::LaterTurn(value) if lost_reply =>
+                assert!(matches!(value.stage(), LaterTurnNativeStage::SubmissionUncertain)),
+            CommandNativeObservation::LaterTurn(value) => assert!(matches!(value.stage(),
+                LaterTurnNativeStage::Submitted { native_turn_id, .. }
+                    if native_turn_id == "turn.later.fixture")),
+            _ => panic!("later command was projected as bootstrap"),
+        }
+    }
     let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     let methods = fs::read_to_string(&frames).unwrap().lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
@@ -3408,6 +3426,42 @@ fn run_disposable_codex_v22_second_turn(lost_reply: bool) {
     assert_eq!(duplicate.receipt, second_receipt.receipt);
     let after = fs::read_to_string(&frames).unwrap();
     assert_eq!(after.lines().count(), methods.len());
+    let wrong_scope = ScopeId::try_from("scope.foreign").unwrap();
+    assert!(host.lookup_command_with_any_native_observation(
+        &transport, &wrong_scope, &command_selector,
+    ).is_err());
+    if lost_reply {
+        let takeover = PodBayStore::open(&fixture.database).unwrap()
+            .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+                target: target.clone(), holder_actor_id: lease.holder_actor_id().clone(),
+                holder_credential_generation: lease.holder_credential_generation(),
+                expected_owner_epoch: lease.owner_epoch(),
+                expected_manager_credential_epoch: lease.manager_credential_epoch(),
+                expected_authority_revision: lease.authority_revision(),
+                expected_writer_epoch: Some(lease.writer_epoch()), ttl_seconds: 60,
+            }).unwrap();
+        assert_eq!(takeover.writer_epoch(), lease.writer_epoch() + 1);
+        let (durable, native) = host.lookup_command_with_any_native_observation(
+            &transport, &fixture.scope, &command_selector,
+        ).unwrap();
+        assert_eq!(durable.receipt, second_receipt.receipt);
+        assert!(native.is_none(), "stale writer must hide supplemental stage");
+    } else {
+        let journal_path = fixture_codex_slot(&fixture).join("codex.turns.log");
+        let bytes = fs::read(&journal_path).unwrap();
+        fs::rename(&journal_path, journal_path.with_extension("log.old")).unwrap();
+        fs::write(&journal_path, bytes).unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (durable, native) = host.lookup_command_with_any_native_observation(
+            &transport, &fixture.scope, &command_selector,
+        ).unwrap();
+        assert_eq!(durable.receipt, second_receipt.receipt);
+        assert!(!matches!(native,
+            Some(CommandNativeObservation::LaterTurn(value))
+                if matches!(value.stage(), LaterTurnNativeStage::Submitted { .. }
+                    | LaterTurnNativeStage::Settled { .. })));
+    }
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), methods.len());
     let final_status = client.attested_status().unwrap();
     if !lost_reply { assert!(final_status.child_running); }
     assert!(!client.stop().unwrap().child_running);
@@ -3572,6 +3626,16 @@ fn rebind_v22_second_later_manager_process_helper() {
     let observed = client.inspect_claimed_codex_turn(&selector, lease.writer_epoch(),
         &submitted.receipt.request_digest, "thread.fixture").unwrap();
     assert!(matches!(observed.stage, LaterTurnControlStage::Submitted { .. }));
+    for _ in 0..2 {
+        let (durable, native) = host.lookup_command_with_any_native_observation(
+            &transport, &fixture.scope,
+            &CommandLookupSelector::Id { command_id: submitted.receipt.command_id.clone() },
+        ).unwrap();
+        assert_eq!(durable.receipt, submitted.receipt);
+        assert!(matches!(native, Some(CommandNativeObservation::LaterTurn(value))
+            if matches!(value.stage(), LaterTurnNativeStage::Submitted { native_turn_id, .. }
+                if native_turn_id == "turn.later.fixture")));
+    }
     let mut retry = second;
     retry.request_id = "request.v22.rebind.second.retry".into();
     let duplicate = host.send_codex_session_from_wire(&transport, retry, &policy).unwrap();

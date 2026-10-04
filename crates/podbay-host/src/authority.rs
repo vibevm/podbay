@@ -1858,6 +1858,13 @@ pub trait HostDispatchPort {
 
     fn accepts_claimed_codex_turn(&self) -> bool { false }
 
+    fn inspect_claimed_codex_turn(
+        &self,
+        _claimed: ResolvedClaimedLaterTurn,
+    ) -> Result<LaterTurnNativeObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
     /// Read a claimed command's pod journal through an independently attested
     /// pod connection. This must not claim, submit, replay, or answer a native
     /// request. Unsupported ports leave `commands.get` durable-only.
@@ -2108,6 +2115,67 @@ pub struct ResolvedClaimedLaterTurn {
     authority_revision: u64,
     store_path: PathBuf,
     store_file_identity: (u64, u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandNativeObservation {
+    Bootstrap(BootstrapNativeObservation),
+    LaterTurn(LaterTurnNativeObservation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaterTurnNativeTerminal { Completed, Failed, Interrupted }
+
+/// Pod journal evidence attached to an original durable receipt. Even a
+/// settled native turn is not a PodBay Run or Delivery settlement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaterTurnNativeStage {
+    ClaimedUnobserved,
+    IntentUncertain,
+    SubmissionUncertain,
+    Submitted { native_thread_id: String, native_session_id: String, native_turn_id: String },
+    CompletionObservedPendingIdleProof { native_turn_id: String, terminal: LaterTurnNativeTerminal },
+    Settled { native_turn_id: String, terminal: LaterTurnNativeTerminal },
+    StorageUncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaterTurnNativeObservation {
+    selector: LaterCodexSendSelector,
+    writer_epoch: u64,
+    request_digest: String,
+    stage: LaterTurnNativeStage,
+}
+
+impl LaterTurnNativeObservation {
+    pub fn from_attested_pod(
+        protocol: &str,
+        selector: LaterCodexSendSelector,
+        writer_epoch: u64,
+        request_digest: String,
+        stage: LaterTurnNativeStage,
+    ) -> Result<Self, HostError> {
+        let valid_id = |value: &str| !value.is_empty() && value.len() <= 512
+            && value.trim() == value && !value.chars().any(char::is_control);
+        let ids_valid = match &stage {
+            LaterTurnNativeStage::Submitted { native_thread_id, native_session_id, native_turn_id } =>
+                valid_id(native_thread_id) && valid_id(native_session_id) && valid_id(native_turn_id),
+            LaterTurnNativeStage::CompletionObservedPendingIdleProof { native_turn_id, .. }
+            | LaterTurnNativeStage::Settled { native_turn_id, .. } => valid_id(native_turn_id),
+            _ => true,
+        };
+        if protocol != "podbay.codex-turn.inspect/1"
+            || selector.scope_id != selector.native_target.scope_id
+            || writer_epoch == 0 || !ids_valid || request_digest.len() != 64
+            || !request_digest.bytes().all(|byte| byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(&byte))
+        { return Err(HostError::InvalidInput); }
+        Ok(Self { selector, writer_epoch, request_digest, stage })
+    }
+    pub fn selector(&self) -> &LaterCodexSendSelector { &self.selector }
+    pub fn writer_epoch(&self) -> u64 { self.writer_epoch }
+    pub fn request_digest(&self) -> &str { &self.request_digest }
+    pub fn stage(&self) -> &LaterTurnNativeStage { &self.stage }
 }
 
 impl ResolvedClaimedLaterTurn {
@@ -6169,6 +6237,72 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 Some(observed)
             })();
             Ok((inspected, native))
+        }
+    }
+
+    /// Read-only native evidence for the original durable command. A missing
+    /// or stale pod proof removes only the supplement, never the store receipt.
+    pub fn lookup_command_with_any_native_observation<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        selector: &CommandLookupSelector,
+    ) -> Result<(CommandInspection, Option<CommandNativeObservation>), DurableAuthorityError> {
+        let (inspected, bootstrap) = self.lookup_command_with_native_observation(
+            transport, scope, selector,
+        )?;
+        if let Some(bootstrap) = bootstrap {
+            return Ok((inspected, Some(CommandNativeObservation::Bootstrap(bootstrap))));
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Ok((inspected, None));
+        #[cfg(target_os = "linux")]
+        {
+            let later = (|| -> Option<LaterTurnNativeObservation> {
+                let actor = self.current_bootstrap_actor(transport).ok()?;
+                if actor.scope_id != *scope { return None; }
+                let principal = VerifiedPrincipal::from_authenticated_boundary(
+                    actor.actor_id.as_str(),
+                ).ok()?;
+                let command_id = CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
+                let (claimed_selector, writer_epoch) = self.store
+                    .claimed_later_turn_selector_for_command(&principal, scope, &command_id)
+                    .ok()??;
+                let claimed = self.store.inspect_claimed_later_codex_send(&claimed_selector).ok()?;
+                if claimed.receipt() != &inspected.receipt
+                    || claimed.holder_actor_id() != &actor.actor_id
+                    || claimed.holder_credential_generation() != actor.credential_generation.get()
+                    || claimed.writer_epoch() != writer_epoch
+                { return None; }
+                self.recheck_actor_resolution_manager().ok()?;
+                let inspection = ResolvedClaimedLaterTurn {
+                    selector: claimed_selector.clone(), writer_epoch,
+                    expected_request_digest: claimed.receipt().request_digest.clone(),
+                    native_thread_id: claimed.native_thread_id().into(),
+                    owner_epoch: claimed.owner_epoch(),
+                    manager_credential_epoch: claimed.manager_credential_epoch(),
+                    authority_revision: claimed.authority_revision(),
+                    store_path: self.canonical_database.clone(),
+                    store_file_identity: self.database_identity,
+                };
+                let observed = self.host.port.inspect_claimed_codex_turn(inspection).ok()?;
+                if observed.selector() != &claimed_selector
+                    || observed.writer_epoch() != writer_epoch
+                    || observed.request_digest() != claimed.receipt().request_digest
+                    || matches!(observed.stage(), LaterTurnNativeStage::Submitted { native_thread_id, .. }
+                        if native_thread_id != claimed.native_thread_id())
+                { return None; }
+                let fresh_actor = self.current_bootstrap_actor(transport).ok()?;
+                if fresh_actor.actor_id != actor.actor_id
+                    || fresh_actor.scope_id != actor.scope_id
+                    || fresh_actor.credential_generation != actor.credential_generation
+                    || self.store.inspect_claimed_later_codex_send(&claimed_selector).ok().as_ref()
+                        != Some(&claimed)
+                { return None; }
+                self.recheck_actor_resolution_manager().ok()?;
+                Some(observed)
+            })();
+            Ok((inspected, later.map(CommandNativeObservation::LaterTurn)))
         }
     }
 

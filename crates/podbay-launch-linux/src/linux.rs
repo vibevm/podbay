@@ -15,6 +15,7 @@ use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
     CurrentCodexAnchorObservation,
+    LaterTurnNativeObservation, LaterTurnNativeStage, LaterTurnNativeTerminal,
     PortDispatchOutcome, PortPendingRecoveryObservation, PortRebindObservation,
     PortRecoveredActiveObservation, PortReceiptRef, PreparedCodexV2Rebind,
     PreparedOperatorProcessRebind, PreparedPendingRecovery,
@@ -25,7 +26,7 @@ use podbay_host::{
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
-    LaterTurnControlStage,
+    LaterTurnControlStage, LaterTurnTerminal,
     CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY, LinuxPeerEvidence,
     OPERATOR_PROCESS_CAPABILITY, OPERATOR_PROCESS_PROFILE_REF, PodClient, PodError,
     PodManifest, PodPeerBootstrap, PodStatus, RebindInspection,
@@ -1382,6 +1383,7 @@ impl HostDispatchPort for LinuxLaunchPort {
             &self.config, target, inspection.store_path(), inspection.store_file_identity(),
             inspection.owner_epoch(), inspection.manager_credential_epoch(),
             inspection.authority_revision(),
+            true,
         ).map_err(|_| HostError::StaleGuard)?;
         let bootstrap = context.store.claimed_bootstrap_lineage_for_session(
             &target.scope_id, &target.session_id,
@@ -1396,7 +1398,7 @@ impl HostDispatchPort for LinuxLaunchPort {
             inspection.bootstrap_request_digest(),
         ).map_err(|_| HostError::StaleGuard)?;
         let after = context.client.attested_status().map_err(|_| HostError::StaleGuard)?;
-        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest)
+        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest, true)
             || after.supervisor_pid != context.before.supervisor_pid
             || after.supervisor_start_ticks != context.before.supervisor_start_ticks
             || after.child_pid != context.before.child_pid
@@ -1439,6 +1441,7 @@ impl HostDispatchPort for LinuxLaunchPort {
             &self.config, target, claimed.store_path(), claimed.store_file_identity(),
             claimed.owner_epoch(), claimed.manager_credential_epoch(),
             claimed.authority_revision(),
+            true,
         ).map_err(refused)?;
         let proof = context.store.inspect_claimed_later_codex_send(selector).map_err(refused)?;
         if proof.receipt().request_digest != claimed.expected_request_digest()
@@ -1461,7 +1464,7 @@ impl HostDispatchPort for LinuxLaunchPort {
             claimed.native_thread_id(),
         ).map_err(|_| uncertain())?;
         let after = context.client.attested_status().map_err(|_| uncertain())?;
-        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest)
+        if !current_codex_turn_status_matches(&after, target, &context.binding, &context.manifest, true)
             || after.supervisor_pid != context.before.supervisor_pid
             || after.supervisor_start_ticks != context.before.supervisor_start_ticks
             || after.child_pid != context.before.child_pid
@@ -1480,6 +1483,90 @@ impl HostDispatchPort for LinuxLaunchPort {
             LaterTurnControlStage::Settled { .. } => Ok(PortDispatchOutcome::Settled(receipt)),
             _ => Err(uncertain()),
         }
+    }
+
+    fn inspect_claimed_codex_turn(
+        &self,
+        claimed: ResolvedClaimedLaterTurn,
+    ) -> Result<LaterTurnNativeObservation, podbay_host::HostError> {
+        use podbay_host::HostError;
+        let selector = claimed.selector();
+        let target = &selector.native_target;
+        let mut context = current_turn_context(
+            &self.config, target, claimed.store_path(), claimed.store_file_identity(),
+            claimed.owner_epoch(), claimed.manager_credential_epoch(),
+            claimed.authority_revision(), false,
+        ).map_err(|_| HostError::StaleGuard)?;
+        let proof = context.store.inspect_claimed_later_codex_send(selector)
+            .map_err(|_| HostError::StaleGuard)?;
+        if proof.receipt().request_digest != claimed.expected_request_digest()
+            || proof.native_thread_id() != claimed.native_thread_id()
+            || proof.writer_epoch() != claimed.writer_epoch()
+            || context.lease.writer_epoch() != proof.writer_epoch()
+            || context.lease.holder_actor_id() != proof.holder_actor_id()
+            || context.lease.holder_credential_generation() != proof.holder_credential_generation()
+            || context.lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+        { return Err(HostError::StaleGuard); }
+        let response = context.client.inspect_claimed_codex_turn(
+            selector, claimed.writer_epoch(), claimed.expected_request_digest(),
+            claimed.native_thread_id(),
+        ).map_err(|_| HostError::StaleGuard)?;
+        if response.native_thread_id.as_deref().is_some_and(
+            |thread| thread != claimed.native_thread_id(),
+        ) || (matches!(&response.stage,
+            LaterTurnControlStage::Submitted { .. }
+            | LaterTurnControlStage::CompletionObservedPendingIdleProof { .. }
+            | LaterTurnControlStage::Settled { .. })
+            && response.native_thread_id.as_deref() != Some(claimed.native_thread_id()))
+        { return Err(HostError::StaleGuard); }
+        let after = context.client.attested_status().map_err(|_| HostError::StaleGuard)?;
+        if !current_codex_turn_status_matches(
+            &after, target, &context.binding, &context.manifest, false,
+        ) || after.supervisor_pid != context.before.supervisor_pid
+            || after.supervisor_start_ticks != context.before.supervisor_start_ticks
+            || after.child_pid != context.before.child_pid
+            || after.child_start_ticks != context.before.child_start_ticks
+            || after.boot_id != context.before.boot_id
+            || after.cgroup_path != context.before.cgroup_path
+            || self.config.recheck().is_err()
+            || checked_store_file(claimed.store_path(), context.manager.uid())
+                .map_err(|_| HostError::StaleGuard)? != claimed.store_file_identity()
+            || fs::symlink_metadata(&context.manifest_path).ok()
+                .map(|meta| (meta.dev(), meta.ino())) != Some(context.manifest_identity)
+            || context.store.inspect_claimed_later_codex_send(selector).ok().as_ref()
+                != Some(&proof)
+        { return Err(HostError::StaleGuard); }
+        let terminal = |value| match value {
+            LaterTurnTerminal::Completed => LaterTurnNativeTerminal::Completed,
+            LaterTurnTerminal::Failed => LaterTurnNativeTerminal::Failed,
+            LaterTurnTerminal::Interrupted => LaterTurnNativeTerminal::Interrupted,
+        };
+        let stage = match response.stage {
+            LaterTurnControlStage::RefusedBeforeEffect => return Err(HostError::StaleGuard),
+            LaterTurnControlStage::ClaimedUnobserved => LaterTurnNativeStage::ClaimedUnobserved,
+            LaterTurnControlStage::IntentUncertain => LaterTurnNativeStage::IntentUncertain,
+            LaterTurnControlStage::SubmissionUncertain => LaterTurnNativeStage::SubmissionUncertain,
+            LaterTurnControlStage::StorageUncertain => LaterTurnNativeStage::StorageUncertain,
+            LaterTurnControlStage::Submitted { native_turn_id } => {
+                LaterTurnNativeStage::Submitted {
+                    native_thread_id: response.native_thread_id.ok_or(HostError::StaleGuard)?,
+                    native_session_id: response.native_session_id.ok_or(HostError::StaleGuard)?,
+                    native_turn_id,
+                }
+            }
+            LaterTurnControlStage::CompletionObservedPendingIdleProof { native_turn_id, terminal: value } =>
+                LaterTurnNativeStage::CompletionObservedPendingIdleProof {
+                    native_turn_id, terminal: terminal(value),
+                },
+            LaterTurnControlStage::Settled { native_turn_id, terminal: value } =>
+                LaterTurnNativeStage::Settled {
+                    native_turn_id, terminal: terminal(value),
+                },
+        };
+        LaterTurnNativeObservation::from_attested_pod(
+            &response.protocol, selector.clone(), claimed.writer_epoch(),
+            claimed.expected_request_digest().into(), stage,
+        )
     }
 }
 
@@ -1946,9 +2033,10 @@ fn current_codex_turn_status_matches(
     target: &NativeWriterTarget,
     binding: &BoundPeerManifest,
     manifest: &PodManifest,
+    require_child_running: bool,
 ) -> bool {
     let Some(bound) = status.bound.as_ref() else { return false; };
-    status.child_running
+    (!require_child_running || status.child_running)
         && status.pod_id == target.pod_id.as_str()
         && status.attempt_id == target.attempt_id.as_str()
         && status.incarnation == target.pod_incarnation
@@ -1984,6 +2072,7 @@ fn current_turn_context(
     owner_epoch: u64,
     manager_credential_epoch: u64,
     authority_revision: u64,
+    require_child_running: bool,
 ) -> Result<CurrentTurnContext, ()> {
     config.recheck().map_err(|_| ())?;
     let manager = LinuxPeerEvidence::for_current_process().map_err(|_| ())?;
@@ -2057,7 +2146,9 @@ fn current_turn_context(
     { return Err(()); }
     let client = PodClient::connect(&manifest_path).map_err(|_| ())?;
     let before = client.attested_status().map_err(|_| ())?;
-    if !current_codex_turn_status_matches(&before, target, &binding, &manifest) {
+    if !current_codex_turn_status_matches(
+        &before, target, &binding, &manifest, require_child_running,
+    ) {
         return Err(());
     }
     Ok(CurrentTurnContext {
