@@ -9,11 +9,11 @@ import { createConnection, Socket } from "node:net";
 import { AuthenticatedUnixSocketWireTransport } from "../src/authenticated-unix-socket.ts";
 import { PodBayWireClient, makeRead } from "../src/generated.ts";
 import { InitialOwnerSetupClient, INITIAL_OWNER_RIGHTS_DIGEST } from "../src/owner-setup.ts";
-import { recoverInstalledOwner } from "../src/owner-recovery.ts";
+import { OwnerRecoveryUncertainError, recoverInstalledOwner } from "../src/owner-recovery.ts";
 import { stageNextOwnerKeyCustody } from "../src/owner-key-custody.ts";
 
 const [mode, root, managerBinary, podBinary] = process.argv.slice(2);
-if (!mode || !root || !managerBinary || !podBinary || !["A", "A_KILL", "B", "B_FAIL", "B_NO_PUBLIC", "B_LOST_ACK", "C"].includes(mode)) throw new Error();
+if (!mode || !root || !managerBinary || !podBinary || !["A", "A_KILL", "B", "B_FAIL", "B_NO_PUBLIC", "B_LOST_ACK", "B_LOST_BOTH", "C"].includes(mode)) throw new Error();
 const state = join(root, "state");
 const database = join(state, "podbay.sqlite");
 const podDigest = createHash("sha256").update(readFileSync(podBinary)).digest("hex");
@@ -87,8 +87,8 @@ try {
       ownerEpoch: ownerEpoch.toString(), stagedPublic: Buffer.from(staged.publicKey).toString("hex"),
     }), { mode: 0o600, flag: "wx" });
   } else {
-    let droppedAck = false;
-    if (mode === "B_LOST_ACK") {
+    let droppedAck = false, droppedReadback = false;
+    if (mode === "B_LOST_ACK" || mode === "B_LOST_BOTH") {
       const original = Socket.prototype.write;
       Object.defineProperty(Socket.prototype, "write", {
         configurable: true, writable: true,
@@ -104,15 +104,40 @@ try {
               queueMicrotask(() => (callback as (error: Error) => void)(new Error("synthetic lost ACK")));
             return true;
           }
+          if (mode === "B_LOST_BOTH" && droppedAck && !droppedReadback &&
+              bytes?.length === 68 && bytes.readUInt32BE(0) === 64) {
+            droppedReadback = true;
+            this.destroy();
+            const callback = args.find((arg) => typeof arg === "function");
+            if (typeof callback === "function")
+              queueMicrotask(() => (callback as (error: Error) => void)(new Error("synthetic lost readback")));
+            return true;
+          }
           return Reflect.apply(original, this, args);
         },
       });
     }
-    const recovered = await recoverInstalledOwner({
+    const recovery = recoverInstalledOwner({
       stateDirectory: state, actorId: "actor.zap.recovery", scopeId: "scope.zap.recovery",
       credentialRef: "vault.zap.recovery",
       validateHostEndpoint: (phase) => liveSocket(join(state, phase === "recovery" ? "owner-recovery.sock" : "manager.sock")),
     });
+    if (mode === "B_LOST_BOTH") {
+      let uncertain: OwnerRecoveryUncertainError | undefined;
+      try { await recovery; }
+      catch (error) {
+        if (error instanceof OwnerRecoveryUncertainError) uncertain = error;
+        else throw error;
+      }
+      if (!droppedAck || !droppedReadback || uncertain === undefined ||
+          uncertain.pendingChannel.expected.credentialGeneration !== 2n)
+        throw new Error("double-loss did not retain the candidate owner channel");
+      writeFileSync(join(root, `receipt-${mode}.json`), JSON.stringify({
+        uncertain: true, generation: uncertain.pendingChannel.expected.credentialGeneration.toString(),
+        channelPath: uncertain.pendingChannel.socketPath,
+      }), { mode: 0o600, flag: "wx" });
+    } else {
+    const recovered = await recovery;
     if (mode === "B_LOST_ACK" && (!droppedAck || !recovered.duplicate))
       throw new Error("lost ACK readback did not return the original receipt");
     await waitSocket(join(state, "manager.sock"));
@@ -133,6 +158,7 @@ try {
       generation: recovered.credentialGeneration.toString(), forbidden,
       duplicate: recovered.duplicate,
     }), { mode: 0o600, flag: "wx" });
+    }
   }
 } catch (error) {
   writeFileSync(join(root, `failure-${mode}.txt`), `${String(error)}\n${Buffer.concat(diagnostics).toString("utf8")}`, { mode: 0o600 });

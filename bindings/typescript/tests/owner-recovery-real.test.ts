@@ -36,6 +36,13 @@ test("lost recovery ACK reads the exact receipt without a second rotation", {
   await runScenario(["A", "B_LOST_ACK"]);
 });
 
+test("lost receipt and readback retain a candidate channel for reconciliation", {
+  skip: process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
+    !process.env["PODBAY_TEST_POD_BINARY"],
+}, async () => {
+  await runScenario(["A", "B_LOST_BOTH"]);
+});
+
 test("missing staged public receipt refuses proof and a later process recovers", {
   skip: process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
     !process.env["PODBAY_TEST_POD_BINARY"],
@@ -89,6 +96,18 @@ async function runScenario(modes: readonly string[]): Promise<void> {
     const a = JSON.parse(await readFile(join(root, "receipt-A.json"), "utf8")) as Record<string, unknown>;
     const finalMode = modes.at(-1)!;
     const b = JSON.parse(await readFile(join(root, `receipt-${finalMode}.json`), "utf8")) as Record<string, unknown>;
+    if (finalMode === "B_LOST_BOTH") {
+      assert.equal(b["uncertain"], true);
+      assert.equal(b["generation"], "2");
+      assert.equal(b["channelPath"], join(root, "state", "manager.sock"));
+      const uncertainStore = new DatabaseSync(join(root, "state", "podbay.sqlite"), { readOnly: true });
+      try {
+        const actor = uncertainStore.prepare("SELECT credential_generation FROM authority_actors WHERE actor_id='actor.zap.recovery'")
+          .get() as { credential_generation: number };
+        assert.equal(actor.credential_generation, 2);
+      } finally { uncertainStore.close(); }
+      return;
+    }
     assert.equal(b["grantRef"], a["grantRef"]);
     assert.equal(b["generation"], "2");
     assert.equal(b["forbidden"], true);

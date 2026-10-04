@@ -42,6 +42,17 @@ export interface OwnerRecoveryResult {
   readonly channel: AuthenticatedUnixSocketOptions;
 }
 
+/** The signed proof may have committed; the candidate channel permits read-only reconciliation. */
+export class OwnerRecoveryUncertainError extends Error {
+  readonly pendingChannel: AuthenticatedUnixSocketOptions;
+
+  constructor(channel: AuthenticatedUnixSocketOptions, cause: unknown) {
+    super("owner recovery proof may have committed; receipt readback failed", { cause });
+    this.name = "OwnerRecoveryUncertainError";
+    this.pendingChannel = channel;
+  }
+}
+
 type Snapshot = {
   lineage: string; ownerEpoch: bigint; revision: bigint; managerCredentialEpoch: bigint;
   generation: bigint; publicKey: Buffer; osIdentity: string; processIdentity: string;
@@ -112,24 +123,28 @@ export async function recoverInstalledOwner(config: TrustedOwnerRecoveryConfig):
   } catch (error) {
     if (!signed) throw error;
     // Possible durable rotation: one read-only same-key receipt path, never another rotation.
-    const socket = await FrameSocket.connect(join(config.stateDirectory, "owner-recovery.sock"));
     try {
-      await socket.write(keys);
-      const challenge = await socket.read();
-      // The manager's second challenge is normal auth/1 for the newly recorded owner.
-      // The authenticated transport parser is the canonical verifier for it.
-      const parsed = parseCanonicalActorChallenge(challenge);
-      if (parsed === null || !matchesCanonicalActorChallenge(parsed, expected) ||
-        await config.validateHostEndpoint("recovery") !== true || !sameCurrentProcess(current))
-        throw new TypeError("owner recovery readback challenge differs");
-      await socket.write(sign(null, challenge, staged.privateKey));
-      if (rotationKey === null) throw new TypeError("original recovery key is unavailable");
-      const receipt = parseReceipt(await socket.read(), config, prior, rotationKey);
-      if (!receipt.duplicate) throw new TypeError("owner recovery readback is not duplicate");
-      await socket.write(Buffer.from("ack", "ascii"));
-      await socket.waitEnd();
-      return { ...receipt, channel };
-    } finally { socket.close(); }
+      const socket = await FrameSocket.connect(join(config.stateDirectory, "owner-recovery.sock"));
+      try {
+        await socket.write(keys);
+        const challenge = await socket.read();
+        // The manager's second challenge is normal auth/1 for the newly recorded owner.
+        // The authenticated transport parser is the canonical verifier for it.
+        const parsed = parseCanonicalActorChallenge(challenge);
+        if (parsed === null || !matchesCanonicalActorChallenge(parsed, expected) ||
+          await config.validateHostEndpoint("recovery") !== true || !sameCurrentProcess(current))
+          throw new TypeError("owner recovery readback challenge differs");
+        await socket.write(sign(null, challenge, staged.privateKey));
+        if (rotationKey === null) throw new TypeError("original recovery key is unavailable");
+        const receipt = parseReceipt(await socket.read(), config, prior, rotationKey);
+        if (!receipt.duplicate) throw new TypeError("owner recovery readback is not duplicate");
+        await socket.write(Buffer.from("ack", "ascii"));
+        await socket.waitEnd();
+        return { ...receipt, channel };
+      } finally { socket.close(); }
+    } catch (readbackError) {
+      throw new OwnerRecoveryUncertainError(channel, readbackError);
+    }
   }
 }
 
