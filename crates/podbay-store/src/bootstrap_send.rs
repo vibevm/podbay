@@ -388,6 +388,53 @@ fn check_host_accepted_launch(
 }
 
 impl PodBayStore {
+    /// Resolve a claimed first-send command for its authenticated principal.
+    /// This only supplies a selector for a separate, read-only pod inspection;
+    /// it does not attest a live pod or authorize native input. Other command
+    /// namespaces and still-Prepared sends have no pod journal to inspect.
+    pub fn claimed_bootstrap_selector_for_command(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope_id: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<(BootstrapSendSelector, u64)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM commands
+                 WHERE command_id=?1 AND principal=?2 AND scope_id=?3 AND namespace=?4",
+                params![
+                    command_id.as_str(),
+                    principal.as_str(),
+                    scope_id.as_str(),
+                    NAMESPACE
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let result = if let Some(rowid) = rowid {
+            let record = read_bootstrap_record(&transaction, rowid)?;
+            if record.effect_state == EffectState::ClaimedUncertain {
+                Some((
+                    BootstrapSendSelector {
+                        scope_id: scope_id.clone(),
+                        command_id: command_id.clone(),
+                        native_target: record.native_target,
+                    },
+                    record.writer_epoch,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Lookup an authenticated actor's original first-send key before today's
     /// grant, writer lease or pod state is checked. A miss authorises nothing;
     /// the host must perform those fresh checks before admitting a new send.

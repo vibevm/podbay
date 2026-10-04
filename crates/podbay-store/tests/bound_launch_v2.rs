@@ -1340,6 +1340,17 @@ fn v18_bootstrap_send_commits_once_claims_once_and_pod_reads_exact_proof() {
         .unwrap();
     assert_eq!(inspection.receipt, receipt);
     assert_eq!(inspection.effect_state, podbay_store::EffectState::Prepared);
+    let principal = VerifiedPrincipal::from_authenticated_boundary("actor.codex.fixture").unwrap();
+    assert_eq!(
+        store
+            .claimed_bootstrap_selector_for_command(
+                &principal,
+                &target.scope_id,
+                &selector.command_id,
+            )
+            .unwrap(),
+        None,
+    );
     assert!(matches!(
         store.inspect_claimed_bootstrap_send(&selector),
         Err(StoreError::Conflict(_))
@@ -1351,6 +1362,27 @@ fn v18_bootstrap_send_commits_once_claims_once_and_pod_reads_exact_proof() {
     assert_eq!(
         store.claim_bootstrap_send(&selector).unwrap(),
         EffectClaim::ExistingUncertain
+    );
+    assert_eq!(
+        store
+            .claimed_bootstrap_selector_for_command(
+                &principal,
+                &target.scope_id,
+                &selector.command_id,
+            )
+            .unwrap(),
+        Some((selector.clone(), writer_epoch)),
+    );
+    let wrong_principal = VerifiedPrincipal::from_authenticated_boundary("actor.other").unwrap();
+    assert_eq!(
+        store
+            .claimed_bootstrap_selector_for_command(
+                &wrong_principal,
+                &target.scope_id,
+                &selector.command_id,
+            )
+            .unwrap(),
+        None,
     );
     let mut pod_read = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
     let proof = pod_read.inspect_claimed_bootstrap_send(&selector).unwrap();
