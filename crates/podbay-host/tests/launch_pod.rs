@@ -19,8 +19,8 @@ use podbay_host::{
     GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
     LaunchPodError, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
     PortDispatchOutcome, PortReceiptRef, RebindContextError, RegisteredLaunchProfile,
-    ResolvedNativeLaunch, Right, Target, TrustedDriverTemplate, TrustedLaunchProfileInput,
-    TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
+    ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target, TrustedDriverTemplate,
+    TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
     BoundLaunchFormat, EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore,
@@ -83,6 +83,7 @@ struct FakeLaunchPort {
     reviewed: Mutex<Vec<AuthorisedBoundLaunch>>,
     fixture_opt_in: bool,
     resolved_opt_in: bool,
+    codex_v2_opt_in: bool,
     resolved_seen: Mutex<Vec<(PathBuf, PathBuf, String)>>,
     manager_seen: Mutex<Vec<ResolvedManagerSeen>>,
     preclaim_change: Mutex<Option<(PathBuf, bool)>>,
@@ -101,6 +102,7 @@ impl FakeLaunchPort {
                 reviewed: Mutex::new(Vec::new()),
                 fixture_opt_in: true,
                 resolved_opt_in: false,
+                codex_v2_opt_in: false,
                 resolved_seen: Mutex::new(Vec::new()),
                 manager_seen: Mutex::new(Vec::new()),
                 preclaim_change: Mutex::new(None),
@@ -119,6 +121,11 @@ impl FakeLaunchPort {
     fn resolved_only(mut self) -> Self {
         self.fixture_opt_in = false;
         self.resolved_opt_in = true;
+        self
+    }
+
+    fn codex_v2(mut self) -> Self {
+        self.codex_v2_opt_in = true;
         self
     }
 }
@@ -156,6 +163,45 @@ impl HostDispatchPort for FakeLaunchPort {
             }
         }
         self.resolved_opt_in
+    }
+
+    fn accepts_resolved_codex_v2(&self) -> bool {
+        self.codex_v2_opt_in
+    }
+
+    fn launch_resolved_codex_v2(
+        &mut self,
+        launch: ResolvedNativeCodexLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        assert!(self.codex_v2_opt_in);
+        assert_eq!(launch.committed_record().format, BoundLaunchFormat::CodexV2);
+        assert_eq!(
+            launch.descriptor_bytes(),
+            launch.committed_record().descriptor
+        );
+        assert_eq!(
+            launch.effective_spec_bytes(),
+            launch.committed_record().effective_spec
+        );
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        let receipt = PortReceiptRef::from_port("receipt.codex.v2").unwrap();
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(PortDispatchError::RefusedBeforeEffect),
+            2 => {
+                self.possible_effects.fetch_add(1, Ordering::SeqCst);
+                Err(PortDispatchError::UncertainAfterPossibleEffect {
+                    receipt_ref: Some(receipt),
+                })
+            }
+            3 => {
+                self.possible_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(PortDispatchOutcome::Settled(receipt))
+            }
+            _ => {
+                self.possible_effects.fetch_add(1, Ordering::SeqCst);
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
+        }
     }
 
     fn launch_resolved(
@@ -710,6 +756,260 @@ fn codex_v2_root_coordinator_and_root_worker_commit_without_port_effect() {
             Err(LaunchPodError::Host(HostError::Unauthorised))
         ));
     }
+}
+
+#[test]
+fn codex_v2_dispatch_claims_once_for_concurrent_same_key_and_never_retries_port() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let grant = install_codex_root_policy(&mut host, &who);
+    let request = codex_root_request(&who, grant, Role::Coordinator, b"canonical.dispatch.v2");
+    let prepared = host
+        .admit_bound_root_codex_v2(&who.transport, request.clone())
+        .unwrap();
+    assert_eq!(prepared.status.stage, LaunchDispatchStage::Prepared);
+    let shared = Mutex::new(host);
+    let (first, second) = std::thread::scope(|scope| {
+        let one = request.clone();
+        let two = request.clone();
+        let first = scope.spawn(|| {
+            shared
+                .lock()
+                .unwrap()
+                .dispatch_prepared_bound_root_codex_v2(&who.transport, one)
+                .unwrap()
+        });
+        let second = scope.spawn(|| {
+            shared
+                .lock()
+                .unwrap()
+                .dispatch_prepared_bound_root_codex_v2(&who.transport, two)
+                .unwrap()
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(first.receipt, prepared.receipt);
+    assert_eq!(second.receipt, prepared.receipt);
+    assert_eq!(first.status.stage, LaunchDispatchStage::HostAccepted);
+    assert_eq!(second.status.stage, LaunchDispatchStage::HostAccepted);
+    assert_eq!(
+        u8::from(first.port_called) + u8::from(second.port_called),
+        1
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let mut host = shared.into_inner().unwrap();
+    let mut retry = request.clone();
+    retry.proposal = None;
+    let original = host
+        .dispatch_prepared_bound_root_codex_v2(&who.transport, retry)
+        .unwrap();
+    assert!(original.duplicate);
+    assert!(!original.port_called);
+    assert_eq!(original.receipt, prepared.receipt);
+    let mut changed = request;
+    changed.canonical_request = b"different.caller.intent".to_vec();
+    assert!(matches!(
+        host.dispatch_prepared_bound_root_codex_v2(&who.transport, changed),
+        Err(LaunchPodError::Store(StoreError::Conflict(_)))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn codex_v2_dispatch_preserves_ambiguous_port_result_without_relaunch() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::LostReply);
+    let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let grant = install_codex_root_policy(&mut host, &who);
+    let request = codex_root_request(&who, grant, Role::Worker, b"canonical.dispatch.uncertain");
+    host.admit_bound_root_codex_v2(&who.transport, request.clone())
+        .unwrap();
+    let first = host
+        .dispatch_prepared_bound_root_codex_v2(&who.transport, request.clone())
+        .unwrap();
+    assert_eq!(
+        first.status.stage,
+        LaunchDispatchStage::UncertainAfterPossibleEffect
+    );
+    assert!(first.port_called);
+    let mut retry = request;
+    retry.proposal = None;
+    let again = host
+        .dispatch_prepared_bound_root_codex_v2(&who.transport, retry)
+        .unwrap();
+    assert_eq!(again.receipt, first.receipt);
+    assert_eq!(again.status, first.status);
+    assert!(again.duplicate);
+    assert!(!again.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn codex_v2_dispatch_records_refusal_and_settlement_truthfully() {
+    for (mode, expected_stage, expected_effects) in [
+        (Mode::Refused, LaunchDispatchStage::RefusedBeforeEffect, 0),
+        (Mode::Settled, LaunchDispatchStage::PortSettled, 1),
+    ] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, effects) = FakeLaunchPort::new(mode);
+        let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+        let grant = install_codex_root_policy(&mut host, &who);
+        let request = codex_root_request(
+            &who,
+            grant,
+            Role::Coordinator,
+            b"canonical.dispatch.outcome",
+        );
+        host.admit_bound_root_codex_v2(&who.transport, request.clone())
+            .unwrap();
+        let first = host
+            .dispatch_prepared_bound_root_codex_v2(&who.transport, request.clone())
+            .unwrap();
+        assert_eq!(first.status.stage, expected_stage);
+        assert!(first.port_called);
+        let mut repeat = request;
+        repeat.proposal = None;
+        let again = host
+            .dispatch_prepared_bound_root_codex_v2(&who.transport, repeat)
+            .unwrap();
+        assert_eq!(again.status, first.status);
+        assert!(!again.port_called);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.load(Ordering::SeqCst), expected_effects);
+    }
+}
+
+#[test]
+fn codex_v2_dispatch_refuses_unsupported_port_and_stale_authority_before_claim() {
+    for case in [
+        "unsupported",
+        "grant",
+        "profile",
+        "credential",
+        "generation",
+        "owner",
+        "revision",
+    ] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let port = if case == "unsupported" {
+            port
+        } else {
+            port.codex_v2()
+        };
+        let (mut host, _) = initial_authority(&fixture.database, port, &who);
+        let grant = install_codex_root_policy(&mut host, &who);
+        let mut request =
+            codex_root_request(&who, grant, Role::Coordinator, b"canonical.dispatch.refuse");
+        let prepared = host
+            .admit_bound_root_codex_v2(&who.transport, request.clone())
+            .unwrap();
+        request.proposal = None;
+        match case {
+            "grant" => host.revoke_grant_from_trusted_policy(grant).unwrap(),
+            "profile" => {
+                let mut input = codex_profile_input(&who);
+                input.profile_generation = 3;
+                host.register_launch_profile_from_trusted_policy(
+                    RegisteredLaunchProfile::from_trusted_policy(input)
+                        .unwrap()
+                        .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            "credential" => {
+                if let HostAction::LaunchPod { credential, .. } = &mut request.host_request.action {
+                    *credential = Some(
+                        CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.two")
+                            .unwrap(),
+                    );
+                }
+            }
+            "generation" => {
+                request.host_request.guards.credential_generation =
+                    CredentialGeneration::new(2).unwrap();
+            }
+            "owner" => {
+                let mut store = PodBayStore::open(&fixture.database).unwrap();
+                store.begin_authority_replay(1, 2).unwrap();
+            }
+            "revision" => {
+                let mut store = PodBayStore::open(&fixture.database).unwrap();
+                let snapshot = store.authority_snapshot().unwrap();
+                store
+                    .apply_authority_mutation(
+                        snapshot.owner_epoch,
+                        snapshot.revision,
+                        podbay_store::AuthorityMutation::PutActor(snapshot.actors[0].clone()),
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        assert!(
+            host.dispatch_prepared_bound_root_codex_v2(&who.transport, request)
+                .is_err()
+        );
+        let store = PodBayStore::open(&fixture.database).unwrap();
+        assert_eq!(
+            store
+                .launch_dispatch_status(
+                    prepared.receipt.outbox_id,
+                    who.scope.as_str(),
+                    who.pod.as_str(),
+                )
+                .unwrap()
+                .stage,
+            LaunchDispatchStage::Prepared,
+            "{case}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}");
+    }
+}
+
+#[test]
+fn codex_v2_prepared_dispatch_reopens_without_original_proposal() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, first_calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let grant = install_codex_root_policy(&mut first, &who);
+    let request = codex_root_request(&who, grant, Role::Coordinator, b"canonical.dispatch.reopen");
+    let prepared = first
+        .admit_bound_root_codex_v2(&who.transport, request)
+        .unwrap();
+    drop(first);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut reopened = DurableAuthority::open(&fixture.database, port.codex_v2()).unwrap();
+    replay(&mut reopened, &who, grant);
+    reopened
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                .unwrap(),
+        )
+        .unwrap();
+    let mut resume =
+        codex_root_request(&who, grant, Role::Coordinator, b"canonical.dispatch.reopen");
+    resume.host_request.guards.manager_epoch = ManagerEpoch::new(2).unwrap();
+    resume.proposal = None;
+    let accepted = reopened
+        .dispatch_prepared_bound_root_codex_v2(&who.transport, resume)
+        .unwrap();
+    assert_eq!(accepted.receipt, prepared.receipt);
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    assert!(accepted.port_called);
+    assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

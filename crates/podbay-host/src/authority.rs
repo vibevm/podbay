@@ -921,6 +921,21 @@ pub trait HostDispatchPort {
         Err(PortDispatchError::RefusedBeforeEffect)
     }
 
+    /// Distinct committed Codex V2 root launch. No V1 descriptor or fixture
+    /// capability can enter this path.
+    fn launch_resolved_codex_v2(
+        &mut self,
+        _launch: ResolvedNativeCodexLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    /// The host checks this before claiming a V2 effect. A default-deny port
+    /// leaves the durable outbox Prepared and calls no external effect.
+    fn accepts_resolved_codex_v2(&self) -> bool {
+        false
+    }
+
     fn accepts_resolved_native_launch(&self) -> bool {
         false
     }
@@ -1815,6 +1830,14 @@ impl From<StoreError> for RebindContextError {
         Self::Store(value)
     }
 }
+impl From<RebindContextError> for LaunchPodError {
+    fn from(value: RebindContextError) -> Self {
+        match value {
+            RebindContextError::Host(error) => Self::Host(error),
+            RebindContextError::Store(error) => Self::Store(error),
+        }
+    }
+}
 
 impl ManagerRebindContext<'_> {
     pub fn store_path(&self) -> &Path {
@@ -2616,6 +2639,183 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             self.hydrate_new_bound(&record)?;
         }
         self.bound_receipt(record, duplicate)
+    }
+
+    /// Dispatches only an already committed, still-Prepared Codex V2 root.
+    /// The caller's key and canonical bytes select the original record; a
+    /// fresh actor/grant review and today's trusted profile must agree with
+    /// the stored typed bytes before effect.
+    /// A repeated or ambiguous claim returns its durable receipt without a
+    /// second port call.
+    pub fn dispatch_prepared_bound_root_codex_v2<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let actor_id = actor.actor_id.clone();
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal);
+        let record = self
+            .store
+            .lookup_bound_launch(&lookup)?
+            .ok_or(StoreError::NotFound)?;
+        if record.format != BoundLaunchFormat::CodexV2 {
+            return Err(HostError::Unauthorised.into());
+        }
+        let status = self.store.launch_dispatch_status(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+        )?;
+        if status.stage != podbay_store::LaunchDispatchStage::Prepared {
+            return self.bound_receipt(record, true);
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        if authorised.actor_id != actor_id || authorised.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthenticated.into());
+        }
+        let reviewed =
+            self.inspect_committed_root_codex_v2(&request.host_request.scope_id, pod_id)?;
+        if reviewed.committed_record() != &record {
+            return Err(HostError::StaleGuard.into());
+        }
+        let HostAction::LaunchPod {
+            pod_id: authorised_pod,
+            role,
+            credential,
+        } = &authorised.action
+        else {
+            return Err(HostError::InvalidInput.into());
+        };
+        let selected_credential = credential.as_ref().ok_or(HostError::Unauthorised)?;
+        let effective = reviewed.effective().base();
+        let policy = reviewed.effective().codex_policy();
+        if authorised.actor_id.as_str() != reviewed.descriptor().actor_id()
+            || authorised_pod.as_str() != reviewed.descriptor().pod_id()
+            || reviewed.descriptor().role() != (*role).into()
+            || request.host_request.grant_id.get() != effective.authority_grant_id()
+            || selected_credential.scope_id() != &authorised.scope_id
+            || selected_credential.as_str() != policy.credential_ref()
+            || policy.credential_scope() != authorised.scope_id.as_str()
+            || effective.credential_refs().len() != 1
+            || effective.credential_refs()[0].reference() != selected_credential.as_str()
+        {
+            return Err(HostError::Unauthorised.into());
+        }
+        if let Some(proposal) = request.proposal.as_ref() {
+            let (proposed_effective, proposed_descriptor) = self.review_bound_root_codex_v2(
+                &authorised,
+                request.host_request.grant_id,
+                proposal,
+            )?;
+            if record.effective_spec != proposed_effective.canonical_bytes()
+                || record.descriptor
+                    != proposed_descriptor
+                        .encode_json()
+                        .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        if !self.host.port.accepts_resolved_codex_v2() {
+            return Err(HostError::NativeResolutionUnverified.into());
+        }
+        let claim_key = format!("claim.{}", record.receipt.command_id);
+        let claim = self.store.claim_effect(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+            self.host.manager_epoch.get(),
+            record.pod_incarnation,
+            self.recorded.revision,
+            &claim_key,
+        )?;
+        if claim != EffectClaim::NewClaim {
+            return self.bound_receipt(record, true);
+        }
+        let postclaim = (|| -> Result<ResolvedNativeCodexLaunch, LaunchPodError> {
+            self.ensure_current_owner_epoch()?;
+            if self.recheck_manager_binding()? != *reviewed.manager_peer() {
+                return Err(HostError::StaleGuard.into());
+            }
+            let fresh =
+                self.inspect_committed_root_codex_v2(&request.host_request.scope_id, pod_id)?;
+            if fresh.committed_record() != &record
+                || fresh.store_path() != reviewed.store_path()
+                || fresh.store_lineage() != reviewed.store_lineage()
+                || fresh.owner_epoch() != reviewed.owner_epoch()
+                || fresh.credential_epoch() != reviewed.credential_epoch()
+                || fresh.authority_revision() != reviewed.authority_revision()
+                || fresh.manager_peer() != reviewed.manager_peer()
+                || fresh.resource_input_epochs() != reviewed.resource_input_epochs()
+                || fresh.cwd() != reviewed.cwd()
+                || fresh.executable() != reviewed.executable()
+                || fresh.executable_sha256() != reviewed.executable_sha256()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            #[cfg(target_os = "linux")]
+            if fresh.store_file_identity() != reviewed.store_file_identity() {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(fresh)
+        })();
+        let resolved = match postclaim {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return self.refuse_claimed_launch(record, true, &claim_key, failure);
+            }
+        };
+        let port_call = self.host.port.launch_resolved_codex_v2(resolved);
+        let observed = match port_call {
+            Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Ok(PortDispatchOutcome::Settled(receipt)) => LaunchPortResult::PortSettled {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Err(PortDispatchError::RefusedBeforeEffect) => LaunchPortResult::RefusedBeforeEffect,
+            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
+                LaunchPortResult::UncertainAfterPossibleEffect {
+                    receipt_ref: receipt_ref.map(|receipt| receipt.as_str().to_owned()),
+                }
+            }
+        };
+        let status = self
+            .store
+            .record_launch_port_result(
+                record.receipt.outbox_id,
+                &record.scope_id,
+                &record.pod_id,
+                self.host.manager_epoch.get(),
+                &claim_key,
+                observed.clone(),
+            )
+            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
+                receipt: record.receipt.clone(),
+                observed,
+                source,
+            })?;
+        Ok(LaunchPodReceipt {
+            receipt: record.receipt,
+            status,
+            duplicate: true,
+            port_called: true,
+        })
     }
 
     /// Only a still-prepared original may be dispatched after restart. The
