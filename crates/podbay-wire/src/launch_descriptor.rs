@@ -8,10 +8,12 @@ use podbay_core::{LaunchBinding, ResourceId, ResourceKind, Role, WorkKind};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::{MAX_FRAME_BYTES, ProtocolVersion};
+use crate::{CodexAppServerPolicyV2, MAX_FRAME_BYTES, ProtocolVersion};
 
 pub const LAUNCH_DESCRIPTOR_SCHEMA: &str = "podbay.launch-descriptor/1";
 const DIGEST_DOMAIN: &[u8] = b"podbay.launch-descriptor/1\0";
+pub const LAUNCH_DESCRIPTOR_V2_SCHEMA: &str = "podbay.launch-descriptor/2";
+const DIGEST_DOMAIN_V2: &[u8] = b"podbay.launch-descriptor/2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -712,4 +714,243 @@ fn validate_body(body: &DescriptorBody) -> Result<(), LaunchDescriptorError> {
         return Err(LaunchDescriptorError::InvalidField("budget"));
     }
     Ok(())
+}
+
+/// V2 retains the complete strictly decoded V1-shaped identity and native
+/// fields under `base`, but requires a separately typed Codex policy. The
+/// outer schema and digest domain are distinct; a V1 descriptor never gains
+/// this policy by decoding through V2.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DescriptorBodyV2 {
+    base: DescriptorBody,
+    codex_policy: CodexAppServerPolicyV2,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DescriptorEnvelopeV2 {
+    protocol: ProtocolVersion,
+    schema: String,
+    digest: String,
+    descriptor: DescriptorBodyV2,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImmutableLaunchDescriptorV2 {
+    body: DescriptorBodyV2,
+    digest: String,
+}
+
+impl ImmutableLaunchDescriptorV2 {
+    pub fn from_binding(
+        binding: &LaunchBinding,
+        policy: ReviewedNativePolicy,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, LaunchDescriptorError> {
+        let base = ImmutableLaunchDescriptor::from_binding(binding, policy)?;
+        let body = DescriptorBodyV2 {
+            base: base.body,
+            codex_policy,
+        };
+        validate_body_v2(&body)?;
+        let digest = digest_body_v2(&body)?;
+        Ok(Self { body, digest })
+    }
+
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, LaunchDescriptorError> {
+        if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+            return Err(LaunchDescriptorError::TooLarge);
+        }
+        let envelope: DescriptorEnvelopeV2 =
+            serde_json::from_slice(bytes).map_err(|_| LaunchDescriptorError::Malformed)?;
+        if envelope.protocol != ProtocolVersion::V1
+            || envelope.schema != LAUNCH_DESCRIPTOR_V2_SCHEMA
+        {
+            return Err(LaunchDescriptorError::UnsupportedVersion);
+        }
+        validate_body_v2(&envelope.descriptor)?;
+        let digest = digest_body_v2(&envelope.descriptor)?;
+        if digest != envelope.digest {
+            return Err(LaunchDescriptorError::DigestMismatch);
+        }
+        let result = Self {
+            body: envelope.descriptor,
+            digest,
+        };
+        if result.encode_json()? != bytes {
+            return Err(LaunchDescriptorError::NonCanonical);
+        }
+        Ok(result)
+    }
+
+    pub fn decode_for_binding(
+        bytes: &[u8],
+        binding: &LaunchBinding,
+        expected_effective_spec_digest: &str,
+    ) -> Result<Self, LaunchDescriptorError> {
+        if !lower_digest(expected_effective_spec_digest) {
+            return Err(LaunchDescriptorError::InvalidField("effectiveSpecDigest"));
+        }
+        let result = Self::decode_json(bytes)?;
+        if result.effective_spec_digest() != expected_effective_spec_digest {
+            return Err(LaunchDescriptorError::DigestMismatch);
+        }
+        result.validate_against_binding(binding)?;
+        Ok(result)
+    }
+
+    pub fn validate_against_binding(
+        &self,
+        binding: &LaunchBinding,
+    ) -> Result<(), LaunchDescriptorError> {
+        let base = ImmutableLaunchDescriptor {
+            digest: digest_body(&self.body.base)?,
+            body: self.body.base.clone(),
+        };
+        base.validate_against_binding(binding)
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, LaunchDescriptorError> {
+        serde_json::to_vec(&self.body).map_err(|_| LaunchDescriptorError::Malformed)
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn encode_json(&self) -> Result<Vec<u8>, LaunchDescriptorError> {
+        let bytes = serde_json::to_vec(&DescriptorEnvelopeV2 {
+            protocol: ProtocolVersion::V1,
+            schema: LAUNCH_DESCRIPTOR_V2_SCHEMA.into(),
+            digest: self.digest.clone(),
+            descriptor: self.body.clone(),
+        })
+        .map_err(|_| LaunchDescriptorError::Malformed)?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(LaunchDescriptorError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    pub fn codex_policy(&self) -> &CodexAppServerPolicyV2 {
+        &self.body.codex_policy
+    }
+    pub fn pod_id(&self) -> &str {
+        &self.body.base.pod_id
+    }
+    pub fn scope_id(&self) -> &str {
+        &self.body.base.scope_id
+    }
+    pub fn parent_run_id(&self) -> Option<&str> {
+        self.body.base.parent_run_id.as_deref()
+    }
+    pub fn role(&self) -> NativeRole {
+        self.body.base.role
+    }
+    pub fn work_kind(&self) -> NativeWorkKind {
+        self.body.base.work_kind
+    }
+    pub fn profile_ref(&self) -> &str {
+        &self.body.base.profile_ref
+    }
+    pub fn profile_generation(&self) -> u64 {
+        self.body.base.profile_generation.get()
+    }
+    pub fn model_id(&self) -> &str {
+        &self.body.base.model_id
+    }
+    pub fn reasoning_effort(&self) -> &str {
+        &self.body.base.reasoning_effort
+    }
+    pub fn executable(&self) -> &str {
+        &self.body.base.executable
+    }
+    pub fn executable_generation(&self) -> &str {
+        &self.body.base.executable_generation
+    }
+    pub fn cwd(&self) -> &str {
+        &self.body.base.cwd
+    }
+    pub fn arguments(&self) -> &[String] {
+        &self.body.base.arguments
+    }
+    pub fn workspace_basis_ref(&self) -> &str {
+        &self.body.base.workspace_basis_ref
+    }
+    pub fn wall_seconds(&self) -> u64 {
+        self.body.base.wall_seconds.get()
+    }
+    pub fn max_children(&self) -> u64 {
+        self.body.base.max_children.get()
+    }
+    pub fn environment_refs(&self) -> &[String] {
+        &self.body.base.environment_refs
+    }
+    pub fn credential_refs(&self) -> &[String] {
+        &self.body.base.credential_refs
+    }
+    pub fn effective_spec_digest(&self) -> &str {
+        &self.body.base.effective_spec_digest
+    }
+    pub fn resources_len(&self) -> usize {
+        self.body.base.resources.len()
+    }
+    pub fn resource(&self, index: usize) -> Option<NativeResourceView<'_>> {
+        self.body
+            .base
+            .resources
+            .get(index)
+            .map(|value| NativeResourceView {
+                resource_id: &value.resource_id,
+                kind: value.kind,
+                epoch: value.epoch.get(),
+                driver: &value.driver,
+            })
+    }
+}
+
+fn validate_body_v2(body: &DescriptorBodyV2) -> Result<(), LaunchDescriptorError> {
+    validate_body(&body.base)?;
+    body.codex_policy
+        .validate()
+        .map_err(|_| LaunchDescriptorError::InvalidField("codexPolicy"))?;
+    if !matches!(
+        (body.base.role, body.base.work_kind),
+        (NativeRole::Coordinator, NativeWorkKind::Service)
+            | (NativeRole::Worker, NativeWorkKind::Task)
+    ) || body.base.resources.len() != 1
+        || body.base.scope_id != body.codex_policy.credential_scope()
+        || body.base.credential_refs.as_slice() != [body.codex_policy.credential_ref()]
+    {
+        return Err(LaunchDescriptorError::InvalidField("codexPolicy binding"));
+    }
+    let resource = &body.base.resources[0];
+    if resource.kind != NativeResourceKind::StructuredProvider {
+        return Err(LaunchDescriptorError::InvalidField("codex resource kind"));
+    }
+    match &resource.driver {
+        ResourceDriver::Structured {
+            driver_ref,
+            protocol_ref,
+        } if driver_ref == body.codex_policy.driver_ref()
+            && protocol_ref == body.codex_policy.protocol_ref() =>
+        {
+            Ok(())
+        }
+        _ => Err(LaunchDescriptorError::InvalidField("codex resource driver")),
+    }
+}
+
+fn digest_body_v2(body: &DescriptorBodyV2) -> Result<String, LaunchDescriptorError> {
+    let bytes = serde_json::to_vec(body).map_err(|_| LaunchDescriptorError::Malformed)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(LaunchDescriptorError::TooLarge);
+    }
+    let mut hash = Sha256::new();
+    hash.update(DIGEST_DOMAIN_V2);
+    hash.update(&bytes);
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }

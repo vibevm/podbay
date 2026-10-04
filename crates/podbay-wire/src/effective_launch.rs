@@ -6,10 +6,16 @@ use std::fmt::{Display, Formatter};
 use podbay_core::{PodId, RunId, ScopeId};
 use sha2::{Digest, Sha256};
 
-use crate::{ImmutableLaunchDescriptor, MAX_FRAME_BYTES, NativeRole};
+use crate::{
+    CodexAppServerPolicyV2, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
+    MAX_FRAME_BYTES, NativeRole,
+};
 
 pub const EFFECTIVE_LAUNCH_VERSION: &str = "podbay.effective-launch/1";
 const PREFIX: &[u8] = b"podbay.effective-launch/1\0";
+pub const EFFECTIVE_LAUNCH_V2_VERSION: &str = "podbay.effective-launch/2";
+const PREFIX_V2: &[u8] = b"podbay.effective-launch/2\0";
+const DIGEST_DOMAIN_V2: &[u8] = b"podbay.effective-launch/2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectiveLaunchError {
@@ -515,4 +521,200 @@ fn valid_relative_cwd(value: &str) -> bool {
         && value.split('/').all(|part| {
             !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
         })
+}
+
+/// Internal Codex launch proof. V1 bytes are nested and revalidated, while
+/// the distinct V2 prefix and mandatory policy prevent any historical V1
+/// launch from acquiring Codex authority by omission or defaulting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectiveLaunchContractV2 {
+    canonical: Vec<u8>,
+    digest: String,
+    base: EffectiveLaunchContract,
+    codex_policy: CodexAppServerPolicyV2,
+}
+
+impl EffectiveLaunchContractV2 {
+    pub fn from_v1(
+        base: EffectiveLaunchContract,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, EffectiveLaunchError> {
+        validate_codex_effective(&base, &codex_policy)?;
+        let policy_bytes = codex_policy
+            .binary_bytes()
+            .map_err(|_| EffectiveLaunchError::InvalidField("codexPolicy"))?;
+        let mut canonical = PREFIX_V2.to_vec();
+        canonical.extend_from_slice(
+            &u32::try_from(base.canonical_bytes().len())
+                .map_err(|_| EffectiveLaunchError::TooLarge)?
+                .to_be_bytes(),
+        );
+        canonical.extend_from_slice(base.canonical_bytes());
+        canonical.extend_from_slice(
+            &u32::try_from(policy_bytes.len())
+                .map_err(|_| EffectiveLaunchError::TooLarge)?
+                .to_be_bytes(),
+        );
+        canonical.extend_from_slice(&policy_bytes);
+        if canonical.len() > MAX_FRAME_BYTES {
+            return Err(EffectiveLaunchError::TooLarge);
+        }
+        let digest = digest_v2(&canonical);
+        Ok(Self {
+            canonical,
+            digest,
+            base,
+            codex_policy,
+        })
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, EffectiveLaunchError> {
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(EffectiveLaunchError::TooLarge);
+        }
+        let mut reader = Reader { bytes, at: 0 };
+        if reader.take(PREFIX_V2.len())? != PREFIX_V2 {
+            return Err(EffectiveLaunchError::InvalidField("version"));
+        }
+        let base_length = reader.u32()? as usize;
+        if base_length == 0 || base_length > MAX_FRAME_BYTES {
+            return Err(EffectiveLaunchError::TooLarge);
+        }
+        let base = EffectiveLaunchContract::decode(reader.take(base_length)?)?;
+        let policy_length = reader.u32()? as usize;
+        if policy_length == 0 || policy_length > 1024 {
+            return Err(EffectiveLaunchError::InvalidField("codexPolicy length"));
+        }
+        let codex_policy = CodexAppServerPolicyV2::decode_binary(reader.take(policy_length)?)
+            .map_err(|_| EffectiveLaunchError::InvalidField("codexPolicy"))?;
+        if reader.at != bytes.len() {
+            return Err(EffectiveLaunchError::TrailingBytes);
+        }
+        let result = Self::from_v1(base, codex_policy)?;
+        if result.canonical != bytes {
+            return Err(EffectiveLaunchError::NonCanonical);
+        }
+        Ok(result)
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn base(&self) -> &EffectiveLaunchContract {
+        &self.base
+    }
+    pub fn codex_policy(&self) -> &CodexAppServerPolicyV2 {
+        &self.codex_policy
+    }
+
+    pub fn compare_with_descriptor(
+        &self,
+        descriptor: &ImmutableLaunchDescriptorV2,
+    ) -> Result<(), EffectiveLaunchError> {
+        let base = &self.base;
+        let credential_refs = base
+            .credential_refs()
+            .iter()
+            .map(|value| value.reference())
+            .collect::<Vec<_>>();
+        let checks = [
+            (descriptor.pod_id() == base.pod_id().as_str(), "podId"),
+            (descriptor.role() == base.role(), "role"),
+            (
+                descriptor.parent_run_id() == base.parent_run_id().map(|value| value.as_str()),
+                "parentRunId",
+            ),
+            (descriptor.profile_ref() == base.profile_ref(), "profileRef"),
+            (
+                descriptor.profile_generation() == base.profile_generation(),
+                "profileGeneration",
+            ),
+            (descriptor.executable() == base.executable(), "executable"),
+            (
+                descriptor.executable_generation() == base.executable_generation(),
+                "binaryGeneration",
+            ),
+            (descriptor.arguments() == base.arguments(), "arguments"),
+            (descriptor.model_id() == base.model_id(), "modelId"),
+            (
+                descriptor.reasoning_effort() == base.reasoning_effort(),
+                "reasoningEffort",
+            ),
+            (
+                descriptor.scope_id() == base.workspace_scope().as_str(),
+                "workspace.scopeId",
+            ),
+            (
+                descriptor.workspace_basis_ref() == base.workspace_basis_ref(),
+                "workspace.basisRef",
+            ),
+            (
+                descriptor.wall_seconds() == base.wall_seconds(),
+                "wallSeconds",
+            ),
+            (
+                descriptor.max_children() == u64::from(base.max_children()),
+                "maxChildren",
+            ),
+            (
+                descriptor.environment_refs() == base.environment_refs(),
+                "environmentRefs",
+            ),
+            (
+                descriptor
+                    .credential_refs()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    == credential_refs,
+                "credentialRefs",
+            ),
+            (
+                descriptor.effective_spec_digest() == self.digest(),
+                "effectiveSpecDigest",
+            ),
+            (
+                descriptor.codex_policy() == self.codex_policy(),
+                "codexPolicy",
+            ),
+        ];
+        for (matches, field) in checks {
+            if !matches {
+                return Err(EffectiveLaunchError::DescriptorMismatch(field));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_codex_effective(
+    base: &EffectiveLaunchContract,
+    codex_policy: &CodexAppServerPolicyV2,
+) -> Result<(), EffectiveLaunchError> {
+    codex_policy
+        .validate()
+        .map_err(|_| EffectiveLaunchError::InvalidField("codexPolicy"))?;
+    let credentials = base.credential_refs();
+    if !matches!(base.role(), NativeRole::Coordinator | NativeRole::Worker)
+        || base.workspace_access() != EffectiveWorkspaceAccess::ReadWrite
+        || credentials.len() != 1
+        || credentials[0].scope_id().as_str() != codex_policy.credential_scope()
+        || credentials[0].reference() != codex_policy.credential_ref()
+    {
+        return Err(EffectiveLaunchError::InvalidField("codexPolicy binding"));
+    }
+    Ok(())
+}
+
+fn digest_v2(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(DIGEST_DOMAIN_V2);
+    hash.update(bytes);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

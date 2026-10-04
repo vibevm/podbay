@@ -1,6 +1,7 @@
 //! Versioned native PodBay wire DTOs and bounded local frames.
 #![forbid(unsafe_code)]
 
+mod codex_policy_v2;
 mod command;
 mod cursor;
 mod decimal;
@@ -14,6 +15,9 @@ mod schema;
 mod timestamp;
 mod typescript;
 
+pub use codex_policy_v2::{
+    CodexAppServerPolicyV2, CodexApprovalPolicyV2, CodexPolicyV2Error, CodexSandboxV2,
+};
 pub use command::{
     AcknowledgementKind, AnswerItem, AnswerMode, ChildPolicy, CommandBody, CommandEnvelope,
     ContentBlock, ControlAcquireBody, ControlReleaseBody, DeliveryAckBody, DeliveryCancelBody,
@@ -29,15 +33,16 @@ pub use command::{
 pub use cursor::EventCursor;
 pub use decimal::DecimalString;
 pub use effective_launch::{
-    CredentialLocator, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract, EffectiveLaunchError,
+    CredentialLocator, EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION,
+    EffectiveLaunchContract, EffectiveLaunchContractV2, EffectiveLaunchError,
     EffectiveWorkspaceAccess,
 };
 pub use error::WireError;
 pub use frame::{MAX_FRAME_BYTES, decode_frame_bytes, encode_frame};
 pub use launch_descriptor::{
-    ImmutableLaunchDescriptor, LAUNCH_DESCRIPTOR_SCHEMA, LaunchDescriptorError, NativeResourceKind,
-    NativeResourceView, NativeRole, NativeWorkKind, ResourceDriver, ReviewedNativePolicy,
-    ReviewedResource, TargetOs,
+    ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LAUNCH_DESCRIPTOR_SCHEMA,
+    LAUNCH_DESCRIPTOR_V2_SCHEMA, LaunchDescriptorError, NativeResourceKind, NativeResourceView,
+    NativeRole, NativeWorkKind, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
 };
 pub use observation::{
     Capability, CapabilityEnvelope, CapabilitySupport, CommandStage, ErrorEnvelope, EventEnvelope,
