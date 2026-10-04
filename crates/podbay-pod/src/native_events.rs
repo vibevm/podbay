@@ -22,7 +22,9 @@ const MAX_FRAME_BYTES: usize = 262_144;
 const MAX_RAW_BYTES: usize = 65_536;
 const MAX_RECORDS: u64 = 65_536;
 const TERMINAL_RESERVE_BYTES: u64 = MAX_FRAME_BYTES as u64 + HEADER_BYTES as u64;
-const RETAINED_EVENTS: usize = 64;
+// A long Codex bootstrap can emit hundreds of JSONL observations before its
+// owner completes the first read. Keep a bounded multi-page replay window.
+const RETAINED_EVENTS: usize = 4096;
 const MAX_READ_EVENTS: usize = 64;
 const HEADER_BYTES: usize = 4 + 32;
 pub const CODEX_NATIVE_EVENTS_READ_PROTOCOL: &str = "podbay.codex-events.read/1";
@@ -1136,7 +1138,8 @@ mod tests {
             .append_applied(1, &raw("first"), NativeEventKind::Output, None, false)
             .unwrap();
         let old = spool.read_after(None, 1).unwrap().next_cursor;
-        for sequence in 2..=70 {
+        let final_sequence = RETAINED_EVENTS as u64 + 6;
+        for sequence in 2..=final_sequence {
             spool
                 .append_applied(
                     sequence,
@@ -1148,7 +1151,7 @@ mod tests {
                 .unwrap();
         }
         let slow = spool.read_after(Some(&old), 64).unwrap();
-        assert_eq!(slow.snapshot.watermark, 70);
+        assert_eq!(slow.snapshot.watermark, final_sequence);
         assert_eq!(slow.events.len(), 64);
         assert_eq!(slow.events[0].source_sequence, 7);
         assert_eq!(
