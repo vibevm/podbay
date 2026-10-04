@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::PodError;
 
 const PROTOCOL: &str = "podbay.rebind-prepare/1";
+const ACTIVATE_PROTOCOL: &str = "podbay.rebind-activate/1";
 const MAX_REQUEST_BYTES: usize = 65_536;
 const MAX_RESPONSE_BYTES: usize = 4_096;
 const MAX_RESOURCES: usize = 64;
@@ -66,7 +67,25 @@ struct PrepareResponseWire {
     incarnation: u64,
     store_lineage: String,
     phase: String,
+    checkpoint_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateWire {
+    protocol: String,
+    operation: String,
+    nonce: String,
+    prepare: PrepareWire,
     pending_checkpoint_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedActivate {
+    pub proposal: RebindProposal,
+    pub prior_checkpoint_digest: String,
+    pub pending_checkpoint_digest: String,
+    pub nonce: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,8 +329,8 @@ pub(crate) fn encode_pending_response(
         attempt_id: identity.attempt_id.as_str().into(),
         incarnation: identity.incarnation.get(),
         store_lineage: identity.store_lineage.as_str().into(),
-        phase: "pending_store".into(),
-        pending_checkpoint_digest: pending_checkpoint_digest.into(),
+        phase: "pending_pod".into(),
+        checkpoint_digest: pending_checkpoint_digest.into(),
     };
     let bytes = serde_json::to_vec(&wire).map_err(|_| invalid())?;
     decode_pending_response(&bytes, identity, echoed_nonce)?;
@@ -328,9 +347,9 @@ pub(crate) fn decode_pending_response(
     }
     nonce(expected_nonce)?;
     let wire: PrepareResponseWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    digest(&wire.pending_checkpoint_digest)?;
+    digest(&wire.checkpoint_digest)?;
     if wire.protocol != PROTOCOL
-        || wire.phase != "pending_store"
+        || wire.phase != "pending_pod"
         || wire.nonce != expected_nonce
         || wire.scope_id != expected.scope_id.as_str()
         || wire.pod_id != expected.pod_id.as_str()
@@ -340,7 +359,102 @@ pub(crate) fn decode_pending_response(
     {
         return Err(invalid());
     }
-    Ok(wire.pending_checkpoint_digest)
+    Ok(wire.checkpoint_digest)
+}
+
+pub(crate) fn encode_activate_request(
+    proposal: &RebindProposal,
+    prior_checkpoint_digest: &str,
+    pending_checkpoint_digest: &str,
+    fresh_nonce: &str,
+) -> Result<Vec<u8>, PodError> {
+    digest(pending_checkpoint_digest)?;
+    let prepare: PrepareWire = serde_json::from_slice(&encode_request(
+        proposal,
+        prior_checkpoint_digest,
+        fresh_nonce,
+    )?)
+    .map_err(|_| invalid())?;
+    let bytes = serde_json::to_vec(&ActivateWire {
+        protocol: ACTIVATE_PROTOCOL.into(),
+        operation: "rebind.activate".into(),
+        nonce: fresh_nonce.into(),
+        prepare,
+        pending_checkpoint_digest: pending_checkpoint_digest.into(),
+    })
+    .map_err(|_| invalid())?;
+    if decode_activate_request(&bytes)?.proposal != *proposal {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_activate_request(bytes: &[u8]) -> Result<DecodedActivate, PodError> {
+    if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
+        return Err(invalid());
+    }
+    let wire: ActivateWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    if wire.protocol != ACTIVATE_PROTOCOL || wire.operation != "rebind.activate" {
+        return Err(invalid());
+    }
+    nonce(&wire.nonce)?;
+    digest(&wire.pending_checkpoint_digest)?;
+    let decoded = convert(wire.prepare)?;
+    if decoded.nonce != wire.nonce {
+        return Err(invalid());
+    }
+    Ok(DecodedActivate {
+        proposal: decoded.proposal,
+        prior_checkpoint_digest: decoded.prior_checkpoint_digest,
+        pending_checkpoint_digest: wire.pending_checkpoint_digest,
+        nonce: wire.nonce,
+    })
+}
+
+pub(crate) fn encode_active_response(
+    identity: &PodFenceIdentity,
+    echoed_nonce: &str,
+    active_checkpoint_digest: &str,
+) -> Result<Vec<u8>, PodError> {
+    let wire = PrepareResponseWire {
+        protocol: ACTIVATE_PROTOCOL.into(),
+        nonce: echoed_nonce.into(),
+        scope_id: identity.scope_id.as_str().into(),
+        pod_id: identity.pod_id.as_str().into(),
+        attempt_id: identity.attempt_id.as_str().into(),
+        incarnation: identity.incarnation.get(),
+        store_lineage: identity.store_lineage.as_str().into(),
+        phase: "active".into(),
+        checkpoint_digest: active_checkpoint_digest.into(),
+    };
+    let bytes = serde_json::to_vec(&wire).map_err(|_| invalid())?;
+    decode_active_response(&bytes, identity, echoed_nonce)?;
+    Ok(bytes)
+}
+
+pub(crate) fn decode_active_response(
+    bytes: &[u8],
+    expected: &PodFenceIdentity,
+    expected_nonce: &str,
+) -> Result<String, PodError> {
+    if bytes.is_empty() || bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(invalid());
+    }
+    nonce(expected_nonce)?;
+    let wire: PrepareResponseWire = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    digest(&wire.checkpoint_digest)?;
+    if wire.protocol != ACTIVATE_PROTOCOL
+        || wire.phase != "active"
+        || wire.nonce != expected_nonce
+        || wire.scope_id != expected.scope_id.as_str()
+        || wire.pod_id != expected.pod_id.as_str()
+        || wire.attempt_id != expected.attempt_id.as_str()
+        || wire.incarnation != expected.incarnation.get()
+        || wire.store_lineage != expected.store_lineage.as_str()
+    {
+        return Err(invalid());
+    }
+    Ok(wire.checkpoint_digest)
 }
 
 #[cfg(test)]
@@ -417,6 +531,17 @@ mod tests {
             "d".repeat(64)
         );
         assert!(decode_pending_response(&response, &proposal.identity, &"e".repeat(64)).is_err());
+        let activate = encode_activate_request(&proposal, &prior, &"d".repeat(64), &nonce).unwrap();
+        let decoded_activate = decode_activate_request(&activate).unwrap();
+        assert_eq!(decoded_activate.proposal, proposal);
+        assert_eq!(decoded_activate.prior_checkpoint_digest, prior);
+        assert_eq!(decoded_activate.pending_checkpoint_digest, "d".repeat(64));
+        let active = encode_active_response(&proposal.identity, &nonce, &"f".repeat(64)).unwrap();
+        assert_eq!(
+            decode_active_response(&active, &proposal.identity, &nonce).unwrap(),
+            "f".repeat(64)
+        );
+        assert!(decode_active_response(&active, &proposal.identity, &"e".repeat(64)).is_err());
     }
 
     #[test]

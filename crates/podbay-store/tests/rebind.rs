@@ -671,6 +671,55 @@ fn proof_bearing_pending_duplicate_refuses_after_destination_owner_changes() {
 }
 
 #[test]
+fn proof_bearing_pending_pod_digest_ack_and_activation_are_exact_and_recoverable() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    let pending = store
+        .prepare_manager_rebind_from_host_observation(&proposal, &observed)
+        .unwrap();
+    let ledger = SqlitePriorObservedPendingLedger::for_pod(&fixture.database, observed.clone());
+    assert_eq!(pending.phase, DurableRebindPhase::Pending);
+    assert!(ledger.pending(&proposal));
+    assert!(!ledger.activated(&proposal));
+    let digest = "d".repeat(64);
+    let acknowledged = store
+        .acknowledge_prior_observed_pod_rebind(&proposal, &digest)
+        .unwrap();
+    assert_eq!(acknowledged.phase, DurableRebindPhase::PodAcknowledged);
+    assert_eq!(
+        acknowledged.pod_checkpoint_ref.as_deref(),
+        Some(digest.as_str())
+    );
+    assert!(ledger.pending(&proposal));
+    assert!(!ledger.activated(&proposal));
+    assert_eq!(
+        store
+            .acknowledge_prior_observed_pod_rebind(&proposal, &digest)
+            .unwrap(),
+        acknowledged
+    );
+    assert!(matches!(
+        store.acknowledge_prior_observed_pod_rebind(&proposal, &"e".repeat(64)),
+        Err(StoreError::Conflict(_))
+    ));
+    let activated = store
+        .activate_prior_observed_manager_rebind(&proposal, &digest)
+        .unwrap();
+    assert_eq!(activated.phase, DurableRebindPhase::Activated);
+    assert!(!ledger.pending(&proposal));
+    assert!(ledger.activated(&proposal));
+    drop(store);
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .activate_prior_observed_manager_rebind(&proposal, &digest)
+            .unwrap(),
+        activated
+    );
+}
+
+#[test]
 fn proof_bearing_new_key_refuses_stale_destination_and_unregistered_manager_peer() {
     let fixture = Fixture::new();
     let mut store = fixture.open();

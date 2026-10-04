@@ -340,6 +340,7 @@ impl PodBayStore {
             proposal,
             pod_checkpoint_ref,
             DurableRebindPhase::PodAcknowledged,
+            false,
         )
     }
 
@@ -355,6 +356,41 @@ impl PodBayStore {
             proposal,
             pod_checkpoint_ref,
             DurableRebindPhase::Activated,
+            false,
+        )
+    }
+
+    /// Trusted host only: record the exact fsynced PendingPod checkpoint
+    /// reported by the live, OS-attested pod. The store validates the prior
+    /// observation and current destination, but cannot attest the socket.
+    pub fn acknowledge_prior_observed_pod_rebind(
+        &mut self,
+        proposal: &RebindProposal,
+        pending_checkpoint_digest: &str,
+    ) -> Result<DurableRebindReceipt, StoreError> {
+        transition(
+            self,
+            proposal,
+            pending_checkpoint_digest,
+            DurableRebindPhase::PodAcknowledged,
+            true,
+        )
+    }
+
+    /// Trusted host only: after the PendingPod fsync is acknowledged, commit
+    /// the destination before asking the pod to activate. A lost pod reply
+    /// leaves an explicit Activated-store/Pending-pod reconciliation state.
+    pub fn activate_prior_observed_manager_rebind(
+        &mut self,
+        proposal: &RebindProposal,
+        pending_checkpoint_digest: &str,
+    ) -> Result<DurableRebindReceipt, StoreError> {
+        transition(
+            self,
+            proposal,
+            pending_checkpoint_digest,
+            DurableRebindPhase::Activated,
+            true,
         )
     }
 }
@@ -364,8 +400,11 @@ fn transition(
     proposal: &RebindProposal,
     checkpoint: &str,
     target: DurableRebindPhase,
+    proof_bearing: bool,
 ) -> Result<DurableRebindReceipt, StoreError> {
-    validate_shape(proposal)?;
+    if !proof_bearing {
+        validate_shape(proposal)?;
+    }
     if checkpoint.is_empty() || checkpoint.len() > 256 || checkpoint.chars().any(char::is_control) {
         return Err(StoreError::InvalidInput(
             "pod checkpoint reference is invalid",
@@ -380,10 +419,21 @@ fn transition(
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (rowid, prior) = load_by_key(&transaction, proposal)?.ok_or(StoreError::NotFound)?;
     verify_stored(&transaction, rowid, proposal, &lineage)?;
-    if prior_observation_exists(&transaction, rowid)? {
-        return Err(StoreError::Conflict(
-            "proof-bearing rebind awaits pod digest check",
-        ));
+    if prior_observation_exists(&transaction, rowid)? != proof_bearing {
+        return Err(StoreError::Conflict("rebind transition proof mode differs"));
+    }
+    if proof_bearing {
+        if checkpoint.len() != 64
+            || !checkpoint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError::InvalidInput(
+                "pending checkpoint digest is invalid",
+            ));
+        }
+        verify_current_fences_with_mode(&transaction, proposal, &lineage, true)?;
+        verify_current_manager_destination(&transaction, proposal, &lineage)?;
     }
     if prior.phase == target {
         if prior.pod_checkpoint_ref.as_deref() != Some(checkpoint) {
@@ -408,7 +458,9 @@ fn transition(
     {
         return Err(StoreError::Conflict("rebind phase or checkpoint differs"));
     }
-    verify_current_fences(&transaction, proposal, &lineage)?;
+    if !proof_bearing {
+        verify_current_fences(&transaction, proposal, &lineage)?;
+    }
     let phase = phase_text(target);
     let changed = transaction.execute(
         "UPDATE manager_rebinds SET phase=?1,pod_checkpoint_ref=?2
@@ -1019,7 +1071,7 @@ impl SqlitePriorObservedPendingLedger {
         }
     }
 
-    fn fresh_pending(&self, proposal: &RebindProposal) -> Option<bool> {
+    fn fresh_phase(&self, proposal: &RebindProposal, activated: bool) -> Option<bool> {
         // Includes exact identity and old vector equality, Active-only prior,
         // strict destination advancement, complete key set and SQLite bounds.
         validate_host_observation(proposal, &self.prior).ok()?;
@@ -1032,14 +1084,22 @@ impl SqlitePriorObservedPendingLedger {
             .ok()?;
         let lineage = self.prior.identity.store_lineage.as_str();
         let (rowid, receipt) = load_by_key(&transaction, proposal).ok()??;
-        let valid_phase = match (receipt.phase, receipt.pod_checkpoint_ref.as_deref()) {
-            (DurableRebindPhase::Pending, None) => true,
-            (DurableRebindPhase::PodAcknowledged, Some(reference)) => {
-                !reference.is_empty()
-                    && reference.len() <= 256
-                    && !reference.chars().any(char::is_control)
-            }
-            _ => false,
+        let valid_reference = receipt
+            .pod_checkpoint_ref
+            .as_deref()
+            .is_some_and(|reference| {
+                reference.len() == 64
+                    && reference
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        let valid_phase = if activated {
+            receipt.phase == DurableRebindPhase::Activated && valid_reference
+        } else {
+            matches!(
+                (receipt.phase, receipt.pod_checkpoint_ref.as_deref()),
+                (DurableRebindPhase::Pending, None)
+            ) || (receipt.phase == DurableRebindPhase::PodAcknowledged && valid_reference)
         };
         if !valid_phase {
             return Some(false);
@@ -1058,11 +1118,10 @@ impl SqlitePriorObservedPendingLedger {
 
 impl RebindLedger for SqlitePriorObservedPendingLedger {
     fn pending(&self, proposal: &RebindProposal) -> bool {
-        self.fresh_pending(proposal).unwrap_or(false)
+        self.fresh_phase(proposal, false).unwrap_or(false)
     }
 
-    fn activated(&self, _proposal: &RebindProposal) -> bool {
-        // The proof-bearing activation protocol is a separate, unopened gate.
-        false
+    fn activated(&self, proposal: &RebindProposal) -> bool {
+        self.fresh_phase(proposal, true).unwrap_or(false)
     }
 }

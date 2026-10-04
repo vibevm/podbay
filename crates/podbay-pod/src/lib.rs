@@ -16,7 +16,7 @@ mod manifest;
 mod native_events;
 mod peer_checkpoint;
 mod ports;
-#[cfg(all(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 mod rebind_protocol;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -72,7 +72,8 @@ pub use ports::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    LinuxBackend, PodClient, RebindInspection, TerminalViewer, launch, launch_bound, serve,
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
+    launch, launch_bound, serve,
 };
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,

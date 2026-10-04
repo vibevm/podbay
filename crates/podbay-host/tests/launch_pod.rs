@@ -20,11 +20,11 @@ use podbay_host::{
     DurableAuthority, DurableAuthorityError, ExecutionMode, GrantId, GrantMode, GrantSpec,
     GuardSet, HostAction, HostDispatchPort, HostError, HostRequest, LaunchPodError,
     LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
-    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, RebindContextError,
-    RegisteredLaunchProfile, ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch,
-    ResolvedNativeLaunch, Right, Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate,
-    TrustedLaunchProfileInput, TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
-    WorkspaceAccess, WorkspaceSelection,
+    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, PreparedCodexV2Rebind,
+    RebindCompletionStage, RebindContextError, RegisteredLaunchProfile, ResolvedClaimedBootstrap,
+    ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target, TrustedBootstrapSendPolicy,
+    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
+    TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
     BoundLaunchFormat, DurableRebindPhase, EffectClaim, EffectState, HostObservedPriorCheckpoint,
@@ -271,6 +271,35 @@ impl HostDispatchPort for FakeLaunchPort {
             303,
             self.rebind_birth.load(Ordering::SeqCst) as u64,
         )
+    }
+
+    fn prepare_existing_codex_v2_rebind(
+        &self,
+        _: &PreparedCodexV2Rebind,
+    ) -> Result<String, HostError> {
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == Mode::Refused as u8 {
+            Err(HostError::StaleGuard)
+        } else {
+            Ok("d".repeat(64))
+        }
+    }
+
+    fn activate_existing_codex_v2_rebind(
+        &self,
+        _: &PreparedCodexV2Rebind,
+        digest: &str,
+    ) -> Result<String, HostError> {
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(digest, "d".repeat(64));
+        if self.mode.load(Ordering::SeqCst) == Mode::LostReply as u8 {
+            Err(HostError::UncertainAfterPossibleEffect {
+                command_key: "rebind.fixture".into(),
+                receipt_ref: None,
+            })
+        } else {
+            Ok("e".repeat(64))
+        }
     }
 
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
@@ -3919,6 +3948,48 @@ fn v2_rebind_prepare_refuses_wrong_descriptor_peer_and_stale_manager() {
             );
         }
     }
+}
+
+#[test]
+fn v2_rebind_completion_keeps_store_activated_unconfirmed_until_exact_retry() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::LostReply);
+    let mut host = restarted_codex_v2_rebind_host(&fixture, &who, port.codex_v2());
+    let uncertain = host
+        .complete_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.complete")
+        .unwrap();
+    assert_eq!(uncertain.durable.phase, DurableRebindPhase::Activated);
+    assert_eq!(
+        uncertain.stage,
+        RebindCompletionStage::StoreActivatedPodUnconfirmed
+    );
+    assert_eq!(
+        uncertain.pending_checkpoint_digest.as_deref(),
+        Some("d".repeat(64).as_str())
+    );
+    assert!(uncertain.active_checkpoint_digest.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+
+    host.port()
+        .mode
+        .store(Mode::Accepted as u8, Ordering::SeqCst);
+    let completed = host
+        .complete_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.complete")
+        .unwrap();
+    assert_eq!(completed.durable, uncertain.durable);
+    assert_eq!(completed.stage, RebindCompletionStage::PodActive);
+    assert_eq!(
+        completed.active_checkpoint_digest.as_deref(),
+        Some("e".repeat(64).as_str())
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "retry must not reinspect or relaunch"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
 }
 
 #[test]

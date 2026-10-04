@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use podbay_core::{
     AttemptId, AttestedPeer, CommandId, CredentialEpoch, FenceOperation, FenceTarget, GrantKind, InputEpoch,
-    OwnerEpoch, OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest, PodFenceCheckpoint,
-    PodFenceIdentity, PodId, PodPeerFence, RebindPhase, ResourceId, ScopeId, StoreLineageId,
+    ManagerLiveness, OwnerEpoch, OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest,
+    PodFenceCheckpoint,
+    PodFenceIdentity, PodId, PodPeerFence, RebindLedger, RebindPhase, RebindProposal, ResourceId, ScopeId,
+    StoreLineageId,
 };
 use podbay_store::{
-    BootstrapSendSelector, BoundLaunchFormat, BoundLaunchRecord, NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness,
-    SqliteOwnerEpochWitness,
+    BootstrapSendSelector, BoundLaunchFormat, BoundLaunchRecord, HostObservedPriorCheckpoint,
+    NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
+    SqlitePriorObservedPendingLedger,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole};
 use serde::{Deserialize, Serialize};
@@ -43,6 +46,10 @@ use crate::peer_checkpoint::{
 use crate::ports::{
     DurableAppendLog, DurableFileIdentity, DurableFiles, LocalControlTransport, PodControlPort,
     PodObservation, SupervisorBackend, TerminalBackend, TerminalResource, TerminalViewerPort,
+};
+use crate::rebind_protocol::{
+    decode_activate_request, decode_active_response, decode_pending_response, decode_request,
+    encode_activate_request, encode_active_response, encode_pending_response, encode_request,
 };
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
@@ -165,6 +172,30 @@ fn inspect_allowed(
             request.credential_epoch,
             observed_peer,
         )
+}
+
+fn persist_pending_rebind_checkpoint(
+    fence: &mut PodPeerFence,
+    proposal: &RebindProposal,
+    peer: &AttestedPeer,
+    old_liveness: ManagerLiveness,
+    witness: &impl OwnerEpochWitness,
+    ledger: &impl RebindLedger,
+    now_ms: u64,
+    mut persist: impl FnMut(&PodFenceCheckpoint) -> Result<String, PodError>,
+) -> Result<String, PodError> {
+    fence.prepare_rebind(
+        proposal.clone(), peer, old_liveness, witness, ledger, now_ms,
+    ).map_err(|_| PodError::Refused("V2 rebind fence refused prepare"))?;
+    if fence.phase() == RebindPhase::PendingStore {
+        persist(&fence.checkpoint())?;
+        fence.confirm_pod_bound(proposal, peer, witness, ledger)
+            .map_err(|_| PodError::Refused("V2 rebind fence refused Pod binding"))?;
+    }
+    if fence.phase() != RebindPhase::PendingPod {
+        return Err(PodError::Refused("V2 rebind did not reach PendingPod"));
+    }
+    persist(&fence.checkpoint())
 }
 
 enum ChildResource {
@@ -721,6 +752,74 @@ impl PodClient {
         Ok(response)
     }
 
+    /// A trusted manager sends only the exact already-Pending proposal; the
+    /// pod authenticates this connection's OS peer and checks the durable
+    /// proof itself before changing its fence. No old manifest bearer enters.
+    pub fn prepare_rebind(
+        manifest_path: impl AsRef<Path>,
+        proposal: &RebindProposal,
+        prior_checkpoint_digest: &str,
+    ) -> Result<String, PodError> {
+        let manifest = read_manifest(manifest_path.as_ref())?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "unbound rebind prepare is unavailable",
+        ))?;
+        if bound_identity(&manifest.descriptor, binding)? != proposal.identity {
+            return Err(PodError::Refused("rebind prepare Pod identity differs"));
+        }
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let request = encode_request(proposal, prior_checkpoint_digest, &nonce)?;
+        let (response, peer) = inspect_exchange(&manifest.socket_path, &request)
+            .map_err(|_| PodError::Uncertain("rebind prepare reply lost after possible fsync"))?;
+        if !unit_cgroup_exact(peer.cgroup(), &manifest.unit_name)
+            || peer.attested_peer().os_identity() != binding.manager_os_identity
+            || peer.attested_peer().boot_identity() != binding.manager_boot_identity
+        {
+            return Err(PodError::Uncertain("rebind prepare server identity differs"));
+        }
+        decode_pending_response(&response, &proposal.identity, &nonce)
+            .map_err(|_| PodError::Uncertain("rebind prepare reply is not an exact PendingPod proof"))
+    }
+
+    /// The store must already have committed Activated for this exact
+    /// PendingPod checkpoint. A lost reply remains uncertain, never a claim
+    /// that ordinary control resumed.
+    pub fn activate_rebind(
+        manifest_path: impl AsRef<Path>,
+        proposal: &RebindProposal,
+        prior_checkpoint_digest: &str,
+        pending_checkpoint_digest: &str,
+    ) -> Result<String, PodError> {
+        let manifest = read_manifest(manifest_path.as_ref())?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "unbound rebind activation is unavailable",
+        ))?;
+        if bound_identity(&manifest.descriptor, binding)? != proposal.identity {
+            return Err(PodError::Refused("rebind activation Pod identity differs"));
+        }
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let request = encode_activate_request(
+            proposal,
+            prior_checkpoint_digest,
+            pending_checkpoint_digest,
+            &nonce,
+        )?;
+        let (response, peer) = inspect_exchange(&manifest.socket_path, &request)
+            .map_err(|_| PodError::Uncertain("rebind activation reply lost after possible fsync"))?;
+        if !unit_cgroup_exact(peer.cgroup(), &manifest.unit_name)
+            || peer.attested_peer().os_identity() != binding.manager_os_identity
+            || peer.attested_peer().boot_identity() != binding.manager_boot_identity
+        {
+            return Err(PodError::Uncertain("rebind activation server identity differs"));
+        }
+        decode_active_response(&response, &proposal.identity, &nonce)
+            .map_err(|_| PodError::Uncertain("rebind activation reply is not an exact Active proof"))
+    }
+
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, PodError> {
         let path = path.as_ref();
         let manifest = read_manifest(path)?;
@@ -834,9 +933,7 @@ impl PodClient {
         target: &NativeWriterTarget,
         writer_epoch: u64,
     ) -> Result<BootstrapControlReceipt, PodError> {
-        let binding = self.manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
-            "Codex bootstrap requires a peer binding",
-        ))?;
+        let binding = active_codex_v2_binding(&self.manifest)?;
         if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY {
             return Err(PodError::Unsupported("Codex bootstrap requires V2"));
         }
@@ -846,7 +943,7 @@ impl PodClient {
             native_target: target.clone(),
         };
         let request = BootstrapControlRequest::from_selector(&selector, writer_epoch, &self.manifest.token);
-        request.checked_selector(binding, &self.manifest.descriptor)?;
+        request.checked_selector(&binding, &self.manifest.descriptor)?;
         let bytes = serde_json::to_vec(&request)?;
         if bytes.len() as u64 > FRAME_LIMIT {
             return Err(PodError::Invalid("bootstrap request exceeds frame bound"));
@@ -936,9 +1033,7 @@ impl PodClient {
         target: &NativeWriterTarget,
         writer_epoch: u64,
     ) -> Result<BootstrapControlReceipt, PodError> {
-        let binding = self.manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
-            "Codex bootstrap inspection requires a peer binding",
-        ))?;
+        let binding = active_codex_v2_binding(&self.manifest)?;
         if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY {
             return Err(PodError::Unsupported("Codex bootstrap inspection requires V2"));
         }
@@ -948,7 +1043,7 @@ impl PodClient {
             native_target: target.clone(),
         };
         let request = BootstrapControlRequest::for_inspection(&selector, writer_epoch, &self.manifest.token);
-        request.checked_inspection_selector(binding, &self.manifest.descriptor)?;
+        request.checked_inspection_selector(&binding, &self.manifest.descriptor)?;
         let bytes = serde_json::to_vec(&request)?;
         if bytes.len() as u64 > FRAME_LIMIT {
             return Err(PodError::Invalid("bootstrap inspection request exceeds frame bound"));
@@ -1594,6 +1689,93 @@ fn current_codex_v2_binding(
     Ok(())
 }
 
+/// Immutable manifest bytes still identify the original launch. Only the
+/// current manager peer/epochs are projected from this pod's fsynced Active
+/// checkpoint plus the exact Activated store row. This is a read-only view,
+/// never a replacement manifest or an authority claim from JSON.
+fn active_codex_v2_binding(manifest: &PodManifest) -> Result<BoundPeerManifest, PodError> {
+    let original = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+        "Codex V2 manifest binding is absent"))?;
+    if original.protocol != PEER_BINDING_V2_PROTOCOL
+        || original.capability != CODEX_V2_CAPABILITY
+    {
+        return Err(PodError::Unsupported("current Codex V2 binding unavailable"));
+    }
+    let identity = bound_identity(&manifest.descriptor, original)?;
+    let directory = manifest.socket_path.parent().ok_or(PodError::Invalid(
+        "Codex V2 socket parent is absent"))?;
+    let observed = read_peer_checkpoint_observation(directory, &identity)
+        .map_err(|_| PodError::Refused("current Codex V2 checkpoint unavailable"))?;
+    let checkpoint = observed.checkpoint();
+    if checkpoint.phase() != RebindPhase::Active {
+        return Err(PodError::Refused("Codex V2 checkpoint is not Active"));
+    }
+    let Some(proposal) = checkpoint.last_rebind() else {
+        if checkpoint.owner_epoch().get() != original.owner_epoch
+            || checkpoint.credential_epoch().get() != original.credential_epoch
+            || checkpoint.manager_peer() != &original.manager_peer()?
+            || checkpoint.input_epochs().iter().map(|(id, epoch)| {
+                (id.as_str().to_owned(), epoch.get())
+            }).collect::<BTreeMap<_, _>>() != original.resource_input_epochs
+        {
+            return Err(PodError::Refused("initial Codex V2 checkpoint differs"));
+        }
+        current_codex_v2_binding(original, &manifest.descriptor)?;
+        return Ok(original.clone());
+    };
+    if proposal.identity != identity
+        || checkpoint.manager_peer() != &proposal.next_manager
+        || checkpoint.owner_epoch() != proposal.next_owner_epoch
+        || checkpoint.credential_epoch() != proposal.next_credential_epoch
+        || checkpoint.input_epochs() != &proposal.next_input_epochs
+    {
+        return Err(PodError::Refused("Activated Codex V2 checkpoint differs"));
+    }
+    let mut store = PodBayStore::open_existing_read_only(&original.store_path)
+        .map_err(|_| PodError::Refused("Activated Codex V2 store unavailable"))?;
+    let row = store.lookup_prior_observed_rebind(proposal)
+        .map_err(|_| PodError::Refused("Activated Codex V2 rebind proof unavailable"))?
+        .ok_or(PodError::Refused("Activated Codex V2 rebind row absent"))?;
+    let current = store.current_bound_pod_snapshot(
+        &manifest.descriptor.scope_id, &manifest.descriptor.pod_id,
+    ).map_err(|_| PodError::Refused("Activated Codex V2 target changed"))?;
+    let claim = store.current_manager_credential_claim(proposal.next_owner_epoch.get())
+        .map_err(|_| PodError::Refused("Activated Codex V2 manager claim changed"))?;
+    if row.receipt.phase != podbay_store::DurableRebindPhase::Activated
+        || row.receipt.pod_checkpoint_ref.is_none()
+        || claim.store_lineage() != identity.store_lineage.as_str()
+        || claim.credential_epoch() != proposal.next_credential_epoch.get()
+        || !store.current_manager_peer_matches(&claim, checkpoint.manager_peer())
+            .map_err(|_| PodError::Refused("Activated Codex V2 manager peer unavailable"))?
+        || current.launch().descriptor != original.wire_descriptor
+        || current.launch().effective_spec != original.effective_spec
+    {
+        return Err(PodError::Refused("Activated Codex V2 binding is stale"));
+    }
+    let mut live = original.clone();
+    live.owner_epoch = checkpoint.owner_epoch().get();
+    live.credential_epoch = checkpoint.credential_epoch().get();
+    live.authority_revision = Some(current.authority_revision());
+    live.resource_input_epochs = checkpoint.input_epochs().iter().map(|(id, epoch)| {
+        (id.as_str().to_owned(), epoch.get())
+    }).collect();
+    live.manager_os_identity = checkpoint.manager_peer().os_identity().into();
+    live.manager_process_id = checkpoint.manager_peer().native_process_id().into();
+    live.manager_boot_identity = checkpoint.manager_peer().boot_identity().into();
+    live.manager_birth_identity = checkpoint.manager_peer().birth_identity().into();
+    live.manager_containment = checkpoint.manager_peer().containment_identity().into();
+    live.binding_digest = live.digest()?;
+    current_codex_v2_binding(&live, &manifest.descriptor)?;
+    Ok(live)
+}
+
+/// Read-only dynamic manager projection for a trusted port. It grants no
+/// control by itself; socket peer and current manager must still be checked.
+pub fn current_bound_peer_binding(manifest_path: impl AsRef<Path>) -> Result<BoundPeerManifest, PodError> {
+    let manifest = read_manifest(manifest_path.as_ref())?;
+    active_codex_v2_binding(&manifest)
+}
+
 fn renew_and_authorize_manager_pod_control(
     fence: &mut PodPeerFence,
     peer: &AttestedPeer,
@@ -1650,10 +1832,10 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         }
     };
     let identity = bound_identity(&manifest.descriptor, binding)?;
-    let manager_peer = binding.manager_peer()?;
-    let owner_epoch =
+    let mut manager_peer = binding.manager_peer()?;
+    let mut owner_epoch =
         OwnerEpoch::new(binding.owner_epoch).map_err(|_| PodError::Invalid("bound owner epoch"))?;
-    let credential_epoch = CredentialEpoch::new(binding.credential_epoch)
+    let mut credential_epoch = CredentialEpoch::new(binding.credential_epoch)
         .map_err(|_| PodError::Invalid("bound credential epoch"))?;
     let mut inputs = BTreeMap::new();
     for (id, epoch) in &binding.resource_input_epochs {
@@ -1801,6 +1983,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         listener.set_nonblocking(true)?;
     }
     let mut native_pump_available = codex_pump;
+    let mut prior_rebind_observation: Option<HostObservedPriorCheckpoint> = None;
     loop {
         // One native frame before each accept keeps control traffic from
         // starving completion observation. An idle tick does constant work.
@@ -1808,7 +1991,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             match &mut child {
                 ChildResource::Codex(resource) => {
                     let tick = resource.poll_bootstrap_notification_once(|| {
-                        current_codex_v2_binding(binding, descriptor)?;
+                        let live = active_codex_v2_binding(&manifest)?;
+                        current_codex_v2_binding(&live, descriptor)?;
                         if !manager_witness.matches_current(
                             owner_epoch.get(), credential_epoch.get(), &manager_peer,
                         ) {
@@ -1973,6 +2157,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && read.protocol == CODEX_NATIVE_EVENTS_READ_PROTOCOL
             {
                 let result = (|| -> Result<NativeEventRead, PodError> {
+                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let binding = &live_binding;
                     if read.operation != "codex.events.read"
                         || binding.protocol != PEER_BINDING_V2_PROTOCOL
                         || binding.capability != CODEX_V2_CAPABILITY
@@ -2022,10 +2208,236 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 return Ok(false);
             }
             if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(prepare) = decode_request(&bytes)
+            {
+                let result = (|| -> Result<String, PodError> {
+                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                        || prepare.proposal.identity != identity
+                    {
+                        return Err(PodError::Refused("V2 rebind prepare identity differs"));
+                    }
+                    let peer = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "V2 rebind manager OS peer unavailable"))?;
+                    if peer.attested_peer() != &prepare.proposal.next_manager
+                        || peer.recheck_before_effect(&stream, &prepare.proposal.next_manager).is_err()
+                        || !manager_witness.matches_current(
+                            prepare.proposal.next_owner_epoch.get(),
+                            prepare.proposal.next_credential_epoch.get(),
+                            &prepare.proposal.next_manager,
+                        )
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                        || crate::runtime::cgroup_path().ok().as_deref() != Some(cgroup_path.as_str())
+                    {
+                        return Err(PodError::Refused("V2 rebind manager or child changed"));
+                    }
+                    let directory = manifest_path.as_ref().parent().ok_or(PodError::Invalid(
+                        "V2 rebind checkpoint directory"))?;
+                    let durable = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Refused("V2 rebind checkpoint unavailable"))?;
+                    let prior = if fence.phase() == RebindPhase::Active {
+                        if durable.checkpoint() != &fence.checkpoint()
+                            || durable.digest() != prepare.prior_checkpoint_digest
+                        {
+                            return Err(PodError::Refused("V2 prior Active checkpoint differs"));
+                        }
+                        let checkpoint = durable.checkpoint();
+                        let observed = HostObservedPriorCheckpoint {
+                            identity: identity.clone(),
+                            phase: RebindPhase::Active,
+                            owner_epoch: checkpoint.owner_epoch(),
+                            credential_epoch: checkpoint.credential_epoch(),
+                            input_epochs: checkpoint.input_epochs().clone(),
+                            checkpoint_digest: durable.digest().into(),
+                            supervisor_pid: std::process::id(),
+                            supervisor_start_ticks: start_ticks(std::process::id())?,
+                            boot_id: boot_id.clone(),
+                            unit_name: manifest.unit_name.clone(),
+                            cgroup_path: cgroup_path.clone(),
+                        };
+                        prior_rebind_observation = Some(observed.clone());
+                        observed
+                    } else {
+                        let cached = prior_rebind_observation.as_ref().ok_or(PodError::Refused(
+                            "V2 prior checkpoint proof was lost"))?;
+                        if cached.checkpoint_digest != prepare.prior_checkpoint_digest
+                            || fence.checkpoint().pending_rebind() != Some(&prepare.proposal)
+                            || (durable.checkpoint() != &fence.checkpoint()
+                                && !(fence.phase() == RebindPhase::PendingStore
+                                    && durable.checkpoint().phase() == RebindPhase::Active
+                                    && durable.digest() == cached.checkpoint_digest)
+                                && !(fence.phase() == RebindPhase::PendingPod
+                                    && durable.checkpoint().phase() == RebindPhase::PendingStore
+                                    && durable.checkpoint().pending_rebind()
+                                        == Some(&prepare.proposal)))
+                        {
+                            return Err(PodError::Refused("V2 Pending checkpoint differs"));
+                        }
+                        cached.clone()
+                    };
+                    let ledger = SqlitePriorObservedPendingLedger::for_pod(
+                        &binding.store_path, prior);
+                    let now = u64::try_from(fence_clock.elapsed().as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1);
+                    let old_liveness = LinuxPeerEvidence::probe_pinned_manager(
+                        fence.checkpoint().manager_peer());
+                    let pending_digest = persist_pending_rebind_checkpoint(
+                        &mut fence, &prepare.proposal, peer.attested_peer(),
+                        old_liveness, &witness, &ledger, now,
+                        |checkpoint| {
+                            write_peer_checkpoint(directory, &identity, checkpoint)
+                                .map_err(|_| PodError::Uncertain("V2 Pending checkpoint fsync unknown"))?;
+                            let observed = read_peer_checkpoint_observation(directory, &identity)
+                                .map_err(|_| PodError::Uncertain("V2 Pending checkpoint readback unavailable"))?;
+                            if observed.checkpoint() != checkpoint {
+                                return Err(PodError::Uncertain("V2 Pending checkpoint readback differs"));
+                            }
+                            Ok(observed.digest().into())
+                        },
+                    )?;
+                    let pending = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Uncertain("V2 PendingPod readback unavailable"))?;
+                    if fence.phase() != RebindPhase::PendingPod
+                        || pending.checkpoint() != &fence.checkpoint()
+                        || pending.digest() != pending_digest
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                        || peer.recheck_before_effect(&stream, &prepare.proposal.next_manager).is_err()
+                        || !ledger.pending(&prepare.proposal)
+                    {
+                        return Err(PodError::Uncertain("V2 PendingPod proof changed"));
+                    }
+                    Ok(pending_digest)
+                })();
+                match result {
+                    Ok(digest) => stream.write_all(&encode_pending_response(
+                        &identity, &prepare.nonce, &digest,
+                    )?)?,
+                    Err(_) => respond(&mut stream, Response {
+                        ok: false, status: None, error: Some("rebind prepare refused or uncertain".into()),
+                        error_code: Some("uncertain".into()), terminal: None,
+                    })?,
+                }
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(activate) = decode_activate_request(&bytes)
+            {
+                let result = (|| -> Result<String, PodError> {
+                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                        || activate.proposal.identity != identity
+                    {
+                        return Err(PodError::Refused("V2 rebind activation identity differs"));
+                    }
+                    let peer = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "V2 activation manager OS peer unavailable"))?;
+                    if peer.attested_peer() != &activate.proposal.next_manager
+                        || peer.recheck_before_effect(&stream, &activate.proposal.next_manager).is_err()
+                        || !manager_witness.matches_current(
+                            activate.proposal.next_owner_epoch.get(),
+                            activate.proposal.next_credential_epoch.get(),
+                            &activate.proposal.next_manager,
+                        )
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                    {
+                        return Err(PodError::Refused("V2 activation manager or child changed"));
+                    }
+                    let prior = prior_rebind_observation.as_ref().ok_or(PodError::Refused(
+                        "V2 prior checkpoint proof was lost"))?;
+                    if prior.checkpoint_digest != activate.prior_checkpoint_digest {
+                        return Err(PodError::Refused("V2 activation prior digest differs"));
+                    }
+                    let ledger = SqlitePriorObservedPendingLedger::for_pod(
+                        &binding.store_path, prior.clone());
+                    if !ledger.activated(&activate.proposal) {
+                        return Err(PodError::Refused("V2 activation store proof is absent"));
+                    }
+                    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                        .map_err(|_| PodError::Refused("V2 activation store unavailable"))?;
+                    let stored = store.lookup_prior_observed_rebind(&activate.proposal)
+                        .map_err(|_| PodError::Refused("V2 activation record unavailable"))?
+                        .ok_or(PodError::Refused("V2 activation record absent"))?;
+                    if stored.receipt.phase != podbay_store::DurableRebindPhase::Activated
+                        || stored.receipt.pod_checkpoint_ref.as_deref()
+                            != Some(activate.pending_checkpoint_digest.as_str())
+                    {
+                        return Err(PodError::Refused("V2 activation checkpoint ref differs"));
+                    }
+                    let directory = manifest_path.as_ref().parent().ok_or(PodError::Invalid(
+                        "V2 rebind checkpoint directory"))?;
+                    let durable = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Refused("V2 activation checkpoint unavailable"))?;
+                    if durable.checkpoint() != &fence.checkpoint()
+                        || (fence.phase() == RebindPhase::PendingPod
+                            && durable.digest() != activate.pending_checkpoint_digest)
+                        || (fence.phase() == RebindPhase::Active
+                            && fence.checkpoint().last_rebind() != Some(&activate.proposal))
+                    {
+                        return Err(PodError::Refused("V2 activation durable phase differs"));
+                    }
+                    fence.activate_rebind(
+                        &activate.proposal, peer.attested_peer(), &witness, &ledger,
+                    ).map_err(|_| PodError::Refused("V2 activation fence refused"))?;
+                    write_peer_checkpoint(directory, &identity, &fence.checkpoint())
+                        .map_err(|_| PodError::Uncertain("V2 Active checkpoint fsync unknown"))?;
+                    let active = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Uncertain("V2 Active readback unavailable"))?;
+                    if active.checkpoint() != &fence.checkpoint()
+                        || active.checkpoint().phase() != RebindPhase::Active
+                        || !ledger.activated(&activate.proposal)
+                        || peer.recheck_before_effect(&stream, &activate.proposal.next_manager).is_err()
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                    {
+                        return Err(PodError::Uncertain("V2 Active proof changed"));
+                    }
+                    let now = u64::try_from(fence_clock.elapsed().as_millis())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1);
+                    let manager_until = now.checked_add(30_000)
+                        .ok_or(PodError::Uncertain("V2 manager lease overflow"))?;
+                    let grant_until = now.checked_add(60_000)
+                        .ok_or(PodError::Uncertain("V2 Pod grant overflow"))?;
+                    fence.renew_manager_lease(peer.attested_peer(), &witness, now, manager_until)
+                        .map_err(|_| PodError::Uncertain("V2 manager lease unavailable"))?;
+                    let grant_id = PeerGrantId::try_from("grant.manager.pod.bootstrap").unwrap();
+                    let grant = PeerGrant::new(
+                        grant_id.clone(), peer.attested_peer().clone(), GrantKind::Controller,
+                        FenceTarget::Pod,
+                        BTreeSet::from([FenceOperation::ObservePod, FenceOperation::StopPod]),
+                        activate.proposal.next_owner_epoch,
+                        activate.proposal.next_credential_epoch,
+                        grant_until,
+                    ).map_err(|_| PodError::Uncertain("V2 manager Pod grant invalid"))?;
+                    if fence.install_grant(peer.attested_peer(), grant, &witness, now).is_err() {
+                        fence.renew_existing_manager_pod_control(
+                            peer.attested_peer(), &grant_id, &witness, now,
+                        ).map_err(|_| PodError::Uncertain("V2 manager Pod grant unavailable"))?;
+                    }
+                    manager_peer = activate.proposal.next_manager.clone();
+                    owner_epoch = activate.proposal.next_owner_epoch;
+                    credential_epoch = activate.proposal.next_credential_epoch;
+                    native_pump_available = codex_pump;
+                    Ok(active.digest().into())
+                })();
+                match result {
+                    Ok(digest) => stream.write_all(&encode_active_response(
+                        &identity, &activate.nonce, &digest,
+                    )?)?,
+                    Err(_) => respond(&mut stream, Response {
+                        ok: false, status: None, error: Some("rebind activation refused or uncertain".into()),
+                        error_code: Some("uncertain".into()), terminal: None,
+                    })?,
+                }
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
                 && let Ok(inspect) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
                 && inspect.protocol == CODEX_BOOTSTRAP_INSPECT_PROTOCOL
             {
                 let verified = (|| -> Result<_, PodError> {
+                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let binding = &live_binding;
                     if binding.protocol != PEER_BINDING_V2_PROTOCOL
                         || binding.capability != CODEX_V2_CAPABILITY
                         || !constant_time_equal(inspect.token.as_bytes(), manifest.token.as_bytes())
@@ -2059,10 +2471,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     {
                         return Err(PodError::Refused("bootstrap inspection proof differs"));
                     }
-                    Ok((selector, proof))
+                    Ok((selector, proof, live_binding))
                 })();
                 let reply = match verified {
-                    Ok((selector, proof)) => {
+                    Ok((selector, proof, live_binding)) => {
+                        let binding = &live_binding;
                         let stage = if let ChildResource::Codex(resource) = &mut child {
                             match resource.inspect_claimed_bootstrap(&proof) {
                                 Ok((stage, settlement)) => (stage, settlement),
@@ -2121,6 +2534,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && let Ok(bootstrap) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
             {
                 let verified = (|| -> Result<_, PodError> {
+                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let binding = &live_binding;
                     if binding.protocol != PEER_BINDING_V2_PROTOCOL
                         || binding.capability != CODEX_V2_CAPABILITY
                         || !constant_time_equal(bootstrap.token.as_bytes(), manifest.token.as_bytes())
@@ -2157,10 +2572,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     {
                         return Err(PodError::Refused("bootstrap writer proof differs"));
                     }
-                    Ok((selector, proof))
+                    Ok((selector, proof, live_binding))
                 })();
                 let reply = match verified {
-                    Ok((selector, proof)) => {
+                    Ok((selector, proof, live_binding)) => {
+                        let binding = &live_binding;
                         if let ChildResource::Codex(resource) = &mut child {
                             let original = proof.clone();
                             let recheck = || -> Result<(), PodError> {
@@ -2386,10 +2802,15 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 cgroup_path: cgroup_path.clone(),
                 child_running: !settled,
                 exit_code,
-                bound: manifest
-                    .peer_binding
-                    .as_ref()
-                    .map(|binding| binding.status(&descriptor.resource_id, &descriptor.scope_id)),
+                bound: if codex_pump {
+                    Some(active_codex_v2_binding(&manifest)?.status(
+                        &descriptor.resource_id, &descriptor.scope_id,
+                    ))
+                } else {
+                    manifest.peer_binding.as_ref().map(|binding| {
+                        binding.status(&descriptor.resource_id, &descriptor.scope_id)
+                    })
+                },
             };
             respond(
                 &mut stream,
@@ -2417,6 +2838,19 @@ fn attest(manifest: &PodManifest, status: &PodStatus) -> Result<(), PodError> {
             "legacy Linux pod status lacks supervisor start identity",
         ));
     }
+    let expected_bound = match manifest.peer_binding.as_ref() {
+        Some(binding) if binding.protocol == PEER_BINDING_V2_PROTOCOL => {
+            Some(active_codex_v2_binding(manifest)?.status(
+                &manifest.descriptor.resource_id,
+                &manifest.descriptor.scope_id,
+            ))
+        }
+        Some(binding) => Some(binding.status(
+            &manifest.descriptor.resource_id,
+            &manifest.descriptor.scope_id,
+        )),
+        None => None,
+    };
     if status.protocol != PROTOCOL
         || status.pod_id != manifest.descriptor.pod_id
         || status.attempt_id != manifest.descriptor.attempt_id
@@ -2428,12 +2862,7 @@ fn attest(manifest: &PodManifest, status: &PodStatus) -> Result<(), PodError> {
         || status.boot_id.is_empty()
         || status.unit_name != manifest.unit_name
         || !unit_cgroup_exact(&status.cgroup_path, &manifest.unit_name)
-        || manifest.peer_binding.as_ref().map(|binding| {
-            binding.status(
-                &manifest.descriptor.resource_id,
-                &manifest.descriptor.scope_id,
-            )
-        }) != status.bound
+        || expected_bound != status.bound
     {
         return Err(PodError::Invalid(
             "pod identity, process start, or cgroup attestation failed",
@@ -2527,6 +2956,69 @@ mod tests {
     use crate::manifest::PodRole;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct PendingFixtureLedger(RebindProposal);
+    impl RebindLedger for PendingFixtureLedger {
+        fn pending(&self, proposal: &RebindProposal) -> bool { &self.0 == proposal }
+        fn activated(&self, _: &RebindProposal) -> bool { false }
+    }
+
+    #[test]
+    fn pending_checkpoint_transition_retries_after_each_partial_fsync() {
+        for fail_at in [1, 2] {
+            let (identity, mut fence, next, _, witness, _) = inspect_fixture();
+            let resource = ResourceId::try_from("resource.inspect.fixture").unwrap();
+            let proposal = RebindProposal {
+                identity,
+                expected_owner_epoch: OwnerEpoch::new(1).unwrap(),
+                next_owner_epoch: OwnerEpoch::new(2).unwrap(),
+                expected_credential_epoch: CredentialEpoch::new(1).unwrap(),
+                next_credential_epoch: CredentialEpoch::new(2).unwrap(),
+                expected_input_epochs: BTreeMap::from([(resource.clone(), InputEpoch::new(1).unwrap())]),
+                next_input_epochs: BTreeMap::from([(resource, InputEpoch::new(2).unwrap())]),
+                next_manager: next.clone(),
+                command_key: podbay_core::CommandKey::try_from("rebind.partial.fixture").unwrap(),
+                digest: podbay_core::RequestDigest::parse(&"a".repeat(64)).unwrap(),
+            };
+            let ledger = PendingFixtureLedger(proposal.clone());
+            let mut calls = 0;
+            let mut persisted = fence.checkpoint();
+            let first = persist_pending_rebind_checkpoint(
+                &mut fence, &proposal, &next, ManagerLiveness::DeadAttested,
+                &witness, &ledger, 1_000,
+                |checkpoint| {
+                    calls += 1;
+                    if calls == fail_at {
+                        return Err(PodError::Uncertain("fixture interrupted fsync"));
+                    }
+                    persisted = checkpoint.clone();
+                    Ok("b".repeat(64))
+                },
+            );
+            assert!(first.is_err(), "failure at checkpoint write {fail_at}");
+            assert_eq!(fence.phase(), if fail_at == 1 {
+                RebindPhase::PendingStore
+            } else {
+                RebindPhase::PendingPod
+            });
+            assert_eq!(persisted.phase(), if fail_at == 1 {
+                RebindPhase::Active
+            } else {
+                RebindPhase::PendingStore
+            });
+            let digest = persist_pending_rebind_checkpoint(
+                &mut fence, &proposal, &next, ManagerLiveness::DeadAttested,
+                &witness, &ledger, 1_001,
+                |checkpoint| {
+                    persisted = checkpoint.clone();
+                    Ok("c".repeat(64))
+                },
+            ).unwrap();
+            assert_eq!(digest, "c".repeat(64));
+            assert_eq!(fence.phase(), RebindPhase::PendingPod);
+            assert_eq!(persisted, fence.checkpoint());
+        }
+    }
 
     #[test]
     fn pinned_manifest_refuses_byte_mode_and_inode_replacement() {

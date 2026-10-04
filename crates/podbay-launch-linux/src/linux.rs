@@ -13,8 +13,9 @@ use podbay_core::{
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, ResolvedClaimedBootstrap,
-    ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
+    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, PreparedCodexV2Rebind,
+    ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch,
+    ResolvedNativeLaunch,
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
@@ -22,8 +23,8 @@ use podbay_pod::{
     PodStatus, RebindInspection,
 };
 use podbay_store::{
-    BootstrapSendSelector, BoundLaunchRecord, EffectState, HostObservedPriorCheckpoint,
-    LaunchDispatchStage, NativeWriterTarget, PodBayStore,
+    BootstrapSendSelector, BoundLaunchRecord, DurableRebindPhase, EffectState,
+    HostObservedPriorCheckpoint, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
 };
 use podbay_wire::{
     EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole,
@@ -433,10 +434,7 @@ impl LinuxLaunchPort {
         }
         let manifest: PodManifest =
             serde_json::from_slice(&fs::read(&manifest_path).map_err(refused)?).map_err(refused)?;
-        let binding = manifest
-            .peer_binding
-            .as_ref()
-            .ok_or(PortDispatchError::RefusedBeforeEffect)?;
+        let binding = podbay_pod::current_bound_peer_binding(&manifest_path).map_err(refused)?;
         if binding.capability != CODEX_V2_CAPABILITY
             || binding.protocol != "podbay.peer-binding/2"
             || binding.store_path != claimed.store_path()
@@ -592,7 +590,8 @@ impl LinuxLaunchPort {
         let manifest: PodManifest =
             serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| Unavailable)?)
                 .map_err(|_| Invalid)?;
-        let binding = manifest.peer_binding.as_ref().ok_or(Invalid)?;
+        let binding =
+            podbay_pod::current_bound_peer_binding(&manifest_path).map_err(|_| Invalid)?;
         let wire = ImmutableLaunchDescriptorV2::decode_json(&binding.wire_descriptor)
             .map_err(|_| Invalid)?;
         let effective =
@@ -631,10 +630,10 @@ impl LinuxLaunchPort {
 
         let mut store = PodBayStore::open_existing_read_only(inspection.store_path())
             .map_err(|_| Unavailable)?;
-        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        check_inspection_store(&mut store, &inspection, &binding, &manager)?;
         let client = PodClient::connect(&manifest_path).map_err(|_| Unavailable)?;
         let before = client.attested_status().map_err(|_| Unavailable)?;
-        if !inspection_status_matches(&before, target, &manifest, binding) {
+        if !inspection_status_matches(&before, target, &manifest, &binding) {
             return Err(Invalid);
         }
         self.config.recheck().map_err(|_| Unavailable)?;
@@ -645,7 +644,7 @@ impl LinuxLaunchPort {
         {
             return Err(Invalid);
         }
-        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        check_inspection_store(&mut store, &inspection, &binding, &manager)?;
         let response = client
             .inspect_claimed_codex_bootstrap(
                 &selector.command_id,
@@ -654,7 +653,7 @@ impl LinuxLaunchPort {
             )
             .map_err(|_| Unavailable)?;
         let after = client.attested_status().map_err(|_| Unavailable)?;
-        if !inspection_status_matches(&after, target, &manifest, binding)
+        if !inspection_status_matches(&after, target, &manifest, &binding)
             || after.supervisor_pid != before.supervisor_pid
             || after.supervisor_start_ticks != before.supervisor_start_ticks
             || after.child_pid != before.child_pid
@@ -675,7 +674,7 @@ impl LinuxLaunchPort {
         {
             return Err(Invalid);
         }
-        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        check_inspection_store(&mut store, &inspection, &binding, &manager)?;
         if response.request_digest.as_deref() != Some(inspection.expected_request_digest()) {
             return Err(Invalid);
         }
@@ -781,6 +780,64 @@ impl HostDispatchPort for LinuxLaunchPort {
     ) -> Result<PortRebindObservation, podbay_host::HostError> {
         self.inspect_codex_v2_rebind(launch)
             .map_err(|_| podbay_host::HostError::StaleGuard)
+    }
+
+    fn prepare_existing_codex_v2_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+    ) -> Result<String, podbay_host::HostError> {
+        let path = self
+            .recheck_prepared_rebind(prepared, DurableRebindPhase::Pending, None)
+            .map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let digest = PodClient::prepare_rebind(
+            &path,
+            prepared.proposal(),
+            prepared.prior_checkpoint_digest(),
+        )
+        .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(),
+            receipt_ref: None,
+        })?;
+        self.recheck_prepared_rebind(prepared, DurableRebindPhase::Pending, None)
+            .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+                command_key: prepared.proposal().command_key.as_str().into(),
+                receipt_ref: None,
+            })?;
+        Ok(digest)
+    }
+
+    fn activate_existing_codex_v2_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+        pending_checkpoint_digest: &str,
+    ) -> Result<String, podbay_host::HostError> {
+        let path = self
+            .recheck_prepared_rebind(
+                prepared,
+                DurableRebindPhase::Activated,
+                Some(pending_checkpoint_digest),
+            )
+            .map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let digest = PodClient::activate_rebind(
+            &path,
+            prepared.proposal(),
+            prepared.prior_checkpoint_digest(),
+            pending_checkpoint_digest,
+        )
+        .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(),
+            receipt_ref: None,
+        })?;
+        self.recheck_prepared_rebind(
+            prepared,
+            DurableRebindPhase::Activated,
+            Some(pending_checkpoint_digest),
+        )
+        .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(),
+            receipt_ref: None,
+        })?;
+        Ok(digest)
     }
 
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
@@ -1259,6 +1316,91 @@ impl VerifiedRebindInspection {
 }
 
 impl LinuxLaunchPort {
+    fn recheck_prepared_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+        phase: DurableRebindPhase,
+        checkpoint_ref: Option<&str>,
+    ) -> Result<PathBuf, PodError> {
+        self.config.recheck()?;
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("rebind manager OS identity unavailable"))?;
+        if manager.attested_peer() != prepared.manager_peer()
+            || checked_store_file(prepared.store_path(), manager.uid())?
+                != prepared.store_file_identity()
+        {
+            return Err(PodError::Refused("rebind manager store path changed"));
+        }
+        let proposal = prepared.proposal();
+        let mut store = PodBayStore::open_existing_read_only(prepared.store_path())
+            .map_err(|_| PodError::Refused("rebind store unavailable"))?;
+        let claim = store
+            .current_manager_credential_claim(proposal.next_owner_epoch.get())
+            .map_err(|_| PodError::Refused("rebind manager claim unavailable"))?;
+        let current = store
+            .current_bound_pod_snapshot(
+                proposal.identity.scope_id.as_str(),
+                proposal.identity.pod_id.as_str(),
+            )
+            .map_err(|_| PodError::Refused("rebind Pod binding unavailable"))?;
+        let readback = store
+            .lookup_prior_observed_rebind(proposal)
+            .map_err(|_| PodError::Refused("rebind Pending proof unavailable"))?
+            .ok_or(PodError::Refused("rebind Pending row absent"))?;
+        let current_inputs = current
+            .resources()
+            .iter()
+            .map(|resource| (resource.id().clone(), resource.input_epoch()))
+            .collect::<BTreeMap<_, _>>();
+        if claim.store_lineage() != proposal.identity.store_lineage.as_str()
+            || claim.credential_epoch() != proposal.next_credential_epoch.get()
+            || !store
+                .current_manager_peer_matches(&claim, manager.attested_peer())
+                .map_err(|_| PodError::Refused("rebind manager peer unavailable"))?
+            || current.owner_epoch().get() != proposal.next_owner_epoch.get()
+            || current.authority_revision() != prepared.authority_revision()
+            || current.launch() != prepared.record()
+            || current_inputs != proposal.next_input_epochs
+            || readback.receipt.phase != phase
+            || readback.receipt.pod_checkpoint_ref.as_deref() != checkpoint_ref
+        {
+            return Err(PodError::Refused("rebind destination or Pod changed"));
+        }
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &proposal.identity.pod_id,
+            &proposal.identity.attempt_id,
+            proposal.identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != manager.uid()
+            || metadata.mode() & 0o077 != 0
+            || fs::canonicalize(&path)? != path
+        {
+            return Err(PodError::Refused("rebind manifest path changed"));
+        }
+        let manifest: PodManifest = serde_json::from_slice(&read_rebind_manifest_bytes(&path)?)?;
+        let binding = manifest
+            .peer_binding
+            .as_ref()
+            .ok_or(PodError::Refused("rebind manifest lacks V2 binding"))?;
+        if binding.protocol != "podbay.peer-binding/2"
+            || binding.capability != CODEX_V2_CAPABILITY
+            || binding.wire_descriptor != prepared.record().descriptor
+            || binding.effective_spec != prepared.record().effective_spec
+            || binding.store_path != prepared.store_path()
+            || binding.store_lineage != proposal.identity.store_lineage.as_str()
+            || manifest.descriptor.pod_id != proposal.identity.pod_id.as_str()
+            || manifest.descriptor.attempt_id != proposal.identity.attempt_id.as_str()
+            || manifest.descriptor.incarnation != proposal.identity.incarnation.get()
+        {
+            return Err(PodError::Refused("rebind manifest immutable bytes differ"));
+        }
+        Ok(path)
+    }
+
     /// Read-only V2 inspection used only by the host's Pending preparation.
     /// The committed profile and private credential locator are revalidated,
     /// but no credential bytes, old bearer, pod control or provider input are

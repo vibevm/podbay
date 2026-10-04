@@ -21,9 +21,10 @@ use podbay_host::{
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
     DurableAuthority, ExecutionMode, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
     HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
-    PortDispatchError, PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile,
-    ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate,
-    TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
+    PortDispatchError, PortDispatchOutcome, PortReceiptRef, RebindCompletionStage,
+    RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy,
+    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess,
+    WorkspaceSelection,
 };
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
@@ -106,6 +107,20 @@ sleep 30
             source,
             scope: ScopeId::try_from("scope.codex.preflight").unwrap(),
             pod: PodId::try_from(format!("pod.codex.preflight.{nonce}").as_str()).unwrap(),
+            directory,
+        }
+    }
+
+    fn from_shared() -> Self {
+        let directory = PathBuf::from(std::env::var_os("PODBAY_REBIND_FIXTURE_DIR").unwrap());
+        let pod =
+            PodId::try_from(std::env::var("PODBAY_REBIND_FIXTURE_POD").unwrap().as_str()).unwrap();
+        Self {
+            database: directory.join("store.sqlite"),
+            executable: directory.join("agent.sh"),
+            source: directory.join("credential.key"),
+            scope: ScopeId::try_from("scope.codex.preflight").unwrap(),
+            pod,
             directory,
         }
     }
@@ -453,6 +468,71 @@ fn port_for(fixture: &Fixture, binary: &Path) -> LinuxLaunchPort {
         )
         .unwrap(),
     )
+}
+
+fn register_restarted_codex_profile(
+    host: &mut DurableAuthority<LinuxLaunchPort>,
+    fixture: &Fixture,
+) {
+    let executable_sha256 = Sha256::digest(fs::read(&fixture.executable).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let credential =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    let profile = TrustedLaunchProfileInput {
+        profile_ref: "profile.codex.preflight".into(),
+        profile_generation: 1,
+        executable: fixture.executable.to_string_lossy().into_owned(),
+        binary_generation: format!("sha256:{executable_sha256}"),
+        executable_sha256,
+        workspace_root: fixture.directory.join("workspace"),
+        resource_layout: vec![TrustedDriverTemplate {
+            kind: ResourceKind::StructuredProvider,
+            driver: ResourceDriver::Structured {
+                driver_ref: "driver.codex".into(),
+                protocol_ref: "protocol.codex".into(),
+            },
+        }],
+        execution_mode: ExecutionMode::LinuxCooperative,
+        fixed_arguments: vec!["app-server".into(), "--listen".into(), "stdio://".into()],
+        permitted_extra_arguments: BTreeSet::new(),
+        default_model: "gpt-6-sol".into(),
+        allowed_models: BTreeSet::from(["gpt-6-sol".into()]),
+        default_effort: "medium".into(),
+        allowed_efforts: BTreeSet::from(["medium".into()]),
+        workspace_scope: fixture.scope.clone(),
+        workspace_basis_ref: "basis.codex".into(),
+        allowed_cwd_prefix: ".".into(),
+        allow_write: true,
+        allowed_tool_bundle_refs: BTreeSet::new(),
+        environment_refs: Vec::new(),
+        credential_refs: vec![credential.clone()],
+        max_wall_seconds: 120,
+        max_children: 2,
+        allow_fallback: false,
+    };
+    let policy = CodexAppServerPolicyV2::new(
+        &fixture.scope,
+        credential.as_str().into(),
+        "driver.codex".into(),
+        "protocol.codex".into(),
+    )
+    .unwrap();
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(profile)
+            .unwrap()
+            .with_codex_policy_from_trusted_policy(policy)
+            .unwrap(),
+    )
+    .unwrap();
+    host.register_native_host_from_trusted_policy(
+        TrustedNativeHostConfig::for_compiled_backend("host.codex.preflight".into())
+            .unwrap()
+            .with_structured_driver("driver.codex".into(), "protocol.codex".into())
+            .unwrap(),
+    )
+    .unwrap();
 }
 
 fn claim_for_port(fixture: &Fixture, proof: &ResolvedNativeCodexLaunch) {
@@ -937,6 +1017,273 @@ fn disposable_codex_v2_port_admits_and_reattaches_without_duplicate_child() {
     assert!(client.attested_status().unwrap().child_running);
     assert!(!client.stop().unwrap().child_running);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "helper for disposable two-process V2 rebind fixture"]
+fn rebind_first_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let (fixture, mut host, _, _, transport, request) = setup_with_port(
+        Role::Coordinator,
+        fixture,
+        port,
+        Duration::from_secs(30),
+        60,
+    );
+    let accepted = host
+        .dispatch_prepared_bound_root_codex_v2(&transport, request)
+        .unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let before = PodClient::connect(&manifest)
+        .unwrap()
+        .attested_status()
+        .unwrap();
+    assert!(before.child_running);
+    fs::write(
+        fixture.directory.join("rebind.first.pid"),
+        before.child_pid.to_string(),
+    )
+    .unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
+#[ignore = "helper for disposable two-process V2 rebind fixture"]
+fn rebind_second_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let frames = fixture.directory.join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 2);
+    let actor = ActorId::try_from("actor.codex.preflight").unwrap();
+    let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000,
+        4242,
+        777,
+        "/user.slice/preflight.scope",
+    )
+    .unwrap();
+    let transport = Transport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        process.clone(),
+        CredentialGeneration::new(1).unwrap(),
+    ));
+    host.reattest_actor_from_trusted_replay(
+        &transport,
+        ActorRegistration::owner_cli_from_trusted_policy(
+            actor.clone(),
+            fixture.scope.clone(),
+            process,
+            CredentialGeneration::new(1).unwrap(),
+        ),
+    )
+    .unwrap();
+    let recorded_id = host.recorded_snapshot().grants[0].grant_id;
+    let grant_id = host
+        .activate_recorded_grant_for_actor_from_trusted_replay(&actor, &fixture.scope, recorded_id)
+        .unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant_id,
+        Instant::now() + Duration::from_secs(45),
+    )
+    .unwrap();
+    let session_id = SessionId::try_from("session.codex.preflight").unwrap();
+    let lease = host
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 60)
+        .unwrap();
+    let (target, session_revision) = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session_id)
+        .unwrap();
+    let send = CommandEnvelope::new(
+        "request.rebind.bootstrap.one",
+        "key.rebind.bootstrap.one",
+        WireTarget::Session {
+            session_id: session_id.as_str().into(),
+        },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+            lease_epoch: None,
+            target_revision: Some(DecimalString::new(session_revision)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text {
+                text: "first turn after manager rebind".into(),
+            }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap();
+    let pending = host
+        .prepare_current_codex_v2_rebind(&fixture.scope, &fixture.pod, "rebind.native.v2.one")
+        .unwrap();
+    assert_eq!(pending.phase, podbay_store::DurableRebindPhase::Pending);
+    assert!(matches!(
+        host.send_first_codex_bootstrap_from_wire(&transport, send.clone(), &policy),
+        Err(podbay_host::BootstrapSendError::Store(
+            podbay_store::StoreError::Conflict("Codex V2 launch is not HostAccepted")
+        ))
+    ));
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 2);
+    let completed = host
+        .complete_current_codex_v2_rebind(&fixture.scope, &fixture.pod, "rebind.native.v2.one")
+        .unwrap();
+    assert_eq!(
+        completed.durable.phase,
+        podbay_store::DurableRebindPhase::Activated
+    );
+    assert_eq!(completed.stage, RebindCompletionStage::PodActive);
+    let repeated = host
+        .complete_current_codex_v2_rebind(&fixture.scope, &fixture.pod, "rebind.native.v2.one")
+        .unwrap();
+    assert_eq!(repeated.durable, completed.durable);
+    assert_eq!(repeated.stage, RebindCompletionStage::PodActive);
+    assert_eq!(
+        repeated.active_checkpoint_digest,
+        completed.active_checkpoint_digest
+    );
+    let manifest = slot_manifest(&fixture).unwrap();
+    let client = PodClient::connect(&manifest).unwrap();
+    let after = client.attested_status().unwrap();
+    let before_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(after.pod_id, fixture.pod.as_str());
+    assert_eq!(after.child_pid, before_pid);
+    assert!(after.child_running);
+    run_rebind_manager_helper("rebind_sibling_status_process_helper", &fixture, &binary);
+    let submitted = host
+        .send_first_codex_bootstrap_from_wire(&transport, send.clone(), &policy)
+        .unwrap();
+    assert!(
+        matches!(
+            submitted.port_observation,
+            Some(BootstrapPortObservation::PodAccepted(_))
+        ),
+        "rebound bootstrap observation: {:?}",
+        submitted.port_observation,
+    );
+    let duplicate = host
+        .send_first_codex_bootstrap_from_wire(&transport, send, &policy)
+        .unwrap();
+    assert_eq!(duplicate.receipt, submitted.receipt);
+    assert!(
+        !duplicate.port_called,
+        "same-key replay cannot send a second native turn"
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fs::read_to_string(&frames)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        != 5
+    {
+        assert!(
+            Instant::now() < deadline,
+            "rebound manager did not send one fake turn"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(client.attested_status().unwrap().child_pid, before_pid);
+    assert!(!client.stop().unwrap().child_running);
+    fs::write(
+        fixture.directory.join("rebind.second.done"),
+        before_pid.to_string(),
+    )
+    .unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
+#[ignore = "helper for disposable two-process V2 rebind fixture"]
+fn rebind_sibling_status_process_helper() {
+    let fixture = Fixture::from_shared();
+    let manifest = slot_manifest(&fixture).unwrap();
+    let refused = PodClient::connect(&manifest).is_err();
+    std::mem::forget(fixture);
+    assert!(
+        refused,
+        "same-UID sibling cannot inherit rebound manager control"
+    );
+}
+
+fn run_rebind_manager_helper(name: &str, fixture: &Fixture, binary: &Path) {
+    let mut process = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", name, "--nocapture"])
+        .env("PODBAY_REBIND_FIXTURE_DIR", &fixture.directory)
+        .env("PODBAY_REBIND_FIXTURE_POD", fixture.pod.as_str())
+        .env("PODBAY_TEST_POD_BINARY", binary)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success(), "{name} failed with {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("{name} exceeded disposable fixture deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_v2_rebind_keeps_exact_pod_and_child_across_two_manager_processes() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).expect("first manager left one bound manifest");
+    let first_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(PathBuf::from(format!("/proc/{first_pid}/stat")).exists());
+    run_rebind_manager_helper("rebind_second_manager_process_helper", &fixture, &binary);
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.second.done")).unwrap(),
+        first_pid.to_string()
+    );
+    let saved: podbay_pod::PodManifest =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while saved.socket_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !saved.socket_path.exists(),
+        "disposable pod socket remained after stop"
+    );
 }
 
 #[test]

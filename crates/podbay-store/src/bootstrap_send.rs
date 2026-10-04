@@ -317,6 +317,7 @@ fn check_host_accepted_launch(
     transaction: &Transaction<'_>,
     target: &NativeWriterTarget,
     owner_epoch: u64,
+    manager_credential_epoch: u64,
 ) -> Result<(), StoreError> {
     let evidence: Option<(
         String,
@@ -360,28 +361,95 @@ fn check_host_accepted_launch(
             },
         )
         .optional()?;
-    if !evidence.is_some_and(
-        |(
-            kind,
-            state,
-            claim_owner,
-            claim_key,
-            stage,
-            session,
-            resources,
-            command_id,
-            outcome_claim,
-        )| {
-            kind == "pod.offer"
-                && matches!(state.as_str(), "claimed_uncertain" | "observed")
-                && claim_owner == i64::try_from(owner_epoch).ok()
-                && claim_key.as_deref() == Some(format!("claim.{command_id}").as_str())
-                && claim_key.as_deref() == Some(outcome_claim.as_str())
-                && matches!(stage.as_str(), "host_accepted" | "port_settled")
-                && session == target.session_id.as_str()
-                && resources == 1
-        },
-    ) {
+    let Some((
+        kind,
+        state,
+        claim_owner,
+        claim_key,
+        stage,
+        session,
+        resources,
+        command_id,
+        outcome_claim,
+    )) = evidence
+    else {
+        return Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"));
+    };
+    if kind != "pod.offer"
+        || !matches!(state.as_str(), "claimed_uncertain" | "observed")
+        || claim_key.as_deref() != Some(format!("claim.{command_id}").as_str())
+        || claim_key.as_deref() != Some(outcome_claim.as_str())
+        || !matches!(stage.as_str(), "host_accepted" | "port_settled")
+        || session != target.session_id.as_str()
+        || resources != 1
+    {
+        return Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"));
+    }
+    if claim_owner == Some(integer(owner_epoch)?) {
+        return Ok(());
+    }
+    // The original launch claim belongs to the old manager. It stays valid
+    // only through an exact proof-bearing Activated rebind for this same
+    // Pod/Attempt and the current manager/Resource vector. Pending, merely
+    // acknowledged, legacy, foreign and stale rows never bridge the claim.
+    let prior_owner = claim_owner
+        .filter(|value| *value > 0)
+        .ok_or(StoreError::Conflict("Codex V2 launch is not HostAccepted"))?;
+    let activated: Option<i64> = transaction
+        .query_row(
+            "SELECT r.rebind_rowid
+                 FROM manager_rebinds AS r
+                 JOIN manager_rebind_prior_observations AS prior
+                   ON prior.rebind_rowid=r.rebind_rowid
+                 JOIN manager_rebind_resources AS rr
+                   ON rr.rebind_rowid=r.rebind_rowid
+                 JOIN authority_resources AS resource
+                   ON resource.resource_id=rr.resource_id
+                 JOIN manager_credential_claims AS claim ON claim.singleton=1
+                 JOIN manager_peer_bindings AS peer
+                   ON peer.store_lineage=r.store_lineage
+                    AND peer.owner_epoch=r.next_owner_epoch
+                    AND peer.credential_epoch=r.next_credential_epoch
+                 WHERE r.store_lineage=?1 AND r.scope_id=?2 AND r.pod_id=?3
+                   AND r.attempt_id=?4 AND r.pod_incarnation=?5
+                   AND r.expected_owner_epoch=?6 AND r.next_owner_epoch=?7
+                   AND r.next_credential_epoch=?8 AND r.phase='activated'
+                   AND r.resource_count=1
+                   AND length(r.pod_checkpoint_ref)=64
+                   AND prior.schema_version='podbay.prior-checkpoint/1'
+                   AND rr.resource_id=?9 AND rr.next_input_epoch=?10
+                   AND resource.scope_id=r.scope_id AND resource.pod_id=r.pod_id
+                   AND resource.pod_incarnation=r.pod_incarnation
+                   AND resource.resource_epoch=?11 AND resource.input_epoch=?10
+                   AND claim.store_lineage=r.store_lineage
+                   AND claim.owner_epoch=r.next_owner_epoch
+                   AND claim.credential_epoch=r.next_credential_epoch
+                   AND peer.peer_schema='podbay.attested-peer/1'
+                   AND peer.os_identity=r.manager_os_identity
+                   AND peer.process_identity=r.manager_process_id
+                   AND peer.boot_identity=r.manager_boot_identity
+                   AND peer.birth_identity=r.manager_birth_identity
+                   AND peer.containment_identity=r.manager_containment
+                   AND (SELECT COUNT(*) FROM manager_rebind_resources
+                        WHERE rebind_rowid=r.rebind_rowid)=1
+                 LIMIT 1",
+            params![
+                target.store_lineage.as_str(),
+                target.scope_id.as_str(),
+                target.pod_id.as_str(),
+                target.attempt_id.as_str(),
+                integer(target.pod_incarnation)?,
+                prior_owner,
+                integer(owner_epoch)?,
+                integer(manager_credential_epoch)?,
+                target.resource_id.as_str(),
+                integer(target.resource_input_epoch)?,
+                integer(target.resource_epoch)?,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if activated.is_none() {
         return Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"));
     }
     Ok(())
@@ -574,6 +642,7 @@ impl PodBayStore {
             &transaction,
             &request.native_target,
             request.expected_owner_epoch,
+            request.expected_manager_credential_epoch,
         )?;
         let occupied: Option<i64> = transaction
             .query_row(
@@ -1120,7 +1189,12 @@ fn check_current_record(
         return Err(StoreError::StaleEpoch);
     }
     check_deadline(transaction, record.deadline_at.as_deref())?;
-    check_host_accepted_launch(transaction, &record.native_target, record.owner_epoch)
+    check_host_accepted_launch(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+    )
 }
 
 impl PodBayStore {

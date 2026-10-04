@@ -939,6 +939,63 @@ pub struct PortRebindObservation {
     child_start_ticks: u64,
 }
 
+/// Private host-created proof passed only to its installed Linux port after
+/// the exact Pending store row commits. It carries no credential or bearer.
+#[derive(Clone)]
+pub struct PreparedCodexV2Rebind {
+    proposal: RebindProposal,
+    pending_receipt: DurableRebindReceipt,
+    prior_checkpoint_digest: String,
+    record: BoundLaunchRecord,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    manager_peer: AttestedPeer,
+    authority_revision: u64,
+}
+
+impl PreparedCodexV2Rebind {
+    pub fn proposal(&self) -> &RebindProposal {
+        &self.proposal
+    }
+    pub fn prior_checkpoint_digest(&self) -> &str {
+        &self.prior_checkpoint_digest
+    }
+    pub fn record(&self) -> &BoundLaunchRecord {
+        &self.record
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
+    }
+    pub fn manager_peer(&self) -> &AttestedPeer {
+        &self.manager_peer
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RebindCompletionStage {
+    PendingPodUnknown,
+    PodAcknowledged,
+    StoreActivationUnknown,
+    StoreActivatedPodUnconfirmed,
+    PodActive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebindCompletionReceipt {
+    pub durable: DurableRebindReceipt,
+    pub stage: RebindCompletionStage,
+    pub pending_checkpoint_digest: Option<String>,
+    pub active_checkpoint_digest: Option<String>,
+}
+
 impl PortRebindObservation {
     pub fn from_trusted_port(
         prior: HostObservedPriorCheckpoint,
@@ -1027,6 +1084,13 @@ fn digest_codex_v2_rebind_intent(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
+fn valid_rebind_checkpoint_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl ResolvedNativeLaunch {
@@ -1218,6 +1282,25 @@ pub trait HostDispatchPort {
         &self,
         _launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortRebindObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Mutating pod checkpoint after Pending is already durable. A lost reply
+    /// remains unknown and must not trigger a blind duplicate Pod launch.
+    fn prepare_existing_codex_v2_rebind(
+        &self,
+        _prepared: &PreparedCodexV2Rebind,
+    ) -> Result<String, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Store Activated is already durable; report Active only after the same
+    /// pod fsyncs its new fence and returns a nonce-bound OS-attested reply.
+    fn activate_existing_codex_v2_rebind(
+        &self,
+        _prepared: &PreparedCodexV2Rebind,
+        _pending_checkpoint_digest: &str,
+    ) -> Result<String, HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -2619,6 +2702,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     initial_owner_projection_failed: bool,
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
     native_host: Option<TrustedNativeHostConfig>,
+    pending_codex_rebinds: HashMap<(ScopeId, PodId, String), PreparedCodexV2Rebind>,
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
@@ -2728,6 +2812,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             initial_owner_projection_failed: false,
             launch_profiles: HashMap::new(),
             native_host: None,
+            pending_codex_rebinds: HashMap::new(),
         })
     }
 
@@ -2956,7 +3041,222 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         if receipt.phase != DurableRebindPhase::Pending {
             return Err(StoreError::Conflict("rebind is no longer Pending").into());
         }
+        let cache_key = (
+            scope.clone(),
+            pod.clone(),
+            proposal.command_key.as_str().to_owned(),
+        );
+        let prepared = PreparedCodexV2Rebind {
+            proposal,
+            pending_receipt: receipt.clone(),
+            prior_checkpoint_digest: observed.prior.checkpoint_digest.clone(),
+            record: reviewed.record.clone(),
+            store_path: reviewed.store_path.clone(),
+            #[cfg(target_os = "linux")]
+            store_file_identity: reviewed.store_file_identity,
+            manager_peer: reviewed.manager_peer.clone(),
+            authority_revision: reviewed.authority_revision,
+        };
+        drop(context);
+        if self
+            .pending_codex_rebinds
+            .get(&cache_key)
+            .is_some_and(|old| {
+                old.proposal != prepared.proposal
+                    || old.prior_checkpoint_digest != prepared.prior_checkpoint_digest
+                    || old.record != prepared.record
+            })
+        {
+            return Err(StoreError::Conflict("cached rebind intent differs").into());
+        }
+        self.pending_codex_rebinds.insert(cache_key, prepared);
         Ok(receipt)
+    }
+
+    fn recheck_prepared_codex_v2_rebind(
+        &mut self,
+        prepared: &PreparedCodexV2Rebind,
+    ) -> Result<(), RebindContextError> {
+        let proposal = &prepared.proposal;
+        let mut context =
+            self.rebind_context(&proposal.identity.scope_id, &proposal.identity.pod_id)?;
+        context.recheck_current()?;
+        if context.identity() != &proposal.identity
+            || context.launch() != &prepared.record
+            || context.store_path() != prepared.store_path()
+            || context.owner_epoch() != proposal.next_owner_epoch.get()
+            || context.credential_epoch() != proposal.next_credential_epoch.get()
+            || context.manager_peer() != &proposal.next_manager
+            || context.manager_peer() != prepared.manager_peer()
+            || context.authority_revision() != prepared.authority_revision
+            || context.resource_input_epochs() != &proposal.next_input_epochs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        #[cfg(target_os = "linux")]
+        if context.database_identity != prepared.store_file_identity() {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(())
+    }
+
+    /// Complete only an already durable, proof-bearing Pending V2 rebind.
+    /// After admission this always returns a known receipt and a truthful
+    /// stage, including after lost pod replies. A same-manager retry uses the
+    /// cached private proposal; it never reinspects Pending as prior Active.
+    pub fn complete_current_codex_v2_rebind(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RebindCompletionReceipt, RebindContextError> {
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        if !self.pending_codex_rebinds.contains_key(&cache_key) {
+            self.prepare_current_codex_v2_rebind(scope, pod, command_key)?;
+        }
+        let prepared = self
+            .pending_codex_rebinds
+            .get(&cache_key)
+            .ok_or(StoreError::Conflict("prepared rebind proof disappeared"))?
+            .clone();
+        let outcome = |durable: DurableRebindReceipt,
+                       stage: RebindCompletionStage,
+                       pending: Option<String>,
+                       active: Option<String>| RebindCompletionReceipt {
+            durable,
+            stage,
+            pending_checkpoint_digest: pending,
+            active_checkpoint_digest: active,
+        };
+        let fallback = || {
+            outcome(
+                prepared.pending_receipt.clone(),
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            )
+        };
+        if self.recheck_prepared_codex_v2_rebind(&prepared).is_err() {
+            return Ok(fallback());
+        }
+        let mut durable = match self.store.lookup_prior_observed_rebind(&prepared.proposal) {
+            Ok(Some(found)) => found.receipt,
+            _ => return Ok(fallback()),
+        };
+        let mut pending_digest = durable.pod_checkpoint_ref.clone();
+        if durable.phase == DurableRebindPhase::Pending {
+            let digest = match self.host.port().prepare_existing_codex_v2_rebind(&prepared) {
+                Ok(value) if valid_rebind_checkpoint_digest(&value) => value,
+                _ => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::PendingPodUnknown,
+                        None,
+                        None,
+                    ));
+                }
+            };
+            if self.recheck_prepared_codex_v2_rebind(&prepared).is_err() {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::PendingPodUnknown,
+                    Some(digest),
+                    None,
+                ));
+            }
+            durable = match self
+                .store
+                .acknowledge_prior_observed_pod_rebind(&prepared.proposal, &digest)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::PendingPodUnknown,
+                        Some(digest),
+                        None,
+                    ));
+                }
+            };
+            pending_digest = Some(digest);
+        }
+        let Some(digest) = pending_digest else {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            ));
+        };
+        if !valid_rebind_checkpoint_digest(&digest) {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            ));
+        }
+        if durable.phase == DurableRebindPhase::PodAcknowledged {
+            if self.recheck_prepared_codex_v2_rebind(&prepared).is_err() {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::PodAcknowledged,
+                    Some(digest),
+                    None,
+                ));
+            }
+            durable = match self
+                .store
+                .activate_prior_observed_manager_rebind(&prepared.proposal, &digest)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::StoreActivationUnknown,
+                        Some(digest),
+                        None,
+                    ));
+                }
+            };
+        }
+        if durable.phase != DurableRebindPhase::Activated {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PodAcknowledged,
+                Some(digest),
+                None,
+            ));
+        }
+        let active = match self
+            .host
+            .port()
+            .activate_existing_codex_v2_rebind(&prepared, &digest)
+        {
+            Ok(value) if valid_rebind_checkpoint_digest(&value) => value,
+            _ => {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::StoreActivatedPodUnconfirmed,
+                    Some(digest),
+                    None,
+                ));
+            }
+        };
+        if self.recheck_prepared_codex_v2_rebind(&prepared).is_err() {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::StoreActivatedPodUnconfirmed,
+                Some(digest),
+                None,
+            ));
+        }
+        Ok(outcome(
+            durable,
+            RebindCompletionStage::PodActive,
+            Some(digest),
+            Some(active),
+        ))
     }
 
     pub fn port(&self) -> &P {
@@ -5706,6 +6006,37 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
+    /// A restarted trusted manager may resolve one recorded grant ID only for
+    /// the exact reattested actor and scope. A wire `grantRef` is not an input
+    /// to this method; it creates no new right or grant row.
+    pub fn activate_recorded_grant_for_actor_from_trusted_replay(
+        &mut self,
+        actor: &ActorId,
+        scope: &ScopeId,
+        recorded_id: u64,
+    ) -> Result<GrantId, DurableAuthorityError> {
+        if recorded_id == 0 {
+            return Err(HostError::InvalidInput.into());
+        }
+        let record = self
+            .recorded
+            .grants
+            .iter()
+            .find(|record| {
+                record.grant_id == recorded_id
+                    && record.actor_id == actor.as_str()
+                    && record.scope_id == scope.as_str()
+            })
+            .ok_or(HostError::Unauthorised)?;
+        if self.host.actors.get(actor).is_none_or(|active| {
+            active.scope_id != *scope
+                || active.credential_generation.get() != record.credential_generation
+        }) {
+            return Err(HostError::Unauthenticated.into());
+        }
+        self.activate_grant_from_trusted_replay(GrantId(recorded_id))
+    }
+
     /// Recorded identity alone never authenticates a restarted process.
     pub fn reattest_actor_from_trusted_replay<T: AuthenticatedTransport>(
         &mut self,
