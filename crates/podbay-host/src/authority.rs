@@ -15,12 +15,16 @@ use podbay_core::{
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
-    BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, CommandInspection,
-    CommandLookupSelector, EffectClaim, LaunchDispatchStatus, LaunchLookupRequest,
-    LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness,
-    StoreError, VerifiedPrincipal,
+    BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
+    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection, CommandLookupSelector,
+    EffectClaim, LaunchDispatchStatus, LaunchLookupRequest, LaunchPortResult,
+    ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness, StoreError,
+    VerifiedPrincipal,
 };
-use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor};
+use podbay_wire::{
+    EffectiveLaunchContract, EffectiveLaunchContractV2, ImmutableLaunchDescriptor,
+    ImmutableLaunchDescriptorV2,
+};
 
 #[cfg(target_os = "linux")]
 use crate::linux_manager_peer::LinuxManagerPeer;
@@ -2393,6 +2397,76 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         self.bound_receipt(record, duplicate)
     }
 
+    /// Reviews and commits one first root Codex V2 launch. This records the
+    /// typed effective policy and native descriptor but makes no OS port call.
+    /// A delegated child Worker needs a distinct parent-authorised admission.
+    pub fn admit_bound_root_codex_v2<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal.clone());
+        if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
+            if record.format != BoundLaunchFormat::CodexV2 {
+                return Err(HostError::Unauthorised.into());
+            }
+            return self.bound_receipt(record, true);
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let (effective, descriptor) =
+            self.review_bound_root_codex_v2(&authorised, request.host_request.grant_id, proposal)?;
+        let admission = self
+            .store
+            .admit_bound_root_launch_v2(BoundRootLaunchRequestV2 {
+                principal,
+                command_key: &request.host_request.command_key,
+                canonical_intent: &request.canonical_request,
+                scope_id: authorised.scope_id.as_str(),
+                pod_id: pod_id.as_str(),
+                proposal: Some(BoundRootLaunchProposalV2 {
+                    session: &proposal.session,
+                    run: &proposal.run,
+                    binding: &proposal.binding,
+                    effective_spec: &effective,
+                    descriptor: &descriptor,
+                    expected_owner_epoch: self.host.manager_epoch.get(),
+                    expected_authority_revision: self.recorded.revision,
+                }),
+            })?;
+        let (record, duplicate) = match admission {
+            BoundLaunchAdmission::Committed(record) => (record, false),
+            BoundLaunchAdmission::Duplicate(record) => (record, true),
+        };
+        if record.format != BoundLaunchFormat::CodexV2 {
+            return Err(HostError::StaleGuard.into());
+        }
+        if !duplicate {
+            if record.effective_spec != effective.canonical_bytes()
+                || record.descriptor
+                    != descriptor
+                        .encode_json()
+                        .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.hydrate_new_bound(&record)?;
+        }
+        self.bound_receipt(record, duplicate)
+    }
+
     /// Only a still-prepared original may be dispatched after restart. The
     /// committed descriptor is used at the port, and today's profile/grant
     /// must independently reauthorize its exact reviewed semantics.
@@ -2418,6 +2492,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .store
             .lookup_bound_launch(&lookup)?
             .ok_or(StoreError::NotFound)?;
+        if record.format != BoundLaunchFormat::V1 {
+            return Err(HostError::Unauthorised.into());
+        }
         let status = self.store.launch_dispatch_status(
             record.receipt.outbox_id,
             &record.scope_id,
@@ -2478,6 +2555,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
         let lookup = self.bound_lookup(request, principal.clone());
         if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
+            if record.format != BoundLaunchFormat::V1 {
+                return Err(HostError::Unauthorised.into());
+            }
             return Ok((None, record, true));
         }
         let authorised = self
@@ -2850,6 +2930,64 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .compare_with_descriptor(&descriptor)
             .map_err(|_| HostError::Unauthorised)?;
         Ok((bytes, descriptor))
+    }
+
+    fn review_bound_root_codex_v2(
+        &self,
+        authorised: &AuthorisedDispatch,
+        grant_id: GrantId,
+        proposal: &BoundHostLaunchProposal,
+    ) -> Result<(EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2), HostError> {
+        let HostAction::LaunchPod {
+            pod_id,
+            role,
+            credential,
+        } = &authorised.action
+        else {
+            return Err(HostError::InvalidInput);
+        };
+        if proposal.binding.scope_id() != &authorised.scope_id
+            || proposal.binding.actor_id() != &authorised.actor_id
+            || proposal.binding.pod_id() != pod_id
+            || proposal.binding.role() != *role
+            || proposal.binding.parent_run_id().is_some()
+        {
+            return Err(HostError::Unauthorised);
+        }
+        let profile = self
+            .launch_profiles
+            .get(&proposal.selection.profile_ref)
+            .ok_or(HostError::Unsupported)?;
+        if profile.workspace_scope() != &authorised.scope_id {
+            return Err(HostError::Unauthorised);
+        }
+        let policy = profile.codex_policy().ok_or(HostError::Unsupported)?;
+        let spec = profile.resolve_codex_v2(
+            pod_id.clone(),
+            *role,
+            grant_id.get(),
+            credential.as_ref(),
+            &proposal.selection,
+        )?;
+        let base_bytes = spec.canonical_bytes()?;
+        let base =
+            EffectiveLaunchContract::decode(&base_bytes).map_err(|_| HostError::Unauthorised)?;
+        let effective = EffectiveLaunchContractV2::from_v1(base, policy.clone())
+            .map_err(|_| HostError::Unauthorised)?;
+        let host = self.native_host.as_ref().ok_or(HostError::Unsupported)?;
+        let (native, _) = profile.resolve_native_policy_codex_v2(
+            host,
+            &spec,
+            &proposal.binding,
+            effective.digest(),
+        )?;
+        let descriptor =
+            ImmutableLaunchDescriptorV2::from_binding(&proposal.binding, native, policy.clone())
+                .map_err(|_| HostError::Unauthorised)?;
+        effective
+            .compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::Unauthorised)?;
+        Ok((effective, descriptor))
     }
 
     fn revalidate_committed_native(
