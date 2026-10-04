@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use podbay_core::{
     AttemptId, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PendingPodProcessEvidence,
-    PodFenceIdentity, PodId,
+    PodFenceCheckpoint, PodFenceIdentity, PodId, POD_FENCE_CHECKPOINT_VERSION,
     RebindPhase, ResourceId, ScopeId, StoreLineageId, SupersessionLedger,
 };
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
     PortDispatchOutcome, PortPendingRecoveryObservation, PortRebindObservation,
+    PortRecoveredActiveObservation,
     PortReceiptRef, PreparedCodexV2Rebind, PreparedPendingRecovery,
     ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection,
     ResolvedClaimedCodexV3Bootstrap, ResolvedNativeCodexLaunch, ResolvedNativeCodexV3Launch,
@@ -24,10 +25,12 @@ use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
     CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY, LinuxPeerEvidence, PodClient, PodError,
     PodManifest, PodPeerBootstrap, PodStatus, RebindInspection,
+    peer_checkpoint_observation_digest,
 };
 use podbay_store::{
     BootstrapSendSelector, BoundLaunchRecord, DurableRebindPhase, EffectState,
     HostObservedPriorCheckpoint, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
+    PriorPlannedRecovery,
     SqliteSupersessionLedger,
 };
 use podbay_wire::{
@@ -1063,6 +1066,15 @@ impl HostDispatchPort for LinuxLaunchPort {
         prepared: &PreparedPendingRecovery,
     ) -> Result<String, podbay_host::HostError> {
         self.prepare_codex_v2_pending_recovery(prepared)
+    }
+
+    fn inspect_recovered_active_codex_v2(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+        prior: &PriorPlannedRecovery,
+    ) -> Result<PortRecoveredActiveObservation, podbay_host::HostError> {
+        self.inspect_codex_v2_recovered_active(launch,prior)
+            .map_err(|_| podbay_host::HostError::StaleGuard)
     }
 
     fn prepare_existing_codex_v2_rebind(
@@ -2207,6 +2219,150 @@ impl LinuxLaunchPort {
             return Err(uncertain());
         }
         Ok(digest)
+    }
+
+    fn inspect_codex_v2_recovered_active(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+        prior: &PriorPlannedRecovery,
+    ) -> Result<PortRecoveredActiveObservation, PodError> {
+        self.config.recheck()?;
+        let wire = launch.descriptor();
+        let scope = ScopeId::try_from(wire.scope_id())
+            .map_err(|_| PodError::Invalid("recovered Active scope"))?;
+        let credential = CredentialRef::from_trusted_vault(
+            scope, launch.effective().codex_policy().credential_ref(),
+        ).map_err(|_| PodError::Refused("recovered Active credential mapping"))?;
+        let source = self.codex_credentials.get(&credential)
+            .ok_or(PodError::Refused("recovered Active credential source"))?;
+        preflight_committed_codex_v2_read_only(launch, source)?;
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("D manager OS identity unavailable"))?;
+        if manager.attested_peer() != launch.manager_peer()
+            || checked_store_file(launch.store_path(), manager.uid())?
+                != launch.store_file_identity()
+        {
+            return Err(PodError::Refused("D manager or store changed"));
+        }
+        let abandoned = &prior.intent.abandoned;
+        let identity = &abandoned.identity;
+        if identity.scope_id.as_str() != wire.scope_id()
+            || identity.pod_id.as_str() != wire.pod_id()
+            || identity.attempt_id.as_str() != wire.attempt_id()
+            || identity.incarnation.get() != wire.pod_incarnation()
+            || identity.store_lineage.as_str() != launch.store_lineage()
+            || prior.receipt.stage != podbay_store::SupersessionStage::Planned
+            || prior.intent.recovering_owner_epoch.get() >= launch.owner_epoch()
+            || prior.intent.recovering_credential_epoch.get() >= launch.credential_epoch()
+        {
+            return Err(PodError::Refused("D predecessor identity differs"));
+        }
+        attest_abandoned_manager_dead(&abandoned.next_manager, manager.boot_id())?;
+        attest_abandoned_manager_dead(&prior.intent.recovering_manager, manager.boot_id())?;
+        let expected_checkpoint = PodFenceCheckpoint::from_durable_parts(
+            POD_FENCE_CHECKPOINT_VERSION,
+            identity.clone(),
+            prior.prior_manager_peer.containment_identity().into(),
+            prior.prior_manager_peer.clone(),
+            abandoned.expected_owner_epoch,
+            abandoned.expected_credential_epoch,
+            abandoned.next_input_epochs.clone(),
+            RebindPhase::Active,
+            None,
+            None,
+        ).map_err(|_| PodError::Refused("reconstructed Active checkpoint invalid"))?;
+        let expected_digest = peer_checkpoint_observation_digest(&expected_checkpoint)
+            .map_err(|_| PodError::Refused("reconstructed Active digest unavailable"))?;
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,&identity.pod_id,&identity.attempt_id,identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.nlink()!=1 || metadata.uid()!=manager.uid()
+            || metadata.mode()&0o077!=0 || !(1..=1_048_576).contains(&metadata.len())
+            || fs::canonicalize(&path)? != path
+        {
+            return Err(PodError::Refused("recovered Active manifest identity differs"));
+        }
+        let bytes = read_rebind_manifest_bytes(&path)?;
+        let manifest: PodManifest = serde_json::from_slice(&bytes)?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+            "recovered Active manifest is unbound"))?;
+        if binding.protocol != "podbay.peer-binding/2"
+            || binding.capability != CODEX_V2_CAPABILITY
+            || binding.wire_descriptor != launch.descriptor_bytes()
+            || binding.effective_spec != launch.effective_spec_bytes()
+            || binding.store_path != launch.store_path()
+            || binding.store_lineage != launch.store_lineage()
+        {
+            return Err(PodError::Refused("recovered Active immutable launch differs"));
+        }
+        let verify = |response: &RebindInspection| -> Result<(), PodError> {
+            let process = &prior.intent.pending_process;
+            let supervisor_pid: u32 = process.supervisor_process_id.parse()
+                .map_err(|_| PodError::Refused("prior supervisor PID malformed"))?;
+            let supervisor_birth: u64 = process.supervisor_birth_identity.parse()
+                .map_err(|_| PodError::Refused("prior supervisor birth malformed"))?;
+            let child_pid: u32 = process.child_process_id.parse()
+                .map_err(|_| PodError::Refused("prior child PID malformed"))?;
+            let child_birth: u64 = process.child_birth_identity.parse()
+                .map_err(|_| PodError::Refused("prior child birth malformed"))?;
+            let expected_inputs = abandoned.next_input_epochs.iter()
+                .map(|(id,epoch)| (id.as_str().to_owned(),epoch.get()))
+                .collect::<BTreeMap<_,_>>();
+            if response.checkpoint_digest != expected_digest
+                || response.prior_owner_epoch != abandoned.expected_owner_epoch.get()
+                || response.prior_credential_epoch != abandoned.expected_credential_epoch.get()
+                || response.prior_input_epochs != expected_inputs
+                || response.supervisor_pid != supervisor_pid
+                || response.supervisor_start_ticks != supervisor_birth
+                || response.child_pid != child_pid
+                || response.child_start_ticks != child_birth
+                || response.boot_id != process.boot_identity
+                || response.cgroup_path != process.containment_identity
+                || response.unit_name != manifest.unit_name
+            {
+                return Err(PodError::Refused("live Active checkpoint differs from C recovery"));
+            }
+            attest_rebind_process_pair_fields(
+                response.supervisor_pid,response.supervisor_start_ticks,
+                response.child_pid,response.child_start_ticks,&response.boot_id,
+                &response.cgroup_path,manager.uid(),manager.gid(),
+            )?;
+            attest_rebind_systemd_unit(
+                &response.unit_name,response.supervisor_pid,&response.cgroup_path,
+            )
+        };
+        let first = PodClient::inspect_rebind(
+            &path,identity,launch.owner_epoch(),launch.credential_epoch(),
+        )?;
+        verify(&first)?;
+        self.config.recheck()?;
+        preflight_committed_codex_v2_read_only(launch,source)?;
+        let second = PodClient::inspect_rebind(
+            &path,identity,launch.owner_epoch(),launch.credential_epoch(),
+        )?;
+        verify(&second)?;
+        if first.checkpoint_digest != second.checkpoint_digest
+            || first.supervisor_pid != second.supervisor_pid
+            || first.supervisor_start_ticks != second.supervisor_start_ticks
+            || first.child_pid != second.child_pid
+            || first.child_start_ticks != second.child_start_ticks
+            || fs::symlink_metadata(&path).map(|meta|(meta.dev(),meta.ino()))?
+                != (metadata.dev(),metadata.ino())
+            || read_rebind_manifest_bytes(&path)? != bytes
+            || checked_store_file(launch.store_path(),manager.uid())?
+                != launch.store_file_identity()
+            || !LinuxPeerEvidence::for_current_process().is_ok_and(|peer|peer==manager)
+        {
+            return Err(PodError::Refused("recovered Active readback changed"));
+        }
+        attest_abandoned_manager_dead(&abandoned.next_manager, manager.boot_id())?;
+        attest_abandoned_manager_dead(&prior.intent.recovering_manager, manager.boot_id())?;
+        PortRecoveredActiveObservation::from_trusted_port(
+            expected_digest,second.supervisor_pid,second.supervisor_start_ticks,
+            second.child_pid,second.child_start_ticks,second.boot_id,
+            second.unit_name,second.cgroup_path,
+        ).map_err(|_| PodError::Refused("recovered Active proof malformed"))
     }
 
     /// Inspect an already-running pod without its old bearer. The path comes

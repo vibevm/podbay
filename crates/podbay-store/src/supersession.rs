@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use podbay_core::{
-    PendingRebindSupersession, PodFenceIdentity, RebindPhase, RebindProposal, SupersessionLedger,
+    AttestedPeer, CommandKey, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch,
+    PendingPodProcessEvidence, PendingRebindSupersession, PodFenceIdentity, PodId, RebindPhase,
+    RebindProposal, RequestDigest, ResourceId, ScopeId, StoreLineageId, SupersessionLedger,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, named_params, params};
 
@@ -30,6 +32,16 @@ pub struct SupersessionReceipt {
     pub request_digest: String,
     pub stage: SupersessionStage,
     pub recovery_checkpoint_digest: Option<String>,
+}
+
+/// Historical C Planned attempt plus A's durable manager peer. These are
+/// store facts only; D must attest C's death and the live pod's exact Active
+/// checkpoint before a successor transaction may use them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriorPlannedRecovery {
+    pub intent: PendingRebindSupersession,
+    pub receipt: SupersessionReceipt,
+    pub prior_manager_peer: AttestedPeer,
 }
 
 fn decode_stage(value: &str) -> Result<SupersessionStage, StoreError> {
@@ -137,6 +149,154 @@ fn canonical_intent(intent: &PendingRebindSupersession) -> Result<Vec<u8>, Store
         ));
     }
     Ok(bytes)
+}
+
+struct CanonicalReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> CanonicalReader<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], StoreError> {
+        let end = self.at.checked_add(count).ok_or(StoreError::Conflict(
+            "supersession canonical length overflows",
+        ))?;
+        let value = self.bytes.get(self.at..end).ok_or(StoreError::Conflict(
+            "supersession canonical intent is truncated",
+        ))?;
+        self.at = end;
+        Ok(value)
+    }
+    fn u64(&mut self) -> Result<u64, StoreError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+    fn text(&mut self) -> Result<String, StoreError> {
+        let len = u32::from_be_bytes(self.take(4)?.try_into().expect("four bytes")) as usize;
+        if len == 0 || len > 4096 {
+            return Err(StoreError::Conflict(
+                "supersession canonical text size differs",
+            ));
+        }
+        String::from_utf8(self.take(len)?.to_vec())
+            .map_err(|_| StoreError::Conflict("supersession canonical text is not UTF-8"))
+    }
+    fn inputs(&mut self) -> Result<BTreeMap<ResourceId, InputEpoch>, StoreError> {
+        let count = u16::from_be_bytes(self.take(2)?.try_into().expect("two bytes")) as usize;
+        if !(1..=64).contains(&count) {
+            return Err(StoreError::Conflict(
+                "supersession canonical resource count differs",
+            ));
+        }
+        let mut inputs = BTreeMap::new();
+        for _ in 0..count {
+            let id = ResourceId::try_from(self.text()?.as_str())
+                .map_err(|_| StoreError::Conflict("supersession canonical Resource ID differs"))?;
+            let epoch = InputEpoch::new(self.u64()?)
+                .map_err(|_| StoreError::Conflict("supersession canonical input epoch differs"))?;
+            if inputs.insert(id, epoch).is_some() {
+                return Err(StoreError::Conflict("duplicate canonical Resource ID"));
+            }
+        }
+        Ok(inputs)
+    }
+    fn peer(&mut self) -> Result<AttestedPeer, StoreError> {
+        let os = self.text()?;
+        let pid = self.text()?;
+        let boot = self.text()?;
+        let birth = self.text()?;
+        let containment = self.text()?;
+        AttestedPeer::from_port(&os, &pid, &boot, &birth, &containment)
+            .map_err(|_| StoreError::Conflict("supersession canonical peer differs"))
+    }
+}
+
+fn decode_canonical_intent(bytes: &[u8]) -> Result<PendingRebindSupersession, StoreError> {
+    if bytes.len() > MAX_INTENT_BYTES || !bytes.starts_with(DOMAIN) {
+        return Err(StoreError::Conflict(
+            "supersession canonical domain differs",
+        ));
+    }
+    let mut reader = CanonicalReader {
+        bytes,
+        at: DOMAIN.len(),
+    };
+    let identity = PodFenceIdentity {
+        store_lineage: StoreLineageId::try_from(reader.text()?.as_str())
+            .map_err(|_| StoreError::Conflict("supersession canonical lineage differs"))?,
+        scope_id: ScopeId::try_from(reader.text()?.as_str())
+            .map_err(|_| StoreError::Conflict("supersession canonical scope differs"))?,
+        pod_id: PodId::try_from(reader.text()?.as_str())
+            .map_err(|_| StoreError::Conflict("supersession canonical Pod differs"))?,
+        attempt_id: podbay_core::AttemptId::try_from(reader.text()?.as_str())
+            .map_err(|_| StoreError::Conflict("supersession canonical Attempt differs"))?,
+        incarnation: Epoch::new(reader.u64()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical incarnation differs"))?,
+    };
+    let abandoned = RebindProposal {
+        identity,
+        expected_owner_epoch: OwnerEpoch::new(reader.u64()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical old owner differs"))?,
+        next_owner_epoch: OwnerEpoch::new(reader.u64()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical next owner differs"))?,
+        expected_credential_epoch: CredentialEpoch::new(reader.u64()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical old credential differs"))?,
+        next_credential_epoch: CredentialEpoch::new(reader.u64()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical next credential differs"))?,
+        expected_input_epochs: reader.inputs()?,
+        next_input_epochs: reader.inputs()?,
+        next_manager: reader.peer()?,
+        command_key: CommandKey::try_from(reader.text()?.as_str())
+            .map_err(|_| StoreError::Conflict("supersession canonical B key differs"))?,
+        digest: RequestDigest::parse(&reader.text()?)
+            .map_err(|_| StoreError::Conflict("supersession canonical B digest differs"))?,
+    };
+    let pending_phase = match reader.take(1)?[0] {
+        1 => RebindPhase::PendingStore,
+        2 => RebindPhase::PendingPod,
+        _ => {
+            return Err(StoreError::Conflict(
+                "supersession canonical pending phase differs",
+            ));
+        }
+    };
+    let pending_checkpoint_digest = RequestDigest::parse(&reader.text()?)
+        .map_err(|_| StoreError::Conflict("supersession canonical pending digest differs"))?;
+    let pending_process = PendingPodProcessEvidence {
+        supervisor_process_id: reader.text()?,
+        supervisor_birth_identity: reader.text()?,
+        child_process_id: reader.text()?,
+        child_birth_identity: reader.text()?,
+        boot_identity: reader.text()?,
+        containment_identity: reader.text()?,
+    };
+    let recovering_owner_epoch = OwnerEpoch::new(reader.u64()?)
+        .map_err(|_| StoreError::Conflict("supersession canonical recovery owner differs"))?;
+    let recovering_credential_epoch = CredentialEpoch::new(reader.u64()?)
+        .map_err(|_| StoreError::Conflict("supersession canonical recovery credential differs"))?;
+    let recovering_input_epochs = reader.inputs()?;
+    let recovering_manager = reader.peer()?;
+    let command_key = CommandKey::try_from(reader.text()?.as_str())
+        .map_err(|_| StoreError::Conflict("supersession canonical recovery key differs"))?;
+    let digest = RequestDigest::parse(&reader.text()?)
+        .map_err(|_| StoreError::Conflict("supersession canonical recovery digest differs"))?;
+    let intent = PendingRebindSupersession {
+        abandoned,
+        pending_phase,
+        pending_checkpoint_digest,
+        pending_process,
+        recovering_owner_epoch,
+        recovering_credential_epoch,
+        recovering_input_epochs,
+        recovering_manager,
+        command_key,
+        digest,
+    };
+    if reader.at != bytes.len() || canonical_intent(&intent)? != bytes {
+        return Err(StoreError::Conflict("supersession canonical bytes differ"));
+    }
+    Ok(intent)
 }
 
 fn validate_shape(intent: &PendingRebindSupersession) -> Result<(), StoreError> {
@@ -591,6 +751,101 @@ fn load_attempt(
 }
 
 impl PodBayStore {
+    /// Indexed read of the newest abandoned B row and its newest C Planned
+    /// attempt for one store-derived Pod identity. This is historical data,
+    /// not evidence that C died or that the pod fsynced recovery Active A.
+    pub fn latest_planned_recovery_for_pod(
+        &mut self,
+        identity: &PodFenceIdentity,
+    ) -> Result<Option<PriorPlannedRecovery>, StoreError> {
+        if identity.store_lineage.as_str() != self.store_lineage {
+            return Err(StoreError::WrongScope);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let abandoned_rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT rebind_rowid FROM manager_rebinds
+             WHERE store_lineage=?1 AND scope_id=?2 AND pod_id=?3 AND attempt_id=?4
+               AND pod_incarnation=?5 ORDER BY next_owner_epoch DESC LIMIT 1",
+                params![
+                    identity.store_lineage.as_str(),
+                    identity.scope_id.as_str(),
+                    identity.pod_id.as_str(),
+                    identity.attempt_id.as_str(),
+                    sqlite_counter(identity.incarnation.get())?
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(abandoned_rowid) = abandoned_rowid else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let latest: Option<(i64, Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT supersession_rowid,intent_bytes,phase
+             FROM rebind_supersession_attempts WHERE abandoned_rebind_rowid=?1
+             ORDER BY supersession_rowid DESC LIMIT 1",
+                [abandoned_rowid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((latest_rowid, bytes, phase)) = latest else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if phase != "planned" {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let intent = decode_canonical_intent(&bytes)?;
+        if &intent.abandoned.identity != identity {
+            return Err(StoreError::WrongScope);
+        }
+        let (verified_rowid, _, _, _, _) =
+            verify_abandoned(&transaction, &intent, &self.store_lineage)?;
+        if verified_rowid != abandoned_rowid {
+            return Err(StoreError::Conflict(
+                "latest recovery abandoned row differs",
+            ));
+        }
+        let receipt = load_attempt(&transaction, &intent, &bytes, abandoned_rowid)?
+            .ok_or(StoreError::Conflict("latest recovery attempt vanished"))?;
+        if receipt.rowid != latest_rowid || receipt.stage != SupersessionStage::Planned {
+            return Err(StoreError::Conflict("latest recovery attempt differs"));
+        }
+        let prior_peer: Option<(String,String,String,String,String)> = transaction.query_row(
+            "SELECT os_identity,process_identity,boot_identity,birth_identity,containment_identity
+             FROM manager_peer_bindings WHERE store_lineage=?1 AND owner_epoch=?2
+               AND credential_epoch=?3 AND peer_schema='podbay.attested-peer/1'",
+            params![identity.store_lineage.as_str(),
+                sqlite_counter(intent.abandoned.expected_owner_epoch.get())?,
+                sqlite_counter(intent.abandoned.expected_credential_epoch.get())?],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?;
+        let (os, pid, boot, birth, containment) = prior_peer.ok_or(StoreError::Conflict(
+            "prior Active manager peer is unavailable",
+        ))?;
+        let prior_manager_peer = AttestedPeer::from_port(&os, &pid, &boot, &birth, &containment)
+            .map_err(|_| StoreError::Conflict("prior Active manager peer is malformed"))?;
+        let current_owner: i64 = transaction.query_row(
+            "SELECT value FROM metadata WHERE key='owner_epoch'",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_owner <= sqlite_counter(intent.recovering_owner_epoch.get())? {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(Some(PriorPlannedRecovery {
+            intent,
+            receipt,
+            prior_manager_peer,
+        }))
+    }
+
     /// Trusted host only. The host must independently attest the live pod
     /// socket/child and abandoned manager death. This transaction verifies
     /// exact committed B row, current C owner/peer and full Resource vector;

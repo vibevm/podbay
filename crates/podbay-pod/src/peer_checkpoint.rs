@@ -186,6 +186,20 @@ pub fn encode_peer_checkpoint(
     Ok(bytes)
 }
 
+/// Exact observation digest of canonical checkpoint bytes. A recovery host
+/// may compute this from store-proven fields, but must still compare it with
+/// a nonce-bound live pod readback before claiming a fsynced checkpoint.
+pub fn peer_checkpoint_observation_digest(
+    checkpoint: &PodFenceCheckpoint,
+) -> Result<String, PeerCheckpointError> {
+    let bytes = encode_peer_checkpoint(checkpoint)?;
+    let mut hash = Sha256::new();
+    hash.update(OBSERVATION_DOMAIN);
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(&bytes);
+    Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -537,16 +551,8 @@ mod linux_file {
         directory: &Path,
         expected: &PodFenceIdentity,
     ) -> Result<PeerCheckpointObservation, PeerCheckpointError> {
-        let (checkpoint, bytes) = read_at_path(&checkpoint_path(directory, expected), expected)?;
-        let mut hash = Sha256::new();
-        hash.update(OBSERVATION_DOMAIN);
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(&bytes);
-        let digest = hash
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let (checkpoint, _bytes) = read_at_path(&checkpoint_path(directory, expected), expected)?;
+        let digest = peer_checkpoint_observation_digest(&checkpoint)?;
         Ok(PeerCheckpointObservation { checkpoint, digest })
     }
 

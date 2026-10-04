@@ -44,5 +44,7 @@ pub use rebind::{
     DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection,
     SqlitePriorObservedPendingLedger, SqliteRebindLedger,
 };
-pub use supersession::{SqliteSupersessionLedger, SupersessionReceipt, SupersessionStage};
+pub use supersession::{
+    PriorPlannedRecovery, SqliteSupersessionLedger, SupersessionReceipt, SupersessionStage,
+};
 pub use store::PodBayStore;

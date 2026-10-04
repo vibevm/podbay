@@ -432,8 +432,62 @@ fn v21_later_manager_supersedes_only_latest_planned_attempt() {
     assert!(witness.supersedes(&d));
     assert!(matches!(store.acknowledge_pending_rebind_supersession(&c, &"a".repeat(64)),
         Err(StoreError::StaleEpoch)));
+    store.acknowledge_pending_rebind_supersession(&d,&"a".repeat(64)).unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let c_phase: String = connection.query_row(
+        "SELECT phase FROM rebind_supersession_attempts WHERE supersession_rowid=?1",
+        [c_receipt.rowid],|row|row.get(0),
+    ).unwrap();
+    let d_phase: String = connection.query_row(
+        "SELECT phase FROM rebind_supersession_attempts WHERE supersession_rowid=?1",
+        [d_receipt.rowid],|row|row.get(0),
+    ).unwrap();
+    assert_eq!((c_phase.as_str(),d_phase.as_str()),("planned","pod_checkpointed"));
     assert_eq!(fixture.count("manager_rebinds"), 1);
     assert_eq!(fixture.count("rebind_supersession_attempts"), 2);
+}
+
+#[test]
+fn v21_d_reads_latest_c_planned_and_exact_historical_a_peer() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    let prior_peer = AttestedPeer::from_port(
+        "linux.uid.1000","pid.100","boot.fixture","birth.100","manager.unit",
+    ).unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute(
+        "INSERT INTO manager_peer_bindings(store_lineage,owner_epoch,credential_epoch,
+           peer_schema,os_identity,process_identity,boot_identity,birth_identity,containment_identity)
+         VALUES(?1,1,1,'podbay.attested-peer/1',?2,?3,?4,?5,?6)",
+        rusqlite::params![proposal.identity.store_lineage.as_str(),
+            prior_peer.os_identity(),prior_peer.native_process_id(),prior_peer.boot_identity(),
+            prior_peer.birth_identity(),prior_peer.containment_identity()],
+    ).unwrap();
+    drop(connection);
+    store.prepare_manager_rebind_from_host_observation(&proposal, &observed).unwrap();
+    store.begin_authority_replay(4,5).unwrap();
+    let c = pending_recovery_intent(&mut store,proposal.clone(),&observed,5,
+        "supersede.pending.c",'e');
+    let receipt = store.plan_pending_rebind_supersession(&c,None).unwrap();
+    store.begin_authority_replay(5,6).unwrap();
+    let found = store.latest_planned_recovery_for_pod(&proposal.identity).unwrap().unwrap();
+    assert_eq!(found.intent,c);
+    assert_eq!(found.receipt,receipt);
+    assert_eq!(found.prior_manager_peer,prior_peer);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute(
+        "UPDATE rebind_supersession_attempts SET intent_bytes=X'00'
+         WHERE supersession_rowid=?1",[receipt.rowid],
+    ).unwrap_err(); // STRICT length constraint refuses an invalid replacement.
+    assert_eq!(store.latest_planned_recovery_for_pod(&proposal.identity).unwrap().unwrap(),found);
+    connection.execute(
+        "DELETE FROM manager_peer_bindings WHERE store_lineage=?1 AND owner_epoch=1
+           AND credential_epoch=1",
+        [proposal.identity.store_lineage.as_str()],
+    ).unwrap();
+    assert!(matches!(store.latest_planned_recovery_for_pod(&proposal.identity),
+        Err(StoreError::Conflict("prior Active manager peer is unavailable"))));
 }
 
 #[test]

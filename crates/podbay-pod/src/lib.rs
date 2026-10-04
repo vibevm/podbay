@@ -67,7 +67,10 @@ pub use native_events::{
     NativeEventSnapshot, NativeEventSpool, NativeEventStatus, PrivateNativeEvidence,
     PublicNativeEvent, decode_private_native_evidence_for_trusted_reader,
 };
-pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
+pub use peer_checkpoint::{
+    PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint,
+    peer_checkpoint_observation_digest,
+};
 #[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{

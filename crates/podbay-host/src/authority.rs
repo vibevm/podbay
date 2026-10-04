@@ -26,7 +26,8 @@ use podbay_store::{
     CommandLookupSelector, CurrentScopeSnapshot, DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
-    ManagerCredentialClaim, NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness,
+    ManagerCredentialClaim, NativeWriterLease, PodBayStore, PriorPlannedRecovery, Receipt,
+    SqliteActorVerifierWitness,
     StoreError, SupersessionReceipt, SupersessionStage, TrustedBootstrapSendRequest,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
@@ -1074,6 +1075,56 @@ impl PortPendingRecoveryObservation {
     pub fn descriptor_digest(&self) -> &str { &self.descriptor_digest }
 }
 
+/// Trusted port observation that an already recovered Active(A) checkpoint
+/// matches the exact reconstructed C Planned predecessor and the same live
+/// supervisor/child. It is read-only and is not itself a store ACK.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortRecoveredActiveObservation {
+    checkpoint_digest: String,
+    supervisor_pid: u32,
+    supervisor_start_ticks: u64,
+    child_pid: u32,
+    child_start_ticks: u64,
+    boot_id: String,
+    unit_name: String,
+    cgroup_path: String,
+}
+
+impl PortRecoveredActiveObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trusted_port(
+        checkpoint_digest: String,
+        supervisor_pid: u32,
+        supervisor_start_ticks: u64,
+        child_pid: u32,
+        child_start_ticks: u64,
+        boot_id: String,
+        unit_name: String,
+        cgroup_path: String,
+    ) -> Result<Self, HostError> {
+        if !valid_rebind_checkpoint_digest(&checkpoint_digest)
+            || supervisor_pid == 0 || supervisor_start_ticks == 0
+            || child_pid == 0 || child_start_ticks == 0
+            || boot_id.is_empty() || unit_name.is_empty()
+            || !cgroup_path.starts_with('/') || cgroup_path.len() > 4096
+        {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            checkpoint_digest,supervisor_pid,supervisor_start_ticks,child_pid,
+            child_start_ticks,boot_id,unit_name,cgroup_path,
+        })
+    }
+    pub fn checkpoint_digest(&self) -> &str { &self.checkpoint_digest }
+    pub fn supervisor_pid(&self) -> u32 { self.supervisor_pid }
+    pub fn supervisor_start_ticks(&self) -> u64 { self.supervisor_start_ticks }
+    pub fn child_pid(&self) -> u32 { self.child_pid }
+    pub fn child_start_ticks(&self) -> u64 { self.child_start_ticks }
+    pub fn boot_id(&self) -> &str { &self.boot_id }
+    pub fn unit_name(&self) -> &str { &self.unit_name }
+    pub fn cgroup_path(&self) -> &str { &self.cgroup_path }
+}
+
 /// Private host-created proof passed only to its installed Linux port after
 /// the exact Pending store row commits. It carries no credential or bearer.
 #[derive(Clone)]
@@ -1311,6 +1362,49 @@ fn digest_pending_recovery_intent(
     RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
 }
 
+fn digest_recovered_active_successor(
+    key: &CommandKey,
+    prior: &PriorPlannedRecovery,
+    context: &ManagerRebindContext<'_>,
+    observed: &PortRecoveredActiveObservation,
+) -> Result<RequestDigest, HostError> {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let mut hash = Sha256::new();
+    field(&mut hash,b"podbay.rebind-recovery-active-successor/1");
+    for text in [
+        key.as_str(),prior.intent.abandoned.identity.store_lineage.as_str(),
+        prior.intent.abandoned.identity.scope_id.as_str(),
+        prior.intent.abandoned.identity.pod_id.as_str(),
+        prior.intent.abandoned.identity.attempt_id.as_str(),
+        prior.intent.digest.as_str(),observed.checkpoint_digest(),
+        context.manager_peer().os_identity(),context.manager_peer().native_process_id(),
+        context.manager_peer().boot_identity(),context.manager_peer().birth_identity(),
+        context.manager_peer().containment_identity(),
+    ] {
+        field(&mut hash,text.as_bytes());
+    }
+    for value in [
+        prior.receipt.rowid as u64,context.owner_epoch(),context.credential_epoch(),
+        u64::from(observed.supervisor_pid()),observed.supervisor_start_ticks(),
+        u64::from(observed.child_pid()),observed.child_start_ticks(),
+    ] {
+        field(&mut hash,&value.to_be_bytes());
+    }
+    for (id,epoch) in context.resource_input_epochs() {
+        let old = prior.intent.recovering_input_epochs.get(id)
+            .ok_or(HostError::StaleGuard)?;
+        field(&mut hash,id.as_str().as_bytes());
+        field(&mut hash,&old.get().to_be_bytes());
+        field(&mut hash,&epoch.get().to_be_bytes());
+    }
+    let digest = hash.finalize().iter().map(|byte|format!("{byte:02x}"))
+        .collect::<String>();
+    RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
 fn valid_rebind_checkpoint_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1537,6 +1631,17 @@ pub trait HostDispatchPort {
         &self,
         _prepared: &PreparedPendingRecovery,
     ) -> Result<String, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Read-only D proof after C lost its recovery ACK. The port must derive
+    /// the expected Active(A,B-next-inputs) checkpoint bytes from historical
+    /// A peer and B row, then compare to a fresh nonce-bound live pod reply.
+    fn inspect_recovered_active_codex_v2(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+        _prior: &PriorPlannedRecovery,
+    ) -> Result<PortRecoveredActiveObservation, HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -3614,6 +3719,100 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             durable,
             stage: RecoveryCompletionStage::PodCheckpointed,
             active_checkpoint_digest: Some(digest),
+        })
+    }
+
+    /// D adopts a fsynced recovery Active A after C died before its ACK.
+    /// The port independently reconstructs exact Active bytes from A's
+    /// historical peer and B's next inputs, then compares a nonce-bound live
+    /// pod inspection twice. C's Planned row remains historical and never
+    /// becomes evidence that C was Active; only D's successor is ACKed.
+    pub fn adopt_recovered_active_codex_v2(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RecoveryCompletionReceipt, RebindContextError> {
+        let key = CommandKey::try_from(command_key).map_err(|_| HostError::InvalidInput)?;
+        let reviewed = self.inspect_committed_root_codex_v2(scope,pod)?;
+        let initial = self.rebind_context(scope,pod)?;
+        let identity = initial.identity().clone();
+        drop(initial);
+        let prior = self.store.latest_planned_recovery_for_pod(&identity)?
+            .ok_or(StoreError::NotFound)?;
+        let first = self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior)?;
+        let second = self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior)?;
+        if first != second {
+            return Err(HostError::StaleGuard.into());
+        }
+        let mut context = self.rebind_context(scope,pod)?;
+        context.recheck_current()?;
+        if context.launch() != reviewed.committed_record()
+            || context.identity() != &identity
+            || context.owner_epoch() <= prior.intent.recovering_owner_epoch.get()
+            || context.credential_epoch() <= prior.intent.recovering_credential_epoch.get()
+            || context.manager_peer() != reviewed.manager_peer()
+            || context.authority_revision() != reviewed.authority_revision()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let digest = digest_recovered_active_successor(&key,&prior,&context,&first)?;
+        let mut intent = prior.intent.clone();
+        intent.recovering_owner_epoch = OwnerEpoch::new(context.owner_epoch())
+            .map_err(|_| HostError::StaleGuard)?;
+        intent.recovering_credential_epoch = CredentialEpoch::new(context.credential_epoch())
+            .map_err(|_| HostError::StaleGuard)?;
+        intent.recovering_input_epochs = context.resource_input_epochs().clone();
+        intent.recovering_manager = context.manager_peer().clone();
+        intent.command_key = key;
+        intent.digest = digest;
+        let planned = context.store.plan_pending_rebind_supersession(
+            &intent,Some(prior.receipt.rowid),
+        )?;
+        if planned.stage != SupersessionStage::Planned {
+            return Err(StoreError::Conflict("D successor is no longer Planned").into());
+        }
+        drop(context);
+        let fallback = |digest: Option<String>| RecoveryCompletionReceipt {
+            durable: planned.clone(),
+            stage: RecoveryCompletionStage::PodRecoveryUnknown,
+            active_checkpoint_digest: digest,
+        };
+        if self.store.plan_pending_rebind_supersession(
+            &intent,Some(prior.receipt.rowid),
+        ).ok().as_ref() != Some(&planned) {
+            return Ok(fallback(None));
+        }
+        // The latest row is now D, so compare the same historical C proof
+        // directly through the trusted port, not a broad historical scan.
+        let after = match self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(None)),
+        };
+        if after != first || self.rebind_context(scope,pod).and_then(|mut context| {
+            context.recheck_current()?;
+            if context.launch() != reviewed.committed_record()
+                || context.owner_epoch() != intent.recovering_owner_epoch.get()
+                || context.credential_epoch() != intent.recovering_credential_epoch.get()
+                || context.resource_input_epochs() != &intent.recovering_input_epochs
+                || context.manager_peer() != &intent.recovering_manager
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(())
+        }).is_err() {
+            return Ok(fallback(Some(first.checkpoint_digest().into())));
+        }
+        let durable = match self.store.acknowledge_pending_rebind_supersession(
+            &intent,first.checkpoint_digest(),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(Some(first.checkpoint_digest().into()))),
+        };
+        Ok(RecoveryCompletionReceipt {
+            durable,
+            stage: RecoveryCompletionStage::PodCheckpointed,
+            active_checkpoint_digest: Some(first.checkpoint_digest().into()),
         })
     }
 
