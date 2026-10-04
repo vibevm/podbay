@@ -207,6 +207,25 @@ impl CodexCommandJournal {
         self.log.identity()
     }
 
+    pub fn matches_identity(&self, expected: &CodexJournalIdentity) -> bool {
+        &self.identity == expected
+    }
+
+    /// Recheck the held file against its path, privacy and complete durable
+    /// tail before a native effect. A changed inode or torn append is never
+    /// interpreted as an absent command.
+    pub fn recheck_held_file(&mut self) -> Result<(), PodError> {
+        self.healthy()?;
+        let identity = self.log.identity().clone();
+        let raw = self.log.read_all_bounded().inspect_err(|_| self.poisoned = true)?;
+        let (snapshot, records) = replay(&raw, &self.identity).inspect_err(|_| self.poisoned = true)?;
+        if self.log.identity() != &identity || snapshot != self.snapshot || records != self.records {
+            self.poisoned = true;
+            return Err(PodError::Uncertain("Codex journal changed outside owner"));
+        }
+        Ok(())
+    }
+
     pub fn view(&self) -> CodexJournalView {
         let stage = if self.poisoned {
             CodexJournalStage::StorageUncertain
@@ -766,6 +785,18 @@ mod tests {
             Err(PodError::Uncertain(_))
         ));
         assert_eq!(files.append_calls(), 1);
+    }
+
+    #[test]
+    fn held_file_recheck_refuses_changed_tail_before_native_effect() {
+        let files = MemoryFiles::new();
+        let digest = "d".repeat(64);
+        let mut journal = CodexCommandJournal::open(&files, Path::new(PATH), identity()).unwrap();
+        journal.begin_thread_create(KEY, &digest).unwrap();
+        journal.recheck_held_file().unwrap();
+        files.state.lock().unwrap().bytes.push(0);
+        assert!(matches!(journal.recheck_held_file(), Err(PodError::Uncertain(_))));
+        assert!(matches!(journal.begin_thread_create(KEY, &digest), Err(PodError::Uncertain(_))));
     }
 
     #[test]

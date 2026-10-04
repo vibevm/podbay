@@ -3,6 +3,8 @@
 
 #[cfg(target_os = "linux")]
 mod codex_credential;
+#[cfg(target_os = "linux")]
+mod codex_bootstrap;
 mod codex_journal;
 #[cfg(target_os = "linux")]
 mod codex_launch;
@@ -32,6 +34,10 @@ pub use codex_credential::{
 pub use codex_journal::{
     CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage,
     CodexJournalView,
+};
+#[cfg(target_os = "linux")]
+pub use codex_bootstrap::{
+    BootstrapControlReceipt, BootstrapControlStage, CODEX_BOOTSTRAP_PROTOCOL,
 };
 #[cfg(target_os = "linux")]
 pub use codex_launch::launch_bound_codex_v2;

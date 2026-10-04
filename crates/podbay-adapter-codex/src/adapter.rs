@@ -631,6 +631,24 @@ impl<T: JsonlTransport> CodexResource<T> {
         bootstrap_text: &str,
         client_message_id: &str,
     ) -> Result<BootstrapTurnSubmission, CodexError> {
+        self.submit_bootstrap_after_checkpoint_checked(
+            permit, expected_thread_id, expected_session_id, bootstrap_text,
+            client_message_id, |_| Ok(()),
+        )
+    }
+
+    /// The pod's final durable/OS preflight runs after the fresh native idle
+    /// read and immediately before the first `turn/start`. Failure poisons
+    /// this instance because its external journal intent may already exist.
+    pub fn submit_bootstrap_after_checkpoint_checked(
+        &mut self,
+        permit: &WriterPermit,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        bootstrap_text: &str,
+        client_message_id: &str,
+        mut before_turn_start: impl FnMut(&mut Self) -> Result<(), CodexError>,
+    ) -> Result<BootstrapTurnSubmission, CodexError> {
         self.check_permit(permit)?;
         if bootstrap_text.is_empty()
             || bootstrap_text.len() > 1_000_000
@@ -660,6 +678,11 @@ impl<T: JsonlTransport> CodexResource<T> {
             || self.observed_active_turn_id.is_some()
         {
             return Err(CodexError::Blocked(BlockReason::NativeBusy));
+        }
+        if let Err(error) = before_turn_start(self) {
+            self.bootstrap = BootstrapState::Unknown;
+            self.poisoned = true;
+            return Err(error);
         }
         let uncertain = BootstrapTurnSubmission {
             native_thread_id: expected_thread_id.into(),
@@ -1588,5 +1611,63 @@ mod split_thread_tests {
             Err(CodexError::InvalidState(_))
         ));
         assert_eq!(resource.transport().writes.len(), 3);
+    }
+
+    #[test]
+    fn final_preflight_after_idle_read_refuses_before_turn_start() {
+        let cwd = PathBuf::from("/tmp/podbay-codex-preflight-fixture");
+        let thread = json!({
+            "id": "thread.fixture",
+            "sessionId": "session.fixture",
+            "cwd": cwd,
+            "status": {"type": "idle"},
+            "turns": []
+        });
+        let io = FakeTransport {
+            reads: VecDeque::from([
+                frame(json!({"id":1,"result":{
+                    "codexHome":"/tmp/codex.fixture","platformFamily":"unix",
+                    "platformOs":"linux","userAgent":"fixture"}})),
+                frame(json!({"id":2,"result":{
+                    "thread":thread,"model":"gpt-6-sol","reasoningEffort":"medium",
+                    "approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},
+                    "cwd":cwd}})),
+                frame(json!({"id":3,"result":{"thread":thread}})),
+            ]),
+            writes: Vec::new(),
+        };
+        let identity = ResourceIdentity {
+            session_id: SessionId::try_from("session.fixture").unwrap(),
+            run_id: RunId::try_from("run.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.fixture").unwrap(),
+            resource_id: ResourceId::try_from("resource.fixture").unwrap(),
+            resource_epoch: Epoch::new(1).unwrap(),
+        };
+        let config = PinnedCodexConfig::new(
+            "gpt-6-sol", "medium", cwd, ApprovalPolicy::Never, Sandbox::DangerFullAccess,
+        ).unwrap();
+        let mut resource = CodexResource::new(io, identity.clone(), config);
+        resource.initialize().unwrap();
+        resource.start_thread_without_turn().unwrap();
+        resource.install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap()).unwrap();
+        let permit = WriterPermit::from_trusted_boundary(identity, Epoch::new(1).unwrap());
+        let mut called = false;
+        assert!(matches!(
+            resource.submit_bootstrap_after_checkpoint_checked(
+                &permit, "thread.fixture", "session.fixture", "bootstrap", "message.fixture",
+                |_| {
+                    called = true;
+                    Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+                },
+            ),
+            Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+        ));
+        assert!(called);
+        assert_eq!(resource.bootstrap_state(), &BootstrapState::Unknown);
+        let methods = resource.transport().writes.iter().map(|line| {
+            serde_json::from_slice::<Value>(line).unwrap()["method"].as_str().unwrap().to_owned()
+        }).collect::<Vec<_>>();
+        assert_eq!(methods, ["initialize", "initialized", "thread/start", "thread/read"]);
     }
 }
