@@ -51,13 +51,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "podbay-codex-preflight-{}-{}",
+            "podbay-codex-preflight-{}-{nonce}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
         ));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -99,7 +99,7 @@ sleep 30
             executable,
             source,
             scope: ScopeId::try_from("scope.codex.preflight").unwrap(),
-            pod: PodId::try_from("pod.codex.preflight").unwrap(),
+            pod: PodId::try_from(format!("pod.codex.preflight.{nonce}").as_str()).unwrap(),
             directory,
         }
     }
@@ -1102,6 +1102,7 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
 #[test]
 #[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY, PODBAY_TEST_REAL_CODEX_BINARY, PODBAY_TEST_REAL_AUTH_SOURCE; submits one real model turn"]
 fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
+    let smoke_start = Instant::now();
     let pod_binary = required_real_test_path("PODBAY_TEST_POD_BINARY");
     let codex_binary = required_real_test_path("PODBAY_TEST_REAL_CODEX_BINARY");
     let auth_source = required_real_test_path("PODBAY_TEST_REAL_AUTH_SOURCE");
@@ -1134,9 +1135,11 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
         Duration::from_secs(180),
         120,
     );
+    eprintln!("real smoke setup_ms={}", smoke_start.elapsed().as_millis());
     let accepted = host
         .dispatch_prepared_bound_root_codex_v2(&transport, launch_request.clone())
         .unwrap();
+    eprintln!("real smoke launch_ms={}", smoke_start.elapsed().as_millis());
     if accepted.status.stage != LaunchDispatchStage::HostAccepted {
         let manifest = slot_manifest(&fixture);
         let pod_status = manifest.as_ref().map(|path| {
@@ -1171,12 +1174,13 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
     let session_id = SessionId::try_from("session.codex.preflight").unwrap();
     let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
         launch_request.host_request.grant_id,
-        Instant::now() + Duration::from_secs(45),
+        Instant::now() + Duration::from_secs(180),
     )
     .unwrap();
     let lease = host
-        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 60)
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 300)
         .unwrap();
+    eprintln!("real smoke lease_ms={}", smoke_start.elapsed().as_millis());
     let (target, session_revision) = PodBayStore::open(&fixture.database)
         .unwrap()
         .current_native_writer_target_for_session(&fixture.scope, &session_id)
@@ -1208,11 +1212,16 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
     let submitted = host
         .send_first_codex_bootstrap_from_wire(&transport, envelope.clone(), &policy)
         .unwrap();
+    eprintln!("real smoke send_ms={}", smoke_start.elapsed().as_millis());
     assert!(submitted.port_called);
-    assert!(matches!(
-        submitted.port_observation,
-        Some(BootstrapPortObservation::PodAccepted(_))
-    ));
+    assert!(
+        matches!(
+            submitted.port_observation,
+            Some(BootstrapPortObservation::PodAccepted(_))
+        ),
+        "first send port observation: {:?}",
+        submitted.port_observation
+    );
     let durable = reopened_bootstrap_journal(&fixture);
     assert!(matches!(
         durable.stage,
