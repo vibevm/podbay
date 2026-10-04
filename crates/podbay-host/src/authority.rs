@@ -454,7 +454,13 @@ impl ActorRegistration {
 pub struct TrustedInitialOwnerPolicy {
     actor_id: ActorId,
     scope_id: ScopeId,
-    credential: CredentialRef,
+    authority: InitialOwnerAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum InitialOwnerAuthority {
+    CodexCredential(CredentialRef),
+    OperatorPod(PodId),
 }
 
 impl TrustedInitialOwnerPolicy {
@@ -469,7 +475,21 @@ impl TrustedInitialOwnerPolicy {
         Ok(Self {
             actor_id,
             scope_id,
-            credential,
+            authority: InitialOwnerAuthority::CodexCredential(credential),
+        })
+    }
+
+    /// A local operator launcher receives only the exact Pod launch right.
+    /// It cannot submit provider input or select another credential or Pod.
+    pub fn for_operator_pod(
+        actor_id: ActorId,
+        scope_id: ScopeId,
+        pod_id: PodId,
+    ) -> Result<Self, HostError> {
+        Ok(Self {
+            actor_id,
+            scope_id,
+            authority: InitialOwnerAuthority::OperatorPod(pod_id),
         })
     }
 
@@ -477,17 +497,20 @@ impl TrustedInitialOwnerPolicy {
     pub fn scope_id(&self) -> &ScopeId { &self.scope_id }
 
     fn grant_spec(&self) -> GrantSpec {
+        let rights = match &self.authority {
+            InitialOwnerAuthority::CodexCredential(credential) => BTreeSet::from([
+                Right::new(Operation::LaunchPod, Target::Scope(self.scope_id.clone())),
+                Right::new(Operation::SendSession, Target::Scope(self.scope_id.clone())),
+                Right::new(Operation::UseCredential, Target::Credential(credential.clone())),
+            ]),
+            InitialOwnerAuthority::OperatorPod(pod) => BTreeSet::from([
+                Right::new(Operation::LaunchPod, Target::Pod(pod.clone())),
+            ]),
+        };
         GrantSpec {
             scope_id: self.scope_id.clone(),
             mode: GrantMode::Controller,
-            rights: BTreeSet::from([
-                Right::new(Operation::LaunchPod, Target::Scope(self.scope_id.clone())),
-                Right::new(Operation::SendSession, Target::Scope(self.scope_id.clone())),
-                Right::new(
-                    Operation::UseCredential,
-                    Target::Credential(self.credential.clone()),
-                ),
-            ]),
+            rights,
             remaining_delegation_depth: 0,
         }
     }
@@ -559,7 +582,7 @@ struct InitialEnrollmentRuntime {
     receipt: InitialOwnerEnrollmentReceipt,
     process: AuthenticatedProcessSubject,
     public_key: [u8; 32],
-    credential: CredentialRef,
+    authority: InitialOwnerAuthority,
 }
 
 fn initial_owner_field(output: &mut Vec<u8>, tag: u8, value: &[u8]) -> Result<(), HostError> {
@@ -589,6 +612,16 @@ fn initial_owner_challenge(
     let revision_bytes = revision.to_be_bytes();
     let start_bytes = process.start_identity().to_be_bytes();
     let mut bytes = b"podbay.owner-initial-enrollment/1\0".to_vec();
+    let (authority_ref, rights) = match &policy.authority {
+        InitialOwnerAuthority::CodexCredential(credential) => (
+            credential.as_str(),
+            "launch_pod.scope+use_credential.exact+send_session.scope",
+        ),
+        InitialOwnerAuthority::OperatorPod(pod) => (
+            pod.as_str(),
+            "launch_pod.exact.operator_process_v1",
+        ),
+    };
     for (tag, field) in [
         (1, nonce.as_slice()),
         (2, lineage.as_bytes()),
@@ -602,11 +635,8 @@ fn initial_owner_challenge(
         (10, start_bytes.as_slice()),
         (11, process.containment_identity().as_bytes()),
         (12, public_key.as_slice()),
-        (13, policy.credential.as_str().as_bytes()),
-        (
-            14,
-            b"launch_pod.scope+use_credential.exact+send_session.scope".as_slice(),
-        ),
+        (13, authority_ref.as_bytes()),
+        (14, rights.as_bytes()),
     ] {
         initial_owner_field(&mut bytes, tag, field)?;
     }
@@ -5507,7 +5537,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             if let Some(previous) = self.initial_owner_enrollments.get(&proof.policy.actor_id) {
                 if previous.process != proof.process
                     || previous.public_key != proof.public_key
-                    || previous.credential != proof.policy.credential
+                    || previous.authority != proof.policy.authority
                     || previous.receipt.authority_revision != current.revision
                 {
                     return Err(HostError::Unauthorised.into());
@@ -5629,7 +5659,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     receipt: receipt.clone(),
                     process: proof.process,
                     public_key: proof.public_key,
-                    credential: proof.policy.credential,
+                    authority: proof.policy.authority,
                 },
             );
             Ok(receipt)

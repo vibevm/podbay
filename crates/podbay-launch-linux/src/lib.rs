@@ -15,7 +15,8 @@ pub use codex_v2::{
 };
 #[cfg(target_os = "linux")]
 pub use linux::{
-    LinuxLaunchPort, TrustedLinuxLaunchConfig, TrustedOperatorProcessProfile,
+    LinuxLaunchPort, OperatorArtifactDigest, TrustedLinuxLaunchConfig,
+    TrustedOperatorArtifact, TrustedOperatorProcessProfile,
     VerifiedRebindInspection,
 };
 #[cfg(target_os = "linux")]

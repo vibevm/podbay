@@ -1507,6 +1507,18 @@ fn validate_initial_owner_enrollment(
             )
         })
         .collect::<BTreeSet<_>>();
+    if rights.len() == 1 && grant.rights.len() == 1 {
+        let only = &grant.rights[0];
+        if only.operation == "launch_pod"
+            && only.target_kind == "pod"
+            && valid_identity(&only.target_id).is_ok()
+        {
+            return Ok(());
+        }
+        return Err(StoreError::InvalidInput(
+            "initial operator Pod grant right is invalid",
+        ));
+    }
     if rights.len() != 3
         || grant.rights.len() != 3
         || !rights.contains(&("launch_pod".into(), "scope".into(), actor.scope_id.clone()))

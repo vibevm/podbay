@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 mod manager_policy;
 #[cfg(target_os = "linux")]
+mod operator_zap;
+#[cfg(target_os = "linux")]
 mod owner_process;
 #[cfg(target_os = "linux")]
 mod socket_reconcile;
@@ -641,7 +643,11 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
-    linux::main()
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("operator")) {
+        operator_zap::main()
+    } else {
+        linux::main()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

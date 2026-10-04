@@ -9,6 +9,7 @@ podbay-core = { path = "../podbay-core" }
 podbay-host = { path = "../podbay-host" }
 podbay-launch-linux = { path = "../podbay-launch-linux" }
 podbay-pod = { path = "../podbay-pod" }
+podbay-store = { path = "../podbay-store" }
 podbay-server = { path = "../podbay-server" }
 podbay-wire = { path = "../podbay-wire" }
 serde = { version = "1.0", features = ["derive"] }
@@ -18,9 +19,9 @@ signal-hook = "0.3"
 libc = "0.2"
 nix = { version = "0.28", features = ["fs"] }
 rustix = { version = "1.1", features = ["event", "process"] }
+ed25519-compact = { version = "2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-ed25519-compact = { version = "2", default-features = false }
 podbay-client = { path = "../podbay-client" }
 podbay-store = { path = "../podbay-store" }
 

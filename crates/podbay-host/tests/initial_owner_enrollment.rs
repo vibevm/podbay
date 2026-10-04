@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
-use podbay_core::{ActorId, ScopeId};
+use podbay_core::{ActorId, PodId, ScopeId};
 use podbay_host::{
     AuthenticatedProcessSubject, AuthorisedBoundLaunch, AuthorisedDispatch, CredentialRef,
     DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError, PortDispatchError,
@@ -139,6 +139,38 @@ fn signed_initial_owner_enrollment_activates_only_after_atomic_commit() {
     assert_eq!(repeated.authority_revision, receipt.authority_revision);
     assert!(repeated.duplicate);
     assert_eq!(host.recorded_snapshot().grants.len(), 1);
+}
+
+#[test]
+fn signed_operator_owner_receives_only_exact_pod_launch_right() {
+    let fixture = Fixture::new();
+    let mut host = DurableAuthority::open(&fixture.database, NoPort).unwrap();
+    let actor = ActorId::try_from("actor.operator.owner").unwrap();
+    let scope = ScopeId::try_from("scope.operator.owner").unwrap();
+    let pod = PodId::try_from("pod.operator.owner").unwrap();
+    let policy = TrustedInitialOwnerPolicy::for_operator_pod(
+        actor.clone(), scope.clone(), pod.clone(),
+    ).unwrap();
+    let owner = process(3000);
+    let key = KeyPair::from_seed(Seed::new([21; 32]));
+    let pending = host.begin_initial_owner_enrollment(
+        policy.clone(), owner.clone(), *key.pk,
+    ).unwrap();
+    assert!(pending.challenge_bytes().windows(b"launch_pod.exact.operator_process_v1".len())
+        .any(|part| part == b"launch_pod.exact.operator_process_v1"));
+    let signature = key.sk.sign(pending.challenge_bytes(), None);
+    host.commit_initial_owner_enrollment(
+        pending.verify(signature.as_ref()).unwrap(), &owner,
+    ).unwrap();
+    let grant = host.current_owner_grant_from_trusted_policy(&policy).unwrap();
+    assert!(grant.get() > 0);
+    let snapshot = host.recorded_snapshot();
+    assert_eq!(snapshot.grants.len(), 1);
+    assert_eq!(snapshot.grants[0].rights.len(), 1);
+    let right = &snapshot.grants[0].rights[0];
+    assert_eq!(right.operation, "launch_pod");
+    assert_eq!(right.target_kind, "pod");
+    assert_eq!(right.target_id, pod.as_str());
 }
 
 #[test]

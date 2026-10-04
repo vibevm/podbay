@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -110,6 +111,189 @@ impl TrustedLinuxLaunchConfig {
     }
 }
 
+const OPERATOR_ARTIFACT_MAX_ENTRIES: u64 = 20_000;
+const OPERATOR_ARTIFACT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const OPERATOR_ARTIFACT_MAX_TIME: Duration = Duration::from_secs(8);
+
+/// One bounded digest of the whole installed Zap code and import tree. A
+/// symlink is recorded by its literal target and may resolve only inside the
+/// root. Mutable Zap state must live outside this tree.
+#[derive(Clone, Debug)]
+pub struct OperatorArtifactDigest {
+    pub sha256: String,
+    pub entries: u64,
+    pub bytes: u64,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone)]
+pub struct TrustedOperatorArtifact {
+    root: PathBuf,
+    sha256: String,
+    root_identity: (u64, u64),
+}
+
+impl TrustedOperatorArtifact {
+    pub fn inspect_tree(root: &Path) -> Result<OperatorArtifactDigest, PodError> {
+        let metadata = fs::symlink_metadata(root)?;
+        let peer = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("operator artifact inspector identity unavailable"))?;
+        if !root.is_absolute()
+            || fs::canonicalize(root)? != root
+            || !metadata.is_dir()
+            || metadata.uid() != peer.uid()
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(PodError::Refused("operator artifact root is not canonical and owned"));
+        }
+        let started = Instant::now();
+        let mut hash = Sha256::new();
+        hash.update(b"podbay.operator-artifact-tree/1\0");
+        let mut entries = 0u64;
+        let mut bytes = 0u64;
+        hash_operator_tree(root, root, &mut hash, &mut entries, &mut bytes, started)?;
+        if started.elapsed() > OPERATOR_ARTIFACT_MAX_TIME {
+            return Err(PodError::Refused("operator artifact hash exceeded time budget"));
+        }
+        let after = fs::symlink_metadata(root)?;
+        if (after.dev(), after.ino(), after.mtime(), after.mtime_nsec())
+            != (metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
+        {
+            return Err(PodError::Refused("operator artifact root changed during hash"));
+        }
+        Ok(OperatorArtifactDigest {
+            sha256: hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect(),
+            entries,
+            bytes,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    pub fn from_trusted_policy(root: PathBuf, sha256: String) -> Result<Self, PodError> {
+        Self::from_trusted_policy_with_receipt(root, sha256).map(|(artifact, _)| artifact)
+    }
+
+    pub fn from_trusted_policy_with_receipt(
+        root: PathBuf,
+        sha256: String,
+    ) -> Result<(Self, OperatorArtifactDigest), PodError> {
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            return Err(PodError::Refused("operator artifact digest is invalid"));
+        }
+        let metadata = fs::symlink_metadata(&root)?;
+        let observed = Self::inspect_tree(&root)?;
+        if observed.sha256 != sha256 {
+            return Err(PodError::Refused("operator artifact tree differs from trusted digest"));
+        }
+        let artifact = Self {
+            root,
+            sha256,
+            root_identity: (metadata.dev(), metadata.ino()),
+        };
+        Ok((artifact, observed))
+    }
+
+    fn recheck(&self) -> Result<(), PodError> {
+        let metadata = fs::symlink_metadata(&self.root)?;
+        if (metadata.dev(), metadata.ino()) != self.root_identity
+            || Self::inspect_tree(&self.root)?.sha256 != self.sha256
+        {
+            return Err(PodError::Refused("operator artifact tree differs from trusted digest"));
+        }
+        Ok(())
+    }
+}
+
+fn operator_hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
+}
+
+fn hash_operator_tree(
+    root: &Path,
+    directory: &Path,
+    hash: &mut Sha256,
+    entries: &mut u64,
+    bytes: &mut u64,
+    started: Instant,
+) -> Result<(), PodError> {
+    let before = fs::symlink_metadata(directory)?;
+    if !before.is_dir() {
+        return Err(PodError::Refused("operator artifact directory changed"));
+    }
+    let mut children = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        if started.elapsed() > OPERATOR_ARTIFACT_MAX_TIME {
+            return Err(PodError::Refused("operator artifact hash exceeded time budget"));
+        }
+        *entries += 1;
+        if *entries > OPERATOR_ARTIFACT_MAX_ENTRIES {
+            return Err(PodError::Refused("operator artifact has too many entries"));
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(root)
+            .map_err(|_| PodError::Refused("operator artifact path escaped root"))?;
+        let metadata = fs::symlink_metadata(&path)?;
+        operator_hash_field(hash, relative.as_os_str().as_bytes());
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)?;
+            let resolved = fs::canonicalize(&path)?;
+            if !resolved.starts_with(root) {
+                return Err(PodError::Refused("operator artifact symlink escaped root"));
+            }
+            hash.update(b"L");
+            operator_hash_field(hash, target.as_os_str().as_bytes());
+        } else if metadata.is_dir() {
+            hash.update(b"D");
+            hash_operator_tree(root, &path, hash, entries, bytes, started)?;
+        } else if metadata.is_file() {
+            hash.update(b"F");
+            let size = metadata.len();
+            *bytes = bytes.checked_add(size)
+                .ok_or(PodError::Refused("operator artifact byte count overflow"))?;
+            if *bytes > OPERATOR_ARTIFACT_MAX_BYTES {
+                return Err(PodError::Refused("operator artifact exceeds byte budget"));
+            }
+            hash.update(size.to_be_bytes());
+            let mut file = OpenOptions::new().read(true)
+                .custom_flags(libc::O_NOFOLLOW).open(&path)?;
+            let opened = file.metadata()?;
+            if (opened.dev(), opened.ino(), opened.len(), opened.mtime(), opened.mtime_nsec())
+                != (metadata.dev(), metadata.ino(), size, metadata.mtime(), metadata.mtime_nsec())
+            {
+                return Err(PodError::Refused("operator artifact file changed before hash"));
+            }
+            let mut chunk = [0u8; 16_384];
+            let mut read = 0u64;
+            loop {
+                let count = file.read(&mut chunk)?;
+                if count == 0 { break; }
+                read += count as u64;
+                hash.update(&chunk[..count]);
+            }
+            let after = file.metadata()?;
+            let path_after = fs::symlink_metadata(&path)?;
+            if read != size
+                || (after.dev(), after.ino(), after.len(), after.mtime(), after.mtime_nsec())
+                    != (metadata.dev(), metadata.ino(), size, metadata.mtime(), metadata.mtime_nsec())
+                || (path_after.dev(), path_after.ino()) != (metadata.dev(), metadata.ino())
+            {
+                return Err(PodError::Refused("operator artifact file changed during hash"));
+            }
+        } else {
+            return Err(PodError::Refused("operator artifact contains special file"));
+        }
+    }
+    let after = fs::symlink_metadata(directory)?;
+    if (after.dev(), after.ino(), after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec())
+        != (before.dev(), before.ino(), before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec())
+    {
+        return Err(PodError::Refused("operator artifact directory changed during hash"));
+    }
+    Ok(())
+}
+
 /// One operator-installed generic process profile. The public V1 descriptor
 /// carries these fixed bytes for review; the port rechecks their provenance
 /// and filesystem identity before entering the pod adapter. This is local
@@ -125,6 +309,7 @@ pub struct TrustedOperatorProcessProfile {
     cwd_identity: (u64, u64),
     data_identity: (u64, u64),
     executable_identity: (u64, u64),
+    artifact: Option<TrustedOperatorArtifact>,
 }
 
 impl TrustedOperatorProcessProfile {
@@ -146,6 +331,7 @@ impl TrustedOperatorProcessProfile {
             cwd_identity: (cwd_meta.dev(), cwd_meta.ino()),
             data_identity: (data_meta.dev(), data_meta.ino()),
             executable_identity: (executable_meta.dev(), executable_meta.ino()),
+            artifact: None,
         };
         result.recheck()?;
         Ok(result)
@@ -184,7 +370,23 @@ impl TrustedOperatorProcessProfile {
         {
             return Err(PodError::Refused("trusted operator process profile changed"));
         }
+        if let Some(artifact) = &self.artifact {
+            artifact.recheck()?;
+        }
         Ok(())
+    }
+
+    /// Bind the complete installed code/import tree to this exact cwd. The
+    /// Linux port repeats its bounded digest immediately before OS admission.
+    pub fn with_verified_artifact(
+        mut self,
+        artifact: TrustedOperatorArtifact,
+    ) -> Result<Self, PodError> {
+        if artifact.root != self.cwd {
+            return Err(PodError::Refused("operator artifact root differs from cwd"));
+        }
+        self.artifact = Some(artifact);
+        Ok(self)
     }
 }
 

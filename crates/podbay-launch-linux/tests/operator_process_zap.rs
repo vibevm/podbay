@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,7 +23,8 @@ use podbay_host::{
     WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
-    LinuxLaunchPort, TrustedLinuxLaunchConfig, TrustedOperatorProcessProfile,
+    LinuxLaunchPort, TrustedLinuxLaunchConfig, TrustedOperatorArtifact,
+    TrustedOperatorProcessProfile,
 };
 use podbay_pod::{
     OPERATOR_PROCESS_CAPABILITY, OPERATOR_PROCESS_PROFILE_REF, PodClient, PodManifest,
@@ -306,6 +307,64 @@ fn operator_profile_refuses_private_data_directory_drift_before_effect() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn operator_artifact_digest_refuses_changed_import_before_port_effect() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("src");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("zap-server.ts"), b"import './module.ts';\n").unwrap();
+    fs::write(source.join("module.ts"), b"export const value = 1;\n").unwrap();
+    let binary = fs::canonicalize("/bin/true").unwrap();
+    let digest = sha256_file(&binary);
+    let proof = TrustedOperatorArtifact::inspect_tree(&fixture.root).unwrap();
+    assert!(proof.entries >= 5);
+    let artifact = TrustedOperatorArtifact::from_trusted_policy(
+        fixture.root.clone(), proof.sha256,
+    ).unwrap();
+    let profile = TrustedOperatorProcessProfile::from_trusted_policy(
+        1, binary.clone(), digest.clone(), fixture.root.clone(),
+        vec!["src/zap-server.ts".into()], fixture.state.clone(), 60,
+    ).unwrap().with_verified_artifact(artifact).unwrap();
+    fs::write(source.join("module.ts"), b"export const value = 2;\n").unwrap();
+    let config = TrustedLinuxLaunchConfig::from_trusted_policy(
+        binary, digest, fixture.pod_directory.clone(),
+    ).unwrap();
+    assert!(LinuxLaunchPort::new(config)
+        .register_operator_process_from_trusted_policy(profile).is_err());
+}
+
+#[test]
+fn operator_artifact_digest_refuses_symlink_outside_installed_tree() {
+    let fixture = Fixture::new();
+    symlink("/etc/hosts", fixture.root.join("escaped-import.ts")).unwrap();
+    assert!(TrustedOperatorArtifact::inspect_tree(&fixture.root).is_err());
+}
+
+#[test]
+#[ignore = "requires PODBAY_TEST_ZAP_ROOT; hashes the installed Zap import tree"]
+fn installed_zap_artifact_tree_fits_bounded_hash_budget() {
+    let root = fs::canonicalize(std::env::var_os("PODBAY_TEST_ZAP_ROOT").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    let installed = fixture.root.join("installed-zap");
+    let reflink = Command::new("cp").args(["-a", "--reflink=always"])
+        .arg(&root).arg(&installed).stdout(Stdio::null()).stderr(Stdio::null())
+        .status().unwrap().success();
+    if !reflink {
+        let _ = fs::remove_dir_all(&installed);
+        assert!(Command::new("cp").args(["-a", "--reflink=auto"])
+            .arg(&root).arg(&installed).status().unwrap().success());
+    }
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+    let proof = TrustedOperatorArtifact::inspect_tree(&installed).unwrap();
+    eprintln!(
+        "Zap artifact digest: entries={} bytes={} elapsed_ms={}",
+        proof.entries, proof.bytes, proof.elapsed.as_millis(),
+    );
+    assert!(proof.entries > 100);
+    assert!(proof.bytes > 1_000_000);
+    assert_eq!(proof.sha256.len(), 64);
 }
 
 #[test]
