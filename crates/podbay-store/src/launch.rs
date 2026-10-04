@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::model::{LaunchDispatchStage, LaunchDispatchStatus, LaunchPortResult, StoreError};
 use crate::store::PodBayStore;

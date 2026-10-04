@@ -12,8 +12,9 @@ mod store;
 
 pub use authority::SqliteActorVerifierWitness;
 pub use bound_launch::{
-    BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest,
-    BoundLaunchResource, CurrentBoundPodSnapshot, CurrentBoundResource,
+    BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
+    BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
+    CurrentBoundPodSnapshot, CurrentBoundResource,
 };
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
@@ -21,10 +22,10 @@ pub use model::{
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
     AuthoritySnapshot, CommandInspection, CommandLookupSelector, CommandRequest, CommittedEvent,
     EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
-    HostObservedPriorCheckpoint,
-    LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding, LaunchLookupRequest,
-    LaunchPortResult, ManagerCredentialClaim, ObservedStage, QuarantinedSourceEvent, Receipt,
-    ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
+    HostObservedPriorCheckpoint, LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding,
+    LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim, ObservedStage,
+    QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError,
+    StoredEffect, VerifiedPrincipal,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{

@@ -6,8 +6,10 @@ use podbay_core::{
     SessionState, StoreLineageId, WorkKind,
 };
 use podbay_wire::{
-    EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract, ImmutableLaunchDescriptor,
-    LAUNCH_DESCRIPTOR_SCHEMA, NativeResourceKind, NativeRole, NativeWorkKind,
+    EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract,
+    EffectiveLaunchContractV2, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
+    LAUNCH_DESCRIPTOR_SCHEMA, LAUNCH_DESCRIPTOR_V2_SCHEMA, NativeResourceKind, NativeRole,
+    NativeWorkKind,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeMap;
@@ -39,11 +41,10 @@ pub struct BoundLaunchRequest<'a> {
     pub proposal: Option<BoundLaunchProposal<'a>>,
 }
 
-/// Trusted, reviewed snapshots for a new Session and its first root Run.
+/// Trusted, reviewed V1 snapshots for a new Session and its first root Run.
 /// The store verifies their exact binding and fences; constructing this value
-/// does not itself prove a host grant or policy review. Effective-spec bytes
-/// receive only a version-prefix/hash check here: the host must verify policy
-/// provenance before calling this method.
+/// does not itself prove a host grant or policy review. The host must verify
+/// policy provenance before calling this method.
 pub struct BoundLaunchProposal<'a> {
     pub session: &'a Session,
     pub run: &'a Run,
@@ -52,6 +53,81 @@ pub struct BoundLaunchProposal<'a> {
     pub descriptor: &'a ImmutableLaunchDescriptor,
     pub expected_owner_epoch: u64,
     pub expected_authority_revision: u64,
+}
+
+/// Reviewed internal Codex V2 proof for a new first root launch. Both values are
+/// typed and canonical before the store checks them again under one writer
+/// transaction. This cannot admit a child Worker of an existing parent Run
+/// and does not itself grant host launch authority.
+pub struct BoundRootLaunchProposalV2<'a> {
+    pub session: &'a Session,
+    pub run: &'a Run,
+    pub binding: &'a LaunchBinding,
+    pub effective_spec: &'a EffectiveLaunchContractV2,
+    pub descriptor: &'a ImmutableLaunchDescriptorV2,
+    pub expected_owner_epoch: u64,
+    pub expected_authority_revision: u64,
+}
+
+/// The caller requests one new Session and its first root Run. A Worker/Task
+/// here is a root Worker, not a delegated child of an existing Run.
+pub struct BoundRootLaunchRequestV2<'a> {
+    pub principal: VerifiedPrincipal,
+    pub command_key: &'a str,
+    pub canonical_intent: &'a [u8],
+    pub scope_id: &'a str,
+    pub pod_id: &'a str,
+    pub proposal: Option<BoundRootLaunchProposalV2<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundLaunchFormat {
+    V1,
+    CodexV2,
+}
+
+impl BoundLaunchFormat {
+    fn effective_version(self) -> &'static str {
+        match self {
+            Self::V1 => EFFECTIVE_LAUNCH_VERSION,
+            Self::CodexV2 => EFFECTIVE_LAUNCH_V2_VERSION,
+        }
+    }
+
+    fn descriptor_version(self) -> &'static str {
+        match self {
+            Self::V1 => LAUNCH_DESCRIPTOR_SCHEMA,
+            Self::CodexV2 => LAUNCH_DESCRIPTOR_V2_SCHEMA,
+        }
+    }
+}
+
+enum ProposalKind<'a> {
+    V1(BoundLaunchProposal<'a>),
+    CodexV2(BoundRootLaunchProposalV2<'a>),
+}
+
+struct AdmissionRequest<'a> {
+    principal: VerifiedPrincipal,
+    command_key: &'a str,
+    canonical_intent: &'a [u8],
+    scope_id: &'a str,
+    pod_id: &'a str,
+    proposal: Option<ProposalKind<'a>>,
+    format: BoundLaunchFormat,
+}
+
+struct CheckedProposal<'a> {
+    session: &'a Session,
+    run: &'a Run,
+    binding: &'a LaunchBinding,
+    effective_spec: &'a [u8],
+    descriptor: Vec<u8>,
+    spec_digest: String,
+    descriptor_digest: String,
+    format: BoundLaunchFormat,
+    expected_owner_epoch: u64,
+    expected_authority_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +140,7 @@ pub struct BoundLaunchResource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundLaunchRecord {
+    pub format: BoundLaunchFormat,
     pub receipt: Receipt,
     pub scope_id: String,
     pub session_id: String,
@@ -248,11 +325,19 @@ impl PodBayStore {
         let bound_attempt_epoch =
             positive_stored_epoch(bound_attempt_epoch, "bound attempt epoch is invalid")?;
         let launch = read_bound_record(&transaction, binding_rowid)?;
-        let descriptor = ImmutableLaunchDescriptor::decode_json(&launch.descriptor)
-            .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
-        if descriptor.attempt_ordinal() != bound_ordinal
-            || descriptor.attempt_epoch() != bound_attempt_epoch
-        {
+        let (attempt_ordinal, attempt_epoch) = match launch.format {
+            BoundLaunchFormat::V1 => {
+                let descriptor = ImmutableLaunchDescriptor::decode_json(&launch.descriptor)
+                    .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
+                (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
+            }
+            BoundLaunchFormat::CodexV2 => {
+                let descriptor = ImmutableLaunchDescriptorV2::decode_json(&launch.descriptor)
+                    .map_err(|_| StoreError::Conflict("stored V2 descriptor is malformed"))?;
+                (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
+            }
+        };
+        if attempt_ordinal != bound_ordinal || attempt_epoch != bound_attempt_epoch {
             return Err(StoreError::Conflict(
                 "bound attempt differs from descriptor",
             ));
@@ -433,6 +518,38 @@ impl PodBayStore {
         &mut self,
         request: BoundLaunchRequest<'_>,
     ) -> Result<BoundLaunchAdmission, StoreError> {
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::V1),
+            format: BoundLaunchFormat::V1,
+        })
+    }
+
+    /// Admits only a new first root Session/Run/Attempt. Child Worker/Task
+    /// admission requires a separate parent-Run transaction and authority gate.
+    pub fn admit_bound_root_launch_v2(
+        &mut self,
+        request: BoundRootLaunchRequestV2<'_>,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::CodexV2),
+            format: BoundLaunchFormat::CodexV2,
+        })
+    }
+
+    fn admit_bound_launch_internal(
+        &mut self,
+        request: AdmissionRequest<'_>,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
         for id in [request.command_key, request.scope_id, request.pod_id] {
             valid_id(id)?;
         }
@@ -463,31 +580,31 @@ impl PodBayStore {
             }
             // A v7 admission has no reviewed binding and is inspection-only.
             let record = read_bound_record(&transaction, rowid)?;
+            if record.format != request.format {
+                return Err(StoreError::Conflict(
+                    "command key changed bound launch format",
+                ));
+            }
             transaction.commit()?;
             return Ok(BoundLaunchAdmission::Duplicate(record));
         }
         let proposal = request.proposal.as_ref().ok_or(StoreError::InvalidInput(
             "new bound launch requires reviewed proposal",
         ))?;
-        validate_initial(&request, proposal)?;
-        let binding = proposal.binding;
-        let descriptor = proposal
-            .descriptor
-            .encode_json()
-            .map_err(|_| StoreError::InvalidInput("launch descriptor cannot encode"))?;
-        let effective = EffectiveLaunchContract::decode(proposal.effective_spec)
-            .map_err(|_| StoreError::InvalidInput("effective launch bytes are malformed"))?;
-        effective
-            .compare_with_descriptor(proposal.descriptor)
-            .map_err(|_| StoreError::Conflict("effective launch differs from descriptor"))?;
-        let spec_digest = effective.digest().to_owned();
+        let checked = check_proposal(&request, proposal)?;
+        if checked.format != request.format {
+            return Err(StoreError::Conflict("reviewed launch format differs"));
+        }
+        let binding = checked.binding;
+        let descriptor = checked.descriptor.clone();
+        let spec_digest = checked.spec_digest.clone();
         let command = CommandRequest {
             principal: request.principal,
             namespace: NAMESPACE.into(),
             command_key: request.command_key.into(),
             scope_id: request.scope_id.into(),
             target_id: request.pod_id.into(),
-            expected_owner_epoch: proposal.expected_owner_epoch,
+            expected_owner_epoch: checked.expected_owner_epoch,
             expected_target_epoch: binding.pod_incarnation().get(),
             canonical_request: request.canonical_intent.to_vec(),
             event_kind: "launch.bound".into(),
@@ -496,10 +613,10 @@ impl PodBayStore {
             effect_payload: descriptor.clone(),
         };
         validate_request(&command)?;
-        let owner = integer(proposal.expected_owner_epoch)?;
-        let authority_revision = integer(proposal.expected_authority_revision)?;
+        let owner = integer(checked.expected_owner_epoch)?;
+        let authority_revision = integer(checked.expected_authority_revision)?;
         let next_authority_revision = integer(
-            proposal
+            checked
                 .expected_authority_revision
                 .checked_add(1)
                 .ok_or(StoreError::InvalidInput("authority revision exhausted"))?,
@@ -542,7 +659,7 @@ impl PodBayStore {
                 binding.session_id().as_str(),
                 binding.scope_id().as_str(),
                 binding.actor_id().as_str(),
-                integer(proposal.session.revision().get())?,
+                integer(checked.session.revision().get())?,
                 binding.run_id().as_str(),
             ],
         )?;
@@ -557,7 +674,7 @@ impl PodBayStore {
                 binding.scope_id().as_str(),
                 role_text(binding.role()),
                 work_kind_text(binding.work_kind()),
-                integer(proposal.run.revision().get())?,
+                integer(checked.run.revision().get())?,
                 binding.attempt_id().as_str(),
             ],
         )?;
@@ -625,11 +742,11 @@ impl PodBayStore {
                 binding.pod_id().as_str(),
                 pod_incarnation,
                 integer(binding.resources().len() as u64)?,
-                EFFECTIVE_LAUNCH_VERSION,
+                checked.format.effective_version(),
                 spec_digest,
-                proposal.effective_spec,
-                LAUNCH_DESCRIPTOR_SCHEMA,
-                proposal.descriptor.digest(),
+                checked.effective_spec,
+                checked.format.descriptor_version(),
+                checked.descriptor_digest,
                 descriptor,
             ],
         )?;
@@ -709,13 +826,109 @@ impl PodBayStore {
     }
 }
 
+fn check_proposal<'a>(
+    request: &AdmissionRequest<'a>,
+    proposal: &ProposalKind<'a>,
+) -> Result<CheckedProposal<'a>, StoreError> {
+    match proposal {
+        ProposalKind::V1(proposal) => {
+            validate_initial(request, proposal.session, proposal.run, proposal.binding)?;
+            proposal
+                .descriptor
+                .validate_against_binding(proposal.binding)
+                .map_err(|_| StoreError::Conflict("descriptor differs from launch binding"))?;
+            for (index, resource) in proposal.binding.resources().iter().enumerate() {
+                let native = proposal
+                    .descriptor
+                    .resource(index)
+                    .ok_or(StoreError::Conflict("descriptor resource is missing"))?;
+                if native.resource_id != resource.id().as_str()
+                    || native.epoch != resource.epoch().get()
+                    || native.kind != NativeResourceKind::from(resource.kind())
+                {
+                    return Err(StoreError::Conflict("descriptor resource differs"));
+                }
+            }
+            let descriptor = proposal
+                .descriptor
+                .encode_json()
+                .map_err(|_| StoreError::InvalidInput("launch descriptor cannot encode"))?;
+            let effective = EffectiveLaunchContract::decode(proposal.effective_spec)
+                .map_err(|_| StoreError::InvalidInput("effective launch bytes are malformed"))?;
+            effective
+                .compare_with_descriptor(proposal.descriptor)
+                .map_err(|_| StoreError::Conflict("effective launch differs from descriptor"))?;
+            Ok(CheckedProposal {
+                session: proposal.session,
+                run: proposal.run,
+                binding: proposal.binding,
+                effective_spec: proposal.effective_spec,
+                descriptor,
+                spec_digest: effective.digest().to_owned(),
+                descriptor_digest: proposal.descriptor.digest().to_owned(),
+                format: BoundLaunchFormat::V1,
+                expected_owner_epoch: proposal.expected_owner_epoch,
+                expected_authority_revision: proposal.expected_authority_revision,
+            })
+        }
+        ProposalKind::CodexV2(proposal) => {
+            validate_initial(request, proposal.session, proposal.run, proposal.binding)?;
+            proposal
+                .descriptor
+                .validate_against_binding(proposal.binding)
+                .map_err(|_| StoreError::Conflict("V2 descriptor differs from launch binding"))?;
+            for (index, resource) in proposal.binding.resources().iter().enumerate() {
+                let native = proposal
+                    .descriptor
+                    .resource(index)
+                    .ok_or(StoreError::Conflict("V2 descriptor resource is missing"))?;
+                if native.resource_id != resource.id().as_str()
+                    || native.epoch != resource.epoch().get()
+                    || native.kind != NativeResourceKind::from(resource.kind())
+                {
+                    return Err(StoreError::Conflict("V2 descriptor resource differs"));
+                }
+            }
+            let descriptor = proposal
+                .descriptor
+                .encode_json()
+                .map_err(|_| StoreError::InvalidInput("V2 descriptor cannot encode"))?;
+            let decoded_descriptor = ImmutableLaunchDescriptorV2::decode_json(&descriptor)
+                .map_err(|_| StoreError::InvalidInput("V2 descriptor is malformed"))?;
+            if decoded_descriptor != *proposal.descriptor {
+                return Err(StoreError::Conflict("V2 descriptor is not canonical"));
+            }
+            let effective_spec = proposal.effective_spec.canonical_bytes();
+            let effective = EffectiveLaunchContractV2::decode(effective_spec)
+                .map_err(|_| StoreError::InvalidInput("V2 effective launch is malformed"))?;
+            if effective != *proposal.effective_spec {
+                return Err(StoreError::Conflict("V2 effective launch is not canonical"));
+            }
+            effective
+                .compare_with_descriptor(proposal.descriptor)
+                .map_err(|_| StoreError::Conflict("V2 effective launch differs from descriptor"))?;
+            Ok(CheckedProposal {
+                session: proposal.session,
+                run: proposal.run,
+                binding: proposal.binding,
+                effective_spec,
+                descriptor,
+                spec_digest: effective.digest().to_owned(),
+                descriptor_digest: proposal.descriptor.digest().to_owned(),
+                format: BoundLaunchFormat::CodexV2,
+                expected_owner_epoch: proposal.expected_owner_epoch,
+                expected_authority_revision: proposal.expected_authority_revision,
+            })
+        }
+    }
+}
+
 fn validate_initial(
-    request: &BoundLaunchRequest<'_>,
-    proposal: &BoundLaunchProposal<'_>,
+    request: &AdmissionRequest<'_>,
+    session: &Session,
+    run: &Run,
+    binding: &LaunchBinding,
 ) -> Result<(), StoreError> {
-    let session = proposal.session;
-    let run = proposal.run;
-    let binding = proposal.binding;
     if binding.parent_run_id().is_some()
         || binding.attempt_ordinal() != 1
         || binding.attempt_epoch().get() != 1
@@ -761,22 +974,6 @@ fn validate_initial(
             "initial aggregates differ from launch binding",
         ));
     }
-    proposal
-        .descriptor
-        .validate_against_binding(binding)
-        .map_err(|_| StoreError::Conflict("descriptor differs from launch binding"))?;
-    for (index, resource) in binding.resources().iter().enumerate() {
-        let native = proposal
-            .descriptor
-            .resource(index)
-            .ok_or(StoreError::Conflict("descriptor resource is missing"))?;
-        if native.resource_id != resource.id().as_str()
-            || native.epoch != resource.epoch().get()
-            || native.kind != NativeResourceKind::from(resource.kind())
-        {
-            return Err(StoreError::Conflict("descriptor resource differs"));
-        }
-    }
     Ok(())
 }
 
@@ -798,6 +995,120 @@ fn resource_kind_text(value: ResourceKind) -> &'static str {
         ResourceKind::Pty => "pty",
         ResourceKind::StructuredProvider => "structured_provider",
         ResourceKind::Auxiliary => "auxiliary",
+    }
+}
+
+struct StoredNativeResource {
+    id: String,
+    kind: NativeResourceKind,
+    epoch: u64,
+}
+
+/// Projection from strictly decoded V1 or V2 wire types only. It is never
+/// formed by parsing raw JSON fields or by trusting a stored digest alone.
+struct StoredLaunchFacts {
+    effective_digest: String,
+    descriptor_digest: String,
+    effective_spec_digest: String,
+    scope_id: String,
+    actor_id: String,
+    session_id: String,
+    run_id: String,
+    attempt_id: String,
+    pod_id: String,
+    pod_incarnation: u64,
+    role: NativeRole,
+    work_kind: NativeWorkKind,
+    parent_run_id: Option<String>,
+    attempt_ordinal: u64,
+    attempt_epoch: u64,
+    resources: Vec<StoredNativeResource>,
+}
+
+fn stored_launch_facts(
+    format: BoundLaunchFormat,
+    effective_bytes: &[u8],
+    descriptor_bytes: &[u8],
+) -> Result<StoredLaunchFacts, StoreError> {
+    match format {
+        BoundLaunchFormat::V1 => {
+            let effective = EffectiveLaunchContract::decode(effective_bytes)
+                .map_err(|_| StoreError::Conflict("stored effective launch is malformed"))?;
+            let descriptor = ImmutableLaunchDescriptor::decode_json(descriptor_bytes)
+                .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
+            effective
+                .compare_with_descriptor(&descriptor)
+                .map_err(|_| {
+                    StoreError::Conflict("stored effective launch differs from descriptor")
+                })?;
+            let resources = (0..descriptor.resources_len())
+                .map(|index| {
+                    let native = descriptor.resource(index).expect("index is in bounds");
+                    StoredNativeResource {
+                        id: native.resource_id.to_owned(),
+                        kind: native.kind,
+                        epoch: native.epoch,
+                    }
+                })
+                .collect();
+            Ok(StoredLaunchFacts {
+                effective_digest: effective.digest().to_owned(),
+                descriptor_digest: descriptor.digest().to_owned(),
+                effective_spec_digest: descriptor.effective_spec_digest().to_owned(),
+                scope_id: descriptor.scope_id().to_owned(),
+                actor_id: descriptor.actor_id().to_owned(),
+                session_id: descriptor.session_id().to_owned(),
+                run_id: descriptor.run_id().to_owned(),
+                attempt_id: descriptor.attempt_id().to_owned(),
+                pod_id: descriptor.pod_id().to_owned(),
+                pod_incarnation: descriptor.pod_incarnation(),
+                role: descriptor.role(),
+                work_kind: descriptor.work_kind(),
+                parent_run_id: descriptor.parent_run_id().map(str::to_owned),
+                attempt_ordinal: descriptor.attempt_ordinal(),
+                attempt_epoch: descriptor.attempt_epoch(),
+                resources,
+            })
+        }
+        BoundLaunchFormat::CodexV2 => {
+            let effective = EffectiveLaunchContractV2::decode(effective_bytes)
+                .map_err(|_| StoreError::Conflict("stored V2 effective launch is malformed"))?;
+            let descriptor = ImmutableLaunchDescriptorV2::decode_json(descriptor_bytes)
+                .map_err(|_| StoreError::Conflict("stored V2 descriptor is malformed"))?;
+            effective
+                .compare_with_descriptor(&descriptor)
+                .map_err(|_| {
+                    StoreError::Conflict("stored V2 effective launch differs from descriptor")
+                })?;
+            let resources = (0..descriptor.resources_len())
+                .map(|index| {
+                    let native = descriptor.resource(index).expect("index is in bounds");
+                    StoredNativeResource {
+                        id: native.resource_id.to_owned(),
+                        kind: native.kind,
+                        epoch: native.epoch,
+                    }
+                })
+                .collect();
+            Ok(StoredLaunchFacts {
+                effective_digest: effective.digest().to_owned(),
+                descriptor_digest: descriptor.digest().to_owned(),
+                effective_spec_digest: descriptor.effective_spec_digest().to_owned(),
+                scope_id: descriptor.scope_id().to_owned(),
+                actor_id: descriptor.actor_id().to_owned(),
+                session_id: descriptor.session_id().to_owned(),
+                run_id: descriptor.run_id().to_owned(),
+                attempt_id: descriptor.attempt_id().to_owned(),
+                pod_id: descriptor.pod_id().to_owned(),
+                pod_incarnation: descriptor.pod_incarnation(),
+                role: descriptor.role(),
+                work_kind: descriptor.work_kind(),
+                parent_run_id: descriptor.parent_run_id().map(str::to_owned),
+                attempt_ordinal: descriptor.attempt_ordinal(),
+                attempt_epoch: descriptor.attempt_epoch(),
+                resources,
+            })
+        }
     }
 }
 
@@ -879,16 +1190,6 @@ pub(crate) fn read_bound_record(
     ) = row.ok_or(StoreError::Conflict(
         "historical launch has no bound v8 descriptor",
     ))?;
-    let effective = EffectiveLaunchContract::decode(&effective_spec)
-        .map_err(|_| StoreError::Conflict("stored effective launch is malformed"))?;
-    if effective.digest() != spec_digest
-        || sha256_hex(&effective_spec) != spec_digest
-        || pod_incarnation != target_epoch
-    {
-        return Err(StoreError::Conflict(
-            "bound launch identity or effective spec changed",
-        ));
-    }
     let command_identity: (String, String, String) = transaction.query_row(
         "SELECT namespace,target_id,digest_version FROM commands WHERE command_rowid=?1",
         [rowid],
@@ -914,16 +1215,28 @@ pub(crate) fn read_bound_record(
             ))
         },
     )?;
+    let format = match (binding_facts.5.as_str(), binding_facts.6.as_str()) {
+        (EFFECTIVE_LAUNCH_VERSION, LAUNCH_DESCRIPTOR_SCHEMA) => BoundLaunchFormat::V1,
+        (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA) => BoundLaunchFormat::CodexV2,
+        _ => return Err(StoreError::Conflict("bound launch version pair differs")),
+    };
     if binding_facts.0 != scope_id
         || binding_facts.1 != attempt_id
         || binding_facts.2 != 1
         || binding_facts.3 != 1
         || binding_facts.4 <= 0
-        || binding_facts.5 != EFFECTIVE_LAUNCH_VERSION
-        || binding_facts.6 != LAUNCH_DESCRIPTOR_SCHEMA
     {
         return Err(StoreError::Conflict(
             "bound launch version or attempt differs",
+        ));
+    }
+    let facts = stored_launch_facts(format, &effective_spec, &descriptor)?;
+    if facts.effective_digest != spec_digest
+        || (format == BoundLaunchFormat::V1 && sha256_hex(&effective_spec) != spec_digest)
+        || pod_incarnation != target_epoch
+    {
+        return Err(StoreError::Conflict(
+            "bound launch identity or effective spec changed",
         ));
     }
     let session: Option<(String, String)> = transaction
@@ -974,25 +1287,20 @@ pub(crate) fn read_bound_record(
     if slot != Some(rowid) {
         return Err(StoreError::Conflict("bound launch slot differs"));
     }
-    let decoded = ImmutableLaunchDescriptor::decode_json(&descriptor)
-        .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
-    effective
-        .compare_with_descriptor(&decoded)
-        .map_err(|_| StoreError::Conflict("stored effective launch differs from descriptor"))?;
-    if decoded.digest() != descriptor_digest
-        || decoded.effective_spec_digest() != spec_digest
-        || decoded.scope_id() != scope_id
-        || decoded.session_id() != session_id
-        || decoded.run_id() != run_id
-        || decoded.attempt_id() != attempt_id
-        || decoded.pod_id() != pod_id
-        || decoded.pod_incarnation() != pod_incarnation as u64
-        || decoded.actor_id() != session_actor
-        || role_native_text(decoded.role()) != run_role
-        || work_native_text(decoded.work_kind()) != run_work
-        || decoded.parent_run_id().is_some()
-        || decoded.attempt_ordinal() != 1
-        || decoded.attempt_epoch() != 1
+    if facts.descriptor_digest != descriptor_digest
+        || facts.effective_spec_digest != spec_digest
+        || facts.scope_id != scope_id
+        || facts.session_id != session_id
+        || facts.run_id != run_id
+        || facts.attempt_id != attempt_id
+        || facts.pod_id != pod_id
+        || facts.pod_incarnation != pod_incarnation as u64
+        || facts.actor_id != session_actor
+        || role_native_text(facts.role) != run_role
+        || work_native_text(facts.work_kind) != run_work
+        || facts.parent_run_id.is_some()
+        || facts.attempt_ordinal != 1
+        || facts.attempt_epoch != 1
     {
         return Err(StoreError::Conflict(
             "stored descriptor differs from binding",
@@ -1097,12 +1405,13 @@ pub(crate) fn read_bound_record(
     })?;
     for (expected, row) in rows.enumerate() {
         let (ordinal, id, kind, epoch) = row?;
-        let native = decoded
-            .resource(expected)
+        let native = facts
+            .resources
+            .get(expected)
             .ok_or(StoreError::Conflict("bound resource count differs"))?;
         if ordinal != expected as i64
             || epoch != 1
-            || native.resource_id != id
+            || native.id != id
             || native.epoch != epoch as u64
             || native.kind != resource_kind_native(&kind)?
         {
@@ -1117,12 +1426,13 @@ pub(crate) fn read_bound_record(
             epoch: epoch as u64,
         });
     }
-    if resources.len() != decoded.resources_len() || resources.len() != binding_facts.4 as usize {
+    if resources.len() != facts.resources.len() || resources.len() != binding_facts.4 as usize {
         return Err(StoreError::Conflict(
             "bound resource inventory is incomplete",
         ));
     }
     Ok(BoundLaunchRecord {
+        format,
         receipt: Receipt {
             command_id,
             event_sequence,
