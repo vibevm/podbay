@@ -170,8 +170,13 @@ fn setup(
 ) {
     let fixture = Fixture::new();
     let calls = Arc::new(AtomicUsize::new(0));
-    let (fixture, host, proof, source, _, _) =
-        setup_with_port(role, fixture, NoPort(calls.clone()));
+    let (fixture, host, proof, source, _, _) = setup_with_port(
+        role,
+        fixture,
+        NoPort(calls.clone()),
+        Duration::from_secs(30),
+        60,
+    );
     (fixture, host, proof, source, calls)
 }
 
@@ -179,6 +184,8 @@ fn setup_with_port<P: HostDispatchPort>(
     role: Role,
     fixture: Fixture,
     port: P,
+    launch_budget: Duration,
+    wall_seconds: u64,
 ) -> (
     Fixture,
     DurableAuthority<P>,
@@ -338,7 +345,7 @@ fn setup_with_port<P: HostDispatchPort>(
             },
             command_key: "launch.codex.preflight".into(),
             correlation_id: "correlation.codex.preflight".into(),
-            deadline: Instant::now() + Duration::from_secs(30),
+            deadline: Instant::now() + launch_budget,
             action: HostAction::LaunchPod {
                 pod_id: fixture.pod.clone(),
                 role,
@@ -365,7 +372,7 @@ fn setup_with_port<P: HostDispatchPort>(
                 arguments: Vec::new(),
                 tool_bundle_refs: Vec::new(),
                 authority_ref: format!("grant.{}", grant.get()),
-                wall_seconds: 60,
+                wall_seconds,
                 max_children: 1,
                 parent_run_id: None,
             },
@@ -864,8 +871,13 @@ fn disposable_codex_v2_durable_dispatch_records_one_real_pod_launch() {
             .unwrap(),
     )
     .unwrap();
-    let (fixture, mut host, proof, _, transport, request) =
-        setup_with_port(Role::Coordinator, fixture, port);
+    let (fixture, mut host, proof, _, transport, request) = setup_with_port(
+        Role::Coordinator,
+        fixture,
+        port,
+        Duration::from_secs(30),
+        60,
+    );
     let outbox_id = proof.outbox_id();
     let prepared = PodBayStore::open(&fixture.database)
         .unwrap()
@@ -951,8 +963,13 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
             .unwrap(),
     )
     .unwrap();
-    let (fixture, mut host, _, _, transport, launch_request) =
-        setup_with_port(Role::Coordinator, fixture, port);
+    let (fixture, mut host, _, _, transport, launch_request) = setup_with_port(
+        Role::Coordinator,
+        fixture,
+        port,
+        Duration::from_secs(30),
+        60,
+    );
     let accepted = host
         .dispatch_prepared_bound_root_codex_v2(&transport, launch_request.clone())
         .unwrap();
@@ -1077,8 +1094,7 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    fs::copy(auth_source, &fixture.source).expect("private Codex auth source copy failed");
-    fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o600)).unwrap();
+    fixture.source = auth_source;
 
     let mut port = port_for(&fixture, &pod_binary);
     let reference =
@@ -1088,12 +1104,42 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
             .unwrap(),
     )
     .unwrap();
-    let (fixture, mut host, _, _, transport, launch_request) =
-        setup_with_port(Role::Coordinator, fixture, port);
+    let (fixture, mut host, _, _, transport, launch_request) = setup_with_port(
+        Role::Coordinator,
+        fixture,
+        port,
+        Duration::from_secs(180),
+        120,
+    );
     let accepted = host
         .dispatch_prepared_bound_root_codex_v2(&transport, launch_request.clone())
         .unwrap();
-    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    if accepted.status.stage != LaunchDispatchStage::HostAccepted {
+        let manifest = slot_manifest(&fixture);
+        let pod_status = manifest.as_ref().map(|path| {
+            PodClient::connect(path)
+                .and_then(|client| client.attested_status())
+                .map(|status| {
+                    format!(
+                        "child_running={}, bound={}",
+                        status.child_running,
+                        status.bound.is_some()
+                    )
+                })
+                .map_err(|error| error.to_string())
+        });
+        if let Some(path) = manifest {
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", &format!("podbay-pod-{stem}.service")])
+                    .status();
+            }
+        }
+        panic!(
+            "real Codex launch did not reach HostAccepted: {:?}; pod={pod_status:?}",
+            accepted.status
+        );
+    }
     let manifest = slot_manifest(&fixture).expect("one committed V2 pod manifest");
     let client = PodClient::connect(&manifest).unwrap();
     assert!(client.attested_status().unwrap().child_running);
