@@ -689,6 +689,8 @@ pub struct ResolvedNativeCodexLaunch {
     descriptor: ImmutableLaunchDescriptorV2,
     paths: ResolvedNativePaths,
     store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
     store_lineage: String,
     owner_epoch: u64,
     credential_epoch: u64,
@@ -698,6 +700,9 @@ pub struct ResolvedNativeCodexLaunch {
 }
 
 impl ResolvedNativeCodexLaunch {
+    pub fn committed_record(&self) -> &BoundLaunchRecord {
+        &self.record
+    }
     pub fn effective(&self) -> &EffectiveLaunchContractV2 {
         &self.effective
     }
@@ -715,6 +720,10 @@ impl ResolvedNativeCodexLaunch {
     }
     pub fn store_path(&self) -> &Path {
         &self.store_path
+    }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
     }
     pub fn store_lineage(&self) -> &str {
         &self.store_lineage
@@ -2136,6 +2145,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .cloned()
             .ok_or(HostError::StaleGuard)?;
         let host = self.native_host.clone().ok_or(HostError::StaleGuard)?;
+        #[cfg(target_os = "linux")]
+        let store_file_identity = self.database_identity;
         let mut current = self.rebind_context(scope, pod)?;
         if current.launch() != &record {
             return Err(HostError::StaleGuard.into());
@@ -2155,6 +2166,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             descriptor,
             paths,
             store_path: current.store_path().to_path_buf(),
+            #[cfg(target_os = "linux")]
+            store_file_identity,
             store_lineage: current.store_lineage().to_owned(),
             owner_epoch: current.owner_epoch(),
             credential_epoch: current.credential_epoch(),
