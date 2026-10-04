@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createPublicKey, generateKeyPairSync, randomBytes, verify } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
@@ -172,6 +172,146 @@ test("an owner-only setup key survives its Node process and proves same-key cont
   }
 });
 
+test("partial temporary write cut leaves no final key and the next process enrolls afresh", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "podbay-owner-custody-cut-"));
+  await chmod(root, 0o700);
+  const custody = join(root, "owner-key-custody.json");
+  const identityPath = join(root, "restarted-identity.json");
+  const receiptPath = join(root, "restarted-receipt.json");
+  try {
+    const cut = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const original=fs.writeFileSync;
+      fs.writeFileSync=(target,bytes,options)=>{
+        if(typeof target==='number' && Buffer.isBuffer(bytes)) {
+          original(target,bytes.subarray(0,11),options);
+          process.exit(71);
+        }
+        return original(target,bytes,options);
+      };
+      syncBuiltinESMExports();
+      const { InitialOwnerSetupClient, INITIAL_OWNER_RIGHTS_DIGEST } = await import(${JSON.stringify(ownerSetupUrl)});
+      const stat=fs.readFileSync('/proc/self/stat','utf8');
+      const fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/u);
+      const cgroup=fs.readFileSync('/proc/self/cgroup','utf8').trimEnd().split('\\n').find(x=>x.startsWith('0::'));
+      if(!cgroup) throw new Error();
+      await new InitialOwnerSetupClient({
+        setupSocketPath:${JSON.stringify(join(root, "owner-setup.sock"))},
+        managerSocketPath:${JSON.stringify(join(root, "manager.sock"))},
+        ownerKeyCustodyPath:${JSON.stringify(custody)},
+        actorId:'actor.owner.partial',scopeId:'scope.owner.partial',
+        credentialRef:'credential.owner.partial',storeLineage:'lineage.owner.partial',
+        ownerEpoch:1n,authorityRevision:1n,
+        osIdentity:'linux.uid.'+String(process.getuid()),
+        processIdentity:'linux.pid.'+String(process.pid),
+        startIdentity:BigInt(fields[19]),containmentIdentity:cgroup.slice(3),
+        rightsDigest:INITIAL_OWNER_RIGHTS_DIGEST,validateHostEndpoint:()=>true,
+      }).prepareOwnerKeyCustody();
+    `;
+    let cutError: unknown;
+    try { execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", cut]); }
+    catch (error) { cutError = error; }
+    assert.equal((cutError as { status?: number } | undefined)?.status, 71);
+    await assert.rejects(() => lstat(custody));
+    const orphanNames = (await readdir(root)).filter((name) => name.startsWith("owner-key-custody.json.tmp."));
+    assert.equal(orphanNames.length, 1);
+    assert.equal((await lstat(join(root, orphanNames[0]!))).size, 11);
+
+    let observedKey: Buffer | undefined;
+    let setupFailure: unknown;
+    const server = createServer((socket) => {
+      void (async () => {
+        const frames = new Frames(socket);
+        const key = await frames.next();
+        observedKey = key;
+        assert.equal(key.length, 32);
+        const identity = JSON.parse(await readFile(identityPath, "utf8")) as {
+          osIdentity: string; processIdentity: string; startIdentity: string; containmentIdentity: string;
+        };
+        const challenge = Buffer.concat([
+          setupDomain,
+          field(1, randomBytes(32)), field(2, "lineage.owner.partial"),
+          field(3, counter(1n)), field(4, counter(1n)),
+          field(5, "actor.owner.partial"), field(6, "scope.owner.partial"),
+          field(7, "owner_cli.coordinator.generation1"),
+          field(8, identity.osIdentity), field(9, identity.processIdentity),
+          field(10, counter(BigInt(identity.startIdentity))),
+          field(11, identity.containmentIdentity), field(12, key),
+          field(13, "credential.owner.partial"), field(14, setupRights),
+        ]);
+        socket.write(frame(challenge));
+        const publicKey = createPublicKey({
+          key: { kty: "OKP", crv: "Ed25519", x: key.toString("base64url") }, format: "jwk",
+        });
+        assert.equal(verify(null, challenge, publicKey, await frames.next()), true);
+        socket.write(frame(Buffer.from(JSON.stringify({
+          actorId: "actor.owner.partial", authorityRevision: "2", duplicate: false,
+          grantRef: "grant.1", ownerEpoch: "1",
+          protocol: "podbay.owner-initial-enrollment/1", scopeId: "scope.owner.partial",
+        }), "utf8")));
+        assert.equal((await frames.next()).toString("ascii"), "ack");
+        socket.end();
+      })().catch((error: unknown) => { setupFailure = error; socket.destroy(); });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(join(root, "owner-setup.sock"), () => { server.off("error", reject); resolve(); });
+    });
+    try {
+      const restart = `
+        import { readFileSync, writeFileSync } from 'node:fs';
+        const { InitialOwnerSetupClient, INITIAL_OWNER_RIGHTS_DIGEST } = await import(${JSON.stringify(ownerSetupUrl)});
+        const stat=readFileSync('/proc/self/stat','utf8');
+        const fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/u);
+        const cgroup=readFileSync('/proc/self/cgroup','utf8').trimEnd().split('\\n').find(x=>x.startsWith('0::'));
+        if(!cgroup) throw new Error();
+        const identity={osIdentity:'linux.uid.'+String(process.getuid()),
+          processIdentity:'linux.pid.'+String(process.pid),
+          startIdentity:fields[19],containmentIdentity:cgroup.slice(3)};
+        writeFileSync(${JSON.stringify(identityPath)},JSON.stringify(identity),{mode:0o600,flag:'wx'});
+        const receipt=await new InitialOwnerSetupClient({
+          setupSocketPath:${JSON.stringify(join(root, "owner-setup.sock"))},
+          managerSocketPath:${JSON.stringify(join(root, "manager.sock"))},
+          ownerKeyCustodyPath:${JSON.stringify(custody)},
+          actorId:'actor.owner.partial',scopeId:'scope.owner.partial',
+          credentialRef:'credential.owner.partial',storeLineage:'lineage.owner.partial',
+          ownerEpoch:1n,authorityRevision:1n,
+          ...identity,startIdentity:BigInt(identity.startIdentity),
+          rightsDigest:INITIAL_OWNER_RIGHTS_DIGEST,validateHostEndpoint:()=>true,
+        }).enroll();
+        writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({
+          actorId:receipt.actorId,grantRef:receipt.grantRef,
+        }),{mode:0o600,flag:'wx'});
+      `;
+      const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", restart],
+        { stdio: ["ignore", "pipe", "pipe"] });
+      const stderr: Buffer[] = [];
+      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject); child.once("exit", (code) => resolve(code));
+      });
+      assert.equal(status, 0, Buffer.concat(stderr).toString("utf8"));
+      assert.equal(setupFailure, undefined);
+      assert.deepEqual(JSON.parse(await readFile(receiptPath, "utf8")), {
+        actorId: "actor.owner.partial", grantRef: "grant.1",
+      });
+      assert.ok(observedKey);
+      assert.deepEqual(loadOwnerKeyCustody(custody, {
+        actorId: "actor.owner.partial", scopeId: "scope.owner.partial",
+        storeLineage: "lineage.owner.partial",
+      }).publicKey, new Uint8Array(observedKey));
+      assert.equal((await readdir(root)).some((name) => name.startsWith("owner-key-custody.json.tmp.")), false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("owner key custody refuses changed binding, path, privacy, duplicate and torn state", {
   skip: process.platform !== "linux",
 }, async (t) => {
@@ -195,7 +335,19 @@ test("owner key custody refuses changed binding, path, privacy, duplicate and to
     const privateKey = generateKeyPairSync("ed25519").privateKey;
     assert.throws(() => loadOwnerKeyCustody(path, expected));
     persistOwnerKeyCustody(path, binding, privateKey);
+    const completeBytes = await readFile(path);
     assert.throws(() => persistOwnerKeyCustody(path, binding, generateKeyPairSync("ed25519").privateKey));
+    assert.deepEqual(await readFile(path), completeBytes);
+    const original = createPublicKey(privateKey).export({ format: "jwk" });
+    assert.equal(typeof original.x, "string");
+    const linkedTemporary = join(root, `owner-key-custody.json.tmp.99999999.1.${"a".repeat(32)}`);
+    await link(path, linkedTemporary);
+    assert.equal((await lstat(path)).nlink, 2);
+    assert.deepEqual(recoverOwnerKeyForInitialEnrollment(path, binding,
+      Buffer.from(original.x!, "base64url")).publicKey,
+      new Uint8Array(Buffer.from(original.x!, "base64url")));
+    assert.equal((await lstat(path)).nlink, 1);
+    await assert.rejects(() => lstat(linkedTemporary));
     const unrelated = createPublicKey(generateKeyPairSync("ed25519").privateKey)
       .export({ format: "jwk" });
     assert.equal(typeof unrelated.x, "string");

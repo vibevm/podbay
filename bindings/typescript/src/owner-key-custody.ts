@@ -1,7 +1,7 @@
 /** Owner-only key custody for a future proof-bearing owner rotation. */
-import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
-import { constants as fsConstants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute } from "node:path";
+import { createPrivateKey, createPublicKey, randomBytes, sign, type KeyObject } from "node:crypto";
+import { constants as fsConstants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 const SCHEMA = "podbay.owner-key-custody/1";
 const FILE_NAME = "owner-key-custody.json";
@@ -22,6 +22,7 @@ export interface OwnerKeyCustodyBinding {
   readonly ownerEpoch: bigint;
   readonly authorityRevision: bigint;
   readonly osIdentity: string;
+  /** Historical key origin. After cross-process enrollment, consult the store for current actor birth. */
   readonly processIdentity: string;
   readonly startIdentity: bigint;
   readonly containmentIdentity: string;
@@ -34,7 +35,7 @@ export interface LoadedOwnerKeyCustody {
   proveContinuity(nonce: Uint8Array): Uint8Array;
 }
 
-/** O_EXCL, mode 0600, file and directory fsync precede any owner setup signature. */
+/** Private temporary write, no-clobber publication, and directory fsync precede any signature. */
 export function persistOwnerKeyCustody(
   path: string,
   binding: OwnerKeyCustodyBinding,
@@ -46,6 +47,7 @@ export function persistOwnerKeyCustody(
     throw new TypeError("owner custody requires one Ed25519 private key");
   const directory = pinnedPrivateDirectory(path);
   try {
+    reconcileOrphanTemps(path, directory);
     const publicKey = rawPublicKey(privateKey);
     const pkcs8 = privateKey.export({ format: "der", type: "pkcs8" });
     if (!Buffer.isBuffer(pkcs8) || pkcs8.length < 32 || pkcs8.length > 256)
@@ -67,16 +69,33 @@ export function persistOwnerKeyCustody(
     };
     const bytes = Buffer.from(JSON.stringify(record), "utf8");
     if (bytes.length > MAX_FILE_BYTES) throw new TypeError("owner custody record exceeds bound");
-    const file = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    if (entryExists(path)) throw new TypeError("owner custody final key already exists");
+    const temporary = `${path}.tmp.${String(process.pid)}.${binding.startIdentity.toString()}.${randomBytes(16).toString("hex")}`;
+    const file = openSync(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    let identity: { dev: number; ino: number };
     try {
       const metadata = fstatSync(file);
       if (!metadata.isFile() || metadata.uid !== process.getuid?.() ||
           (metadata.mode & 0o7777) !== 0o600 || metadata.nlink !== 1)
-        throw new TypeError("owner custody file identity differs");
+        throw new TypeError("owner custody temporary file identity differs");
+      identity = { dev: metadata.dev, ino: metadata.ino };
       writeFileSync(file, bytes);
       fsyncSync(file);
     } finally { closeSync(file); }
+    try {
+      linkSync(temporary, path);
+    } finally {
+      const current = lstatSync(temporary);
+      if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino ||
+          current.uid !== process.getuid?.() || (current.mode & 0o7777) !== 0o600 ||
+          current.nlink < 1 || current.nlink > 2)
+        throw new TypeError("owner custody temporary file changed before unlink");
+      unlinkSync(temporary);
+    }
     fsyncSync(directory);
+    const loaded = loadOwnerKeyMaterial(path, binding);
+    if (!Buffer.from(loaded.publicKey).equals(publicKey))
+      throw new TypeError("owner custody published key differs");
   } finally { closeSync(directory); }
 }
 
@@ -161,6 +180,8 @@ export function loadOwnerKeyCustody(
  * Reuse the exact pre-enrollment key after a cut before first setup proof.
  * A different process is admitted only after the prior PID and birth are gone.
  * This does not authorize rotation of an already enrolled owner actor.
+ * Later rotation must verify the current actor binding from the durable store;
+ * the saved process birth is only the origin of these key bytes.
  */
 export function recoverOwnerKeyForInitialEnrollment(
   path: string,
@@ -169,6 +190,9 @@ export function recoverOwnerKeyForInitialEnrollment(
 ): { readonly privateKey: KeyObject; readonly publicKey: Uint8Array } {
   validateBinding(expected);
   assertCurrentLinuxBirth(expected);
+  const cleanupDirectory = pinnedPrivateDirectory(path);
+  try { reconcileOrphanTemps(path, cleanupDirectory); }
+  finally { closeSync(cleanupDirectory); }
   const material = loadOwnerKeyMaterial(path, expected);
   const prior = material.binding;
   if (prior.credentialRef !== expected.credentialRef ||
@@ -229,16 +253,54 @@ function pinnedPrivateDirectory(path: string): number {
   return descriptor;
 }
 
+function reconcileOrphanTemps(path: string, directory: number): void {
+  const parent = dirname(path);
+  let changed = false;
+  for (const name of readdirSync(parent)) {
+    const match = /^owner-key-custody\.json\.tmp\.([1-9][0-9]*)\.([1-9][0-9]*)\.([a-f0-9]{32})$/u.exec(name);
+    if (!match) continue;
+    const live = processBirthStillLive(match[1]!, BigInt(match[2]!));
+    const temporary = join(parent, name);
+    const metadata = lstatSync(temporary);
+    if (!metadata.isFile() || metadata.uid !== process.getuid?.() ||
+        (metadata.mode & 0o7777) !== 0o600 ||
+        metadata.nlink < 1 || metadata.nlink > 2 || realpathSync(temporary) !== temporary)
+      throw new TypeError("owner custody orphan temporary file is not private and canonical");
+    if (live && (match[1] !== String(process.pid) || metadata.nlink === 1)) continue;
+    if (metadata.nlink === 2) {
+      const final = lstatSync(path);
+      if (!final.isFile() || final.dev !== metadata.dev || final.ino !== metadata.ino ||
+          final.uid !== metadata.uid || (final.mode & 0o7777) !== 0o600 || final.nlink !== 2)
+        throw new TypeError("owner custody published hard link differs from orphan");
+    }
+    unlinkSync(temporary);
+    changed = true;
+  }
+  if (changed) fsyncSync(directory);
+}
+
+function entryExists(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    if (isRecord(error) && error["code"] === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function priorProcessStillLive(binding: OwnerKeyCustodyBinding): boolean {
   const match = /^linux\.pid\.([1-9][0-9]*)$/u.exec(binding.processIdentity);
   if (!match) return true;
+  return processBirthStillLive(match[1]!, binding.startIdentity);
+}
+
+function processBirthStillLive(pid: string, expectedStart: bigint): boolean {
   try {
-    const stat = readFileSync(`/proc/${match[1]}/stat`, "utf8");
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const end = stat.lastIndexOf(")");
     if (end < 0) return true;
     const start = stat.slice(end + 2).trim().split(/\s+/u)[19];
     return start === undefined || !/^[1-9][0-9]*$/u.test(start) ||
-      BigInt(start) === binding.startIdentity;
+      BigInt(start) === expectedStart;
   } catch (error) {
     return !isRecord(error) || error["code"] !== "ENOENT";
   }
