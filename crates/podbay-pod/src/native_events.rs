@@ -17,6 +17,7 @@ use crate::ports::{DurableAppendLog, DurableFiles};
 const FRAME_DOMAIN: &[u8] = b"podbay.native-event-frame/1\0";
 const EVENT_DOMAIN: &[u8] = b"podbay.native-event-id/1\0";
 const MAX_LOG_BYTES: u64 = 16 * 1_048_576;
+pub const MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES: u64 = MAX_LOG_BYTES;
 const MAX_FRAME_BYTES: usize = 262_144;
 const MAX_RAW_BYTES: usize = 65_536;
 const MAX_RECORDS: u64 = 65_536;
@@ -206,6 +207,101 @@ pub struct NativeEventRead {
     pub events: Vec<PublicNativeEvent>,
     pub next_cursor: NativeEventCursor,
     pub gap: Option<NativeEventGap>,
+}
+
+/// Privileged point-in-time evidence for an internal manager bridge only.
+/// This type deliberately does not implement Serialize, and Debug redacts
+/// the exact private JSONL bytes.
+pub struct PrivateNativeEvidence {
+    source_sequence: u64,
+    event_id: String,
+    private_jsonl: Vec<u8>,
+}
+
+impl std::fmt::Debug for PrivateNativeEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivateNativeEvidence")
+            .field("source_sequence", &self.source_sequence)
+            .field("event_id", &self.event_id)
+            .field("private_bytes", &self.private_jsonl.len())
+            .finish()
+    }
+}
+
+impl PrivateNativeEvidence {
+    pub fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    pub fn private_jsonl(&self) -> &[u8] {
+        &self.private_jsonl
+    }
+}
+
+/// A trusted manager reader supplies only EventIds from an attested pod
+/// snapshot. Parse the entire bounded held-file copy once to reject a torn
+/// or conflicting tail, then return exact selected private frames. This is
+/// not the normal public snapshot path and must not be exposed by a server.
+pub fn decode_private_native_evidence_for_trusted_reader(
+    raw: &[u8],
+    identity: &NativeEventIdentity,
+    selected: &[PublicNativeEvent],
+) -> Result<Vec<PrivateNativeEvidence>, PodError> {
+    if raw.len() as u64 > MAX_LOG_BYTES || selected.len() > MAX_READ_EVENTS {
+        return Err(PodError::Invalid(
+            "private native evidence read exceeds bound",
+        ));
+    }
+    identity.validate()?;
+    let _ = replay(raw, identity)?;
+    let mut wanted = BTreeMap::new();
+    for event in selected {
+        if event.identity != *identity
+            || wanted
+                .insert(event.source_sequence, event.event_id.as_str())
+                .is_some()
+        {
+            return Err(PodError::Refused("private evidence selector differs"));
+        }
+    }
+    let mut found = BTreeMap::new();
+    let mut at = 0usize;
+    while at < raw.len() {
+        let len = u32::from_be_bytes(raw[at..at + 4].try_into().expect("validated frame")) as usize;
+        let end = at + HEADER_BYTES + len;
+        let record: PrivateRecord = serde_json::from_slice(&raw[at + HEADER_BYTES..end])
+            .map_err(|_| PodError::Uncertain("validated native event changed"))?;
+        if let PrivateBody::Event {
+            source_sequence,
+            event_id,
+            private_jsonl,
+            ..
+        } = record.body
+            && let Some(expected) = wanted.get(&source_sequence)
+        {
+            if *expected != event_id {
+                return Err(PodError::Conflict("private evidence EventId differs"));
+            }
+            found.insert(
+                source_sequence,
+                PrivateNativeEvidence {
+                    source_sequence,
+                    event_id,
+                    private_jsonl: private_jsonl.into_bytes(),
+                },
+            );
+        }
+        at = end;
+    }
+    if found.len() != wanted.len() {
+        return Err(PodError::Uncertain(
+            "private evidence is absent from held log",
+        ));
+    }
+    Ok(found.into_values().collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -922,6 +1018,25 @@ mod tests {
             "readback replayed lifetime log"
         );
         assert!(String::from_utf8_lossy(&files.0.lock().unwrap().bytes).contains("private prompt"));
+        let evidence = decode_private_native_evidence_for_trusted_reader(
+            &files.0.lock().unwrap().bytes,
+            &identity(),
+            &after.events,
+        )
+        .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].private_jsonl(), raw("second"));
+        assert!(!format!("{:?}", evidence[0]).contains("second"));
+        let mut wrong = after.events.clone();
+        wrong[0].event_id = "native.changed".into();
+        assert!(matches!(
+            decode_private_native_evidence_for_trusted_reader(
+                &files.0.lock().unwrap().bytes,
+                &identity(),
+                &wrong,
+            ),
+            Err(PodError::Conflict(_))
+        ));
     }
 
     #[test]

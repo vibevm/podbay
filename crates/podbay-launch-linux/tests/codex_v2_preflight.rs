@@ -28,11 +28,12 @@ use podbay_host::{
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
     preflight_committed_codex_v2, preflight_committed_codex_v2_read_only,
+    TrustedNativeEventDirectory, read_committed_codex_native_evidence,
 };
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CodexCommandJournal,
-    CodexJournalIdentity, CodexJournalStage, LinuxBackend, PodClient, PodError,
-    launch_bound_codex_v2,
+    CodexJournalIdentity, CodexJournalStage, LinuxBackend, NativeEventCursor, NativeEventKind,
+    PodClient, PodError, launch_bound_codex_v2,
 };
 use podbay_store::{
     CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
@@ -90,6 +91,7 @@ printf '{"id":3,"result":{"thread":{"id":"thread.fixture","sessionId":"native.se
 read -r turn
 printf '%s\n' "$turn" >> "$CODEX_HOME/frames.log"
 printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\n'
+printf '{"method":"item/agentMessage/delta","params":{"threadId":"thread.fixture","delta":"private manager evidence"}}\n'
 sleep 30
 "##,
         )
@@ -831,6 +833,12 @@ fn launch_entry_refuses_revision_store_and_credential_syntax_drift_before_manife
         ),
         Err(PodError::Refused("Codex V2 store file identity changed"))
     ));
+    let trusted_directory =
+        TrustedNativeEventDirectory::from_trusted_policy(fixture.directory.clone()).unwrap();
+    assert!(matches!(
+        read_committed_codex_native_evidence(&proof, &source, &trusted_directory, None, 16),
+        Err(PodError::Refused(_)),
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1028,7 +1036,7 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
             .unwrap(),
     )
     .unwrap();
-    let (fixture, mut host, _, _, transport, launch_request) = setup_with_port(
+    let (fixture, mut host, proof, source, transport, launch_request) = setup_with_port(
         Role::Coordinator,
         fixture,
         port,
@@ -1127,6 +1135,62 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
             "thread/read",
             "turn/start"
         ]
+    );
+
+    let trusted_directory =
+        TrustedNativeEventDirectory::from_trusted_policy(fixture.directory.clone()).unwrap();
+    let event_deadline = Instant::now() + Duration::from_secs(3);
+    let snapshot = loop {
+        let read =
+            read_committed_codex_native_evidence(&proof, &source, &trusted_directory, None, 16)
+                .unwrap();
+        if read.redacted().snapshot.watermark > 0 {
+            break read;
+        }
+        assert!(
+            Instant::now() < event_deadline,
+            "fake native output was not spooled"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(snapshot.redacted().events.is_empty());
+    let cursor = NativeEventCursor {
+        identity: snapshot.redacted().snapshot.identity.clone(),
+        sequence: 0,
+    };
+    let evidence = read_committed_codex_native_evidence(
+        &proof,
+        &source,
+        &trusted_directory,
+        Some(&cursor),
+        16,
+    )
+    .unwrap();
+    assert_eq!(evidence.redacted().events.len(), 1);
+    assert_eq!(evidence.redacted().events[0].kind, NativeEventKind::Output);
+    assert!(evidence.redacted().gap.is_none());
+    assert_eq!(evidence.private_evidence().len(), 1);
+    assert!(
+        String::from_utf8_lossy(evidence.private_evidence()[0].private_jsonl())
+            .contains("private manager evidence")
+    );
+    assert!(!format!("{evidence:?}").contains("private manager evidence"));
+    assert!(
+        !serde_json::to_string(evidence.redacted())
+            .unwrap()
+            .contains("private manager evidence")
+    );
+    let mut foreign = cursor.clone();
+    foreign.identity.scope_id = "scope.other".into();
+    assert!(
+        read_committed_codex_native_evidence(
+            &proof,
+            &source,
+            &trusted_directory,
+            Some(&foreign),
+            16,
+        )
+        .is_err()
     );
 
     // Treat the original port reply as lost. commands.get must recover the

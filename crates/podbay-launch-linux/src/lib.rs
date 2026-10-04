@@ -6,9 +6,15 @@ mod codex_v2;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod native_ingest;
+#[cfg(target_os = "linux")]
 pub use codex_v2::{
     CodexV2Preflight, TrustedCodexCredentialSource, preflight_committed_codex_v2,
     preflight_committed_codex_v2_read_only,
 };
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig, VerifiedRebindInspection};
+#[cfg(target_os = "linux")]
+pub use native_ingest::{
+    ManagerNativeEvidenceRead, TrustedNativeEventDirectory, read_committed_codex_native_evidence,
+};

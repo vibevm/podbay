@@ -353,6 +353,7 @@ dependencies = [
 name = "podbay-launch-linux"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "podbay-core",
  "podbay-host",
  "podbay-pod",
