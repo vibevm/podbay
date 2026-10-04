@@ -181,6 +181,60 @@ pub struct RebindProposal {
     pub digest: RequestDigest,
 }
 
+/// Shape-only process facts copied from an independently attested live pod.
+/// The future store ledger must bind these values to exact persisted evidence;
+/// these public strings alone are never OS attestation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPodProcessEvidence {
+    pub supervisor_process_id: String,
+    pub supervisor_birth_identity: String,
+    pub child_process_id: String,
+    pub child_birth_identity: String,
+    pub boot_identity: String,
+    pub containment_identity: String,
+}
+
+impl PendingPodProcessEvidence {
+    fn valid_shape(&self) -> bool {
+        [
+            &self.supervisor_process_id,
+            &self.supervisor_birth_identity,
+            &self.child_process_id,
+            &self.child_birth_identity,
+            &self.boot_identity,
+        ]
+        .iter()
+        .all(|value| valid_piece(value, 256))
+            && valid_piece(&self.containment_identity, 4096)
+    }
+}
+
+/// Proposed recovery from an exactly observed PendingStore/PendingPod rebind.
+/// This DTO is forgeable. A future durable supersession ledger must prove its
+/// exact abandoned row, checkpoint and process evidence, current owner and
+/// resource vector before the pod may change its checkpoint. Recovery keeps
+/// advanced input epochs and never claims that the abandoned manager became
+/// Active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRebindSupersession {
+    pub abandoned: RebindProposal,
+    pub pending_phase: RebindPhase,
+    pub pending_checkpoint_digest: RequestDigest,
+    pub pending_process: PendingPodProcessEvidence,
+    pub recovering_owner_epoch: OwnerEpoch,
+    pub recovering_credential_epoch: CredentialEpoch,
+    pub recovering_input_epochs: BTreeMap<ResourceId, InputEpoch>,
+    pub recovering_manager: AttestedPeer,
+    pub command_key: CommandKey,
+    pub digest: RequestDigest,
+}
+
+/// Implemented only by a future durable exact supersession ledger. A caller
+/// supplied bool or a copied Pending checkpoint is never sufficient.
+pub trait SupersessionLedger {
+    fn supersedes(&self, intent: &PendingRebindSupersession) -> bool;
+}
+
 /// Implemented only by the trusted durable rebind ledger. A Boolean from a
 /// request body is not an admission or activation proof.
 pub trait RebindLedger {
@@ -1019,6 +1073,104 @@ impl PodPeerFence {
         Ok(self.phase)
     }
 
+    /// Abort only an abandoned Pending rebind after a newer manager has
+    /// durably superseded it. The recovery checkpoint is Active under the
+    /// *old* pinned manager, with zero leases/grants and the Pending rebind's
+    /// advanced input epochs retained. Since the durable current owner is the
+    /// recovering manager, no peer can use ordinary control in this state.
+    /// The caller must fsync this checkpoint before starting a fresh rebind.
+    pub fn supersede_pending_rebind(
+        &mut self,
+        intent: &PendingRebindSupersession,
+        observed_pending_digest: &RequestDigest,
+        observed_pending_process: &PendingPodProcessEvidence,
+        recovering_peer: &AttestedPeer,
+        abandoned_manager_liveness: ManagerLiveness,
+        witness: &impl OwnerEpochWitness,
+        ledger: &impl SupersessionLedger,
+        now_ms: u64,
+    ) -> Result<RebindPhase, FenceError> {
+        if now_ms == 0
+            || self.phase != intent.pending_phase
+            || !matches!(
+                self.phase,
+                RebindPhase::PendingStore | RebindPhase::PendingPod
+            )
+            || self.pending.as_ref() != Some(&intent.abandoned)
+            || self.last_rebind.as_ref() != Some(&intent.abandoned)
+            || intent.pending_checkpoint_digest != *observed_pending_digest
+        {
+            return Err(FenceError::PendingRebind);
+        }
+        if intent.pending_process != *observed_pending_process
+            || !intent.pending_process.valid_shape()
+        {
+            return Err(FenceError::InvalidEvidence);
+        }
+        if intent.abandoned.identity != self.identity
+            || intent.abandoned.expected_owner_epoch != self.manager.owner_epoch
+            || intent.abandoned.expected_credential_epoch != self.manager.credential_epoch
+            || intent.abandoned.next_manager == *recovering_peer
+        {
+            return Err(FenceError::WrongAssociation);
+        }
+        if intent.recovering_manager != *recovering_peer {
+            return Err(FenceError::WrongPeer);
+        }
+        if recovering_peer.containment_identity() != self.manager_containment.as_ref() {
+            return Err(FenceError::WrongContainment);
+        }
+        if abandoned_manager_liveness != ManagerLiveness::DeadAttested {
+            return Err(FenceError::LeaseHeld);
+        }
+        self.require_owner(witness, intent.recovering_owner_epoch)?;
+        strictly_advanced(
+            intent.abandoned.next_owner_epoch,
+            intent.recovering_owner_epoch,
+            OwnerEpoch::get,
+        )?;
+        strictly_advanced(
+            intent.abandoned.next_credential_epoch,
+            intent.recovering_credential_epoch,
+            CredentialEpoch::get,
+        )?;
+        if intent.abandoned.next_input_epochs.len() != self.resources.len()
+            || intent.recovering_input_epochs.len() != self.resources.len()
+        {
+            return Err(FenceError::StaleEpoch);
+        }
+        for (resource_id, state) in &self.resources {
+            let abandoned = intent
+                .abandoned
+                .next_input_epochs
+                .get(resource_id)
+                .ok_or(FenceError::WrongAssociation)?;
+            let recovering = intent
+                .recovering_input_epochs
+                .get(resource_id)
+                .ok_or(FenceError::WrongAssociation)?;
+            if state.epoch != *abandoned {
+                return Err(FenceError::StaleEpoch);
+            }
+            strictly_advanced(*abandoned, *recovering, InputEpoch::get)?;
+        }
+        if !ledger.supersedes(intent) {
+            return Err(FenceError::NotAdmitted);
+        }
+        let mut recovered = self.clone();
+        recovered.grants.clear();
+        recovered.manager.lease_until_ms = 0;
+        for state in recovered.resources.values_mut() {
+            state.lease = None;
+        }
+        recovered.pending = None;
+        recovered.last_rebind = None;
+        recovered.phase = RebindPhase::Active;
+        recovered.checkpoint().validate()?;
+        *self = recovered;
+        Ok(RebindPhase::Active)
+    }
+
     fn repeat_phase(&self, proposal: &RebindProposal) -> Result<Option<RebindPhase>, FenceError> {
         if let Some(last) = &self.last_rebind {
             if last.command_key == proposal.command_key {
@@ -1164,6 +1316,15 @@ mod tests {
         pending: bool,
         active: bool,
     }
+    struct SupersessionProof {
+        intent: PendingRebindSupersession,
+        admitted: bool,
+    }
+    impl SupersessionLedger for SupersessionProof {
+        fn supersedes(&self, intent: &PendingRebindSupersession) -> bool {
+            self.admitted && &self.intent == intent
+        }
+    }
     impl RebindLedger for Ledger {
         fn pending(&self, proposal: &RebindProposal) -> bool {
             self.pending && proposal == &self.proposal
@@ -1241,6 +1402,247 @@ mod tests {
             command_key: CommandKey::try_from("key.rebind.fixture").unwrap(),
             digest: RequestDigest::parse(&"a".repeat(64)).unwrap(),
         }
+    }
+
+    fn pending_supersession(
+        abandoned: RebindProposal,
+        phase: RebindPhase,
+    ) -> PendingRebindSupersession {
+        let recovering_input_epochs = abandoned
+            .next_input_epochs
+            .iter()
+            .map(|(id, epoch)| (id.clone(), epoch.checked_next().unwrap()))
+            .collect();
+        PendingRebindSupersession {
+            abandoned,
+            pending_phase: phase,
+            pending_checkpoint_digest: RequestDigest::parse(&"c".repeat(64)).unwrap(),
+            pending_process: PendingPodProcessEvidence {
+                supervisor_process_id: "pid.400".into(),
+                supervisor_birth_identity: "birth.400".into(),
+                child_process_id: "pid.401".into(),
+                child_birth_identity: "birth.401".into(),
+                boot_identity: "boot.fixture".into(),
+                containment_identity: "pod.unit".into(),
+            },
+            recovering_owner_epoch: owner(3),
+            recovering_credential_epoch: credential(3),
+            recovering_input_epochs,
+            recovering_manager: peer("pid.300", "birth.300", "manager.unit"),
+            command_key: CommandKey::try_from("supersede.pending.fixture").unwrap(),
+            digest: RequestDigest::parse(&"d".repeat(64)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn durable_supersession_recovers_pending_phase_without_decreasing_input_epochs() {
+        for phase in [RebindPhase::PendingStore, RebindPhase::PendingPod] {
+            let mut fence = fence();
+            let abandoned = proposal(input(1), input(1));
+            let ledger = Ledger {
+                proposal: abandoned.clone(),
+                pending: true,
+                active: false,
+            };
+            let witness_b = Witness::new(Some(owner(2)));
+            fence
+                .prepare_rebind(
+                    abandoned.clone(),
+                    &successor(),
+                    ManagerLiveness::DeadAttested,
+                    &witness_b,
+                    &ledger,
+                    180,
+                )
+                .unwrap();
+            if phase == RebindPhase::PendingPod {
+                fence
+                    .confirm_pod_bound(&abandoned, &successor(), &witness_b, &ledger)
+                    .unwrap();
+            }
+            let intent = pending_supersession(abandoned.clone(), phase);
+            let proof = SupersessionProof {
+                intent: intent.clone(),
+                admitted: true,
+            };
+            let witness_c = Witness::new(Some(owner(3)));
+            let observed = intent.pending_checkpoint_digest.clone();
+            assert_eq!(
+                fence.supersede_pending_rebind(
+                    &intent,
+                    &observed,
+                    &intent.pending_process,
+                    &intent.recovering_manager,
+                    ManagerLiveness::DeadAttested,
+                    &witness_c,
+                    &proof,
+                    190,
+                ),
+                Ok(RebindPhase::Active)
+            );
+            let checkpoint = fence.checkpoint();
+            assert_eq!(checkpoint.phase(), RebindPhase::Active);
+            assert_eq!(checkpoint.manager_peer(), &manager());
+            assert_eq!(checkpoint.owner_epoch(), owner(1));
+            assert_eq!(checkpoint.credential_epoch(), credential(1));
+            assert_eq!(checkpoint.input_epochs(), &abandoned.next_input_epochs);
+            assert!(checkpoint.pending_rebind().is_none());
+            assert!(checkpoint.last_rebind().is_none());
+            let restored = PodPeerFence::restore_after_crash(checkpoint.clone()).unwrap();
+            assert_eq!(restored.checkpoint(), checkpoint);
+            assert_eq!(
+                fence.authorize(
+                    &manager(),
+                    &request(
+                        "grant.controller",
+                        FenceOperation::ObservePod,
+                        None,
+                        owner(1),
+                        credential(1),
+                    ),
+                    &witness_c,
+                    190
+                ),
+                Err(FenceError::OwnerUnverified)
+            );
+            // A fresh A→C proposal may now advance B's input epoch 2→3;
+            // neither the abandoned manager B nor the old manager A is Active.
+            let mut next = abandoned.clone();
+            next.expected_input_epochs = abandoned.next_input_epochs.clone();
+            next.next_input_epochs = intent.recovering_input_epochs.clone();
+            next.next_owner_epoch = owner(3);
+            next.next_credential_epoch = credential(3);
+            next.next_manager = intent.recovering_manager.clone();
+            next.command_key = CommandKey::try_from("rebind.after.supersession").unwrap();
+            next.digest = RequestDigest::parse(&"e".repeat(64)).unwrap();
+            let next_ledger = Ledger {
+                proposal: next.clone(),
+                pending: true,
+                active: false,
+            };
+            assert_eq!(
+                fence.prepare_rebind(
+                    next,
+                    &intent.recovering_manager,
+                    ManagerLiveness::DeadAttested,
+                    &witness_c,
+                    &next_ledger,
+                    200,
+                ),
+                Ok(RebindPhase::PendingStore)
+            );
+        }
+    }
+
+    #[test]
+    fn supersession_refuses_missing_or_changed_pending_and_keeps_fence_exact() {
+        let mut fence = fence();
+        let abandoned = proposal(input(1), input(1));
+        let ledger = Ledger {
+            proposal: abandoned.clone(),
+            pending: true,
+            active: false,
+        };
+        let witness_b = Witness::new(Some(owner(2)));
+        fence
+            .prepare_rebind(
+                abandoned.clone(),
+                &successor(),
+                ManagerLiveness::DeadAttested,
+                &witness_b,
+                &ledger,
+                180,
+            )
+            .unwrap();
+        let original = fence.checkpoint();
+        let intent = pending_supersession(abandoned, RebindPhase::PendingStore);
+        let proof = SupersessionProof {
+            intent: intent.clone(),
+            admitted: true,
+        };
+        let witness_c = Witness::new(Some(owner(3)));
+        let changed_digest = RequestDigest::parse(&"f".repeat(64)).unwrap();
+        for result in [
+            fence.supersede_pending_rebind(
+                &intent,
+                &changed_digest,
+                &intent.pending_process,
+                &intent.recovering_manager,
+                ManagerLiveness::DeadAttested,
+                &witness_c,
+                &proof,
+                190,
+            ),
+            fence.supersede_pending_rebind(
+                &intent,
+                &intent.pending_checkpoint_digest,
+                &intent.pending_process,
+                &intent.recovering_manager,
+                ManagerLiveness::Alive,
+                &witness_c,
+                &proof,
+                190,
+            ),
+            fence.supersede_pending_rebind(
+                &intent,
+                &intent.pending_checkpoint_digest,
+                &intent.pending_process,
+                &intent.recovering_manager,
+                ManagerLiveness::DeadAttested,
+                &Witness::new(Some(owner(2))),
+                &proof,
+                190,
+            ),
+            fence.supersede_pending_rebind(
+                &intent,
+                &intent.pending_checkpoint_digest,
+                &intent.pending_process,
+                &intent.recovering_manager,
+                ManagerLiveness::DeadAttested,
+                &witness_c,
+                &SupersessionProof {
+                    intent: intent.clone(),
+                    admitted: false,
+                },
+                190,
+            ),
+        ] {
+            assert!(result.is_err());
+            assert_eq!(fence.checkpoint(), original);
+        }
+        let mut changed = intent.clone();
+        changed.recovering_input_epochs.insert(resource(), input(2));
+        assert!(
+            fence
+                .supersede_pending_rebind(
+                    &changed,
+                    &changed.pending_checkpoint_digest,
+                    &intent.pending_process,
+                    &changed.recovering_manager,
+                    ManagerLiveness::DeadAttested,
+                    &witness_c,
+                    &proof,
+                    190,
+                )
+                .is_err()
+        );
+        assert_eq!(fence.checkpoint(), original);
+        let mut changed_birth = intent.clone();
+        changed_birth.pending_process.child_birth_identity = "birth.reused".into();
+        assert_eq!(
+            fence.supersede_pending_rebind(
+                &changed_birth,
+                &changed_birth.pending_checkpoint_digest,
+                &intent.pending_process,
+                &changed_birth.recovering_manager,
+                ManagerLiveness::DeadAttested,
+                &witness_c,
+                &proof,
+                190,
+            ),
+            Err(FenceError::InvalidEvidence)
+        );
+        assert_eq!(fence.checkpoint(), original);
     }
 
     #[test]
