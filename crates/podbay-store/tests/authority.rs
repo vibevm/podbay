@@ -660,7 +660,7 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, count), (18, 0));
+    assert_eq!((version, count), (19, 0));
 }
 
 #[test]
