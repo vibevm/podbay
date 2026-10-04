@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
-    ActorId, AttestedPeer, LaunchBinding, PlannedRootBinding, PodId, ResourceId, Role, Run,
-    ScopeId, Session, StoreLineageId,
+    ActorId, Attempt, AttestedPeer, Epoch, LaunchBinding, PlannedRootBinding, Pod, PodId, Resource,
+    ResourceId, ResourceKind, Role, Run, ScopeId, Session, StoreLineageId, WorkKind,
 };
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
@@ -22,13 +22,16 @@ use podbay_store::{
     StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{
-    EffectiveLaunchContract, EffectiveLaunchContractV2, ImmutableLaunchDescriptor,
-    ImmutableLaunchDescriptorV2,
+    CommandBody, CommandEnvelope, EffectiveLaunchContract, EffectiveLaunchContractV2,
+    FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole,
+    SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
+    WorkspaceAccess as WireWorkspaceAccess,
 };
 
 #[cfg(target_os = "linux")]
 use crate::linux_manager_peer::LinuxManagerPeer;
 
+use crate::id_mint::{RootIdMintError, RootLaunchIds};
 use crate::launch_spec::{
     EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile, ResolvedNativePaths,
     TrustedNativeHostConfig,
@@ -966,6 +969,33 @@ pub struct BoundLaunchPodRequest {
     pub proposal: Option<BoundHostLaunchProposal>,
 }
 
+/// Host-owned context for the first high-level wire root. The GrantId comes
+/// from trusted grant installation or replay; wire `grantRef` is only compared
+/// with it. The caller supplies a monotonic deadline from its own policy.
+#[derive(Clone, Debug)]
+pub struct TrustedWireRootLaunchPolicy {
+    grant_id: GrantId,
+    deadline: Instant,
+    result_contract_ref: Box<str>,
+}
+
+impl TrustedWireRootLaunchPolicy {
+    pub fn from_trusted_policy(
+        grant_id: GrantId,
+        deadline: Instant,
+        result_contract_ref: &str,
+    ) -> Result<Self, HostError> {
+        if deadline <= Instant::now() || !valid_token(result_contract_ref) {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            grant_id,
+            deadline,
+            result_contract_ref: result_contract_ref.into(),
+        })
+    }
+}
+
 pub trait StablePortReceipt {
     fn stable_reference(&self) -> &str;
 }
@@ -990,7 +1020,15 @@ pub struct LaunchPodReceipt {
 pub enum LaunchPodError {
     Host(HostError),
     Store(StoreError),
+    IdMint(RootIdMintError),
     WrongOperation,
+    /// Admission committed, but dispatch/readback did not produce a complete
+    /// reply. The original CommandId remains queryable and must not be retried
+    /// under a new key or with newly minted root IDs.
+    CommittedDispatchUnavailable {
+        receipt: Receipt,
+        source: Box<LaunchPodError>,
+    },
     /// A port outcome or pre-port refusal could not be durably recorded.
     /// Query the original receipt; a committed claim must never be resent.
     OutcomeNotRecorded {
@@ -1009,6 +1047,11 @@ impl From<HostError> for LaunchPodError {
 impl From<StoreError> for LaunchPodError {
     fn from(value: StoreError) -> Self {
         Self::Store(value)
+    }
+}
+impl From<RootIdMintError> for LaunchPodError {
+    fn from(value: RootIdMintError) -> Self {
+        Self::IdMint(value)
     }
 }
 
@@ -2693,6 +2736,230 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return Err(HostError::Unauthorised.into());
         }
         Ok(record)
+    }
+
+    /// Plan one new Coordinator/Service root from an authenticated `launch`
+    /// envelope. The key and verified semantic digest are looked up before any
+    /// IDs are minted. Only trusted host state supplies actor, profile
+    /// generation, credential, manager generation, and a preinstalled grant.
+    /// An explicit deadline comes from the calling manager policy; this first
+    /// slice refuses a wire `deadlineAt` until wall-to-monotonic conversion is
+    /// implemented. No server mutation endpoint calls this method yet.
+    pub fn launch_new_root_codex_v2_from_wire<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: CommandEnvelope,
+        policy: &TrustedWireRootLaunchPolicy,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        request.encode_json().map_err(|_| HostError::InvalidInput)?;
+        let WireTarget::Scope { scope_id } = &request.target else {
+            return Err(HostError::Unsupported.into());
+        };
+        let scope = ScopeId::try_from(scope_id.as_str()).map_err(|_| HostError::InvalidInput)?;
+        let CommandBody::Launch(body) = &request.body else {
+            return Err(HostError::Unsupported.into());
+        };
+        if !valid_token(&request.key) || !valid_token(&request.request_id) {
+            return Err(HostError::InvalidInput.into());
+        }
+        let mut canonical_intent = b"podbay.wire-launch/1\0".to_vec();
+        canonical_intent.extend_from_slice(request.payload_digest.as_bytes());
+        if let Some(record) = self.lookup_bound_root_codex_v2_by_key(
+            transport,
+            &scope,
+            &request.key,
+            &canonical_intent,
+        )? {
+            return self.bound_receipt(record, true);
+        }
+        if !matches!(body.session, SessionChoice::New)
+            || body.role != LaunchRole::Coordinator
+            || body.work.kind != WireWorkKind::Service
+            || body.parent_run_id.is_some()
+            || body.work.input.is_some()
+            || body.work.task_ref.is_some()
+            || !body.tool_bundle_refs.is_empty()
+            || body.selection.fallback != FallbackPolicy::None
+            || body.workspace.access != WireWorkspaceAccess::ReadWrite
+            || request.deadline_at.is_some()
+        {
+            return Err(HostError::Unsupported.into());
+        }
+        if policy.deadline <= Instant::now() {
+            return Err(HostError::DeadlineExpired.into());
+        }
+        if body.work.result_contract_ref != policy.result_contract_ref.as_ref()
+            || body.authority.grant_ref != format!("grant.{}", policy.grant_id.get())
+            || body.workspace.scope_id != scope.as_str()
+        {
+            return Err(HostError::Unauthorised.into());
+        }
+        let basis_ref = body
+            .workspace
+            .basis_ref
+            .clone()
+            .ok_or(HostError::InvalidInput)?;
+        let model_id = body
+            .selection
+            .model_id
+            .clone()
+            .ok_or(HostError::InvalidInput)?;
+        let reasoning_effort = body
+            .selection
+            .reasoning_effort
+            .clone()
+            .ok_or(HostError::InvalidInput)?;
+        let max_children =
+            u32::try_from(body.limits.max_children.get()).map_err(|_| HostError::InvalidInput)?;
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != scope {
+            return Err(HostError::Unauthorised.into());
+        }
+        let actor_id = actor.actor_id.clone();
+        let generation = actor.credential_generation;
+        let profile = self
+            .launch_profiles
+            .get(&body.profile_ref)
+            .ok_or(HostError::Unsupported)?;
+        if profile.workspace_scope() != &scope {
+            return Err(HostError::Unauthorised.into());
+        }
+        let codex_policy = profile.codex_policy().ok_or(HostError::Unsupported)?;
+        let credential =
+            CredentialRef::from_trusted_vault(scope.clone(), codex_policy.credential_ref())?;
+        let profile_generation = profile.generation();
+        self.host.check_grant(
+            actor,
+            policy.grant_id,
+            &scope,
+            &Right::new(Operation::LaunchPod, Target::Scope(scope.clone())),
+        )?;
+        self.host.check_grant(
+            actor,
+            policy.grant_id,
+            &scope,
+            &Right::new(
+                Operation::UseCredential,
+                Target::Credential(credential.clone()),
+            ),
+        )?;
+        if let Some(guard) = &request.guard {
+            let matches = guard
+                .manager_epoch
+                .is_none_or(|epoch| epoch.get() == self.host.manager_epoch.get())
+                && guard.pod_epoch.is_none_or(|epoch| epoch.get() == 1)
+                && guard.resource_epoch.is_none()
+                && guard.writer_epoch.is_none()
+                && guard.lease_epoch.is_none()
+                && guard.target_revision.is_none();
+            if !matches {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+
+        let ids = RootLaunchIds::mint()?;
+        let first_epoch = Epoch::new(1).map_err(|_| HostError::InvalidInput)?;
+        let mut session = Session::new(ids.session_id, actor_id, scope.clone());
+        let run = Run::new(
+            ids.run_id,
+            &session,
+            Role::Coordinator,
+            WorkKind::Service,
+            None,
+        );
+        session
+            .bind_run(session.revision(), &run)
+            .map_err(|_| HostError::InvalidInput)?;
+        let mut attempt = Attempt::new(ids.attempt_id, run.id().clone(), 1, first_epoch)
+            .map_err(|_| HostError::InvalidInput)?;
+        let mut pod = Pod::new(ids.pod_id, attempt.id().clone(), first_epoch);
+        attempt
+            .attach_pod(attempt.revision(), &pod)
+            .map_err(|_| HostError::InvalidInput)?;
+        let resource = Resource::new(
+            ids.resource_id,
+            pod.id().clone(),
+            ResourceKind::StructuredProvider,
+            first_epoch,
+        );
+        pod.attach_resource(pod.revision(), &resource)
+            .map_err(|_| HostError::InvalidInput)?;
+        let binding = LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource])
+            .map_err(|_| HostError::InvalidInput)?
+            .identity()
+            .clone();
+        let planned_request = BoundLaunchPodRequest {
+            host_request: HostRequest {
+                scope_id: scope.clone(),
+                grant_id: policy.grant_id,
+                guards: GuardSet {
+                    manager_epoch: self.host.manager_epoch,
+                    pod_incarnation: PodIncarnation::new(1)?,
+                    resource_epoch: None,
+                    credential_generation: generation,
+                },
+                command_key: request.key,
+                correlation_id: request.request_id,
+                deadline: policy.deadline,
+                action: HostAction::LaunchPod {
+                    pod_id: pod.id().clone(),
+                    role: Role::Coordinator,
+                    credential: Some(credential),
+                },
+            },
+            canonical_request: canonical_intent,
+            proposal: Some(BoundHostLaunchProposal {
+                session,
+                run,
+                binding,
+                selection: LaunchSelection {
+                    profile_ref: body.profile_ref.clone(),
+                    profile_generation,
+                    model_id: Some(model_id),
+                    reasoning_effort: Some(reasoning_effort),
+                    fallback_approved: false,
+                    workspace: crate::launch_spec::WorkspaceSelection {
+                        scope_id: scope,
+                        basis_ref,
+                        relative_cwd: body.workspace.relative_cwd.clone(),
+                        access: crate::launch_spec::WorkspaceAccess::ReadWrite,
+                    },
+                    arguments: Vec::new(),
+                    tool_bundle_refs: Vec::new(),
+                    authority_ref: format!("grant.{}", policy.grant_id.get()),
+                    wall_seconds: body.limits.wall_seconds.get(),
+                    max_children,
+                    parent_run_id: None,
+                },
+            }),
+        };
+        let admitted = self.admit_bound_root_codex_v2(transport, planned_request.clone())?;
+        if admitted.duplicate {
+            return Ok(admitted);
+        }
+        let admitted_receipt = admitted.receipt.clone();
+        let key = planned_request.host_request.command_key.clone();
+        let intent = planned_request.canonical_request.clone();
+        let scope = planned_request.host_request.scope_id.clone();
+        match self.dispatch_prepared_bound_root_codex_v2(transport, planned_request) {
+            Ok(dispatched) => Ok(dispatched),
+            Err(source) => {
+                if let Ok(Some(record)) =
+                    self.lookup_bound_root_codex_v2_by_key(transport, &scope, &key, &intent)
+                {
+                    if let Ok(current) = self.bound_receipt(record, true) {
+                        return Ok(current);
+                    }
+                }
+                Err(LaunchPodError::CommittedDispatchUnavailable {
+                    receipt: admitted_receipt,
+                    source: Box::new(source),
+                })
+            }
+        }
     }
 
     /// Dispatches only an already committed, still-Prepared Codex V2 root.

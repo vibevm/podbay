@@ -20,14 +20,19 @@ use podbay_host::{
     LaunchPodError, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
     PortDispatchOutcome, PortReceiptRef, RebindContextError, RegisteredLaunchProfile,
     ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target, TrustedDriverTemplate,
-    TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
+    TrustedLaunchProfileInput, TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
+    WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
     BoundLaunchFormat, EffectClaim, LaunchDispatchStage, LaunchLookupRequest, PodBayStore,
     StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{
-    CodexAppServerPolicyV2, ImmutableLaunchDescriptor, NativeRole, ResourceDriver, TargetOs,
+    CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
+    FallbackPolicy, Guard as WireGuard, ImmutableLaunchDescriptor, LaunchBody, LaunchLimits,
+    LaunchRole, LaunchSelection as WireLaunchSelection, LaunchWork, NativeRole, RequestedAuthority,
+    ResourceDriver, SessionChoice, Target as WireTarget, TargetOs, WorkKind as WireWorkKind,
+    WorkspaceAccess as WireWorkspaceAccess, WorkspaceBinding,
 };
 use sha2::{Digest, Sha256};
 
@@ -699,6 +704,361 @@ fn codex_root_request(
     selection.model_id = Some("gpt-6-sol".into());
     request.proposal = Some(bound_codex_root_proposal(who, &who.pod, role, selection));
     request
+}
+
+fn wire_root_body(grant: GrantId, model: &str) -> LaunchBody {
+    LaunchBody {
+        session: SessionChoice::New,
+        role: LaunchRole::Coordinator,
+        work: LaunchWork {
+            kind: WireWorkKind::Service,
+            input: None,
+            task_ref: None,
+            result_contract_ref: "result.none".into(),
+        },
+        parent_run_id: None,
+        profile_ref: "profile.fixture".into(),
+        selection: WireLaunchSelection {
+            model_id: Some(model.into()),
+            reasoning_effort: Some("medium".into()),
+            fallback: FallbackPolicy::None,
+        },
+        workspace: WorkspaceBinding {
+            scope_id: "scope.launch".into(),
+            relative_cwd: ".".into(),
+            basis_ref: Some("basis.commit.one".into()),
+            access: WireWorkspaceAccess::ReadWrite,
+        },
+        tool_bundle_refs: Vec::new(),
+        authority: RequestedAuthority {
+            grant_ref: format!("grant.{}", grant.get()),
+        },
+        limits: LaunchLimits {
+            wall_seconds: DecimalString::new(60),
+            max_children: DecimalString::new(1),
+        },
+    }
+}
+
+fn wire_root_request(id: &str, key: &str, body: LaunchBody) -> CommandEnvelope {
+    CommandEnvelope::new(
+        id,
+        key,
+        WireTarget::Scope {
+            scope_id: "scope.launch".into(),
+        },
+        None,
+        None,
+        CommandBody::Launch(body),
+    )
+    .unwrap()
+}
+
+fn install_wire_root_policy(
+    host: &mut DurableAuthority<FakeLaunchPort>,
+    who: &Identity,
+) -> (GrantId, TrustedWireRootLaunchPolicy) {
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(who))
+            .unwrap()
+            .with_codex_policy_from_trusted_policy(codex_policy(who))
+            .unwrap(),
+    )
+    .unwrap();
+    let credential =
+        CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.one").unwrap();
+    let grant = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([
+                    Right::new(Operation::LaunchPod, Target::Scope(who.scope.clone())),
+                    Right::new(Operation::UseCredential, Target::Credential(credential)),
+                ]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let policy = TrustedWireRootLaunchPolicy::from_trusted_policy(
+        grant,
+        Instant::now() + Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    (grant, policy)
+}
+
+#[test]
+fn wire_root_planner_admits_once_and_reads_duplicate_before_new_ids() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let (grant, policy) = install_wire_root_policy(&mut host, &who);
+    let first_wire = wire_root_request(
+        "request.wire.first",
+        "key.wire.root",
+        wire_root_body(grant, "gpt-6-sol"),
+    );
+    let first = host
+        .launch_new_root_codex_v2_from_wire(&who.transport, first_wire.clone(), &policy)
+        .unwrap();
+    assert_eq!(first.status.stage, LaunchDispatchStage::HostAccepted);
+    assert!(first.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert_eq!(host.recorded_snapshot().pods.len(), 1);
+    let minted_pod = &host.recorded_snapshot().pods[0].pod_id;
+    assert!(minted_pod.starts_with("pod."));
+    assert_ne!(minted_pod, who.pod.as_str());
+    let duplicated = wire_root_request(
+        "request.wire.second",
+        "key.wire.root",
+        wire_root_body(grant, "gpt-6-sol"),
+    );
+    assert_eq!(first_wire.payload_digest, duplicated.payload_digest);
+    assert_ne!(first_wire.request_id, duplicated.request_id);
+    let again = host
+        .launch_new_root_codex_v2_from_wire(&who.transport, duplicated, &policy)
+        .unwrap();
+    assert!(again.duplicate);
+    assert!(!again.port_called);
+    assert_eq!(again.receipt, first.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.recorded_snapshot().pods.len(), 1);
+    let stale_transport = FakeTransport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        who.process.clone(),
+        CredentialGeneration::new(2).unwrap(),
+    ));
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(
+            &stale_transport,
+            wire_root_request(
+                "request.stale.actor",
+                "key.wire.root",
+                wire_root_body(grant, "gpt-6-sol")
+            ),
+            &policy,
+        ),
+        Err(LaunchPodError::Host(HostError::Unauthenticated))
+    ));
+    let changed = wire_root_request(
+        "request.wire.changed",
+        "key.wire.root",
+        wire_root_body(grant, "model.other"),
+    );
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(&who.transport, changed, &policy),
+        Err(LaunchPodError::Store(StoreError::Conflict(_)))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.recorded_snapshot().pods.len(), 1);
+}
+
+#[test]
+fn wire_root_planner_refuses_unsupported_shapes_and_untrusted_grants() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let (grant, policy) = install_wire_root_policy(&mut host, &who);
+    for (index, mutation) in [(0, "session"), (1, "parent"), (2, "worker"), (3, "input")] {
+        let mut body = wire_root_body(grant, "gpt-6-sol");
+        match mutation {
+            "session" => {
+                body.session = SessionChoice::Existing {
+                    session_id: "session.other".into(),
+                }
+            }
+            "parent" => body.parent_run_id = Some("run.parent".into()),
+            "worker" => body.role = LaunchRole::Worker,
+            "input" => {
+                body.work.input = Some(vec![ContentBlock::Text {
+                    text: "ignored".into(),
+                }])
+            }
+            _ => unreachable!(),
+        }
+        let wire = wire_root_request(
+            &format!("request.unsupported.{index}"),
+            &format!("key.unsupported.{index}"),
+            body,
+        );
+        assert!(matches!(
+            host.launch_new_root_codex_v2_from_wire(&who.transport, wire, &policy),
+            Err(LaunchPodError::Host(HostError::Unsupported))
+        ));
+    }
+    let mut wrong_alias = wire_root_body(grant, "gpt-6-sol");
+    wrong_alias.authority.grant_ref = "grant.99999".into();
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request("request.alias", "key.alias", wrong_alias),
+            &policy,
+        ),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    let foreign = CommandEnvelope::new(
+        "request.foreign.scope",
+        "key.foreign.scope",
+        WireTarget::Scope {
+            scope_id: "scope.foreign".into(),
+        },
+        None,
+        None,
+        CommandBody::Launch(wire_root_body(grant, "gpt-6-sol")),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(&who.transport, foreign, &policy),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    let explicit_utc = CommandEnvelope::new(
+        "request.utc.deadline",
+        "key.utc.deadline",
+        WireTarget::Scope {
+            scope_id: who.scope.as_str().into(),
+        },
+        None,
+        Some("2099-01-01T00:00:00Z".into()),
+        CommandBody::Launch(wire_root_body(grant, "gpt-6-sol")),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(&who.transport, explicit_utc, &policy),
+        Err(LaunchPodError::Host(HostError::Unsupported))
+    ));
+    let stale_guard = CommandEnvelope::new(
+        "request.stale.guard",
+        "key.stale.guard",
+        WireTarget::Scope {
+            scope_id: who.scope.as_str().into(),
+        },
+        Some(WireGuard {
+            manager_epoch: Some(DecimalString::new(2)),
+            ..WireGuard::default()
+        }),
+        None,
+        CommandBody::Launch(wire_root_body(grant, "gpt-6-sol")),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(&who.transport, stale_guard, &policy),
+        Err(LaunchPodError::Host(HostError::StaleGuard))
+    ));
+    let scope_only = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([Right::new(
+                    Operation::LaunchPod,
+                    Target::Scope(who.scope.clone()),
+                )]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let no_credential_policy = TrustedWireRootLaunchPolicy::from_trusted_policy(
+        scope_only,
+        Instant::now() + Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    assert!(matches!(
+        host.launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request(
+                "request.no.credential",
+                "key.no.credential",
+                wire_root_body(scope_only, "gpt-6-sol")
+            ),
+            &no_credential_policy,
+        ),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert!(host.recorded_snapshot().pods.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn wire_root_planner_returns_committed_receipt_when_dispatch_cannot_start() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    let (grant, policy) = install_wire_root_policy(&mut host, &who);
+    let request = wire_root_request(
+        "request.prepared",
+        "key.prepared",
+        wire_root_body(grant, "gpt-6-sol"),
+    );
+    let prepared = host
+        .launch_new_root_codex_v2_from_wire(&who.transport, request.clone(), &policy)
+        .unwrap();
+    assert_eq!(prepared.status.stage, LaunchDispatchStage::Prepared);
+    assert!(!prepared.port_called);
+    assert!(!prepared.receipt.command_id.is_empty());
+    let duplicate = host
+        .launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request(
+                "request.prepared.retry",
+                "key.prepared",
+                wire_root_body(grant, "gpt-6-sol"),
+            ),
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(duplicate.receipt, prepared.receipt);
+    assert!(duplicate.duplicate);
+    assert!(!duplicate.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn wire_root_planner_keeps_uncertain_dispatch_and_original_receipt() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::LostReply);
+    let (mut host, _) = initial_authority(&fixture.database, port.codex_v2(), &who);
+    let (grant, policy) = install_wire_root_policy(&mut host, &who);
+    let first = host
+        .launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request(
+                "request.uncertain",
+                "key.uncertain",
+                wire_root_body(grant, "gpt-6-sol"),
+            ),
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(
+        first.status.stage,
+        LaunchDispatchStage::UncertainAfterPossibleEffect
+    );
+    assert!(first.port_called);
+    let duplicate = host
+        .launch_new_root_codex_v2_from_wire(
+            &who.transport,
+            wire_root_request(
+                "request.uncertain.retry",
+                "key.uncertain",
+                wire_root_body(grant, "gpt-6-sol"),
+            ),
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_eq!(duplicate.status, first.status);
+    assert!(!duplicate.port_called);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
 }
 
 #[test]
