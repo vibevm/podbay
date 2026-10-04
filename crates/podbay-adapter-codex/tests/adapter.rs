@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use podbay_adapter_codex::{
     AnswerWriteOutcome, ApprovalDecision, ApprovalPolicy, AuthorizedAnswerPermit, AvailableLine,
     AvailableWrite, BlockReason, BootstrapReadPoll, BootstrapState, BootstrapTurnStage, CodecError,
-    CodexError, CodexResource, InterruptState, JsonlTransport, MAX_FRAME_BYTES, NativeAnswer,
-    NativeObservationKind, NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig,
-    ResourceIdentity, Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode,
-    TurnSubmissionStage, WriterPermit, decode, encode,
+    CodexError, CodexResource, InterruptState, JsonlTransport, LaterTurnCompletionObservation,
+    LaterTurnTerminalStatus, MAX_FRAME_BYTES, NativeAnswer, NativeObservationKind,
+    NativeRequestKind, NativeRequestStage, NativeRpcId, PinnedCodexConfig, ResourceIdentity,
+    Sandbox, TESTED_CODEX_CLI_VERSION, TESTED_V2_SCHEMA_SHA256, TurnMode, TurnSubmissionStage,
+    WriterPermit, decode, encode,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, SessionId};
 use serde_json::{Value, json};
@@ -1674,6 +1675,145 @@ fn checked_later_turn_lost_reply_or_changed_thread_never_resends() {
             .count(),
         1
     );
+}
+
+#[test]
+fn later_turn_completion_requires_matching_notification_and_nonblocking_fresh_idle() {
+    let mut io = FakeTransport::with_reads([
+        initialized(),
+        effective(2, "thread.one"),
+        turn_started_response(),
+        completed("turn.bootstrap", "completed"),
+        status("idle", &[]),
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.one"),
+        completed("turn.one", "completed"),
+    ]);
+    io.reads.extend([
+        Vec::new(),
+        encode(&read_response(6, "idle", None)).unwrap(),
+        Vec::new(),
+    ]);
+    io.pending_probe_writes = 1;
+    let mut adapter = CodexResource::new(io, identity("resource.structured"), config());
+    adapter.initialize().unwrap();
+    adapter
+        .start_new("Begin work", "bootstrap:session.one")
+        .unwrap();
+    adapter.poll_once().unwrap();
+    adapter.poll_once().unwrap();
+    adapter
+        .install_writer_epoch_from_trusted_boundary(Epoch::new(1).unwrap())
+        .unwrap();
+    adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(adapter.poll_available_once().unwrap());
+    let observed = adapter.last_later_turn_completion().cloned().unwrap();
+    assert_eq!(observed.native_turn_id, "turn.one");
+    assert_eq!(observed.status, LaterTurnTerminalStatus::Completed);
+    let poll = |adapter: &mut CodexResource<FakeTransport>| {
+        adapter.poll_later_turn_read_proof_once(&observed)
+    };
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Pending);
+    assert_eq!(adapter.turn_control_state().owned_active_turn_id, None);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Advanced);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Pending);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Advanced);
+    assert_eq!(poll(&mut adapter).unwrap(), BootstrapReadPoll::Verified);
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "turn/start")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn foreign_later_completion_cannot_start_an_idle_proof() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.one"),
+        completed("turn.other", "completed"),
+    ]);
+    adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(adapter.poll_available_once().unwrap());
+    assert!(adapter.last_later_turn_completion().is_none());
+    let forged = LaterTurnCompletionObservation {
+        native_thread_id: "thread.one".into(),
+        native_session_id: "thread.one".into(),
+        native_turn_id: "turn.one".into(),
+        status: LaterTurnTerminalStatus::Completed,
+    };
+    assert_eq!(
+        adapter.poll_later_turn_read_proof_once(&forged),
+        Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+    );
+    assert_eq!(
+        adapter
+            .transport()
+            .methods()
+            .iter()
+            .filter(|method| **method == "thread/read")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn later_turn_idle_read_cannot_settle_a_pending_host_request() {
+    let question = json!({"id":70,"method":"item/commandExecution/requestApproval","params":{
+        "threadId":"thread.one","turnId":"turn.one","itemId":"item.one","startedAtMs":1,
+    }});
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.one"),
+        question,
+        completed("turn.one", "completed"),
+        read_response(6, "idle", None),
+    ]);
+    adapter
+        .send_turn_after_checkpoint_checked(
+            &writer_permit(1),
+            "thread.one",
+            "thread.one",
+            "First",
+            "message.one",
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert!(adapter.poll_available_once().unwrap());
+    assert!(adapter.poll_available_once().unwrap());
+    let observed = adapter.last_later_turn_completion().cloned().unwrap();
+    assert_eq!(adapter.pending_request_count(), 1);
+    assert_eq!(
+        adapter.poll_later_turn_read_proof_once(&observed).unwrap(),
+        BootstrapReadPoll::Advanced
+    );
+    assert_ne!(
+        adapter.poll_later_turn_read_proof_once(&observed).unwrap(),
+        BootstrapReadPoll::Verified
+    );
+    assert_eq!(adapter.pending_request_count(), 1);
 }
 
 #[test]

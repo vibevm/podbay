@@ -197,6 +197,10 @@ impl CodexLaterTurnJournal {
         self.log.identity()
     }
 
+    pub fn matches_identity(&self, expected: &CodexJournalIdentity) -> bool {
+        &self.identity == expected
+    }
+
     pub fn recheck_held_file(&mut self) -> Result<(), PodError> {
         self.healthy()?;
         let identity = self.log.identity().clone();
@@ -245,6 +249,13 @@ impl CodexLaterTurnJournal {
             native_turn_id: fact.native_turn_id.clone(),
             stage,
         })
+    }
+
+    pub fn active_view(&self) -> Option<LaterTurnView> {
+        self.snapshot
+            .active
+            .as_deref()
+            .and_then(|key| self.view(key))
     }
 
     pub fn begin_turn(
