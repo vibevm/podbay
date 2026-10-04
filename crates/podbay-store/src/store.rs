@@ -14,7 +14,7 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -43,6 +43,13 @@ const RUNTIME_RUNS_V8: &str = "CREATE TABLE runtime_runs (
   last_attempt_ordinal INTEGER NOT NULL CHECK(last_attempt_ordinal>=0),
   FOREIGN KEY(session_id,scope_id) REFERENCES runtime_sessions(session_id,scope_id),
   UNIQUE(run_id,session_id,scope_id)
+) STRICT";
+// A Run's child capacity is a lifetime admission budget. Existing Runs get
+// zero capacity on migration; no process exit or uncertain effect refunds it.
+const RUN_CHILD_BUDGETS_V16: &str = "CREATE TABLE run_child_budgets (
+  run_id TEXT NOT NULL PRIMARY KEY REFERENCES runtime_runs(run_id) CHECK(length(run_id)>0),
+  max_children INTEGER NOT NULL DEFAULT 0 CHECK(max_children>=0 AND max_children<=4294967295),
+  reserved_children INTEGER NOT NULL DEFAULT 0 CHECK(reserved_children>=0 AND reserved_children<=max_children)
 ) STRICT";
 const LAUNCH_BINDINGS_V8: &str = "CREATE TABLE launch_bindings (
   command_rowid INTEGER PRIMARY KEY,
@@ -635,6 +642,25 @@ impl PodBayStore {
                 ));
             }
             transaction.execute_batch(&format!("{OWNER_ACTOR_ROTATIONS_V15};"))?;
+        }
+        if version < 16 {
+            verify_runtime_schema_v8(&transaction)?;
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='run_child_budgets'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v16 run budget schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{RUN_CHILD_BUDGETS_V16};"))?;
+            transaction.execute(
+                "INSERT INTO run_child_budgets(run_id,max_children,reserved_children)
+                 SELECT run_id,0,0 FROM runtime_runs",
+                [],
+            )?;
         }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
@@ -2282,6 +2308,21 @@ fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()
 }
 
 fn verify_runtime_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    verify_runtime_schema_v8(transaction)?;
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='run_child_budgets'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(RUN_CHILD_BUDGETS_V16) {
+        return Err(StoreError::Conflict("v16 run budget schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_runtime_schema_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     for (name, kind, expected) in [
         ("runtime_sessions", "table", RUNTIME_SESSIONS_V8),
         ("runtime_runs", "table", RUNTIME_RUNS_V8),

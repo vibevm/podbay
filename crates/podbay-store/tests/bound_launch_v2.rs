@@ -318,6 +318,23 @@ fn codex_v2_root_coordinator_and_root_worker_commit_with_exact_snapshot_and_dupl
         assert_eq!(record.resources.len(), 1);
         assert_eq!(record.resources[0].kind, "structured_provider");
         assert_eq!(record.effective_spec, proposal.effective.canonical_bytes());
+        let budget = store
+            .inspect_run_child_budget(
+                &ScopeId::try_from("scope.launch").unwrap(),
+                &RunId::try_from("run.codex.fixture").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(budget.max_children(), 2);
+        assert_eq!(budget.reserved_children(), 0);
+        assert_eq!(budget.scope_id().as_str(), "scope.launch");
+        assert_eq!(budget.run_id().as_str(), "run.codex.fixture");
+        assert!(matches!(
+            store.inspect_run_child_budget(
+                &ScopeId::try_from("scope.other").unwrap(),
+                &RunId::try_from("run.codex.fixture").unwrap(),
+            ),
+            Err(StoreError::NotFound)
+        ));
         assert_eq!(
             record.descriptor,
             proposal.descriptor.encode_json().unwrap()
@@ -470,6 +487,13 @@ fn changed_key_intent_and_v1_v2_cross_format_replay_refuse() {
             .format,
         BoundLaunchFormat::V1
     );
+    let budget = store
+        .inspect_run_child_budget(
+            &ScopeId::try_from("scope.launch").unwrap(),
+            &RunId::try_from("run.codex.fixture").unwrap(),
+        )
+        .unwrap();
+    assert_eq!((budget.max_children(), budget.reserved_children()), (0, 0));
 }
 
 #[test]
@@ -663,6 +687,7 @@ fn failure_after_command_insert_rolls_back_every_v2_admission_row() {
         "commands",
         "runtime_sessions",
         "runtime_runs",
+        "run_child_budgets",
         "authority_pods",
         "target_epochs",
         "launch_slots",
@@ -678,6 +703,13 @@ fn failure_after_command_insert_rolls_back_every_v2_admission_row() {
             .unwrap();
         assert_eq!(count, 0, "{table} escaped the failed transaction");
     }
+    assert!(matches!(
+        reopened.inspect_run_child_budget(
+            &ScopeId::try_from("scope.launch").unwrap(),
+            &RunId::try_from("run.codex.fixture").unwrap(),
+        ),
+        Err(StoreError::NotFound)
+    ));
     drop(reopened);
     connection
         .execute_batch("DROP TRIGGER fail_launch_slot")
@@ -687,5 +719,125 @@ fn failure_after_command_insert_rolls_back_every_v2_admission_row() {
         store
             .admit_bound_root_launch_v2(proposal.request("key.rollback.v2", b"intent.rollback.v2")),
         Ok(BoundLaunchAdmission::Committed(_))
+    ));
+}
+
+#[test]
+fn v15_existing_v2_run_migrates_to_default_deny_budget() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let original = match store
+        .admit_bound_root_launch_v2(proposal.request("key.before.v16", b"intent.before.v16"))
+        .unwrap()
+    {
+        BoundLaunchAdmission::Committed(record) => record,
+        other => panic!("expected committed V2 root: {other:?}"),
+    };
+    assert_eq!(
+        store
+            .inspect_run_child_budget(
+                &ScopeId::try_from("scope.launch").unwrap(),
+                &RunId::try_from("run.codex.fixture").unwrap(),
+            )
+            .unwrap()
+            .max_children(),
+        2
+    );
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE run_child_budgets; PRAGMA user_version=15;")
+        .unwrap();
+    drop(connection);
+    let mut migrated = fixture.open();
+    let budget = migrated
+        .inspect_run_child_budget(
+            &ScopeId::try_from("scope.launch").unwrap(),
+            &RunId::try_from("run.codex.fixture").unwrap(),
+        )
+        .unwrap();
+    assert_eq!((budget.max_children(), budget.reserved_children()), (0, 0));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM run_child_budgets", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(connection);
+    assert_eq!(
+        migrated
+            .current_bound_pod_snapshot("scope.launch", "pod.launch")
+            .unwrap()
+            .launch(),
+        &original
+    );
+    drop(migrated);
+    let read_only = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(
+        read_only
+            .inspect_run_child_budget(
+                &ScopeId::try_from("scope.launch").unwrap(),
+                &RunId::try_from("run.codex.fixture").unwrap(),
+            )
+            .unwrap()
+            .max_children(),
+        0
+    );
+}
+
+#[test]
+fn v16_run_budget_schema_is_verified_exactly() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE run_child_budgets;
+             CREATE TABLE run_child_budgets (
+               run_id TEXT PRIMARY KEY,
+               max_children INTEGER,
+               reserved_children INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::Conflict("v16 run budget schema differs"))
+    ));
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v16 run budget schema differs"))
+    ));
+}
+
+#[test]
+fn missing_budget_row_refuses_exact_run_inspection() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    store
+        .admit_bound_root_launch_v2(
+            proposal.request("key.budget.missing", b"intent.budget.missing"),
+        )
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "DELETE FROM run_child_budgets WHERE run_id='run.codex.fixture'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        store.inspect_run_child_budget(
+            &ScopeId::try_from("scope.launch").unwrap(),
+            &RunId::try_from("run.codex.fixture").unwrap(),
+        ),
+        Err(StoreError::Conflict("Run child budget is missing"))
     ));
 }

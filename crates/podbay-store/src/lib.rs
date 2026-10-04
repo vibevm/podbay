@@ -14,7 +14,7 @@ pub use authority::SqliteActorVerifierWitness;
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
-    CurrentBoundPodSnapshot, CurrentBoundResource,
+    CurrentBoundPodSnapshot, CurrentBoundResource, RunChildBudget,
 };
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{

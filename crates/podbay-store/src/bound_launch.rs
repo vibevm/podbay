@@ -129,6 +129,7 @@ struct CheckedProposal<'a> {
     spec_digest: String,
     descriptor_digest: String,
     format: BoundLaunchFormat,
+    max_children: u32,
     expected_owner_epoch: u64,
     expected_authority_revision: u64,
 }
@@ -222,6 +223,31 @@ pub struct BoundLaunchRecord {
     pub descriptor: Vec<u8>,
 }
 
+/// A read-only lifetime child-admission budget tied to one scoped Run. It is
+/// not a reservation, parent-liveness observation, or launch authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunChildBudget {
+    scope_id: ScopeId,
+    run_id: RunId,
+    max_children: u32,
+    reserved_children: u32,
+}
+
+impl RunChildBudget {
+    pub fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    pub fn max_children(&self) -> u32 {
+        self.max_children
+    }
+    pub fn reserved_children(&self) -> u32 {
+        self.reserved_children
+    }
+}
+
 /// One read-only, active-run candidate. It proves database associations at
 /// one committed SQLite snapshot, not process liveness, launch authority or
 /// a control grant; the host must still obtain fresh OS and pod evidence.
@@ -304,6 +330,44 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
+    /// Inspect a Run's committed budget only through its exact scope. A
+    /// missing budget row is corruption, not permission to infer capacity.
+    pub fn inspect_run_child_budget(
+        &self,
+        scope_id: &ScopeId,
+        run_id: &RunId,
+    ) -> Result<RunChildBudget, StoreError> {
+        let row: Option<(Option<i64>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT budget.max_children,budget.reserved_children
+                 FROM runtime_runs AS run
+                 LEFT JOIN run_child_budgets AS budget ON budget.run_id=run.run_id
+                 WHERE run.scope_id=?1 AND run.run_id=?2",
+                params![scope_id.as_str(), run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (Some(max), Some(reserved)) = row.ok_or(StoreError::NotFound)? else {
+            return Err(StoreError::Conflict("Run child budget is missing"));
+        };
+        let max_children = u32::try_from(max)
+            .map_err(|_| StoreError::Conflict("Run child budget maximum is invalid"))?;
+        let reserved_children = u32::try_from(reserved)
+            .map_err(|_| StoreError::Conflict("Run child budget reservation is invalid"))?;
+        if reserved_children > max_children {
+            return Err(StoreError::Conflict(
+                "Run child budget reservation exceeds maximum",
+            ));
+        }
+        Ok(RunChildBudget {
+            scope_id: scope_id.clone(),
+            run_id: run_id.clone(),
+            max_children,
+            reserved_children,
+        })
+    }
+
     /// Read an existing bound launch before a manager mints any Session, Run,
     /// Attempt, Pod, or Resource IDs. A miss permits planning; a changed
     /// canonical caller intent conflicts and must never mint another launch.
@@ -853,6 +917,14 @@ impl PodBayStore {
             ],
         )?;
         transaction.execute(
+            "INSERT INTO run_child_budgets(run_id,max_children,reserved_children)
+             VALUES(?1,?2,0)",
+            params![
+                binding.run_id().as_str(),
+                integer(u64::from(checked.max_children))?,
+            ],
+        )?;
+        transaction.execute(
             "INSERT INTO authority_pods(pod_id,scope_id,incarnation) VALUES(?1,?2,?3)",
             params![
                 binding.pod_id().as_str(),
@@ -1067,6 +1139,7 @@ fn check_proposal<'a>(
                 spec_digest: effective.digest().to_owned(),
                 descriptor_digest: proposal.descriptor.digest().to_owned(),
                 format: BoundLaunchFormat::V1,
+                max_children: 0,
                 expected_owner_epoch: proposal.expected_owner_epoch,
                 expected_authority_revision: proposal.expected_authority_revision,
             })
@@ -1118,6 +1191,7 @@ fn check_proposal<'a>(
                 spec_digest: effective.digest().to_owned(),
                 descriptor_digest: proposal.descriptor.digest().to_owned(),
                 format: BoundLaunchFormat::CodexV2,
+                max_children: effective.base().max_children(),
                 expected_owner_epoch: proposal.expected_owner_epoch,
                 expected_authority_revision: proposal.expected_authority_revision,
             })

@@ -91,7 +91,9 @@ fn remove_v8_schema(connection: &rusqlite::Connection) {
     // user_version attached to the new tables.
     connection
         .execute_batch(
-            "DROP TABLE actor_verifiers;
+            "DROP TABLE run_child_budgets;
+             DROP TABLE owner_actor_rotations;
+             DROP TABLE actor_verifiers;
              DROP TABLE manager_rebind_prior_observations;
              DROP TABLE manager_peer_bindings;
              DROP TABLE manager_credential_claims;
@@ -412,7 +414,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_fourteen_has_empty_runtime_rebind_manager_and_verifier_tables() {
+fn fresh_schema_sixteen_has_empty_runtime_rebind_manager_and_verifier_tables() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -420,10 +422,11 @@ fn fresh_schema_fourteen_has_empty_runtime_rebind_manager_and_verifier_tables() 
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 16);
     for table in [
         "runtime_sessions",
         "runtime_runs",
+        "run_child_budgets",
         "launch_bindings",
         "launch_resources",
         "manager_rebinds",
@@ -461,7 +464,9 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE actor_verifiers;
+            "DROP TABLE run_child_budgets;
+             DROP TABLE owner_actor_rotations;
+             DROP TABLE actor_verifiers;
              DROP TABLE manager_rebind_prior_observations;
              DROP TABLE manager_peer_bindings;
              DROP TABLE manager_credential_claims;
@@ -491,10 +496,11 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 16);
     for table in [
         "runtime_sessions",
         "runtime_runs",
+        "run_child_budgets",
         "launch_bindings",
         "launch_resources",
         "manager_rebinds",
@@ -503,6 +509,7 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
         "manager_peer_bindings",
         "manager_rebind_prior_observations",
         "actor_verifiers",
+        "owner_actor_rotations",
     ] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
@@ -524,7 +531,8 @@ fn schema_eight_refuses_preexisting_or_malformed_runtime_tables() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE launch_resources;
+            "DROP TABLE run_child_budgets;
+             DROP TABLE launch_resources;
              DROP TABLE launch_bindings;
              DROP TABLE runtime_runs;
              DROP TABLE runtime_sessions;
