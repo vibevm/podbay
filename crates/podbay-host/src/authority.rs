@@ -15,9 +15,10 @@ use podbay_core::{
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
-    BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, EffectClaim, LaunchDispatchStatus,
-    LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt,
-    SqliteActorVerifierWitness, StoreError, VerifiedPrincipal,
+    BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, CommandInspection,
+    CommandLookupSelector, EffectClaim, LaunchDispatchStatus, LaunchLookupRequest,
+    LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt, SqliteActorVerifierWitness,
+    StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor};
 
@@ -2256,6 +2257,71 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
             RebindContextError::Store(error) => DurableAuthorityError::Store(error),
         })
+    }
+
+    /// Read only this live actor's own durable command receipt and outbox
+    /// status. The transport, never the request, supplies the actor principal
+    /// and credential generation. Historical receipt lookup remains available
+    /// after a grant changes, but grants no host or provider effect.
+    pub fn lookup_command<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope: &ScopeId,
+        selector: &CommandLookupSelector,
+    ) -> Result<CommandInspection, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (transport, scope, selector);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.recheck_actor_resolution_manager()?;
+            let actor = self.host.authenticate(transport)?.clone();
+            if actor.scope_id != *scope {
+                return Err(StoreError::NotFound.into());
+            }
+            let expected = durable_actor(&actor);
+            let current = self.store.authority_snapshot()?;
+            if current.owner_epoch != self.manager_claim.owner_epoch()
+                || current.owner_epoch != self.host.manager_epoch.get()
+                || current.revision != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            for snapshot in [&current, &self.recorded] {
+                let mut matching = snapshot
+                    .actors
+                    .iter()
+                    .filter(|record| record.actor_id == actor.actor_id.as_str());
+                if matching.next() != Some(&expected) || matching.next().is_some() {
+                    return Err(HostError::Unauthenticated.into());
+                }
+            }
+            let principal =
+                VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+            let found = self
+                .store
+                .lookup_command(scope.as_str(), &principal, selector);
+            self.recheck_actor_resolution_manager()?;
+            let fresh = self.store.authority_snapshot()?;
+            if fresh.owner_epoch != current.owner_epoch || fresh.revision != current.revision {
+                return Err(HostError::StaleGuard.into());
+            }
+            let mut matching = fresh
+                .actors
+                .iter()
+                .filter(|record| record.actor_id == actor.actor_id.as_str());
+            if matching.next() != Some(&expected) || matching.next().is_some() {
+                return Err(HostError::Unauthenticated.into());
+            }
+            let live = self.host.authenticate(transport)?;
+            if durable_actor(live) != expected {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            found.map_err(Into::into)
+        }
     }
 
     /// Trusted policy must register the effective profile on every manager
