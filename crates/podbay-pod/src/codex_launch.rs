@@ -375,22 +375,25 @@ fn validate_pod_binary(path: &Path) -> Result<(), PodError> {
 
 fn attest_running(client: &PodClient, expected: &BoundPeerManifest) -> Result<(), PodError> {
     let status = client
-        .status()
-        .map_err(|_| PodError::Uncertain("Codex V2 pod status unavailable"))?;
-    let bound = client
-        .bound_status()
-        .map_err(|_| PodError::Uncertain("Codex V2 bound status unavailable"))?;
+        .attested_status()
+        .map_err(|_| PodError::Uncertain("Codex V2 pod peer status unavailable"))?;
     let final_status = client
-        .status()
-        .map_err(|_| PodError::Uncertain("Codex V2 pod status unavailable"))?;
+        .attested_status()
+        .map_err(|_| PodError::Uncertain("Codex V2 pod peer status unavailable"))?;
     let wire = ImmutableLaunchDescriptorV2::decode_json(&expected.wire_descriptor)
         .map_err(|_| PodError::Uncertain("Codex V2 status descriptor malformed"))?;
     let resource = wire
         .resource(0)
         .ok_or(PodError::Uncertain("Codex V2 status resource missing"))?;
+    let bound = expected.status(resource.resource_id, wire.scope_id());
     if !status.child_running
         || !final_status.child_running
-        || bound != expected.status(resource.resource_id, wire.scope_id())
+        || status.bound.as_ref() != Some(&bound)
+        || final_status.bound.as_ref() != Some(&bound)
+        || status.supervisor_pid != final_status.supervisor_pid
+        || status.supervisor_start_ticks != final_status.supervisor_start_ticks
+        || status.child_pid != final_status.child_pid
+        || status.child_start_ticks != final_status.child_start_ticks
     {
         return Err(PodError::Uncertain("Codex V2 status identity differs"));
     }

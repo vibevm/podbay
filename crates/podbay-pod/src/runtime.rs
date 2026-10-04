@@ -431,6 +431,50 @@ impl PodClient {
         self.request("status").map(Into::into)
     }
 
+    /// Read one status from the exact connected Unix peer, retaining its
+    /// kernel PID/UID and procfs birth, boot and cgroup across the bounded
+    /// exchange. The returned bound status belongs to that same reply. This
+    /// proves a process in the expected unit, not systemd MainPID or hostile
+    /// same-UID isolation; those require separate platform evidence.
+    pub fn attested_status(&self) -> Result<PodStatus, PodError> {
+        let request = Request {
+            protocol: PROTOCOL.to_owned(),
+            pod_id: self.manifest.descriptor.pod_id.clone(),
+            attempt_id: self.manifest.descriptor.attempt_id.clone(),
+            incarnation: self.manifest.descriptor.incarnation,
+            token: self.manifest.token.clone(),
+            operation: "status".into(),
+            terminal: None,
+        };
+        let (bytes, observed) =
+            inspect_exchange(&self.manifest.socket_path, &serde_json::to_vec(&request)?)?;
+        let response: Response = serde_json::from_slice(&bytes)?;
+        if !response.ok {
+            return Err(PodError::Refused("pod rejected authenticated status"));
+        }
+        let status = response
+            .status
+            .ok_or(PodError::Invalid("pod status missing"))?;
+        attest(&self.manifest, &status)?;
+        let fresh_manifest = read_manifest(&self.manifest_path)?;
+        let metadata = fs::symlink_metadata(&self.manifest_path)?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("client OS identity unavailable"))?;
+        if serde_json::to_vec(&fresh_manifest)? != serde_json::to_vec(&self.manifest)?
+            || observed.uid() != metadata.uid()
+            || observed.uid() != current.uid()
+            || status.supervisor_pid != observed.pid() as u32
+            || status.supervisor_start_ticks != observed.start_ticks()
+            || status.boot_id != observed.boot_id()
+            || status.cgroup_path != observed.cgroup()
+            || status.unit_name != self.manifest.unit_name
+            || !unit_cgroup_exact(observed.cgroup(), &self.manifest.unit_name)
+        {
+            return Err(PodError::Refused("pod status server OS identity differs"));
+        }
+        Ok(status)
+    }
+
     pub fn bound_status(&self) -> Result<BoundPodStatus, PodError> {
         self.request("status")?
             .bound
@@ -1817,6 +1861,92 @@ mod tests {
             "relative/podbay-fixture.service",
             "podbay-fixture.service"
         ));
+    }
+
+    #[test]
+    fn attested_status_refuses_server_claiming_another_unit_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("pb-as-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let descriptor = LaunchDescriptor {
+            protocol: PROTOCOL.into(),
+            pod_id: "pod.attested.fixture".into(),
+            attempt_id: "attempt.attested.fixture".into(),
+            session_id: "session.attested.fixture".into(),
+            run_id: "run.attested.fixture".into(),
+            scope_id: "scope.attested.fixture".into(),
+            role: PodRole::Worker,
+            incarnation: 1,
+            resource_id: "resource.attested.fixture".into(),
+            executable: "/bin/true".into(),
+            args: vec![],
+            cwd: directory.clone(),
+            pty: None,
+        };
+        let path = manifest_path(&directory, &descriptor).unwrap();
+        let manifest = PodManifest {
+            digest: descriptor.digest().unwrap(),
+            token: "a".repeat(64),
+            viewer_token: None,
+            socket_path: path.with_extension("sock"),
+            unit_name: unit_name(&path).unwrap(),
+            descriptor,
+            peer_binding: None,
+        };
+        write_manifest(&path, &manifest).unwrap();
+        let listener = UnixListener::bind(&manifest.socket_path).unwrap();
+        let current = LinuxPeerEvidence::for_current_process().unwrap();
+        let claimed = PodStatus {
+            protocol: PROTOCOL.into(),
+            pod_id: manifest.descriptor.pod_id.clone(),
+            attempt_id: manifest.descriptor.attempt_id.clone(),
+            incarnation: 1,
+            manifest_digest: manifest.digest.clone(),
+            supervisor_pid: std::process::id(),
+            supervisor_start_ticks: current.start_ticks(),
+            child_pid: std::process::id(),
+            child_start_ticks: current.start_ticks(),
+            boot_id: current.boot_id().into(),
+            unit_name: manifest.unit_name.clone(),
+            cgroup_path: format!("/user.slice/{}", manifest.unit_name),
+            child_running: true,
+            exit_code: None,
+            bound: None,
+        };
+        let reply = serde_json::to_vec(&Response {
+            ok: true,
+            status: Some(claimed),
+            error: None,
+            error_code: None,
+            terminal: None,
+        })
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).unwrap();
+                assert!(!request.is_empty());
+                socket.write_all(&reply).unwrap();
+            }
+        });
+        let client = PodClient {
+            manifest_path: path,
+            manifest,
+        };
+        // The historical DTO path accepts the claimed cgroup. The kernel
+        // peer path sees this test process's actual cgroup and refuses it.
+        assert!(client.status().is_ok());
+        assert!(matches!(
+            client.attested_status(),
+            Err(PodError::Refused(_))
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
