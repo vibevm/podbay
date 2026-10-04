@@ -238,12 +238,68 @@ fn scope_launch_right_persists_without_pod_and_refuses_foreign_or_stop_scope() {
     assert!(matches!(
         store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(stop)),
         Err(StoreError::InvalidInput(
-            "scope right supports launch_pod only"
+            "scope right supports launch_pod or send_session only"
         ))
     ));
     drop(store);
     let mut reopened = PodBayStore::open(&fixture.database).unwrap();
     assert_eq!(reopened.authority_snapshot().unwrap().grants, vec![scoped]);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let targets: i64 = connection
+        .query_row("SELECT COUNT(*) FROM target_epochs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(targets, 0);
+}
+
+#[test]
+fn scope_send_right_persists_before_session_and_refuses_foreign_scope_or_terminal_right() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(unattached_actor("scope.main")),
+        )
+        .unwrap();
+    let send = grant(
+        "scope.main",
+        "actor.worker",
+        "send_session",
+        "scope",
+        "scope.main",
+    );
+    let revision = store
+        .apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(send.clone()))
+        .unwrap();
+    assert_eq!(
+        store.authority_snapshot().unwrap().grants,
+        vec![send.clone()]
+    );
+    let mut foreign = send.clone();
+    foreign.grant_id = 2;
+    foreign.rights[0].target_id = "scope.foreign".into();
+    assert!(matches!(
+        store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(foreign)),
+        Err(StoreError::WrongScope)
+    ));
+    let mut terminal = send.clone();
+    terminal.grant_id = 3;
+    terminal.rights[0].operation = "write_input".into();
+    assert!(matches!(
+        store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(terminal)),
+        Err(StoreError::InvalidInput(
+            "scope right supports launch_pod or send_session only"
+        ))
+    ));
+    drop(store);
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    let snapshot = reopened.authority_snapshot().unwrap();
+    assert_eq!(snapshot.grants, vec![send]);
+    assert_eq!(snapshot.revision, revision);
+    assert!(snapshot.pods.is_empty());
+    assert!(snapshot.resources.is_empty());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     let targets: i64 = connection
         .query_row("SELECT COUNT(*) FROM target_epochs", [], |row| row.get(0))

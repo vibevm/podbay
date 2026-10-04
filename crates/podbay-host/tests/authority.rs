@@ -1045,6 +1045,105 @@ fn scope_launch_right_never_grants_stop_or_credential_use() {
 }
 
 #[test]
+fn scope_send_right_is_same_scope_controller_only_and_grants_no_other_action() {
+    let mut f = fixture();
+    let send = f
+        .host
+        .install_grant_from_trusted_policy(
+            &f.owner_actor,
+            GrantSpec {
+                scope_id: f.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: rights([(Operation::SendSession, Target::Scope(f.scope.clone()))]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    for right in [
+        Right::new(
+            Operation::SendSession,
+            Target::Scope(f.sibling_scope.clone()),
+        ),
+        Right::new(Operation::SendSession, Target::Resource(f.resource.clone())),
+    ] {
+        assert_eq!(
+            f.host.install_grant_from_trusted_policy(
+                &f.owner_actor,
+                GrantSpec {
+                    scope_id: f.scope.clone(),
+                    mode: GrantMode::Controller,
+                    rights: BTreeSet::from([right]),
+                    remaining_delegation_depth: 0,
+                }
+            ),
+            Err(HostError::Unauthorised)
+        );
+    }
+    assert_eq!(
+        f.host.install_grant_from_trusted_policy(
+            &f.owner_actor,
+            GrantSpec {
+                scope_id: f.scope.clone(),
+                mode: GrantMode::Viewer,
+                rights: rights([(Operation::SendSession, Target::Scope(f.scope.clone()))]),
+                remaining_delegation_depth: 0,
+            }
+        ),
+        Err(HostError::Unauthorised)
+    );
+    for action in [
+        HostAction::LaunchPod {
+            pod_id: f.child_pod.clone(),
+            role: Role::Worker,
+            credential: None,
+        },
+        HostAction::StopPod {
+            pod_id: f.child_pod.clone(),
+        },
+        HostAction::ObserveResource {
+            resource_id: f.resource.clone(),
+        },
+    ] {
+        assert_eq!(
+            f.host.dispatch(
+                &f.owner,
+                request(&f.scope, send, guards(1, 1, None, 1), action)
+            ),
+            Err(HostError::Unauthorised)
+        );
+    }
+    let lease = f
+        .host
+        .acquire_input_lease(
+            &f.owner,
+            f.owner_grant,
+            &f.scope,
+            &f.resource,
+            guards(1, 1, Some(1), 1),
+            input_epoch(1),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert_eq!(
+        f.host.dispatch(
+            &f.owner,
+            request(
+                &f.scope,
+                send,
+                guards(1, 1, Some(1), 1),
+                HostAction::WriteInput {
+                    resource_id: f.resource.clone(),
+                    lease,
+                    bytes: b"hello".to_vec(),
+                },
+            )
+        ),
+        Err(HostError::Unauthorised)
+    );
+    assert_eq!(f.host.port().calls.len(), 0);
+}
+
+#[test]
 fn linux_subject_accepts_realistic_cgroup_but_rejects_relative_identity() {
     let real = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
         1000,

@@ -987,9 +987,9 @@ impl PodBayStore {
                     valid_identity(&right.target_kind)?;
                     valid_identity(&right.target_id)?;
                     if right.target_kind == "scope" {
-                        if right.operation != "launch_pod" {
+                        if right.operation != "launch_pod" && right.operation != "send_session" {
                             return Err(StoreError::InvalidInput(
-                                "scope right supports launch_pod only",
+                                "scope right supports launch_pod or send_session only",
                             ));
                         }
                         if right.target_id != record.scope_id {

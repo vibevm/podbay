@@ -435,6 +435,8 @@ impl ActorRegistration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Operation {
     LaunchPod,
+    /// Structured session input only; no terminal, pod, or provider control.
+    SendSession,
     StopPod,
     ObserveResource,
     AcquireInput,
@@ -1361,7 +1363,10 @@ impl<P: HostDispatchPort> HostAuthority<P> {
     fn rights_match_scope(&self, spec: &GrantSpec) -> bool {
         spec.rights.iter().all(|right| match &right.target {
             Target::Scope(scope) => {
-                right.operation == Operation::LaunchPod && scope == &spec.scope_id
+                matches!(
+                    right.operation,
+                    Operation::LaunchPod | Operation::SendSession
+                ) && scope == &spec.scope_id
             }
             Target::Pod(id) => {
                 matches!(right.operation, Operation::LaunchPod | Operation::StopPod)
@@ -3921,6 +3926,7 @@ fn durable_grant(id: GrantId, grant: &Grant) -> AuthorityGrantRecord {
             .map(|right| {
                 let operation = match right.operation {
                     Operation::LaunchPod => "launch_pod",
+                    Operation::SendSession => "send_session",
                     Operation::StopPod => "stop_pod",
                     Operation::ObserveResource => "observe_resource",
                     Operation::AcquireInput => "acquire_input",
@@ -3957,6 +3963,7 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
     for right in &record.rights {
         let operation = match right.operation.as_str() {
             "launch_pod" => Operation::LaunchPod,
+            "send_session" => Operation::SendSession,
             "stop_pod" => Operation::StopPod,
             "observe_resource" => Operation::ObserveResource,
             "acquire_input" => Operation::AcquireInput,

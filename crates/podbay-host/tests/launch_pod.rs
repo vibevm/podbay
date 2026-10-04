@@ -1172,6 +1172,55 @@ fn codex_v2_root_coordinator_and_root_worker_commit_without_port_effect() {
 }
 
 #[test]
+fn preinstalled_scope_send_right_replays_without_a_launch_or_dispatch() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    let send = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([Right::new(
+                    Operation::SendSession,
+                    Target::Scope(who.scope.clone()),
+                )]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let before = host.recorded_snapshot().clone();
+    let record = before
+        .grants
+        .iter()
+        .find(|grant| grant.grant_id == send.get())
+        .unwrap();
+    assert_eq!(record.rights.len(), 1);
+    assert_eq!(record.rights[0].operation, "send_session");
+    assert_eq!(record.rights[0].target_kind, "scope");
+    assert_eq!(record.rights[0].target_id, who.scope.as_str());
+    assert!(before.pods.is_empty());
+    drop(host);
+
+    let (port, replay_calls, replay_effects) = FakeLaunchPort::new(Mode::Accepted);
+    let mut reopened = DurableAuthority::open(&fixture.database, port).unwrap();
+    replay(&mut reopened, &who, send);
+    assert_eq!(
+        reopened.activate_grant_from_trusted_replay(send).unwrap(),
+        send
+    );
+    let after = reopened.recorded_snapshot();
+    assert_eq!(after.grants, before.grants);
+    assert!(after.pods.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert_eq!(replay_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replay_effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn scope_launch_grant_admits_new_pod_and_replays_original_receipt() {
     let fixture = Fixture::new();
     let who = identity(&fixture);
