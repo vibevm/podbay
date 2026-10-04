@@ -23,7 +23,8 @@ pub use host_requests::{
     RedactedNativeObservation,
 };
 pub use process_transport::{
-    ChildBirthObservation, ChildExitObservation, ChildLaunchSpec, ProcessJsonlTransport,
+    ChildBirthObservation, ChildExitObservation, ChildLaunchSpec, KernelChildBirthObservation,
+    ProcessJsonlTransport,
 };
 
 pub const TESTED_CODEX_CLI_VERSION: &str = "0.159.3";

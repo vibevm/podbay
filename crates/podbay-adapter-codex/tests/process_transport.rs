@@ -101,6 +101,68 @@ fn fake_child_handshake_frames_and_direct_child_exit_are_observed() {
     assert!(transport.observe_exit().unwrap().is_some());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn long_lived_fake_child_has_exact_rechecked_kernel_birth_without_a_native_session() {
+    let dirs = PrivateDirs::new();
+    // This child only sleeps. No Codex coordinator, thread, turn, or account is used.
+    let mut transport = ProcessJsonlTransport::spawn(dirs.spec(
+        "blocked",
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    ))
+    .unwrap();
+    let first = transport.attest_kernel_birth().unwrap();
+    assert_eq!(first.pid, transport.birth().pid);
+    assert!(first.start_ticks > 0);
+    assert_eq!(
+        first.boot_id,
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+    );
+    let stat = fs::read_to_string(format!("/proc/{}/stat", first.pid)).unwrap();
+    let start_ticks: u64 = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(first.start_ticks, start_ticks);
+    let cgroups = fs::read_to_string(format!("/proc/{}/cgroup", first.pid)).unwrap();
+    assert!(
+        cgroups
+            .lines()
+            .any(|line| line == format!("0::{}", first.cgroup_path))
+    );
+    assert_eq!(transport.attest_kernel_birth().unwrap(), first);
+    transport.dispose().unwrap();
+    assert_eq!(
+        transport.attest_kernel_birth().unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_child_spawn_remains_usable_but_linux_birth_is_unsupported() {
+    let dirs = PrivateDirs::new();
+    let mut transport = ProcessJsonlTransport::spawn(dirs.spec(
+        "blocked",
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    ))
+    .unwrap();
+    assert_eq!(
+        transport.attest_kernel_birth().unwrap_err().kind(),
+        ErrorKind::Unsupported
+    );
+    transport.dispose().unwrap();
+}
+
 /// Manual native conformance fixture. It exercises only the real app-server
 /// handshake and read-only model catalog through PodBay's bounded child pipes.
 /// Run with an absolute, reviewed Codex executable at the pinned CLI version:

@@ -133,6 +133,16 @@ pub struct ChildBirthObservation {
     pub observed_at: SystemTime,
 }
 
+/// Linux kernel evidence for the exact owned direct child at one observation.
+/// This does not attest pod membership, descendants, credentials, or readiness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelChildBirthObservation {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub boot_id: String,
+    pub cgroup_path: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChildExitObservation {
     pub pid: u32,
@@ -150,6 +160,8 @@ pub struct ProcessJsonlTransport {
     read_timeout: Duration,
     write_timeout: Duration,
     birth: ChildBirthObservation,
+    #[cfg(target_os = "linux")]
+    kernel_birth: Result<KernelChildBirthObservation, ErrorKind>,
     exit: Option<ChildExitObservation>,
 }
 
@@ -199,11 +211,21 @@ impl ProcessJsonlTransport {
                 let _ = child.wait();
                 return Err(error);
             }
+            #[cfg(target_os = "linux")]
+            let kernel_birth = capture_kernel_birth(child.id())
+                .and_then(|first| {
+                    let second = capture_kernel_birth(child.id())?;
+                    compare_kernel_birth(&first, &second)?;
+                    Ok(first)
+                })
+                .map_err(|error| error.kind());
             Ok(Self {
                 birth: ChildBirthObservation {
                     pid: child.id(),
                     observed_at: SystemTime::now(),
                 },
+                #[cfg(target_os = "linux")]
+                kernel_birth,
                 child,
                 stdin: Some(stdin),
                 stdout: Some(stdout),
@@ -217,6 +239,53 @@ impl ProcessJsonlTransport {
 
     pub fn birth(&self) -> &ChildBirthObservation {
         &self.birth
+    }
+
+    /// Rechecks the owned child and its kernel birth evidence immediately
+    /// before returning a point-in-time receipt. A child that exited before
+    /// initial capture can still be used for ordinary process I/O, but cannot
+    /// yield this receipt. A PID alone is never enough.
+    pub fn attest_kernel_birth(&mut self) -> io::Result<KernelChildBirthObservation> {
+        #[cfg(target_os = "linux")]
+        {
+            let expected = self
+                .kernel_birth
+                .as_ref()
+                .map_err(|kind| {
+                    io::Error::new(*kind, "initial direct-child kernel birth was unavailable")
+                })?
+                .clone();
+            if self.observe_exit()?.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    "direct child has exited",
+                ));
+            }
+            let first = capture_kernel_birth(self.birth.pid)?;
+            compare_kernel_birth(&expected, &first)?;
+            if self.observe_exit()?.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    "direct child exited during birth attestation",
+                ));
+            }
+            let second = capture_kernel_birth(self.birth.pid)?;
+            compare_kernel_birth(&first, &second)?;
+            if self.observe_exit()?.is_some() {
+                return Err(io::Error::new(
+                    ErrorKind::NotFound,
+                    "direct child exited during birth attestation",
+                ));
+            }
+            return Ok(second);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "Linux kernel child-birth evidence is unavailable on this platform",
+            ))
+        }
     }
 
     pub fn observe_exit(&mut self) -> io::Result<Option<ChildExitObservation>> {
@@ -298,6 +367,101 @@ impl ProcessJsonlTransport {
             ),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_kernel_birth(pid: u32) -> io::Result<KernelChildBirthObservation> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    if stat.len() > 16_384 || !stat.starts_with(&format!("{pid} (")) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "direct child stat identity is malformed",
+        ));
+    }
+    let end = stat
+        .rfind(") ")
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "direct child stat is malformed"))?;
+    let fields: Vec<_> = stat[end + 2..].split_whitespace().collect();
+    // The first field after `(comm)` is stat field 3 (state); starttime is 22.
+    let state = fields
+        .first()
+        .copied()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "direct child state is missing"))?;
+    if matches!(state, "Z" | "X" | "x") {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "direct child is no longer live",
+        ));
+    }
+    let start_ticks = fields
+        .get(19)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "direct child start is missing"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "direct child start is malformed"))?;
+    if start_ticks == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "direct child start is zero",
+        ));
+    }
+
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot_id = boot_id.trim();
+    if boot_id.len() != 36
+        || !boot_id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "boot ID is malformed",
+        ));
+    }
+
+    let cgroups = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    if cgroups.len() > 16_384 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "direct child cgroup evidence exceeds bound",
+        ));
+    }
+    let mut unified = cgroups.lines().filter_map(|line| line.strip_prefix("0::"));
+    let cgroup_path = unified
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unified child cgroup is missing"))?;
+    if unified.next().is_some()
+        || !cgroup_path.starts_with('/')
+        || cgroup_path.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "unified child cgroup is malformed",
+        ));
+    }
+    Ok(KernelChildBirthObservation {
+        pid,
+        start_ticks,
+        boot_id: boot_id.to_owned(),
+        cgroup_path: cgroup_path.to_owned(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn compare_kernel_birth(
+    expected: &KernelChildBirthObservation,
+    observed: &KernelChildBirthObservation,
+) -> io::Result<()> {
+    if observed != expected {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "direct child kernel birth identity changed",
+        ));
+    }
+    Ok(())
 }
 
 impl JsonlTransport for ProcessJsonlTransport {
@@ -448,6 +612,48 @@ impl JsonlTransport for ProcessJsonlTransport {
 impl Drop for ProcessJsonlTransport {
     fn drop(&mut self) {
         let _ = self.dispose();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kernel_birth_tests {
+    use super::{KernelChildBirthObservation, compare_kernel_birth};
+    use std::io::ErrorKind;
+
+    #[test]
+    fn pid_reuse_and_changed_boot_or_cgroup_shapes_are_refused() {
+        let expected = KernelChildBirthObservation {
+            pid: 123,
+            start_ticks: 456,
+            boot_id: "11111111-2222-3333-4444-555555555555".into(),
+            cgroup_path: "/user.slice/pod.fixture".into(),
+        };
+        for observed in [
+            KernelChildBirthObservation {
+                start_ticks: 457,
+                ..expected.clone()
+            },
+            KernelChildBirthObservation {
+                pid: 124,
+                ..expected.clone()
+            },
+            KernelChildBirthObservation {
+                boot_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                ..expected.clone()
+            },
+            KernelChildBirthObservation {
+                cgroup_path: "/user.slice/other".into(),
+                ..expected.clone()
+            },
+        ] {
+            assert_eq!(
+                compare_kernel_birth(&expected, &observed)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidData,
+            );
+        }
+        compare_kernel_birth(&expected, &expected).unwrap();
     }
 }
 
