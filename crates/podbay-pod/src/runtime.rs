@@ -199,6 +199,90 @@ impl ChildResource {
 pub struct PodClient {
     manifest_path: PathBuf,
     manifest: PodManifest,
+    pinned_manifest: Option<PinnedManifest>,
+}
+
+/// Cheap per-status file proof after one full manifest/descriptor validation.
+/// Every read still checks the exact path, inode, owner, mode and bytes; the
+/// executable hash is checked once before polling and once on acceptance.
+struct PinnedManifest {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    uid: u32,
+    mode: u32,
+    bytes: Vec<u8>,
+}
+
+impl PinnedManifest {
+    fn capture(path: &Path, manifest: &PodManifest) -> Result<Self, PodError> {
+        let (metadata, bytes) = Self::read_exact(path)?;
+        if bytes != serde_json::to_vec(manifest)? {
+            return Err(PodError::Refused("validated pod manifest bytes differ"));
+        }
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            uid: metadata.uid(),
+            mode: metadata.mode() & 0o7777,
+            bytes,
+        })
+    }
+
+    fn recheck(&self, path: &Path) -> Result<(), PodError> {
+        let (metadata, bytes) = Self::read_exact(path)
+            .map_err(|_| PodError::Refused("pinned pod manifest is unavailable"))?;
+        if metadata.dev() != self.dev
+            || metadata.ino() != self.ino
+            || metadata.len() != self.len
+            || metadata.uid() != self.uid
+            || metadata.mode() & 0o7777 != self.mode
+            || bytes != self.bytes
+        {
+            return Err(PodError::Refused("pinned pod manifest changed"));
+        }
+        Ok(())
+    }
+
+    fn read_exact(path: &Path) -> Result<(fs::Metadata, Vec<u8>), PodError> {
+        let parent = path.parent().ok_or(PodError::Invalid("manifest parent"))?;
+        private_directory(parent)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        let at_path = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > 65_536
+            || metadata.mode() & 0o077 != 0
+            || metadata.uid() != fs::metadata(parent)?.uid()
+            || metadata.nlink() != 1
+            || metadata.dev() != at_path.dev()
+            || metadata.ino() != at_path.ino()
+            || fs::canonicalize(path)? != path
+        {
+            return Err(PodError::Refused("pinned pod manifest file identity changed"));
+        }
+        let mut bytes = vec![0; metadata.len() as usize];
+        file.read_exact(&mut bytes)?;
+        let after = file.metadata()?;
+        let path_after = fs::symlink_metadata(path)?;
+        if after.dev() != metadata.dev()
+            || after.ino() != metadata.ino()
+            || after.len() != metadata.len()
+            || after.uid() != metadata.uid()
+            || after.nlink() != metadata.nlink()
+            || after.mode() & 0o7777 != metadata.mode() & 0o7777
+            || path_after.dev() != metadata.dev()
+            || path_after.ino() != metadata.ino()
+        {
+            return Err(PodError::Refused("pinned pod manifest changed during read"));
+        }
+        Ok((metadata, bytes))
+    }
 }
 
 /// Linux backend adapter; the manifest and socket protocol retain their PB05
@@ -642,9 +726,28 @@ impl PodClient {
         let client = Self {
             manifest_path: path.to_path_buf(),
             manifest,
+            pinned_manifest: None,
         };
         client.status()?;
         Ok(client)
+    }
+
+    /// Launch-only path after `read_manifest` has fully validated the
+    /// descriptor, including the executable hash. Polls recheck its exact
+    /// private file identity and bytes without repeating that large hash.
+    pub(crate) fn from_validated_manifest(
+        path: &Path,
+        manifest: PodManifest,
+    ) -> Result<Self, PodError> {
+        if manifest.peer_binding.is_none() {
+            return Err(PodError::Unsupported("unbound pod control is retired"));
+        }
+        let pinned_manifest = PinnedManifest::capture(path, &manifest)?;
+        Ok(Self {
+            manifest_path: path.to_path_buf(),
+            manifest,
+            pinned_manifest: Some(pinned_manifest),
+        })
     }
 
     pub fn manifest_path(&self) -> Result<&Path, PodError> {
@@ -661,6 +764,9 @@ impl PodClient {
     /// proves a process in the expected unit, not systemd MainPID or hostile
     /// same-UID isolation; those require separate platform evidence.
     pub fn attested_status(&self) -> Result<PodStatus, PodError> {
+        if let Some(pinned) = &self.pinned_manifest {
+            pinned.recheck(&self.manifest_path)?;
+        }
         let request = Request {
             protocol: PROTOCOL.to_owned(),
             pod_id: self.manifest.descriptor.pod_id.clone(),
@@ -680,11 +786,27 @@ impl PodClient {
             .status
             .ok_or(PodError::Invalid("pod status missing"))?;
         attest(&self.manifest, &status)?;
-        let fresh_manifest = read_manifest(&self.manifest_path)?;
-        let metadata = fs::symlink_metadata(&self.manifest_path)?;
+        let fresh_manifest = if let Some(pinned) = &self.pinned_manifest {
+            pinned.recheck(&self.manifest_path)?;
+            None
+        } else {
+            Some(read_manifest(&self.manifest_path)?)
+        };
+        let metadata = fs::symlink_metadata(&self.manifest_path).map_err(|error| {
+            if self.pinned_manifest.is_some() {
+                PodError::Refused("pinned pod manifest path is unavailable")
+            } else {
+                PodError::Io(error)
+            }
+        })?;
         let current = LinuxPeerEvidence::for_current_process()
             .map_err(|_| PodError::Refused("client OS identity unavailable"))?;
-        if serde_json::to_vec(&fresh_manifest)? != serde_json::to_vec(&self.manifest)?
+        let manifest_changed = if let Some(fresh) = &fresh_manifest {
+            serde_json::to_vec(fresh)? != serde_json::to_vec(&self.manifest)?
+        } else {
+            false
+        };
+        if manifest_changed
             || observed.uid() != metadata.uid()
             || observed.uid() != current.uid()
             || status.supervisor_pid != observed.pid() as u32
@@ -2188,6 +2310,61 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn pinned_manifest_refuses_byte_mode_and_inode_replacement() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-pinned-manifest-{}-{nonce}", std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let directory = fs::canonicalize(directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let descriptor = LaunchDescriptor {
+            protocol: PROTOCOL.into(),
+            pod_id: "pod.pinned.fixture".into(),
+            attempt_id: "attempt.pinned.fixture".into(),
+            session_id: "session.pinned.fixture".into(),
+            run_id: "run.pinned.fixture".into(),
+            scope_id: "scope.pinned.fixture".into(),
+            role: PodRole::Worker,
+            incarnation: 1,
+            resource_id: "resource.pinned.fixture".into(),
+            executable: PathBuf::from("/bin/true"),
+            args: vec![],
+            cwd: PathBuf::from("/tmp"),
+            pty: None,
+        };
+        let path = manifest_path(&directory, &descriptor).unwrap();
+        let manifest = PodManifest {
+            digest: descriptor.digest().unwrap(),
+            token: "a".repeat(64),
+            viewer_token: None,
+            socket_path: path.with_extension("sock"),
+            unit_name: unit_name(&path).unwrap(),
+            descriptor,
+            peer_binding: None,
+        };
+        write_manifest(&path, &manifest).unwrap();
+        let pinned = PinnedManifest::capture(&path, &manifest).unwrap();
+        pinned.recheck(&path).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut changed = original.clone();
+        let at = changed.iter().position(|byte| *byte == b'a').unwrap();
+        changed[at] = b'b';
+        fs::write(&path, changed).unwrap();
+        assert!(matches!(pinned.recheck(&path), Err(PodError::Refused(_))));
+        fs::write(&path, &original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(pinned.recheck(&path), Err(PodError::Refused(_))));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = directory.join("replacement.json");
+        fs::write(&replacement, &original).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(matches!(pinned.recheck(&path), Err(PodError::Refused(_))));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     struct InspectOwnerWitness {
         identity: PodFenceIdentity,
         owner: Option<OwnerEpoch>,
@@ -2716,6 +2893,7 @@ mod tests {
         let client = PodClient {
             manifest_path: path,
             manifest,
+            pinned_manifest: None,
         };
         // The historical DTO path accepts the claimed cgroup. The kernel
         // peer path sees this test process's actual cgroup and refuses it.

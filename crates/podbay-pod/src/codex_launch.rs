@@ -20,14 +20,15 @@ use sha2::{Digest, Sha256};
 
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
-    BoundPeerManifest, CODEX_V2_CAPABILITY, LaunchDescriptor, PEER_BINDING_V2_PROTOCOL, PROTOCOL,
-    PodError, PodManifest, PodPeerBootstrap, PodRole, hex, manifest_path, private_directory,
-    read_manifest, unit_name, write_manifest,
+    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, LaunchDescriptor,
+    PEER_BINDING_V2_PROTOCOL, PROTOCOL, PodError, PodManifest, PodPeerBootstrap, PodRole, hex,
+    manifest_path, private_directory, read_manifest, unit_name, write_manifest,
 };
 use crate::runtime::PodClient;
 
 const MAX_CREDENTIAL_BYTES: u64 = 1_048_576;
-const STATUS_WAIT: Duration = Duration::from_secs(45);
+const MAX_STATUS_WAIT_SECONDS: u64 = 300;
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Starts only one already-claimed Codex V2 pod, using the private source
 /// reviewed by Linux preflight. It never reads credential bytes. Existing
@@ -140,6 +141,8 @@ pub fn launch_bound_codex_v2(
     };
     bound.binding_digest = bound.digest()?;
     bound.validate(&descriptor, directory)?;
+    let expected_status = bound.status(resource.resource_id, wire.scope_id());
+    let status_wait = readiness_wait(wire.wall_seconds())?;
     let path = manifest_path(directory, &descriptor)?;
     let source_text = credential_source
         .to_str()
@@ -167,9 +170,26 @@ pub fn launch_bound_codex_v2(
                     "existing Codex V2 manifest differs; no replacement launched",
                 ));
             }
-            let client = PodClient::connect(&path)
-                .map_err(|_| PodError::Uncertain("existing Codex V2 pod is unreachable"))?;
-            attest_running(&client, &bound)?;
+            let client = PodClient::from_validated_manifest(&path, existing.clone())
+                .map_err(|_| PodError::Uncertain("existing Codex V2 manifest identity changed"))?;
+            wait_for_ready(status_wait, STATUS_POLL_INTERVAL, || {
+                attest_running(&client, &expected_status)
+            })?;
+            final_acceptance_guards(
+                &client,
+                &path,
+                &existing,
+                &mut store,
+                &record,
+                &bound,
+                peer,
+                expected_authority_revision,
+                expected_store_file_identity,
+                credential_source,
+                credential_source_identity,
+                &expected_status,
+            )
+            .map_err(|_| PodError::Uncertain("existing Codex V2 final guards changed"))?;
             return Ok(client);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -220,6 +240,20 @@ pub fn launch_bound_codex_v2(
     // A partial durable write is ambiguous. Never remove or replace the slot.
     write_manifest(&path, &manifest)
         .map_err(|_| PodError::Uncertain("Codex V2 manifest write did not settle"))?;
+    // Validate the persisted manifest, including its large executable digest,
+    // once. The pinned client checks only exact small file bytes and inode
+    // during readiness polling; final acceptance performs one full recheck.
+    let persisted = read_manifest(&path)
+        .map_err(|_| PodError::Uncertain("Codex V2 persisted manifest is unavailable"))?;
+    if serde_json::to_vec(&persisted)
+        .map_err(|_| PodError::Uncertain("Codex V2 persisted manifest cannot encode"))?
+        != serde_json::to_vec(&manifest)
+            .map_err(|_| PodError::Uncertain("Codex V2 manifest cannot encode"))?
+    {
+        return Err(PodError::Uncertain("Codex V2 persisted manifest differs"));
+    }
+    let client = PodClient::from_validated_manifest(&path, persisted)
+        .map_err(|_| PodError::Uncertain("Codex V2 persisted manifest identity changed"))?;
     recheck_credential_source(credential_source, credential_source_identity)
         .map_err(|_| PodError::Uncertain("Codex V2 credential changed after manifest write"))?;
     recheck_current_binding(
@@ -256,24 +290,104 @@ pub fn launch_bound_codex_v2(
             "systemd Codex V2 admission not attested; manifest retained",
         ));
     }
-    let deadline = Instant::now() + STATUS_WAIT;
-    while Instant::now() < deadline {
-        if let Ok(client) = PodClient::connect(&path) {
-            match attest_running(&client, &bound) {
-                Ok(()) => return Ok(client),
-                Err(PodError::Uncertain(_)) => {
-                    return Err(PodError::Uncertain(
-                        "Codex V2 pod status differs; manifest retained",
-                    ));
-                }
-                Err(_) => {}
+    wait_for_ready(status_wait, STATUS_POLL_INTERVAL, || {
+        attest_running(&client, &expected_status)
+    })?;
+    final_acceptance_guards(
+        &client,
+        &path,
+        &manifest,
+        &mut store,
+        &record,
+        &bound,
+        peer,
+        expected_authority_revision,
+        expected_store_file_identity,
+        credential_source,
+        credential_source_identity,
+        &expected_status,
+    )
+    .map_err(|_| PodError::Uncertain("Codex V2 final guards changed; manifest retained"))?;
+    Ok(client)
+}
+
+fn readiness_wait(wall_seconds: u64) -> Result<Duration, PodError> {
+    if wall_seconds == 0 {
+        return Err(PodError::Invalid("Codex V2 wall time is zero"));
+    }
+    Ok(Duration::from_secs(
+        wall_seconds.min(MAX_STATUS_WAIT_SECONDS),
+    ))
+}
+
+fn transient_readiness_error(error: &PodError) -> bool {
+    matches!(error, PodError::Io(io) if matches!(
+        io.kind(),
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
+    ))
+}
+
+fn wait_for_ready(
+    wait: Duration,
+    interval: Duration,
+    mut probe: impl FnMut() -> Result<(), PodError>,
+) -> Result<(), PodError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match probe() {
+            Ok(()) => return Ok(()),
+            Err(error) if transient_readiness_error(&error) => {}
+            Err(_) => {
+                return Err(PodError::Uncertain(
+                    "Codex V2 pod status differs; manifest retained",
+                ));
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(PodError::Uncertain(
+                "Codex V2 pod status not attested; manifest retained",
+            ));
+        }
+        std::thread::sleep(interval.min(deadline.saturating_duration_since(now)));
     }
-    Err(PodError::Uncertain(
-        "Codex V2 pod status not attested; manifest retained",
-    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_acceptance_guards(
+    client: &PodClient,
+    path: &Path,
+    expected_manifest: &PodManifest,
+    store: &mut PodBayStore,
+    record: &BoundLaunchRecord,
+    binding: &BoundPeerManifest,
+    manager_peer: &podbay_core::AttestedPeer,
+    expected_authority_revision: u64,
+    expected_store_file_identity: (u64, u64),
+    credential_source: &Path,
+    credential_source_identity: (u64, u64),
+    expected_status: &BoundPodStatus,
+) -> Result<(), PodError> {
+    let persisted = read_manifest(path)?;
+    if serde_json::to_vec(&persisted)? != serde_json::to_vec(expected_manifest)? {
+        return Err(PodError::Refused("Codex V2 final manifest differs"));
+    }
+    recheck_store_file(&binding.store_path, expected_store_file_identity)?;
+    recheck_current_binding(
+        store,
+        record,
+        binding,
+        manager_peer,
+        expected_authority_revision,
+    )?;
+    recheck_credential_source(credential_source, credential_source_identity)?;
+    let manager = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| PodError::Refused("manager process identity unavailable"))?;
+    if manager.attested_peer() != manager_peer {
+        return Err(PodError::Refused("Codex V2 manager process changed"));
+    }
+    attest_running(client, expected_status)
 }
 
 fn recheck_current_binding(
@@ -373,23 +487,13 @@ fn validate_pod_binary(path: &Path) -> Result<(), PodError> {
     Ok(())
 }
 
-fn attest_running(client: &PodClient, expected: &BoundPeerManifest) -> Result<(), PodError> {
-    let status = client
-        .attested_status()
-        .map_err(|_| PodError::Uncertain("Codex V2 pod peer status unavailable"))?;
-    let final_status = client
-        .attested_status()
-        .map_err(|_| PodError::Uncertain("Codex V2 pod peer status unavailable"))?;
-    let wire = ImmutableLaunchDescriptorV2::decode_json(&expected.wire_descriptor)
-        .map_err(|_| PodError::Uncertain("Codex V2 status descriptor malformed"))?;
-    let resource = wire
-        .resource(0)
-        .ok_or(PodError::Uncertain("Codex V2 status resource missing"))?;
-    let bound = expected.status(resource.resource_id, wire.scope_id());
+fn attest_running(client: &PodClient, expected: &BoundPodStatus) -> Result<(), PodError> {
+    let status = client.attested_status()?;
+    let final_status = client.attested_status()?;
     if !status.child_running
         || !final_status.child_running
-        || status.bound.as_ref() != Some(&bound)
-        || final_status.bound.as_ref() != Some(&bound)
+        || status.bound.as_ref() != Some(expected)
+        || final_status.bound.as_ref() != Some(expected)
         || status.supervisor_pid != final_status.supervisor_pid
         || status.supervisor_start_ticks != final_status.supervisor_start_ticks
         || status.child_pid != final_status.child_pid
@@ -405,4 +509,43 @@ fn sha256(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_wait_uses_reviewed_wall_time_with_finite_ceiling() {
+        assert_eq!(readiness_wait(120).unwrap(), Duration::from_secs(120));
+        assert_eq!(readiness_wait(60).unwrap(), Duration::from_secs(60));
+        assert_eq!(readiness_wait(86_400).unwrap(), Duration::from_secs(300));
+        assert!(matches!(readiness_wait(0), Err(PodError::Invalid(_))));
+    }
+
+    #[test]
+    fn slow_readiness_retries_connection_delay_but_refuses_identity_drift() {
+        let mut attempts = 0;
+        wait_for_ready(Duration::from_millis(250), Duration::from_millis(1), || {
+            attempts += 1;
+            if attempts < 5 {
+                Err(PodError::Io(std::io::Error::from(
+                    ErrorKind::ConnectionRefused,
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 5);
+        attempts = 0;
+        assert!(matches!(
+            wait_for_ready(Duration::from_millis(250), Duration::from_millis(1), || {
+                attempts += 1;
+                Err(PodError::Refused("pinned identity changed"))
+            }),
+            Err(PodError::Uncertain(_))
+        ));
+        assert_eq!(attempts, 1);
+    }
 }
