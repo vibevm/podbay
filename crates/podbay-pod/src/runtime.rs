@@ -1541,6 +1541,7 @@ pub fn launch_bound(
         owner_epoch: bootstrap.owner_epoch,
         credential_epoch: bootstrap.credential_epoch,
         authority_revision: None,
+        policy_fence: None,
         resource_input_epochs: bootstrap.resource_input_epochs,
         manager_os_identity: peer.os_identity().into(),
         manager_process_id: peer.native_process_id().into(),

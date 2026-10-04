@@ -11,7 +11,10 @@ use podbay_core::{
     Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
     SessionId, WorkKind,
 };
-use podbay_pod::{BoundPeerManifest, LaunchDescriptor, LinuxPeerEvidence, PodRole};
+use podbay_pod::{
+    BoundPeerManifest, BoundPolicyFenceV3, CODEX_V3_CAPABILITY, LaunchDescriptor,
+    LinuxPeerEvidence, PEER_BINDING_V3_PROTOCOL, PodRole,
+};
 use podbay_wire::{
     CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
     ImmutableLaunchDescriptorV2, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
@@ -240,6 +243,7 @@ fn case(fixture: &Fixture, executable: &Path, workspace: &Path) -> Case {
         owner_epoch: 1,
         credential_epoch: 1,
         authority_revision: Some(1),
+        policy_fence: None,
         resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
         manager_os_identity: manager.os_identity().into(),
         manager_process_id: manager.native_process_id().into(),
@@ -283,6 +287,9 @@ fn codex_v2_manifest_requires_positive_revision_and_legacy_omits_field() {
     let fixture = Fixture::new();
     let baseline = case(&fixture, &fixture.executable, &fixture.workspace);
     assert_eq!(baseline.peer.authority_revision, Some(1));
+    assert!(!String::from_utf8(serde_json::to_vec(&baseline.peer).unwrap())
+        .unwrap()
+        .contains("policy_fence"));
     for revision in [None, Some(0)] {
         let mut changed = baseline.clone();
         changed.peer.authority_revision = revision;
@@ -303,6 +310,83 @@ fn codex_v2_manifest_requires_positive_revision_and_legacy_omits_field() {
         !json
             .windows(b"authority_revision".len())
             .any(|window| { window == b"authority_revision" })
+    );
+}
+
+#[test]
+fn codex_v3_manifest_binds_policy_epoch_without_reinterpreting_v2_revision() {
+    let fixture = Fixture::new();
+    let baseline = case(&fixture, &fixture.executable, &fixture.workspace);
+    let mut v3 = baseline.clone();
+    v3.peer.protocol = PEER_BINDING_V3_PROTOCOL.into();
+    v3.peer.capability = CODEX_V3_CAPABILITY.into();
+    v3.peer.authority_revision = None;
+    v3.peer.policy_fence = Some(BoundPolicyFenceV3 {
+        policy_fence_epoch: 3,
+        admission_authority_revision: 11,
+    });
+    v3.peer.binding_digest = v3.peer.digest().unwrap();
+    v3.peer.validate(&v3.launch, &fixture.root).unwrap();
+    assert!(!fixture.root.join("store.sqlite").exists());
+    assert!(
+        v3.peer
+            .check_current_codex_v3_policy(&v3.launch, &fixture.root)
+            .is_err()
+    );
+    assert!(!fixture.root.join("store.sqlite").exists());
+
+    let mut v2_with_v3_fence = baseline.clone();
+    v2_with_v3_fence.peer.policy_fence = v3.peer.policy_fence.clone();
+    v2_with_v3_fence.peer.binding_digest = v2_with_v3_fence.peer.digest().unwrap();
+    assert!(
+        v2_with_v3_fence
+            .peer
+            .validate(&v2_with_v3_fence.launch, &fixture.root)
+            .is_err()
+    );
+
+    for (policy_epoch, admission_revision) in [(0, 11), (3, 0)] {
+        let mut changed = v3.clone();
+        changed.peer.policy_fence = Some(BoundPolicyFenceV3 {
+            policy_fence_epoch: policy_epoch,
+            admission_authority_revision: admission_revision,
+        });
+        changed.peer.binding_digest = changed.peer.digest().unwrap();
+        assert!(
+            changed
+                .peer
+                .validate(&changed.launch, &fixture.root)
+                .is_err()
+        );
+    }
+
+    let mut changed = v3.clone();
+    changed.peer.authority_revision = Some(11);
+    changed.peer.binding_digest = changed.peer.digest().unwrap();
+    assert!(
+        changed
+            .peer
+            .validate(&changed.launch, &fixture.root)
+            .is_err()
+    );
+
+    let mut changed = v3.clone();
+    changed.peer.binding_digest = baseline.peer.binding_digest;
+    assert!(
+        changed
+            .peer
+            .validate(&changed.launch, &fixture.root)
+            .is_err()
+    );
+
+    let mut changed = v3;
+    changed.peer.protocol = "podbay.peer-binding/2".into();
+    changed.peer.binding_digest = changed.peer.digest().unwrap();
+    assert!(
+        changed
+            .peer
+            .validate(&changed.launch, &fixture.root)
+            .is_err()
     );
 }
 

@@ -129,6 +129,7 @@ pub fn launch_bound_codex_v2(
         owner_epoch: bootstrap.owner_epoch,
         credential_epoch: bootstrap.credential_epoch,
         authority_revision: Some(expected_authority_revision),
+        policy_fence: None,
         resource_input_epochs: bootstrap.resource_input_epochs.clone(),
         manager_os_identity: peer.os_identity().into(),
         manager_process_id: peer.native_process_id().into(),
