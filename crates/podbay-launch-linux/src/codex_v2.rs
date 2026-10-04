@@ -82,6 +82,24 @@ pub fn preflight_committed_codex_v2(
     launch: &ResolvedNativeCodexLaunch,
     credential: &TrustedCodexCredentialSource,
 ) -> Result<CodexV2Preflight, PodError> {
+    preflight_committed_codex_v2_with_store(launch, credential, false)
+}
+
+/// Same exact policy/path/authority checks for a read-only rebind inspection.
+/// This never opens a writer or runs a schema migration before the explicit
+/// host store prepare transaction.
+pub fn preflight_committed_codex_v2_read_only(
+    launch: &ResolvedNativeCodexLaunch,
+    credential: &TrustedCodexCredentialSource,
+) -> Result<CodexV2Preflight, PodError> {
+    preflight_committed_codex_v2_with_store(launch, credential, true)
+}
+
+fn preflight_committed_codex_v2_with_store(
+    launch: &ResolvedNativeCodexLaunch,
+    credential: &TrustedCodexCredentialSource,
+    read_only: bool,
+) -> Result<CodexV2Preflight, PodError> {
     let record = launch.committed_record();
     let wire = launch.descriptor();
     let effective = launch.effective();
@@ -145,8 +163,12 @@ pub fn preflight_committed_codex_v2(
     {
         return Err(PodError::Refused("committed store identity changed"));
     }
-    let mut store = PodBayStore::open(launch.store_path())
-        .map_err(|_| PodError::Refused("committed store unavailable"))?;
+    let mut store = (if read_only {
+        PodBayStore::open_existing_read_only(launch.store_path())
+    } else {
+        PodBayStore::open(launch.store_path())
+    })
+    .map_err(|_| PodError::Refused("committed store unavailable"))?;
     let claim = store
         .current_manager_credential_claim(launch.owner_epoch())
         .map_err(|_| PodError::Refused("manager claim unavailable"))?;

@@ -240,6 +240,10 @@ impl PodBayStore {
             if prior != expected_observation {
                 return Err(StoreError::Conflict("prior checkpoint observation changed"));
             }
+            // A duplicate is a readback of this manager's still-current
+            // Pending intent, never a way for an older owner to revive it.
+            verify_current_fences_with_mode(&transaction, proposal, &lineage, true)?;
+            verify_current_manager_destination(&transaction, proposal, &lineage)?;
             transaction.commit()?;
             return Ok(receipt);
         }

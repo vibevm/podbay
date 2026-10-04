@@ -653,6 +653,24 @@ fn proof_bearing_duplicate_conflicts_on_changed_prior_or_command() {
 }
 
 #[test]
+fn proof_bearing_pending_duplicate_refuses_after_destination_owner_changes() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    let original = store
+        .prepare_manager_rebind_from_host_observation(&proposal, &observed)
+        .unwrap();
+    assert_eq!(original.phase, DurableRebindPhase::Pending);
+    store.begin_authority_replay(4, 5).unwrap();
+    assert!(matches!(
+        store.prepare_manager_rebind_from_host_observation(&proposal, &observed),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+    assert_eq!(fixture.count("manager_rebind_prior_observations"), 1);
+}
+
+#[test]
 fn proof_bearing_new_key_refuses_stale_destination_and_unregistered_manager_peer() {
     let fixture = Fixture::new();
     let mut store = fixture.open();

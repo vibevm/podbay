@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
-    Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
-    SessionId, WorkKind,
+    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, CredentialEpoch, Epoch, InputEpoch,
+    LaunchBinding, OwnerEpoch, Pod, PodFenceIdentity, PodId, RebindPhase, Resource, ResourceId,
+    ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session, SessionId, StoreLineageId,
+    WorkKind,
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
@@ -19,15 +20,16 @@ use podbay_host::{
     DurableAuthority, DurableAuthorityError, ExecutionMode, GrantId, GrantMode, GrantSpec,
     GuardSet, HostAction, HostDispatchPort, HostError, HostRequest, LaunchPodError,
     LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RebindContextError, RegisteredLaunchProfile,
-    ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch, ResolvedNativeLaunch, Right, Target,
-    TrustedBootstrapSendPolicy, TrustedDriverTemplate, TrustedLaunchProfileInput,
-    TrustedNativeHostConfig, TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
+    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, RebindContextError,
+    RegisteredLaunchProfile, ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch,
+    ResolvedNativeLaunch, Right, Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate,
+    TrustedLaunchProfileInput, TrustedNativeHostConfig, TrustedWireRootLaunchPolicy,
+    WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_store::{
-    BoundLaunchFormat, EffectClaim, EffectState, LaunchDispatchStage, LaunchLookupRequest,
-    NativeWriterTarget, PodBayStore, StoreError, TrustedNativeWriterLeaseRequest,
-    VerifiedPrincipal,
+    BoundLaunchFormat, DurableRebindPhase, EffectClaim, EffectState, HostObservedPriorCheckpoint,
+    LaunchDispatchStage, LaunchLookupRequest, NativeWriterTarget, PodBayStore, StoreError,
+    TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
     CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
@@ -97,6 +99,9 @@ struct FakeLaunchPort {
     manager_seen: Mutex<Vec<ResolvedManagerSeen>>,
     preclaim_change: Mutex<Option<(PathBuf, bool)>>,
     preclaim_replace: Mutex<Option<PathBuf>>,
+    rebind_birth: AtomicUsize,
+    rebind_foreign_boot: AtomicBool,
+    rebind_bad_descriptor: AtomicBool,
 }
 
 impl FakeLaunchPort {
@@ -118,6 +123,9 @@ impl FakeLaunchPort {
                 manager_seen: Mutex::new(Vec::new()),
                 preclaim_change: Mutex::new(None),
                 preclaim_replace: Mutex::new(None),
+                rebind_birth: AtomicUsize::new(12345),
+                rebind_foreign_boot: AtomicBool::new(false),
+                rebind_bad_descriptor: AtomicBool::new(false),
             },
             port_calls,
             possible_effects,
@@ -184,6 +192,85 @@ impl HostDispatchPort for FakeLaunchPort {
 
     fn accepts_resolved_codex_v2(&self) -> bool {
         self.codex_v2_opt_in
+    }
+
+    fn inspect_existing_codex_v2_rebind(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortRebindObservation, HostError> {
+        if !self.codex_v2_opt_in || self.mode.load(Ordering::SeqCst) == Mode::Refused as u8 {
+            return Err(HostError::StaleGuard);
+        }
+        self.port_calls.fetch_add(1, Ordering::SeqCst);
+        let record = launch.committed_record();
+        let prior_inputs = launch
+            .resource_input_epochs()
+            .iter()
+            .map(|(id, current)| {
+                Ok((
+                    ResourceId::try_from(id.as_str()).map_err(|_| HostError::InvalidInput)?,
+                    InputEpoch::new(current.checked_sub(1).ok_or(HostError::StaleGuard)?)
+                        .map_err(|_| HostError::StaleGuard)?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, HostError>>()?;
+        let boot = if self.rebind_foreign_boot.load(Ordering::SeqCst) {
+            "foreign.boot".to_owned()
+        } else {
+            launch
+                .manager_peer()
+                .boot_identity()
+                .strip_prefix("linux.boot.")
+                .ok_or(HostError::StaleGuard)?
+                .to_owned()
+        };
+        let prior = HostObservedPriorCheckpoint {
+            identity: PodFenceIdentity {
+                scope_id: ScopeId::try_from(record.scope_id.as_str())
+                    .map_err(|_| HostError::InvalidInput)?,
+                pod_id: PodId::try_from(record.pod_id.as_str())
+                    .map_err(|_| HostError::InvalidInput)?,
+                attempt_id: AttemptId::try_from(record.attempt_id.as_str())
+                    .map_err(|_| HostError::InvalidInput)?,
+                incarnation: Epoch::new(record.pod_incarnation)
+                    .map_err(|_| HostError::InvalidInput)?,
+                store_lineage: StoreLineageId::try_from(launch.store_lineage())
+                    .map_err(|_| HostError::InvalidInput)?,
+            },
+            phase: RebindPhase::Active,
+            owner_epoch: OwnerEpoch::new(
+                launch
+                    .owner_epoch()
+                    .checked_sub(1)
+                    .ok_or(HostError::StaleGuard)?,
+            )
+            .map_err(|_| HostError::StaleGuard)?,
+            credential_epoch: CredentialEpoch::new(
+                launch
+                    .credential_epoch()
+                    .checked_sub(1)
+                    .ok_or(HostError::StaleGuard)?,
+            )
+            .map_err(|_| HostError::StaleGuard)?,
+            input_epochs: prior_inputs,
+            checkpoint_digest: "c".repeat(64),
+            supervisor_pid: 101,
+            supervisor_start_ticks: 202,
+            boot_id: boot,
+            unit_name: "podbay-pod-fixture.service".into(),
+            cgroup_path: "/user.slice/podbay-pod-fixture.service".into(),
+        };
+        let descriptor_digest = if self.rebind_bad_descriptor.load(Ordering::SeqCst) {
+            "d".repeat(64)
+        } else {
+            launch.descriptor().digest().into()
+        };
+        PortRebindObservation::from_trusted_port(
+            prior,
+            descriptor_digest,
+            303,
+            self.rebind_birth.load(Ordering::SeqCst) as u64,
+        )
     }
 
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
@@ -3711,6 +3798,127 @@ fn rebind_context_refuses_foreign_selector_and_new_unbound_target_incarnation() 
     .unwrap();
     assert!(host.rebind_context(&who.scope, &who.pod).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn restarted_codex_v2_rebind_host(
+    fixture: &Fixture,
+    who: &Identity,
+    port: FakeLaunchPort,
+) -> DurableAuthority<FakeLaunchPort> {
+    let (first_port, _, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut first, _) = initial_authority(&fixture.database, first_port, who);
+    let grant = install_codex_root_policy(&mut first, who);
+    first
+        .admit_bound_root_codex_v2(
+            &who.transport,
+            codex_root_request(who, grant, Role::Coordinator, b"canonical.rebind-v2-root"),
+        )
+        .unwrap();
+    drop(first);
+    let mut restarted = DurableAuthority::open(&fixture.database, port).unwrap();
+    restarted
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(who))
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(codex_policy(who))
+                .unwrap(),
+        )
+        .unwrap();
+    restarted
+        .register_native_host_from_trusted_policy(native_host_config())
+        .unwrap();
+    restarted
+}
+
+#[test]
+fn v2_rebind_prepare_commits_pending_once_and_changed_child_birth_conflicts() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let mut host = restarted_codex_v2_rebind_host(&fixture, &who, port.codex_v2());
+    let first = host
+        .prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.one")
+        .unwrap();
+    assert_eq!(first.phase, DurableRebindPhase::Pending);
+    assert_eq!(first.pod_checkpoint_ref, None);
+    assert_eq!(
+        host.prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.one")
+            .unwrap(),
+        first
+    );
+    host.port().rebind_birth.store(12346, Ordering::SeqCst);
+    assert!(matches!(
+        host.prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.one"),
+        Err(RebindContextError::Store(StoreError::Conflict(_)))
+    ));
+    host.port().rebind_birth.store(12345, Ordering::SeqCst);
+    assert_eq!(
+        host.prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.one")
+            .unwrap(),
+        first
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn v2_rebind_prepare_refuses_wrong_descriptor_peer_and_stale_manager() {
+    for case in 0..4 {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+        let mut host = restarted_codex_v2_rebind_host(&fixture, &who, port.codex_v2());
+        match case {
+            0 => host
+                .port()
+                .rebind_bad_descriptor
+                .store(true, Ordering::SeqCst),
+            1 => host
+                .port()
+                .rebind_foreign_boot
+                .store(true, Ordering::SeqCst),
+            2 => {
+                let mut store = PodBayStore::open(&fixture.database).unwrap();
+                store.begin_authority_replay(2, 3).unwrap();
+            }
+            _ => {
+                let mut store = PodBayStore::open(&fixture.database).unwrap();
+                let snapshot = store.authority_snapshot().unwrap();
+                let mut resource = snapshot.resources[0].clone();
+                resource.input_epoch += 1;
+                store
+                    .apply_authority_mutation(
+                        snapshot.owner_epoch,
+                        snapshot.revision,
+                        podbay_store::AuthorityMutation::PutResource(resource),
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            host.prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.refuse")
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        if case >= 2 {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            host.port()
+                .rebind_bad_descriptor
+                .store(false, Ordering::SeqCst);
+            host.port()
+                .rebind_foreign_boot
+                .store(false, Ordering::SeqCst);
+            assert_eq!(
+                host.prepare_current_codex_v2_rebind(&who.scope, &who.pod, "rebind.v2.refuse")
+                    .unwrap()
+                    .phase,
+                DurableRebindPhase::Pending
+            );
+        }
+    }
 }
 
 #[test]

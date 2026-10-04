@@ -3,22 +3,27 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use podbay_core::{Epoch, ScopeId};
+use podbay_core::{
+    AttemptId, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PodFenceIdentity, PodId,
+    RebindPhase, ResourceId, ScopeId, StoreLineageId,
+};
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, ResolvedClaimedBootstrap,
+    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, ResolvedClaimedBootstrap,
     ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
     CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodClient, PodError, PodManifest, PodPeerBootstrap,
-    PodStatus,
+    PodStatus, RebindInspection,
 };
 use podbay_store::{
-    BootstrapSendSelector, BoundLaunchRecord, EffectState, LaunchDispatchStage, NativeWriterTarget,
-    PodBayStore,
+    BootstrapSendSelector, BoundLaunchRecord, EffectState, HostObservedPriorCheckpoint,
+    LaunchDispatchStage, NativeWriterTarget, PodBayStore,
 };
 use podbay_wire::{
     EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole,
@@ -26,7 +31,10 @@ use podbay_wire::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::codex_v2::{TrustedCodexCredentialSource, preflight_committed_codex_v2};
+use crate::codex_v2::{
+    TrustedCodexCredentialSource, preflight_committed_codex_v2,
+    preflight_committed_codex_v2_read_only,
+};
 
 /// Trusted host configuration for local Linux pod admission. Pinning is
 /// cooperative and does not provide hostile same-UID isolation.
@@ -767,6 +775,14 @@ impl HostDispatchPort for LinuxLaunchPort {
         self.launch_codex_v2(launch)
     }
 
+    fn inspect_existing_codex_v2_rebind(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortRebindObservation, podbay_host::HostError> {
+        self.inspect_codex_v2_rebind(launch)
+            .map_err(|_| podbay_host::HostError::StaleGuard)
+    }
+
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
         self.config.recheck().is_ok()
     }
@@ -851,6 +867,273 @@ fn inspection_status_matches(
         && status.unit_name == manifest.unit_name
         && status.bound.as_ref()
             == Some(&binding.status(target.resource_id.as_str(), target.scope_id.as_str()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RebindProcessEvidence {
+    ppid: u32,
+    start_ticks: u64,
+    cgroup: String,
+    uid: u32,
+    gid: u32,
+}
+
+fn read_bounded_proc(path: &Path) -> Result<String, PodError> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(65_537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65_536 {
+        return Err(PodError::Refused("V2 rebind proc evidence exceeds bound"));
+    }
+    String::from_utf8(bytes).map_err(|_| PodError::Refused("V2 rebind proc evidence is malformed"))
+}
+
+fn read_rebind_manifest_bytes(path: &Path) -> Result<Vec<u8>, PodError> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(1_048_577)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > 1_048_576 {
+        return Err(PodError::Refused("V2 rebind manifest exceeds bound"));
+    }
+    Ok(bytes)
+}
+
+fn parse_rebind_stat(text: &str, expected_pid: u32) -> Result<(char, u32, u64), PodError> {
+    let close = text
+        .rfind(") ")
+        .ok_or(PodError::Refused("V2 rebind proc stat is malformed"))?;
+    let prefix = &text[..close];
+    let (pid, _) = prefix
+        .split_once(" (")
+        .ok_or(PodError::Refused("V2 rebind proc stat is malformed"))?;
+    if pid.parse::<u32>().ok() != Some(expected_pid) {
+        return Err(PodError::Refused("V2 rebind proc PID changed"));
+    }
+    let fields = text[close + 2..].split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.chars().next())
+        .ok_or(PodError::Refused("V2 rebind proc state is missing"))?;
+    let ppid = fields
+        .get(1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or(PodError::Refused("V2 rebind proc parent is malformed"))?;
+    let start_ticks = fields
+        .get(19)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(PodError::Refused("V2 rebind proc birth is malformed"))?;
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return Err(PodError::Refused("V2 rebind process has exited"));
+    }
+    Ok((state, ppid, start_ticks))
+}
+
+fn parse_rebind_status(text: &str) -> Result<(u32, u32), PodError> {
+    let mut state = None;
+    let mut uid = None;
+    let mut gid = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("State:") {
+            if state
+                .replace(
+                    value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.chars().next()),
+                )
+                .is_some()
+            {
+                return Err(PodError::Refused("V2 rebind duplicate proc state"));
+            }
+        } else if let Some(value) = line.strip_prefix("Uid:") {
+            if uid
+                .replace(
+                    value
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u32>().ok()),
+                )
+                .is_some()
+            {
+                return Err(PodError::Refused("V2 rebind duplicate proc UID"));
+            }
+        } else if let Some(value) = line.strip_prefix("Gid:") {
+            if gid
+                .replace(
+                    value
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u32>().ok()),
+                )
+                .is_some()
+            {
+                return Err(PodError::Refused("V2 rebind duplicate proc GID"));
+            }
+        }
+    }
+    if state
+        .flatten()
+        .is_none_or(|value| matches!(value, 'Z' | 'X' | 'x'))
+    {
+        return Err(PodError::Refused("V2 rebind proc state is not live"));
+    }
+    Ok((
+        uid.flatten()
+            .ok_or(PodError::Refused("V2 rebind proc UID is missing"))?,
+        gid.flatten()
+            .ok_or(PodError::Refused("V2 rebind proc GID is missing"))?,
+    ))
+}
+
+fn read_rebind_process(pid: u32) -> Result<RebindProcessEvidence, PodError> {
+    if pid == 0 {
+        return Err(PodError::Refused("V2 rebind process PID is zero"));
+    }
+    let root = PathBuf::from(format!("/proc/{pid}"));
+    let first = parse_rebind_stat(&read_bounded_proc(&root.join("stat"))?, pid)?;
+    let status = parse_rebind_status(&read_bounded_proc(&root.join("status"))?)?;
+    let cgroup_text = read_bounded_proc(&root.join("cgroup"))?;
+    let mut cgroups = cgroup_text.lines();
+    let cgroup = cgroups
+        .next()
+        .and_then(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
+        .ok_or(PodError::Refused("V2 rebind process cgroup is malformed"))?;
+    if cgroups.next().is_some() {
+        return Err(PodError::Refused("V2 rebind process cgroup is ambiguous"));
+    }
+    let second = parse_rebind_stat(&read_bounded_proc(&root.join("stat"))?, pid)?;
+    if first.1 != second.1 || first.2 != second.2 {
+        return Err(PodError::Refused("V2 rebind process birth changed"));
+    }
+    Ok(RebindProcessEvidence {
+        ppid: first.1,
+        start_ticks: first.2,
+        cgroup: cgroup.to_owned(),
+        uid: status.0,
+        gid: status.1,
+    })
+}
+
+fn attest_rebind_process_pair(
+    response: &RebindInspection,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), PodError> {
+    let boot = read_bounded_proc(Path::new("/proc/sys/kernel/random/boot_id"))?;
+    if boot.trim() != response.boot_id {
+        return Err(PodError::Refused("V2 rebind boot identity changed"));
+    }
+    let supervisor = read_rebind_process(response.supervisor_pid)?;
+    let child = read_rebind_process(response.child_pid)?;
+    if supervisor.start_ticks != response.supervisor_start_ticks
+        || child.start_ticks != response.child_start_ticks
+        || child.ppid != response.supervisor_pid
+        || supervisor.cgroup != response.cgroup_path
+        || child.cgroup != response.cgroup_path
+        || supervisor.uid != expected_uid
+        || supervisor.gid != expected_gid
+        || child.uid != expected_uid
+        || child.gid != expected_gid
+        || read_rebind_process(response.supervisor_pid)? != supervisor
+        || read_rebind_process(response.child_pid)? != child
+        || read_bounded_proc(Path::new("/proc/sys/kernel/random/boot_id"))?.trim()
+            != response.boot_id
+    {
+        return Err(PodError::Refused("V2 rebind process tree changed"));
+    }
+    Ok(())
+}
+
+fn attest_rebind_systemd_unit(
+    unit: &str,
+    supervisor_pid: u32,
+    expected_cgroup: &str,
+) -> Result<(), PodError> {
+    if !unit.starts_with("podbay-pod-")
+        || !unit.ends_with(".service")
+        || unit.len() > 96
+        || !unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    {
+        return Err(PodError::Refused("V2 rebind unit name is invalid"));
+    }
+    let mut query = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=MainPID",
+            "--property=ControlGroup",
+            unit,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = query.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = query.kill();
+            let _ = query.wait();
+            return Err(PodError::Refused("V2 rebind unit query timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = query
+        .stdout
+        .take()
+        .ok_or(PodError::Refused("V2 rebind unit query lost stdout"))?;
+    let mut bytes = Vec::new();
+    stdout.take(4097).read_to_end(&mut bytes)?;
+    if !status.success() || bytes.len() > 4096 {
+        return Err(PodError::Refused("V2 rebind unit query failed"));
+    }
+    let response = String::from_utf8(bytes)
+        .map_err(|_| PodError::Refused("V2 rebind unit response is malformed"))?;
+    parse_rebind_systemd_unit(&response, supervisor_pid, expected_cgroup)
+}
+
+fn parse_rebind_systemd_unit(
+    response: &str,
+    supervisor_pid: u32,
+    expected_cgroup: &str,
+) -> Result<(), PodError> {
+    let mut active = None;
+    let mut pid = None;
+    let mut cgroup = None;
+    for line in response.lines() {
+        if let Some(value) = line.strip_prefix("ActiveState=") {
+            if active.replace(value).is_some() {
+                return Err(PodError::Refused("V2 rebind duplicate unit state"));
+            }
+        } else if let Some(value) = line.strip_prefix("MainPID=") {
+            if pid.replace(value.parse::<u32>().ok()).is_some() {
+                return Err(PodError::Refused("V2 rebind duplicate unit PID"));
+            }
+        } else if let Some(value) = line.strip_prefix("ControlGroup=") {
+            if cgroup.replace(value).is_some() {
+                return Err(PodError::Refused("V2 rebind duplicate unit cgroup"));
+            }
+        } else if !line.is_empty() {
+            return Err(PodError::Refused(
+                "V2 rebind unit response has unknown field",
+            ));
+        }
+    }
+    if active != Some("active")
+        || pid.flatten() != Some(supervisor_pid)
+        || cgroup != Some(expected_cgroup)
+    {
+        return Err(PodError::Refused("V2 rebind systemd unit differs"));
+    }
+    Ok(())
 }
 
 fn checked_store_file(path: &Path, expected_uid: u32) -> Result<(u64, u64), PodError> {
@@ -976,6 +1259,186 @@ impl VerifiedRebindInspection {
 }
 
 impl LinuxLaunchPort {
+    /// Read-only V2 inspection used only by the host's Pending preparation.
+    /// The committed profile and private credential locator are revalidated,
+    /// but no credential bytes, old bearer, pod control or provider input are
+    /// used. `PodClient::inspect_rebind` authenticates the connected supervisor
+    /// through SO_PEERCRED and procfs; this port independently checks its
+    /// direct child and the exact unit cgroup before returning.
+    fn inspect_codex_v2_rebind(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortRebindObservation, PodError> {
+        self.config.recheck()?;
+        let record = launch.committed_record();
+        let wire = launch.descriptor();
+        let policy = launch.effective().codex_policy();
+        if policy.credential_scope() != wire.scope_id() {
+            return Err(PodError::Refused("V2 rebind credential scope differs"));
+        }
+        let scope =
+            ScopeId::try_from(wire.scope_id()).map_err(|_| PodError::Invalid("V2 rebind scope"))?;
+        let reference = CredentialRef::from_trusted_vault(scope.clone(), policy.credential_ref())
+            .map_err(|_| PodError::Refused("V2 rebind credential mapping is absent"))?;
+        let source = self
+            .codex_credentials
+            .get(&reference)
+            .ok_or(PodError::Refused("V2 rebind credential source is absent"))?;
+        preflight_committed_codex_v2_read_only(launch, source)?;
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("manager process unavailable"))?;
+        if manager.attested_peer() != launch.manager_peer()
+            || checked_store_file(launch.store_path(), manager.uid())?
+                != launch.store_file_identity()
+        {
+            return Err(PodError::Refused("V2 rebind manager or store changed"));
+        }
+        let identity = PodFenceIdentity {
+            scope_id: scope,
+            pod_id: PodId::try_from(record.pod_id.as_str())
+                .map_err(|_| PodError::Invalid("V2 rebind Pod ID"))?,
+            attempt_id: AttemptId::try_from(record.attempt_id.as_str())
+                .map_err(|_| PodError::Invalid("V2 rebind Attempt ID"))?,
+            incarnation: Epoch::new(record.pod_incarnation)
+                .map_err(|_| PodError::Invalid("V2 rebind Pod incarnation"))?,
+            store_lineage: StoreLineageId::try_from(launch.store_lineage())
+                .map_err(|_| PodError::Invalid("V2 rebind lineage"))?,
+        };
+        let manifest_path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &identity.pod_id,
+            &identity.attempt_id,
+            identity.incarnation,
+        );
+        let manifest_meta = fs::symlink_metadata(&manifest_path)?;
+        if !manifest_meta.is_file()
+            || manifest_meta.nlink() != 1
+            || manifest_meta.uid() != manager.uid()
+            || manifest_meta.mode() & 0o077 != 0
+            || !(1..=1_048_576).contains(&manifest_meta.len())
+            || fs::canonicalize(&manifest_path)? != manifest_path
+        {
+            return Err(PodError::Refused("V2 rebind manifest identity differs"));
+        }
+        let manifest_bytes = read_rebind_manifest_bytes(&manifest_path)?;
+        let manifest: PodManifest = serde_json::from_slice(&manifest_bytes)?;
+        let binding = manifest
+            .peer_binding
+            .as_ref()
+            .ok_or(PodError::Refused("V2 rebind manifest is unbound"))?;
+        let expected_unit = format!(
+            "podbay-pod-{}.service",
+            manifest_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or(PodError::Invalid("V2 rebind manifest slot"))?
+        );
+        let resource = wire
+            .resource(0)
+            .ok_or(PodError::Refused("V2 rebind Resource is absent"))?;
+        if binding.protocol != "podbay.peer-binding/2"
+            || binding.capability != CODEX_V2_CAPABILITY
+            || binding.wire_descriptor != launch.descriptor_bytes()
+            || binding.effective_spec != launch.effective_spec_bytes()
+            || binding.descriptor_digest != wire.digest()
+            || binding.effective_digest != launch.effective().digest()
+            || binding.resource_epoch != resource.epoch
+            || binding.store_path != launch.store_path()
+            || binding.store_lineage != launch.store_lineage()
+            || binding.canonical_executable != launch.executable()
+            || binding.executable_sha256 != launch.executable_sha256()
+            || manifest.unit_name != expected_unit
+            || manifest.descriptor.scope_id != record.scope_id
+            || manifest.descriptor.session_id != record.session_id
+            || manifest.descriptor.run_id != record.run_id
+            || manifest.descriptor.attempt_id != record.attempt_id
+            || manifest.descriptor.pod_id != record.pod_id
+            || manifest.descriptor.incarnation != record.pod_incarnation
+            || manifest.descriptor.resource_id != resource.resource_id
+            || manifest.descriptor.pty.is_some()
+        {
+            return Err(PodError::Refused(
+                "V2 rebind manifest differs from committed launch",
+            ));
+        }
+        let response = PodClient::inspect_rebind(
+            &manifest_path,
+            &identity,
+            launch.owner_epoch(),
+            launch.credential_epoch(),
+        )?;
+        if response.unit_name != expected_unit
+            || response.cgroup_path.rsplit('/').next() != Some(expected_unit.as_str())
+            || response.boot_id != manager.boot_id()
+            || response.prior_owner_epoch == 0
+            || response.prior_owner_epoch >= launch.owner_epoch()
+            || response.prior_credential_epoch == 0
+            || response.prior_credential_epoch >= launch.credential_epoch()
+            || response.prior_input_epochs.len() != launch.resource_input_epochs().len()
+        {
+            return Err(PodError::Refused("V2 rebind checkpoint differs"));
+        }
+        let mut prior_inputs = BTreeMap::new();
+        for (id, next) in launch.resource_input_epochs() {
+            let old = response
+                .prior_input_epochs
+                .get(id)
+                .ok_or(PodError::Refused("V2 rebind Resource set differs"))?;
+            if *old == 0 || *old >= *next {
+                return Err(PodError::Refused("V2 rebind input epoch did not advance"));
+            }
+            prior_inputs.insert(
+                ResourceId::try_from(id.as_str())
+                    .map_err(|_| PodError::Invalid("V2 rebind Resource ID"))?,
+                InputEpoch::new(*old)
+                    .map_err(|_| PodError::Invalid("V2 rebind prior input epoch"))?,
+            );
+        }
+        attest_rebind_process_pair(&response, manager.uid(), manager.gid())?;
+        attest_rebind_systemd_unit(
+            &response.unit_name,
+            response.supervisor_pid,
+            &response.cgroup_path,
+        )?;
+        self.config.recheck()?;
+        preflight_committed_codex_v2_read_only(launch, source)?;
+        let final_meta = fs::symlink_metadata(&manifest_path)?;
+        if (final_meta.dev(), final_meta.ino()) != (manifest_meta.dev(), manifest_meta.ino())
+            || read_rebind_manifest_bytes(&manifest_path)? != manifest_bytes
+            || !LinuxPeerEvidence::for_current_process().is_ok_and(|peer| peer == manager)
+        {
+            return Err(PodError::Refused("V2 rebind manifest or manager changed"));
+        }
+        attest_rebind_process_pair(&response, manager.uid(), manager.gid())?;
+        attest_rebind_systemd_unit(
+            &response.unit_name,
+            response.supervisor_pid,
+            &response.cgroup_path,
+        )?;
+        let prior = HostObservedPriorCheckpoint {
+            identity,
+            phase: RebindPhase::Active,
+            owner_epoch: OwnerEpoch::new(response.prior_owner_epoch)
+                .map_err(|_| PodError::Invalid("V2 rebind prior owner"))?,
+            credential_epoch: CredentialEpoch::new(response.prior_credential_epoch)
+                .map_err(|_| PodError::Invalid("V2 rebind prior credential"))?,
+            input_epochs: prior_inputs,
+            checkpoint_digest: response.checkpoint_digest,
+            supervisor_pid: response.supervisor_pid,
+            supervisor_start_ticks: response.supervisor_start_ticks,
+            boot_id: response.boot_id,
+            unit_name: response.unit_name,
+            cgroup_path: response.cgroup_path,
+        };
+        PortRebindObservation::from_trusted_port(
+            prior,
+            wire.digest().to_owned(),
+            response.child_pid,
+            response.child_start_ticks,
+        )
+        .map_err(|_| PodError::Refused("V2 rebind port observation is invalid"))
+    }
+
     /// Inspect an already-running pod without its old bearer. The path comes
     /// only from trusted adapter configuration and store-derived identities.
     /// This method performs no launch, rebind preparation or authority write.
@@ -1760,6 +2223,81 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rebind_proc_evidence_requires_exact_live_direct_child_birth_and_cgroup() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let mut sibling = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let result = (|| {
+            let manager = LinuxPeerEvidence::for_current_process().unwrap();
+            let parent = read_rebind_process(std::process::id()).unwrap();
+            let direct = read_rebind_process(child.id()).unwrap();
+            let other = read_rebind_process(sibling.id()).unwrap();
+            let mut response = RebindInspection {
+                protocol: "podbay.rebind-inspect/1".into(),
+                nonce: "a".repeat(64),
+                scope_id: "scope.fixture".into(),
+                pod_id: "pod.fixture".into(),
+                attempt_id: "attempt.fixture".into(),
+                incarnation: 1,
+                store_lineage: "lineage.fixture".into(),
+                prior_owner_epoch: 1,
+                prior_credential_epoch: 1,
+                prior_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
+                checkpoint_digest: "c".repeat(64),
+                supervisor_pid: std::process::id(),
+                supervisor_start_ticks: parent.start_ticks,
+                child_pid: child.id(),
+                child_start_ticks: direct.start_ticks,
+                boot_id: manager.boot_id().into(),
+                unit_name: "unit.fixture".into(),
+                cgroup_path: manager.cgroup().into(),
+            };
+            assert!(attest_rebind_process_pair(&response, manager.uid(), manager.gid()).is_ok());
+            response.child_start_ticks += 1;
+            assert!(attest_rebind_process_pair(&response, manager.uid(), manager.gid()).is_err());
+            response.child_start_ticks -= 1;
+            response.supervisor_pid = sibling.id();
+            response.supervisor_start_ticks = other.start_ticks;
+            assert!(attest_rebind_process_pair(&response, manager.uid(), manager.gid()).is_err());
+            response.supervisor_pid = std::process::id();
+            response.supervisor_start_ticks = parent.start_ticks;
+            response.cgroup_path = "/wrong.scope".into();
+            assert!(attest_rebind_process_pair(&response, manager.uid(), manager.gid()).is_err());
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        result
+    }
+
+    #[test]
+    fn rebind_systemd_main_pid_and_control_group_must_match_exactly() {
+        let good = "ActiveState=active\nMainPID=42\nControlGroup=/user.slice/app.slice/podbay-pod-abc.service\n";
+        assert!(
+            parse_rebind_systemd_unit(good, 42, "/user.slice/app.slice/podbay-pod-abc.service")
+                .is_ok()
+        );
+        for bad in [
+            good.replace("MainPID=42", "MainPID=43"),
+            good.replace("ActiveState=active", "ActiveState=inactive"),
+            good.replace("podbay-pod-abc.service", "podbay-pod-sibling.service"),
+            format!("{good}MainPID=42\n"),
+            format!("{good}Unexpected=field\n"),
+        ] {
+            assert!(
+                parse_rebind_systemd_unit(&bad, 42, "/user.slice/app.slice/podbay-pod-abc.service")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

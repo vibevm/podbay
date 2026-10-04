@@ -27,7 +27,7 @@ use podbay_host::{
 };
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
-    preflight_committed_codex_v2,
+    preflight_committed_codex_v2, preflight_committed_codex_v2_read_only,
 };
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CodexCommandJournal,
@@ -560,6 +560,44 @@ fn preflight_returns_exact_bootstrap_and_private_source_without_port_effect() {
             LaunchDispatchStage::Prepared
         );
     }
+}
+
+#[test]
+fn rebind_preflight_is_read_only_and_refuses_stale_profile_path() {
+    let (fixture, _host, proof, source, calls) = setup(Role::Coordinator);
+    let before_bytes = fs::read(&fixture.database).unwrap();
+    let before_modified = fs::metadata(&fixture.database).unwrap().modified().unwrap();
+    let wal_path = PathBuf::from(format!("{}-wal", fixture.database.display()));
+    let before_wal = fs::read(&wal_path).ok();
+    let before_wal_modified = fs::metadata(&wal_path)
+        .ok()
+        .and_then(|value| value.modified().ok());
+    let mut before_store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    let before_revision = before_store.authority_snapshot().unwrap().revision;
+    drop(before_store);
+
+    preflight_committed_codex_v2_read_only(&proof, &source).unwrap();
+    let after_bytes = fs::read(&fixture.database).unwrap();
+    let after_modified = fs::metadata(&fixture.database).unwrap().modified().unwrap();
+    let mut after_store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(
+        after_store.authority_snapshot().unwrap().revision,
+        before_revision
+    );
+    assert_eq!(after_bytes, before_bytes);
+    assert_eq!(after_modified, before_modified);
+    assert_eq!(fs::read(&wal_path).ok(), before_wal);
+    assert_eq!(
+        fs::metadata(&wal_path)
+            .ok()
+            .and_then(|value| value.modified().ok()),
+        before_wal_modified
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    fs::write(&fixture.executable, b"stale profile executable").unwrap();
+    assert!(preflight_committed_codex_v2_read_only(&proof, &source).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
