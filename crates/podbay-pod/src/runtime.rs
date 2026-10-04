@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -33,12 +33,13 @@ use crate::peer_checkpoint::{
     write_peer_checkpoint,
 };
 use crate::ports::{
-    DurableFiles, LocalControlTransport, PodControlPort, PodObservation, SupervisorBackend,
-    TerminalBackend, TerminalResource, TerminalViewerPort,
+    DurableAppendLog, DurableFileIdentity, DurableFiles, LocalControlTransport, PodControlPort,
+    PodObservation, SupervisorBackend, TerminalBackend, TerminalResource, TerminalViewerPort,
 };
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
 const FRAME_LIMIT: u64 = 1_048_576;
+const MAX_HELD_LOG_BYTES: u64 = 64 * 1_048_576;
 const INSPECT_PROTOCOL: &str = "podbay.rebind-inspect/1";
 
 #[derive(Serialize, Deserialize)]
@@ -243,6 +244,216 @@ impl LocalControlTransport for LinuxBackend {
     }
 }
 
+/// One Linux file descriptor remains pinned from open through every read and
+/// append. The path and parent are checked against those identities each time;
+/// a failed write/sync poisons this handle rather than inviting a retry.
+struct LinuxHeldAppendLog {
+    file: File,
+    path: PathBuf,
+    parent: PathBuf,
+    parent_identity: (u64, u64),
+    identity: DurableFileIdentity,
+    native_identity: (u64, u64),
+    max_bytes: u64,
+    known_len: u64,
+    poisoned: bool,
+    #[cfg(test)]
+    fail_next_partial: bool,
+}
+
+impl LinuxHeldAppendLog {
+    fn open(path: &Path, max_bytes: u64) -> Result<Self, PodError> {
+        if !path.is_absolute()
+            || path.as_os_str().len() > 4_096
+            || !(1..=MAX_HELD_LOG_BYTES).contains(&max_bytes)
+        {
+            return Err(PodError::Invalid("private append log path or bound"));
+        }
+        let parent = path
+            .parent()
+            .ok_or(PodError::Invalid("private append log parent"))?;
+        private_directory(parent)?;
+        let parent_metadata = fs::symlink_metadata(parent)?;
+        let parent_identity = (parent_metadata.dev(), parent_metadata.ino());
+        let mut created = false;
+        let file = match OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => {
+                created = true;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+                .read(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?,
+            Err(error) => return Err(error.into()),
+        };
+        if created {
+            file.sync_all()
+                .map_err(|_| PodError::Uncertain("private append log create sync unknown"))?;
+            File::open(parent)?
+                .sync_all()
+                .map_err(|_| PodError::Uncertain("private append log directory sync unknown"))?;
+        }
+        let metadata = file.metadata()?;
+        let native_identity = (metadata.dev(), metadata.ino());
+        let mut native = Vec::with_capacity(16);
+        native.extend_from_slice(&metadata.dev().to_be_bytes());
+        native.extend_from_slice(&metadata.ino().to_be_bytes());
+        let mut held = Self {
+            file,
+            path: path.to_path_buf(),
+            parent: parent.to_path_buf(),
+            parent_identity,
+            identity: DurableFileIdentity::from_backend("linux.dev-ino/1", native)?,
+            native_identity,
+            max_bytes,
+            known_len: metadata.len(),
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_partial: false,
+        };
+        held.recheck()?;
+        Ok(held)
+    }
+
+    fn recheck(&mut self) -> Result<(), PodError> {
+        if self.poisoned {
+            return Err(PodError::Uncertain(
+                "private append log handle is uncertain",
+            ));
+        }
+        let result = self.check_current();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn check_current(&self) -> Result<(), PodError> {
+        private_directory(&self.parent)?;
+        let parent = fs::symlink_metadata(&self.parent)?;
+        let handle = self.file.metadata()?;
+        let path = fs::symlink_metadata(&self.path)?;
+        if (parent.dev(), parent.ino()) != self.parent_identity
+            || !handle.is_file()
+            || !path.is_file()
+            || (handle.dev(), handle.ino()) != self.native_identity
+            || (path.dev(), path.ino()) != self.native_identity
+            || handle.uid() != parent.uid()
+            || path.uid() != parent.uid()
+            || handle.mode() & 0o7777 != 0o600
+            || path.mode() & 0o7777 != 0o600
+            || handle.nlink() != 1
+            || path.nlink() != 1
+            || handle.len() > self.max_bytes
+            || path.len() > self.max_bytes
+            || fs::canonicalize(&self.path)? != self.path
+        {
+            return Err(PodError::Refused(
+                "private append log identity or privacy changed",
+            ));
+        }
+        if handle.len() != self.known_len || path.len() != self.known_len {
+            return Err(PodError::Uncertain(
+                "private append log length changed outside owner",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_one_partial_append(&mut self) {
+        self.fail_next_partial = true;
+    }
+}
+
+impl DurableAppendLog for LinuxHeldAppendLog {
+    fn identity(&self) -> &DurableFileIdentity {
+        &self.identity
+    }
+
+    fn len(&self) -> u64 {
+        self.known_len
+    }
+
+    fn read_all_bounded(&mut self) -> Result<Vec<u8>, PodError> {
+        self.recheck()?;
+        if self.file.seek(SeekFrom::Start(0)).is_err() {
+            self.poisoned = true;
+            return Err(PodError::Uncertain(
+                "private append log read position unknown",
+            ));
+        }
+        let mut bytes = vec![0; self.known_len as usize];
+        if self.file.read_exact(&mut bytes).is_err() {
+            self.poisoned = true;
+            return Err(PodError::Uncertain("private append log read changed"));
+        }
+        self.recheck()?;
+        Ok(bytes)
+    }
+
+    fn append_synced(&mut self, bytes: &[u8]) -> Result<(), PodError> {
+        if bytes.is_empty() || bytes.len() > FRAME_LIMIT as usize {
+            return Err(PodError::Invalid("private append log record bound"));
+        }
+        let expected_len = self
+            .known_len
+            .checked_add(bytes.len() as u64)
+            .filter(|value| *value <= self.max_bytes)
+            .ok_or(PodError::Refused(
+                "private append log retention bound reached",
+            ))?;
+        self.recheck()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_partial) {
+            let partial = bytes.len().div_ceil(2);
+            let _ = self.file.write_all(&bytes[..partial]);
+            self.poisoned = true;
+            return Err(PodError::Uncertain(
+                "synthetic private append partial write",
+            ));
+        }
+        if self.file.write_all(bytes).is_err() || self.file.sync_data().is_err() {
+            self.poisoned = true;
+            return Err(PodError::Uncertain(
+                "private append log write or sync unknown",
+            ));
+        }
+        let actual_len = match self.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                self.poisoned = true;
+                return Err(PodError::Uncertain(
+                    "private append log length after write unknown",
+                ));
+            }
+        };
+        if actual_len != expected_len {
+            self.poisoned = true;
+            return Err(PodError::Uncertain(
+                "private append log length after write unknown",
+            ));
+        }
+        self.known_len = expected_len;
+        if self.recheck().is_err() {
+            self.poisoned = true;
+            return Err(PodError::Uncertain(
+                "private append log changed after write",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl DurableFiles for LinuxBackend {
     fn create_private(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError> {
         let parent = path
@@ -295,6 +506,15 @@ impl DurableFiles for LinuxBackend {
         .sync_all()
         .map_err(|_| PodError::Uncertain("durable replace sync outcome unknown"))?;
         Ok(())
+    }
+
+    fn open_private_append_log(
+        &self,
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<Box<dyn DurableAppendLog>, PodError> {
+        LinuxHeldAppendLog::open(path, max_bytes)
+            .map(|held| Box::new(held) as Box<dyn DurableAppendLog>)
     }
 }
 
@@ -1969,6 +2189,128 @@ mod tests {
         symlink(&path, &link).unwrap();
         assert!(LinuxBackend.append_durable(&link, b"wrong").is_err());
         assert_eq!(fs::read(&path).unwrap(), b"c");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn held_log_directory() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("podbay-held-log-{}-{unique}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[test]
+    fn held_append_log_reopens_with_exact_identity_and_bounded_bytes() {
+        let directory = held_log_directory();
+        let path = directory.join("native.commands");
+        let mut first = LinuxBackend.open_private_append_log(&path, 32).unwrap();
+        let identity = first.identity().clone();
+        assert_eq!(first.len(), 0);
+        first.append_synced(b"intent").unwrap();
+        assert_eq!(first.read_all_bounded().unwrap(), b"intent");
+        drop(first);
+        let mut reopened = LinuxBackend.open_private_append_log(&path, 32).unwrap();
+        assert_eq!(reopened.identity(), &identity);
+        reopened.append_synced(b"receipt").unwrap();
+        assert_eq!(reopened.len(), 13);
+        assert_eq!(reopened.read_all_bounded().unwrap(), b"intentreceipt");
+        assert!(matches!(
+            reopened.append_synced(&[b'x'; 20]),
+            Err(PodError::Refused(_))
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn held_append_log_refuses_symlink_mode_hardlink_replacement_and_oversize() {
+        let directory = held_log_directory();
+        let target = directory.join("target");
+        fs::write(&target, b"target").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(LinuxBackend.open_private_append_log(&link, 32).is_err());
+        let parent_link = directory.with_extension("link");
+        symlink(&directory, &parent_link).unwrap();
+        assert!(
+            LinuxBackend
+                .open_private_append_log(&parent_link.join("native.commands"), 32)
+                .is_err()
+        );
+        fs::remove_file(parent_link).unwrap();
+
+        let mode_path = directory.join("mode.commands");
+        let mut mode = LinuxBackend
+            .open_private_append_log(&mode_path, 32)
+            .unwrap();
+        fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(mode.append_synced(b"wrong-mode").is_err());
+        assert!(
+            LinuxBackend
+                .open_private_append_log(&mode_path, 32)
+                .is_err()
+        );
+        fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            mode.append_synced(b"retry"),
+            Err(PodError::Uncertain(_))
+        ));
+
+        let hardlink_path = directory.join("hardlink.commands");
+        let mut hardlink = LinuxBackend
+            .open_private_append_log(&hardlink_path, 32)
+            .unwrap();
+        let sibling = directory.join("hardlink");
+        fs::hard_link(&hardlink_path, &sibling).unwrap();
+        assert!(hardlink.append_synced(b"hardlink").is_err());
+        assert!(
+            LinuxBackend
+                .open_private_append_log(&hardlink_path, 32)
+                .is_err()
+        );
+        fs::remove_file(&sibling).unwrap();
+
+        let inode_path = directory.join("inode.commands");
+        let mut inode = LinuxBackend
+            .open_private_append_log(&inode_path, 32)
+            .unwrap();
+        let original = directory.join("old.commands");
+        fs::rename(&inode_path, &original).unwrap();
+        fs::write(&inode_path, b"replacement").unwrap();
+        fs::set_permissions(&inode_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(inode.append_synced(b"wrong-inode").is_err());
+
+        let oversized = directory.join("oversized.commands");
+        fs::write(&oversized, b"123456789").unwrap();
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(LinuxBackend.open_private_append_log(&oversized, 8).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn held_append_log_partial_write_is_uncertain_and_replay_keeps_raw_tail() {
+        let directory = held_log_directory();
+        let path = directory.join("native.commands");
+        let mut held = LinuxHeldAppendLog::open(&path, 32).unwrap();
+        held.append_synced(b"intent").unwrap();
+        held.fail_one_partial_append();
+        assert!(matches!(
+            held.append_synced(b"receipt"),
+            Err(PodError::Uncertain(_))
+        ));
+        assert!(matches!(
+            held.append_synced(b"retry"),
+            Err(PodError::Uncertain(_))
+        ));
+        drop(held);
+        let mut reopened = LinuxBackend.open_private_append_log(&path, 32).unwrap();
+        let raw = reopened.read_all_bounded().unwrap();
+        assert_eq!(raw, b"intentrece");
         fs::remove_dir_all(directory).unwrap();
     }
 }

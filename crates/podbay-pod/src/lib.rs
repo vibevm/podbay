@@ -46,9 +46,9 @@ pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_pe
 #[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
-    DurableFiles, LocalConnection, LocalControlTransport, PodControlPort, PodObservation,
-    ProcessIdentity, SupervisorBackend, SupervisorEvidence, TerminalBackend, TerminalResource,
-    TerminalViewerPort,
+    DurableAppendLog, DurableFileIdentity, DurableFiles, LocalConnection, LocalControlTransport,
+    PodControlPort, PodObservation, ProcessIdentity, SupervisorBackend, SupervisorEvidence,
+    TerminalBackend, TerminalResource, TerminalViewerPort,
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{

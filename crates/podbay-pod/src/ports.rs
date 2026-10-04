@@ -116,8 +116,81 @@ pub trait LocalControlTransport {
     fn exchange(&self, endpoint: &Path, request: &[u8]) -> Result<Vec<u8>, PodError>;
 }
 
+/// Opaque identity of a held native file. Equality can detect replacement
+/// across reopen; the bytes do not grant authority or encode a portable PID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableFileIdentity {
+    backend: &'static str,
+    native: Vec<u8>,
+}
+
+impl DurableFileIdentity {
+    /// Backend-specific bytes are bounded comparison evidence, not an
+    /// authority token. Native backends may construct their own stable ID.
+    pub fn from_backend(backend: &'static str, native: Vec<u8>) -> Result<Self, PodError> {
+        if !(3..=64).contains(&backend.len())
+            || !backend.bytes().all(|byte| byte.is_ascii_graphic())
+            || !(1..=64).contains(&native.len())
+        {
+            return Err(PodError::Invalid("durable file identity bounds"));
+        }
+        Ok(Self { backend, native })
+    }
+}
+
+/// One held, private append log. A failed write or sync returns Uncertain and
+/// poisons the handle; the caller must reopen, inspect its complete raw tail,
+/// and never assume the last record was absent. Frame parsing belongs to the
+/// journal, not this OS port.
+pub trait DurableAppendLog: Send {
+    fn identity(&self) -> &DurableFileIdentity;
+    fn len(&self) -> u64;
+    fn read_all_bounded(&mut self) -> Result<Vec<u8>, PodError>;
+    fn append_synced(&mut self, bytes: &[u8]) -> Result<(), PodError>;
+}
+
 pub trait DurableFiles {
     fn create_private(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError>;
     fn append_durable(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError>;
     fn replace_durable(&self, path: &Path, bytes: &[u8]) -> Result<(), PodError>;
+
+    /// Open or create a single-writer log with a held native file identity.
+    /// Backends without private no-follow read/reopen and append durability
+    /// must refuse before creating a file.
+    fn open_private_append_log(
+        &self,
+        _path: &Path,
+        _max_bytes: u64,
+    ) -> Result<Box<dyn DurableAppendLog>, PodError> {
+        Err(PodError::Unsupported(
+            "private durable append log is unavailable on this backend",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct LegacyOnlyFiles;
+
+    impl DurableFiles for LegacyOnlyFiles {
+        fn create_private(&self, _: &Path, _: &[u8]) -> Result<(), PodError> {
+            panic!("default-deny open may not create a file")
+        }
+        fn append_durable(&self, _: &Path, _: &[u8]) -> Result<(), PodError> {
+            panic!("default-deny open may not append")
+        }
+        fn replace_durable(&self, _: &Path, _: &[u8]) -> Result<(), PodError> {
+            panic!("default-deny open may not replace")
+        }
+    }
+
+    #[test]
+    fn held_append_log_defaults_to_unsupported_without_side_effect() {
+        assert!(matches!(
+            LegacyOnlyFiles.open_private_append_log(Path::new("unused"), 32),
+            Err(PodError::Unsupported(_))
+        ));
+    }
 }
