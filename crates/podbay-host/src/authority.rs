@@ -24,8 +24,9 @@ use podbay_store::{
     CommandLookupSelector, CurrentScopeSnapshot, DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
-    ManagerCredentialClaim, NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness,
-    StoreError, TrustedBootstrapSendRequest, TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
+    ManagerCredentialClaim, NativeWriterLease, OwnerActorRotationReceipt, PodBayStore, Receipt,
+    SqliteActorVerifierWitness, StoreError, TrustedBootstrapSendRequest,
+    TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
 };
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -38,6 +39,7 @@ use podbay_wire::{
 use crate::linux_manager_peer::LinuxManagerPeer;
 
 use crate::id_mint::{RootIdMintError, RootLaunchIds};
+use crate::owner_recovery::{PendingOwnerRecovery, ProvenOwnerRecovery, prior_owner_gone};
 use crate::launch_spec::{
     EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile, ResolvedNativePaths,
     TrustedNativeHostConfig,
@@ -3275,6 +3277,211 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     pub fn recorded_snapshot(&self) -> &AuthoritySnapshot {
         &self.recorded
+    }
+
+    /// Read-only recovery challenge for a trusted Linux listener's freshly
+    /// kernel-attested launcher parent. Request bytes cannot name the prior
+    /// actor, owner epoch, verifier or manager credential. No rotation, grant
+    /// activation, pod launch or native input occurs here.
+    pub fn begin_owner_recovery(
+        &mut self,
+        policy: &TrustedInitialOwnerPolicy,
+        observed_process: AuthenticatedProcessSubject,
+        offered_old_key: [u8; 32],
+        next_key: [u8; 32],
+    ) -> Result<PendingOwnerRecovery, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (policy, observed_process, offered_old_key, next_key);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if observed_process.platform() != HostPlatform::Linux {
+                return Err(HostError::Unsupported.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if current.owner_epoch != self.manager_claim.owner_epoch()
+                || current.owner_epoch != self.host.manager_epoch.get()
+                || current.revision != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let mut matching = current.actors.iter().filter(|actor| {
+                actor.actor_id == policy.actor_id.as_str()
+                    && actor.scope_id == policy.scope_id.as_str()
+                    && actor.origin == "owner_cli"
+                    && actor.role == "coordinator"
+            });
+            let prior = matching.next().ok_or(HostError::Unauthorised)?.clone();
+            if matching.next().is_some()
+                || self.recorded.actors.iter().filter(|actor| *actor == &prior).count() != 1
+                || !prior_owner_gone(&prior)
+            {
+                return Err(HostError::Unauthorised.into());
+            }
+            let current_key = self.store.current_actor_verifier(
+                current.owner_epoch,
+                current.revision,
+                &prior,
+            )?;
+            if current_key != offered_old_key {
+                return Err(HostError::Unauthenticated.into());
+            }
+            let mut nonce = [0_u8; 32];
+            getrandom::fill(&mut nonce).map_err(|_| {
+                DurableAuthorityError::Io(std::io::Error::other(
+                    "owner recovery challenge entropy unavailable",
+                ))
+            })?;
+            let candidate = PendingOwnerRecovery::from_trusted_host(
+                prior.clone(),
+                current_key,
+                observed_process,
+                next_key,
+                self.manager_claim.store_lineage().to_owned(),
+                current.owner_epoch,
+                self.manager_claim.credential_epoch(),
+                current.revision,
+                nonce,
+            )?;
+            self.recheck_actor_resolution_manager()?;
+            let fresh = self.store.authority_snapshot()?;
+            if fresh != current
+                || !prior_owner_gone(&prior)
+                || self.store.current_actor_verifier(
+                    current.owner_epoch,
+                    current.revision,
+                    &prior,
+                )? != current_key
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(candidate)
+        }
+    }
+
+    /// Consumes a dual-key proof from the exact recovery challenge and a
+    /// freshly reattested socket peer. The store rotates actor, verifier and
+    /// only live owner grants in one transaction; the host activates their
+    /// exact replay projection only after commit. No pod or native input runs.
+    pub fn commit_owner_recovery(
+        &mut self,
+        proof: ProvenOwnerRecovery,
+        freshly_observed_process: &AuthenticatedProcessSubject,
+    ) -> Result<OwnerActorRotationReceipt, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (proof, freshly_observed_process);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if proof.next_process() != freshly_observed_process {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if current != self.recorded
+                || proof.store_lineage() != self.manager_claim.store_lineage()
+                || proof.owner_epoch() != self.manager_claim.owner_epoch()
+                || proof.manager_credential_epoch() != self.manager_claim.credential_epoch()
+                || proof.authority_revision() != current.revision
+                || !prior_owner_gone(proof.prior_actor())
+                || self.store.current_actor_verifier(
+                    current.owner_epoch, current.revision, proof.prior_actor(),
+                )? != *proof.old_public_key()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let actor_id = ActorId::try_from(proof.actor_id())
+                .map_err(|_| HostError::InvalidInput)?;
+            let scope_id = ScopeId::try_from(proof.scope_id())
+                .map_err(|_| HostError::InvalidInput)?;
+            if self.host.actors.contains_key(&actor_id)
+                || self.host.actors.values().any(|actor| actor.process == *freshly_observed_process)
+            {
+                return Err(HostError::Unauthorised.into());
+            }
+            let next_generation = CredentialGeneration::new(proof.next_generation())?;
+            let registration = ActorRegistration::owner_cli_from_trusted_policy(
+                actor_id.clone(), scope_id.clone(), proof.next_process().clone(),
+                next_generation,
+            );
+            let mut next_actor = proof.prior_actor().clone();
+            next_actor.credential_generation = proof.next_generation();
+            next_actor.process_identity = proof.next_process().process_identity().to_owned();
+            next_actor.start_identity = proof.next_process().start_identity();
+            next_actor.containment_identity =
+                proof.next_process().containment_identity().to_owned();
+            let mut expected = current.clone();
+            let old_record = expected.actors.iter_mut()
+                .find(|actor| *actor == proof.prior_actor())
+                .ok_or(HostError::StaleGuard)?;
+            *old_record = next_actor.clone();
+            let mut activations = Vec::new();
+            for grant in &mut expected.grants {
+                if grant.actor_id == proof.actor_id()
+                    && grant.scope_id == proof.scope_id()
+                    && grant.credential_generation == proof.prior_actor().credential_generation
+                {
+                    grant.credential_generation = proof.next_generation();
+                    let id = GrantId(grant.grant_id);
+                    let spec = replay_grant_spec(grant)?;
+                    activations.push((id, Grant {
+                        actor_id: actor_id.clone(), scope_id: scope_id.clone(),
+                        credential_generation: next_generation, spec,
+                    }));
+                }
+            }
+            let trusted = TrustedOwnerRotationProof {
+                store_lineage: proof.store_lineage().to_owned(),
+                expected_owner_epoch: proof.owner_epoch(),
+                expected_revision: proof.authority_revision(),
+                rotation_key: proof.rotation_key().to_owned(),
+                expected_actor: proof.prior_actor().clone(),
+                expected_public_key: *proof.old_public_key(),
+                next_actor,
+                next_public_key: *proof.next_public_key(),
+            };
+            self.recheck_actor_resolution_manager()?;
+            if self.store.authority_snapshot()? != current {
+                return Err(HostError::StaleGuard.into());
+            }
+            let receipt = self.store.rotate_owner_actor_from_trusted_host(&trusted)?;
+            let fresh = self.store.authority_snapshot()?;
+            expected.revision = receipt.authority_revision;
+            if receipt.prior_generation != proof.prior_actor().credential_generation
+                || receipt.next_generation != proof.next_generation()
+                || receipt.owner_epoch != proof.owner_epoch()
+                || fresh != expected
+                || self.store.current_actor_verifier(
+                    fresh.owner_epoch, fresh.revision, &trusted.next_actor,
+                )? != *proof.next_public_key()
+            {
+                self.initial_owner_projection_failed = true;
+                return Err(DurableAuthorityError::Corrupt(
+                    "owner recovery durable projection differs",
+                ));
+            }
+            if self.host.register_actor_from_trusted_policy(registration).is_err() {
+                self.initial_owner_projection_failed = true;
+                return Err(DurableAuthorityError::Corrupt(
+                    "owner recovery actor activation failed",
+                ));
+            }
+            for (id, grant) in activations {
+                if self.host.grants.insert(id, grant).is_some() {
+                    self.initial_owner_projection_failed = true;
+                    return Err(DurableAuthorityError::Corrupt(
+                        "owner recovery grant activation failed",
+                    ));
+                }
+            }
+            self.recorded = fresh;
+            Ok(receipt)
+        }
     }
 
     /// Begin one owner enrollment on a trusted one-use setup connection.

@@ -182,3 +182,107 @@ fn wrong_key_birth_and_reopened_manager_refuse_initial_enrollment() {
         Err(DurableAuthorityError::Host(HostError::Unauthorised))
     ));
 }
+
+#[test]
+fn restarted_manager_requires_old_and_new_key_proofs_before_any_owner_mutation() {
+    let fixture = Fixture::new();
+    let mut first = DurableAuthority::open(&fixture.database, NoPort).unwrap();
+    let (_, _, policy) = policy();
+    let observed = process(3000);
+    let old = KeyPair::from_seed(Seed::new([7; 32]));
+    let next = KeyPair::from_seed(Seed::new([8; 32]));
+    let pending = first
+        .begin_initial_owner_enrollment(policy.clone(), observed.clone(), *old.pk)
+        .unwrap();
+    let signature = old.sk.sign(pending.challenge_bytes(), None);
+    first.commit_initial_owner_enrollment(
+        pending.verify(signature.as_ref()).unwrap(), &observed,
+    ).unwrap();
+    drop(first);
+
+    let mut restarted = DurableAuthority::open(&fixture.database, NoPort).unwrap();
+    let before = restarted.recorded_snapshot().clone();
+    assert_eq!(before.owner_epoch, 2);
+    assert!(matches!(
+        restarted.begin_owner_recovery(&policy, process(3001), *next.pk, *next.pk),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    let candidate = restarted.begin_owner_recovery(
+        &policy, process(3001), *old.pk, *next.pk,
+    ).unwrap();
+    assert!(candidate.challenge_bytes().starts_with(b"podbay.owner-recovery/1\0"));
+    let old_signature = old.sk.sign(candidate.challenge_bytes(), None);
+    let next_signature = next.sk.sign(candidate.challenge_bytes(), None);
+    assert!(matches!(
+        restarted.begin_owner_recovery(&policy, process(3001), *old.pk, *next.pk)
+            .unwrap().verify(next_signature.as_ref(), old_signature.as_ref()),
+        Err(HostError::Unauthenticated)
+    ));
+    let proven = candidate.verify(old_signature.as_ref(), next_signature.as_ref()).unwrap();
+    assert_eq!(proven.actor_id(), "actor.initial.zap");
+    assert_eq!(proven.next_generation(), 2);
+    assert_eq!(restarted.recorded_snapshot(), &before);
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(store.authority_snapshot().unwrap(), before);
+}
+
+#[test]
+fn proved_recovery_rotates_owner_and_only_recorded_grant_without_pod_effect() {
+    let fixture = Fixture::new();
+    let mut first = DurableAuthority::open(&fixture.database, NoPort).unwrap();
+    let (actor, scope, policy) = policy();
+    let old_process = process(3000);
+    let old = KeyPair::from_seed(Seed::new([7; 32]));
+    let next = KeyPair::from_seed(Seed::new([8; 32]));
+    let pending = first.begin_initial_owner_enrollment(
+        policy.clone(), old_process.clone(), *old.pk,
+    ).unwrap();
+    let signature = old.sk.sign(pending.challenge_bytes(), None);
+    let enrollment = first.commit_initial_owner_enrollment(
+        pending.verify(signature.as_ref()).unwrap(), &old_process,
+    ).unwrap();
+    drop(first);
+
+    let mut restarted = DurableAuthority::open(&fixture.database, NoPort).unwrap();
+    let new_process = process(3001);
+    let pending = restarted.begin_owner_recovery(
+        &policy, new_process.clone(), *old.pk, *next.pk,
+    ).unwrap();
+    let old_signature = old.sk.sign(pending.challenge_bytes(), None);
+    let next_signature = next.sk.sign(pending.challenge_bytes(), None);
+    let proof = pending.verify(old_signature.as_ref(), next_signature.as_ref()).unwrap();
+    assert!(matches!(
+        restarted.commit_owner_recovery(proof, &process(3002)),
+        Err(DurableAuthorityError::Host(HostError::Unauthenticated))
+    ));
+    assert_eq!(restarted.recorded_snapshot().actors[0].credential_generation, 1);
+    let pending = restarted.begin_owner_recovery(
+        &policy, new_process.clone(), *old.pk, *next.pk,
+    ).unwrap();
+    let old_signature = old.sk.sign(pending.challenge_bytes(), None);
+    let next_signature = next.sk.sign(pending.challenge_bytes(), None);
+    let receipt = restarted.commit_owner_recovery(
+        pending.verify(old_signature.as_ref(), next_signature.as_ref()).unwrap(),
+        &new_process,
+    ).unwrap();
+    assert_eq!(receipt.prior_generation, 1);
+    assert_eq!(receipt.next_generation, 2);
+    assert_eq!(restarted.recorded_snapshot().actors[0].start_identity, 3001);
+    assert_eq!(restarted.recorded_snapshot().grants.len(), 1);
+    assert_eq!(restarted.recorded_snapshot().grants[0].grant_id, enrollment.grant_id.get());
+    assert_eq!(restarted.recorded_snapshot().grants[0].credential_generation, 2);
+    assert!(restarted.challenge_candidate_for_observed_process(&actor, &old_process).is_err());
+    let candidate = restarted.challenge_candidate_for_observed_process(&actor, &new_process).unwrap();
+    let normal = candidate.begin_challenge([2; 32]).unwrap();
+    let signature = next.sk.sign(normal.transcript_bytes().unwrap(), None);
+    assert!(normal.verify(&new_process, signature.as_ref()).is_ok());
+    assert!(restarted.activate_recorded_grant_for_actor_from_trusted_replay(
+        &actor, &scope, enrollment.grant_id.get(),
+    ).is_ok());
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(store.authority_snapshot().unwrap(), *restarted.recorded_snapshot());
+    assert!(store.current_actor_verifier(
+        receipt.owner_epoch, receipt.authority_revision,
+        &restarted.recorded_snapshot().actors[0],
+    ).is_ok());
+}
