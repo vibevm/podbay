@@ -53,6 +53,13 @@ PodBay resource identity and a monotonically installed writer epoch. The
 permit is supplied by an authenticated higher layer and is **not** durable
 authority by itself. Every send or interrupt reads native thread state before
 its turn RPC. The 0.159.3 path uses metadata-only `thread/read` for status.
+`start_thread_without_turn` now returns the idle, unmaterialized native thread
+after `thread/start` without sending `turn/start`. A fake transport test verifies
+that this split writes no model input and leaves bootstrap NotStarted. It gives
+the pod a checkpoint point for the native thread ID. The higher layer must
+authorise and journal the thread-create intent before invoking it. No durable journal or
+writer authority is supplied by this adapter method, and no separate bootstrap
+submission path is exposed yet.
 Idle chooses `turn/start`. An active turn permits `turn/steer` only when this
 same adapter process owns the exact turn ID from its `turn/start` receipt and
 the caller supplies that ID. Native `expectedTurnId` is the final compare-and-set

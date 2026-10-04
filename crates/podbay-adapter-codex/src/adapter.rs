@@ -520,20 +520,13 @@ impl<T: JsonlTransport> CodexResource<T> {
         Ok(())
     }
 
-    /// Creates one native thread, then submits one bootstrap turn. Any lost
-    /// reply leaves this resource unusable for another start until reconciled.
-    pub fn start_new(
-        &mut self,
-        bootstrap_text: &str,
-        client_message_id: &str,
-    ) -> Result<StartReceipt, CodexError> {
+    /// Creates only an unmaterialized native thread. No turn or model input is
+    /// sent. The higher layer must authorise and journal the create intent
+    /// before this RPC, then durably checkpoint this exact thread ID before a
+    /// later bootstrap turn. This receipt is neither writer authority nor
+    /// native-session readiness.
+    pub fn start_thread_without_turn(&mut self) -> Result<NativeThread, CodexError> {
         self.require_fresh_thread()?;
-        if bootstrap_text.is_empty()
-            || bootstrap_text.len() > 1_000_000
-            || !valid_token(client_message_id)
-        {
-            return Err(CodexError::InvalidInput("bootstrap text or key is invalid"));
-        }
         let result = self.request("thread/start", self.thread_settings())?;
         let thread = self
             .validate_effective_thread(&result, None)
@@ -556,6 +549,26 @@ impl<T: JsonlTransport> CodexResource<T> {
                 "native thread became busy before bootstrap",
             ));
         }
+        Ok(thread)
+    }
+
+    /// Creates one native thread, then submits one bootstrap turn. Any lost
+    /// reply leaves this resource unusable for another start until reconciled.
+    /// This compatibility path has no durable checkpoint between its RPCs;
+    /// the pod must use a separate journaled turn path before exposing it.
+    pub fn start_new(
+        &mut self,
+        bootstrap_text: &str,
+        client_message_id: &str,
+    ) -> Result<StartReceipt, CodexError> {
+        self.require_fresh_thread()?;
+        if bootstrap_text.is_empty()
+            || bootstrap_text.len() > 1_000_000
+            || !valid_token(client_message_id)
+        {
+            return Err(CodexError::InvalidInput("bootstrap text or key is invalid"));
+        }
+        let thread = self.start_thread_without_turn()?;
         self.bootstrap = BootstrapState::Unknown;
         let turn = self.request(
             "turn/start",
@@ -1365,4 +1378,107 @@ fn same_path(value: Option<&Value>, expected: &Path) -> bool {
     value
         .and_then(Value::as_str)
         .is_some_and(|text| Path::new(text) == expected)
+}
+
+#[cfg(test)]
+mod split_thread_tests {
+    use super::*;
+
+    fn frame(value: Value) -> Vec<u8> {
+        let mut encoded = serde_json::to_vec(&value).unwrap();
+        encoded.push(b'\n');
+        encoded
+    }
+
+    struct FakeTransport {
+        reads: VecDeque<Vec<u8>>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl JsonlTransport for FakeTransport {
+        fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+            self.writes.push(line.to_vec());
+            Ok(())
+        }
+
+        fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.reads.pop_front())
+        }
+    }
+
+    #[test]
+    fn thread_start_can_stop_before_any_bootstrap_turn() {
+        let cwd = PathBuf::from("/tmp/podbay-codex-thread-fixture");
+        let io = FakeTransport {
+            reads: VecDeque::from([
+                frame(json!({
+                    "id": 1,
+                    "result": {
+                        "codexHome": "/tmp/codex.fixture",
+                        "platformFamily": "unix",
+                        "platformOs": "linux",
+                        "userAgent": "fixture"
+                    }
+                })),
+                frame(json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": "thread.fixture",
+                            "sessionId": "session.fixture",
+                            "cwd": cwd,
+                            "status": {"type": "idle"},
+                            "turns": []
+                        },
+                        "model": "gpt-6-sol",
+                        "reasoningEffort": "medium",
+                        "approvalPolicy": "never",
+                        "sandbox": {"type": "dangerFullAccess"},
+                        "cwd": cwd
+                    }
+                })),
+            ]),
+            writes: Vec::new(),
+        };
+        let identity = ResourceIdentity {
+            session_id: SessionId::try_from("session.fixture").unwrap(),
+            run_id: RunId::try_from("run.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.fixture").unwrap(),
+            resource_id: ResourceId::try_from("resource.fixture").unwrap(),
+            resource_epoch: Epoch::new(1).unwrap(),
+        };
+        let config = PinnedCodexConfig::new(
+            "gpt-6-sol",
+            "medium",
+            cwd,
+            ApprovalPolicy::Never,
+            Sandbox::DangerFullAccess,
+        )
+        .unwrap();
+        let mut resource = CodexResource::new(io, identity, config);
+        resource.initialize().unwrap();
+        let thread = resource.start_thread_without_turn().unwrap();
+        assert_eq!(thread.thread_id, "thread.fixture");
+        assert_eq!(resource.native_thread(), Some(&thread));
+        assert_eq!(resource.bootstrap_state(), &BootstrapState::NotStarted);
+        assert!(!resource.bootstrap_ready());
+        let methods = resource
+            .transport()
+            .writes
+            .iter()
+            .map(|line| {
+                serde_json::from_slice::<Value>(line).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["initialize", "initialized", "thread/start"]);
+        assert!(matches!(
+            resource.start_new("bootstrap", "message.fixture"),
+            Err(CodexError::InvalidState(_))
+        ));
+        assert_eq!(resource.transport().writes.len(), 3);
+    }
 }
