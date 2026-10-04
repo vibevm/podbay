@@ -290,6 +290,7 @@ pub struct TurnControlState {
 pub enum CodexError {
     InvalidInput(&'static str),
     InvalidState(&'static str),
+    Unsupported(&'static str),
     Protocol(&'static str),
     Codec(CodecError),
     TransportUncertain,
@@ -597,10 +598,7 @@ impl<T: JsonlTransport> CodexResource<T> {
         if !valid_token(expected_thread_id) {
             return Err(CodexError::InvalidInput("native thread id is invalid"));
         }
-        let read = self.request(
-            "thread/read",
-            json!({"threadId":expected_thread_id,"includeTurns":true}),
-        )?;
+        let read = self.request("thread/read", json!({"threadId":expected_thread_id}))?;
         let observed = self
             .validate_read_thread(&read, expected_thread_id)
             .inspect_err(|_| {
@@ -611,6 +609,11 @@ impl<T: JsonlTransport> CodexResource<T> {
                 "native thread reported system error",
             ));
         }
+        if observed.status == ThreadStatus::Active {
+            return Err(CodexError::Unsupported(
+                "active native thread cannot be resumed without verified turn identity",
+            ));
+        }
         let mut params = self.thread_settings();
         let map = params
             .as_object_mut()
@@ -618,12 +621,19 @@ impl<T: JsonlTransport> CodexResource<T> {
         map.insert("threadId".into(), json!(expected_thread_id));
         map.remove("ephemeral");
         map.remove("serviceName");
+        map.insert("excludeTurns".into(), json!(true));
         let result = self.request("thread/resume", params)?;
         let thread = self
             .validate_effective_thread(&result, Some(expected_thread_id))
             .inspect_err(|_| {
                 self.poisoned = true;
             })?;
+        if thread.status == ThreadStatus::Active {
+            self.poisoned = true;
+            return Err(CodexError::Unsupported(
+                "active resumed thread has no verified turn identity",
+            ));
+        }
         self.thread = Some(thread.clone());
         self.native_status = thread.status;
         self.bootstrap = BootstrapState::Unknown;
@@ -640,21 +650,23 @@ impl<T: JsonlTransport> CodexResource<T> {
             .ok_or(CodexError::InvalidState("native thread is not bound"))?
             .thread_id
             .clone();
-        let result = self.request(
-            "thread/read",
-            json!({"threadId":expected,"includeTurns":true}),
-        )?;
+        let result = self.request("thread/read", json!({"threadId":expected}))?;
         let thread = self
             .validate_read_thread(&result, &expected)
             .inspect_err(|_| {
                 self.poisoned = true;
             })?;
-        let observed_active_turn_id = active_turn_from_thread(&result).inspect_err(|_| {
-            self.poisoned = true;
-        })?;
         self.thread = Some(thread.clone());
         self.native_status = thread.status;
-        self.observed_active_turn_id = observed_active_turn_id;
+        // Metadata-only thread/read says whether a turn is active, but carries
+        // no turn identity. A prior receipt or notification is not a fresh
+        // observation from this read. Retain local ownership separately.
+        self.observed_active_turn_id = None;
+        if thread.status == ThreadStatus::Active && self.owned_active_turn_id.is_none() {
+            // Metadata reports activity, but this process never received the
+            // matching turn/start receipt. It must not steer another writer.
+            self.external_conflict = true;
+        }
         self.status_waiting = waiting_flag(result.pointer("/thread/status")).inspect_err(|_| {
             self.poisoned = true;
         })?;
@@ -700,33 +712,26 @@ impl<T: JsonlTransport> CodexResource<T> {
 
         let (mode, active_turn_id) = match (
             self.native_status,
-            self.observed_active_turn_id.as_deref(),
             self.owned_active_turn_id.as_deref(),
             expected_active_turn_id,
         ) {
-            (ThreadStatus::Idle, None, None, None) if self.bootstrap_ready() => {
-                (TurnMode::Start, None)
+            (ThreadStatus::Idle, None, None) if self.bootstrap_ready() => (TurnMode::Start, None),
+            (ThreadStatus::Active, Some(owned), Some(expected)) if owned == expected => {
+                // Native expectedTurnId is the final compare-and-set. The
+                // metadata-only read establishes activity, not the turn ID.
+                (TurnMode::Steer, Some(owned.to_owned()))
             }
-            (ThreadStatus::Active, Some(native), Some(owned), Some(expected))
-                if native == owned && owned == expected =>
-            {
-                (TurnMode::Steer, Some(expected.to_owned()))
-            }
-            (ThreadStatus::Active, Some(_), None, _) => {
+            (ThreadStatus::Active, None, _) => {
                 self.external_conflict = true;
                 return Err(CodexError::Blocked(BlockReason::ExternalWriter));
             }
-            (ThreadStatus::Active, Some(native), Some(owned), Some(_)) => {
-                if native != owned {
-                    self.external_conflict = true;
-                    return Err(CodexError::Blocked(BlockReason::ExternalWriter));
-                }
+            (ThreadStatus::Active, Some(_), Some(_)) => {
                 return Err(CodexError::Blocked(BlockReason::StaleExpectedTurn));
             }
-            (ThreadStatus::Active, Some(_), Some(_), None) => {
+            (ThreadStatus::Active, Some(_), None) => {
                 return Err(CodexError::Blocked(BlockReason::NativeBusy));
             }
-            (ThreadStatus::Idle, None, None, Some(_)) => {
+            (ThreadStatus::Idle, None, Some(_)) => {
                 return Err(CodexError::Blocked(BlockReason::NativeBusy));
             }
             _ => return Err(CodexError::Blocked(BlockReason::ObservationUnknown)),
@@ -767,6 +772,12 @@ impl<T: JsonlTransport> CodexResource<T> {
         let response = match self.request(method, params) {
             Ok(value) => value,
             Err(CodexError::TransportUncertain) => return Ok(uncertain),
+            Err(error @ CodexError::RemoteError(_)) if mode == TurnMode::Steer => {
+                // A rejected exact-turn CAS may indicate a competing native
+                // writer. Keep the native error and block further input.
+                self.external_conflict = true;
+                return Err(error);
+            }
             Err(error) => return Err(error),
         };
         let turn_id = match mode {
@@ -835,7 +846,7 @@ impl<T: JsonlTransport> CodexResource<T> {
         }
         self.read_thread()?;
         if self.native_status != ThreadStatus::Active
-            || self.observed_active_turn_id.as_deref() != Some(expected_turn_id)
+            || self.owned_active_turn_id.as_deref() != Some(expected_turn_id)
             || self.external_conflict
         {
             return Err(CodexError::Blocked(BlockReason::ExternalWriter));
@@ -1309,31 +1320,6 @@ fn waiting_flag(status: Option<&Value>) -> Result<bool, CodexError> {
         Some("notLoaded" | "idle" | "systemError") => Ok(false),
         _ => Err(CodexError::Protocol("native status type is invalid")),
     }
-}
-
-fn active_turn_from_thread(response: &Value) -> Result<Option<String>, CodexError> {
-    let turns = response
-        .pointer("/thread/turns")
-        .and_then(Value::as_array)
-        .ok_or(CodexError::Protocol("thread/read omitted turns"))?;
-    let mut active = None;
-    for turn in turns {
-        let id = nonempty_string(turn.get("id"))
-            .ok_or(CodexError::Protocol("thread turn omitted id"))?;
-        let status = turn.get("status").and_then(Value::as_str);
-        if !matches!(
-            status,
-            Some("inProgress" | "completed" | "interrupted" | "failed")
-        ) {
-            return Err(CodexError::Protocol("thread turn has unknown status"));
-        }
-        if status == Some("inProgress") {
-            if active.replace(id.to_owned()).is_some() {
-                return Err(CodexError::Protocol("thread has multiple active turns"));
-            }
-        }
-    }
-    Ok(active)
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<&str> {

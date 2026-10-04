@@ -334,7 +334,7 @@ fn isolated_real_app_server_thread_start_without_turn() {
 fn probe_thread_start_without_turn(
     transport: &mut ProcessJsonlTransport,
     dirs: &PrivateDirs,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let initialize = raw_real_rpc(
         transport,
         1,
@@ -393,8 +393,115 @@ fn probe_thread_start_without_turn(
     }
     // The 0.159.3 app-server may refuse thread/read's list_turns path even
     // though thread/start returned a complete idle thread with no turns.
-    let _ = thread_id;
-    Ok(())
+    Ok(thread_id.to_owned())
+}
+
+/// Read-only method compatibility probe for the same fresh thread. It never
+/// sends turn/start, a user message, or a model request.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "requires an explicit reviewed Codex 0.159.3 executable"]
+fn isolated_real_app_server_reconciliation_methods_without_turn() {
+    let executable = PathBuf::from(
+        std::env::var_os("PODBAY_CODEX_APP_SERVER_EXE")
+            .expect("PODBAY_CODEX_APP_SERVER_EXE must name a reviewed executable"),
+    );
+    assert!(
+        executable.is_absolute(),
+        "Codex executable must be absolute"
+    );
+    let dirs = PrivateDirs::new();
+    let version_spec = ChildLaunchSpec::new(
+        executable.clone(),
+        vec!["--version".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut version_child = ProcessJsonlTransport::spawn(version_spec).unwrap();
+    let version = version_child
+        .read_line()
+        .unwrap()
+        .expect("Codex version closed early");
+    version_child.dispose().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version).trim(),
+        format!("codex-cli {TESTED_CODEX_CLI_VERSION}"),
+    );
+    let spec = ChildLaunchSpec::new(
+        executable,
+        vec!["app-server".into(), "--listen".into(), "stdio://".into()],
+        dirs.root.clone(),
+        dirs.home.clone(),
+        dirs.codex_home.clone(),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let mut transport = ProcessJsonlTransport::spawn(spec).unwrap();
+    let pid = transport.birth().pid;
+    let observed = (|| -> Result<(), String> {
+        let id = probe_thread_start_without_turn(&mut transport, &dirs)?;
+        let metadata = raw_real_rpc(&mut transport, 3, "thread/read", json!({"threadId":id}))?;
+        let thread = metadata
+            .get("thread")
+            .ok_or("metadata read omitted thread")?;
+        if thread.get("id").and_then(Value::as_str) != Some(id.as_str())
+            || thread.pointer("/status/type").and_then(Value::as_str) != Some("idle")
+            || thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .is_none_or(|turns| !turns.is_empty())
+        {
+            return Err("metadata read did not prove the empty thread idle".into());
+        }
+        eprintln!("thread/read metadata: idle, turns=0");
+        let turns = raw_real_rpc(
+            &mut transport,
+            4,
+            "thread/turns/list",
+            json!({"threadId":id,"limit":1,"sortDirection":"desc"}),
+        )
+        .err()
+        .ok_or("unmaterialized thread unexpectedly returned a turn list")?;
+        if !turns.contains("code=Some(-32600)")
+            || !turns.contains("unavailable before first user message")
+        {
+            return Err(format!("unexpected no-turn list result: {turns}"));
+        }
+        eprintln!("thread/turns/list: unmaterialized before first user message (-32600)");
+        let resumed = raw_real_rpc(
+            &mut transport,
+            5,
+            "thread/resume",
+            json!({
+                "threadId":id,
+                "excludeTurns":true,
+                "cwd":dirs.root,
+                "model":"gpt-6-sol",
+                "approvalPolicy":"never",
+                "sandbox":"danger-full-access",
+                "config":{"model_reasoning_effort":"medium"}
+            }),
+        )
+        .err()
+        .ok_or("unmaterialized thread unexpectedly resumed")?;
+        if !resumed.contains("code=Some(-32600)") || !resumed.contains("no rollout found") {
+            return Err(format!("unexpected no-turn resume result: {resumed}"));
+        }
+        eprintln!("thread/resume excludeTurns: no rollout found (-32600)");
+        Ok(())
+    })();
+    let exit = transport
+        .dispose()
+        .expect("real app-server direct child was not reaped");
+    assert_eq!(exit.pid, pid);
+    if let Err(detail) = observed {
+        panic!("isolated reconciliation probe failed: {detail}");
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

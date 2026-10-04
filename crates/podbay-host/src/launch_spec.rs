@@ -4,9 +4,10 @@ use std::path::{Component, Path, PathBuf};
 
 use podbay_core::{LaunchBinding, PodId, ResourceKind, Role, ScopeId};
 use podbay_wire::{
-    CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveWorkspaceAccess,
-    ImmutableLaunchDescriptor, NativeResourceKind, ResourceDriver, ReviewedNativePolicy,
-    ReviewedResource, TargetOs,
+    CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
+    EffectiveWorkspaceAccess, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
+    NativeResourceKind, NativeRole, ResourceDriver, ReviewedNativePolicy, ReviewedResource,
+    TargetOs,
 };
 use sha2::{Digest, Sha256};
 
@@ -306,6 +307,36 @@ impl RegisteredLaunchProfile {
         if self.codex_policy.is_some() {
             return Err(HostError::Unsupported);
         }
+        self.resolve_native_policy_for_review(host, spec, binding, effective_digest)
+    }
+
+    pub(crate) fn resolve_native_policy_codex_v2(
+        &self,
+        host: &TrustedNativeHostConfig,
+        spec: &EffectiveLaunchSpec,
+        binding: &LaunchBinding,
+        effective_digest: &str,
+    ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
+        let policy = self.codex_policy.as_ref().ok_or(HostError::Unsupported)?;
+        if binding.parent_run_id().is_some()
+            || binding.resources().len() != 1
+            || binding.resources()[0].kind() != ResourceKind::StructuredProvider
+            || spec.credential_refs.len() != 1
+            || spec.credential_refs[0].scope_id().as_str() != policy.credential_scope()
+            || spec.credential_refs[0].as_str() != policy.credential_ref()
+        {
+            return Err(HostError::Unauthorised);
+        }
+        self.resolve_native_policy_for_review(host, spec, binding, effective_digest)
+    }
+
+    fn resolve_native_policy_for_review(
+        &self,
+        host: &TrustedNativeHostConfig,
+        spec: &EffectiveLaunchSpec,
+        binding: &LaunchBinding,
+        effective_digest: &str,
+    ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
         if host.target_os != TargetOs::Linux
             || self.input.execution_mode != ExecutionMode::LinuxCooperative
             || spec.profile_ref != self.input.profile_ref
@@ -401,6 +432,101 @@ impl RegisteredLaunchProfile {
         Ok(paths)
     }
 
+    /// Rebuilds the complete effective launch from today's trusted policy.
+    /// The committed V2 bytes are the only selection source; a caller cannot
+    /// supply a replacement descriptor or silently choose profile defaults.
+    pub(crate) fn revalidate_committed_codex_v2(
+        &self,
+        host: &TrustedNativeHostConfig,
+        effective: &EffectiveLaunchContractV2,
+        descriptor: &ImmutableLaunchDescriptorV2,
+    ) -> Result<ResolvedNativePaths, HostError> {
+        let policy = self.codex_policy.as_ref().ok_or(HostError::StaleGuard)?;
+        let base = effective.base();
+        if effective.codex_policy() != policy
+            || descriptor.codex_policy() != policy
+            || base.parent_run_id().is_some()
+            || descriptor.parent_run_id().is_some()
+            || host.target_os != TargetOs::Linux
+            || descriptor.target_os() != host.target_os
+            || descriptor.host_id() != host.host_id
+            || self.input.execution_mode != ExecutionMode::LinuxCooperative
+            || !self.input.allow_write
+            || self.input.resource_layout.len() != 1
+            || descriptor.resources_len() != 1
+            || self.input.credential_refs.len() != 1
+            || base.profile_ref() != self.input.profile_ref
+            || base.profile_generation() != self.input.profile_generation
+            || base.workspace_scope() != &self.input.workspace_scope
+            || base.workspace_basis_ref() != self.input.workspace_basis_ref
+            || base.workspace_access() != EffectiveWorkspaceAccess::ReadWrite
+            || base.credential_refs().len() != 1
+            || base.credential_refs()[0].scope_id() != &self.input.workspace_scope
+            || base.credential_refs()[0].reference() != policy.credential_ref()
+            || self.input.credential_refs[0].as_str() != policy.credential_ref()
+        {
+            return Err(HostError::StaleGuard);
+        }
+        let role = match base.role() {
+            NativeRole::Coordinator => Role::Coordinator,
+            NativeRole::Worker => Role::Worker,
+            NativeRole::Advisor => return Err(HostError::StaleGuard),
+        };
+        let arguments = base
+            .arguments()
+            .strip_prefix(self.input.fixed_arguments.as_slice())
+            .ok_or(HostError::StaleGuard)?
+            .to_vec();
+        let selection = LaunchSelection {
+            profile_ref: base.profile_ref().to_owned(),
+            profile_generation: base.profile_generation(),
+            model_id: Some(base.model_id().to_owned()),
+            reasoning_effort: Some(base.reasoning_effort().to_owned()),
+            fallback_approved: base.fallback_approved(),
+            workspace: WorkspaceSelection {
+                scope_id: base.workspace_scope().clone(),
+                basis_ref: base.workspace_basis_ref().to_owned(),
+                relative_cwd: base.relative_cwd().to_owned(),
+                access: WorkspaceAccess::ReadWrite,
+            },
+            arguments,
+            tool_bundle_refs: base.tool_bundle_refs().to_vec(),
+            authority_ref: format!("grant.{}", base.authority_grant_id()),
+            wall_seconds: base.wall_seconds(),
+            max_children: base.max_children(),
+            parent_run_id: None,
+        };
+        let spec = self
+            .resolve_codex_v2(
+                base.pod_id().clone(),
+                role,
+                base.authority_grant_id(),
+                Some(&self.input.credential_refs[0]),
+                &selection,
+            )
+            .map_err(|_| HostError::StaleGuard)?;
+        if spec.canonical_bytes()? != base.canonical_bytes() {
+            return Err(HostError::StaleGuard);
+        }
+        let template = &self.input.resource_layout[0];
+        let native = descriptor.resource(0).ok_or(HostError::StaleGuard)?;
+        if template.kind != ResourceKind::StructuredProvider
+            || native.kind != NativeResourceKind::StructuredProvider
+            || native.driver != &template.driver
+            || !host.supports_driver(&template.driver)
+            || descriptor.executable_generation() != self.input.binary_generation
+        {
+            return Err(HostError::StaleGuard);
+        }
+        let paths = self.resolve_native_paths(base.relative_cwd())?;
+        if descriptor.cwd() != paths.cwd.to_string_lossy()
+            || descriptor.executable() != paths.executable.to_string_lossy()
+        {
+            return Err(HostError::StaleGuard);
+        }
+        Ok(paths)
+    }
+
     fn resolve_native_paths(&self, relative_cwd: &str) -> Result<ResolvedNativePaths, HostError> {
         if !valid_relative_cwd(relative_cwd) {
             return Err(HostError::Unauthorised);
@@ -424,6 +550,41 @@ impl RegisteredLaunchProfile {
         if self.codex_policy.is_some() {
             return Err(HostError::Unsupported);
         }
+        self.resolve_selection(pod_id, role, grant_id, selected_credential, selection)
+    }
+
+    pub(crate) fn resolve_codex_v2(
+        &self,
+        pod_id: PodId,
+        role: Role,
+        grant_id: u64,
+        selected_credential: Option<&CredentialRef>,
+        selection: &LaunchSelection,
+    ) -> Result<EffectiveLaunchSpec, HostError> {
+        let policy = self.codex_policy.as_ref().ok_or(HostError::Unsupported)?;
+        let credential = selected_credential.ok_or(HostError::Unauthorised)?;
+        if !matches!(role, Role::Coordinator | Role::Worker)
+            || selection.parent_run_id.is_some()
+            || selection.model_id.is_none()
+            || selection.reasoning_effort.is_none()
+            || selection.workspace.access != WorkspaceAccess::ReadWrite
+            || selection.fallback_approved
+            || credential.scope_id().as_str() != policy.credential_scope()
+            || credential.as_str() != policy.credential_ref()
+        {
+            return Err(HostError::Unauthorised);
+        }
+        self.resolve_selection(pod_id, role, grant_id, Some(credential), selection)
+    }
+
+    fn resolve_selection(
+        &self,
+        pod_id: PodId,
+        role: Role,
+        grant_id: u64,
+        selected_credential: Option<&CredentialRef>,
+        selection: &LaunchSelection,
+    ) -> Result<EffectiveLaunchSpec, HostError> {
         let profile = &self.input;
         if selection.profile_ref != profile.profile_ref
             || selection.profile_generation != profile.profile_generation
