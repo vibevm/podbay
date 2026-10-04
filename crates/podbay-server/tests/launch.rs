@@ -1814,6 +1814,8 @@ fn claimed_later_turn_commands_get_is_read_only_and_keeps_uncertain_receipt() {
         assert_eq!(value["receipt"]["commandId"], second_id, "{request_id}");
         assert_eq!(value["state"], "uncertain");
         assert_eq!(value["effectState"], "claimed_uncertain");
+        assert!(value.get("bootstrapGuard").is_none());
+        assert!(value.get("currentLaterSendGuard").is_none());
         assert_eq!(value["nativeObservation"]["kind"], "codex_turn");
         assert_eq!(value["nativeObservation"]["stage"], "submitted");
         assert_eq!(value["nativeObservation"]["nativeTurnId"], "turn.native.two");

@@ -550,12 +550,13 @@ mod tests {
     #[test]
     fn uncertain_and_host_accepted_are_never_projected_as_settled() {
         let uncertain =
-            inspection_json(inspection(EffectState::ClaimedUncertain, None), None, None);
+            inspection_json(inspection(EffectState::ClaimedUncertain, None), None, None, None);
         assert_eq!(uncertain["state"], "uncertain");
         assert_eq!(uncertain["effectState"], "claimed_uncertain");
         assert_eq!(uncertain["receipt"]["eventSequence"], "7");
         let accepted = inspection_json(
             inspection(EffectState::Observed, Some(ObservedStage::HostAccepted)),
+            None,
             None,
             None,
         );
@@ -576,7 +577,7 @@ mod tests {
                 stage,
                 receipt_ref: Some("host.receipt.one".into()),
             });
-            let response = inspection_json(fact, None, None);
+            let response = inspection_json(fact, None, None, None);
             assert_eq!(response["state"], "host_accepted");
             assert_eq!(response["effectState"], label);
             assert_eq!(response["launchStage"], label);
@@ -624,7 +625,7 @@ mod tests {
         ).unwrap();
         let native = CommandNativeObservation::LaterTurn(observed);
         let projected = inspection_json(
-            inspection(EffectState::ClaimedUncertain, None), Some(&native), None,
+            inspection(EffectState::ClaimedUncertain, None), Some(&native), None, None,
         );
         assert_eq!(projected["state"], "uncertain");
         assert_eq!(projected["effectState"], "claimed_uncertain");
