@@ -151,7 +151,24 @@ fn setup(
 ) {
     let fixture = Fixture::new();
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut host = DurableAuthority::open(&fixture.database, NoPort(calls.clone())).unwrap();
+    let (fixture, host, proof, source, _, _) =
+        setup_with_port(role, fixture, NoPort(calls.clone()));
+    (fixture, host, proof, source, calls)
+}
+
+fn setup_with_port<P: HostDispatchPort>(
+    role: Role,
+    fixture: Fixture,
+    port: P,
+) -> (
+    Fixture,
+    DurableAuthority<P>,
+    ResolvedNativeCodexLaunch,
+    TrustedCodexCredentialSource,
+    Transport,
+    BoundLaunchPodRequest,
+) {
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
     let actor = ActorId::try_from("actor.codex.preflight").unwrap();
     let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
         1000,
@@ -339,7 +356,9 @@ fn setup(
             },
         }),
     };
-    let receipt = host.admit_bound_root_codex_v2(&transport, request).unwrap();
+    let receipt = host
+        .admit_bound_root_codex_v2(&transport, request.clone())
+        .unwrap();
     assert_eq!(receipt.status.stage, LaunchDispatchStage::Prepared);
     let proof = host
         .inspect_committed_root_codex_v2(&fixture.scope, &fixture.pod)
@@ -347,7 +366,7 @@ fn setup(
     let source =
         TrustedCodexCredentialSource::from_trusted_policy(credential, fixture.source.clone())
             .unwrap();
-    (fixture, host, proof, source, calls)
+    (fixture, host, proof, source, transport, request)
 }
 
 fn launch_from_review(
@@ -778,4 +797,91 @@ fn disposable_codex_v2_port_admits_and_reattaches_without_duplicate_child() {
     assert!(client.attested_status().unwrap().child_running);
     assert!(!client.stop().unwrap().child_running);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_v2_durable_dispatch_records_one_real_pod_launch() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let (fixture, mut host, proof, _, transport, request) =
+        setup_with_port(Role::Coordinator, fixture, port);
+    let outbox_id = proof.outbox_id();
+    let prepared = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .launch_dispatch_status(outbox_id, fixture.scope.as_str(), fixture.pod.as_str())
+        .unwrap();
+    assert_eq!(prepared.stage, LaunchDispatchStage::Prepared);
+
+    let accepted = host
+        .dispatch_prepared_bound_root_codex_v2(&transport, request.clone())
+        .unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    assert!(accepted.port_called);
+    let durable = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .launch_dispatch_status(outbox_id, fixture.scope.as_str(), fixture.pod.as_str())
+        .unwrap();
+    assert_eq!(durable, accepted.status);
+    let manifest = slot_manifest(&fixture).expect("one durable pod manifest");
+    let client = PodClient::connect(&manifest).unwrap();
+    let first = client.attested_status().unwrap();
+    assert!(first.child_running);
+    assert_eq!(
+        first.bound.as_ref().unwrap().capability,
+        CODEX_V2_CAPABILITY
+    );
+
+    let mut duplicate = request;
+    duplicate.proposal = None;
+    let repeated = host
+        .dispatch_prepared_bound_root_codex_v2(&transport, duplicate)
+        .unwrap();
+    assert!(repeated.duplicate);
+    assert!(!repeated.port_called);
+    assert_eq!(repeated.receipt, accepted.receipt);
+    assert_eq!(repeated.status, durable);
+    let second = client.attested_status().unwrap();
+    assert!(second.child_running);
+    assert_eq!(second.supervisor_pid, first.supervisor_pid);
+    assert_eq!(second.supervisor_start_ticks, first.supervisor_start_ticks);
+    assert_eq!(second.child_pid, first.child_pid);
+    assert_eq!(second.child_start_ticks, first.child_start_ticks);
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("home/codex/frames.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+
+    assert!(!client.stop().unwrap().child_running);
+    let unit = format!(
+        "podbay-pod-{}.service",
+        manifest.file_stem().unwrap().to_str().unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=LoadState", "--value", &unit])
+            .output()
+            .unwrap();
+        assert!(state.status.success(), "systemd unit state unavailable");
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disposable pod unit remained loaded"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
