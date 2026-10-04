@@ -440,10 +440,42 @@ fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
     assert!(first["cursor"]["storeLineage"].as_str().is_some());
     assert_eq!(first["value"]["duplicate"], false);
     assert_eq!(first["value"]["portCalled"], true);
+    assert_eq!(first["value"]["scopeId"], "scope.server.launch");
+    for (field, prefix) in [
+        ("sessionId", "session."),
+        ("runId", "run."),
+        ("attemptId", "attempt."),
+        ("podId", "pod."),
+    ] {
+        assert!(first["value"][field].as_str().unwrap().starts_with(prefix));
+    }
+    assert_eq!(first["value"]["podIncarnation"], "1");
+    assert_eq!(first["value"]["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        first["value"]["resources"][0]["kind"],
+        "structured_provider"
+    );
+    assert!(
+        first["value"]["resources"][0]["resourceId"]
+            .as_str()
+            .unwrap()
+            .starts_with("resource.")
+    );
     let replay = &responses[1]["ok"];
     assert_eq!(replay["commandId"], first["commandId"]);
     assert_eq!(replay["revision"], first["revision"]);
     assert_eq!(replay["cursor"], first["cursor"]);
+    for field in [
+        "scopeId",
+        "sessionId",
+        "runId",
+        "attemptId",
+        "podId",
+        "podIncarnation",
+        "resources",
+    ] {
+        assert_eq!(replay["value"][field], first["value"][field]);
+    }
     assert_eq!(replay["value"]["duplicate"], true);
     assert_eq!(replay["value"]["portCalled"], false);
     assert_eq!(responses[2]["error"]["code"], "conflict");
