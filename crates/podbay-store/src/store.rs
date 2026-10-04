@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 use crate::bound_launch::{ensure_current_dispatch_eligible, read_bound_record};
 
 use crate::model::{
-    Admission, AdmittedLaunchInspection, CommandRequest, CommittedEvent, DIGEST_VERSION,
-    EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
-    LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding, LaunchLookupRequest,
-    ObservedStage, QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder,
-    StoreError, StoredEffect,
+    Admission, AdmittedLaunchInspection, CommandInspection, CommandLookupSelector, CommandRequest,
+    CommittedEvent, DIGEST_VERSION, EffectClaim, EffectObservation, EffectState, EventCursor,
+    EventReference, HostAcceptanceProof, LaunchDispatchStage, LaunchDispatchStatus,
+    LaunchIntentBinding, LaunchLookupRequest, ObservedStage, QuarantinedSourceEvent, Receipt,
+    ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
 const SCHEMA_VERSION: i64 = 14;
@@ -842,6 +842,241 @@ impl PodBayStore {
             digest_version: DIGEST_VERSION,
             request_digest: digest,
         }))
+    }
+
+    /// Inspect an admitted command by opaque ID or caller key. The principal
+    /// and authorised scope must come from the authenticated read boundary.
+    /// Foreign and absent rows are indistinguishable; a key used in more than
+    /// one namespace within this principal/scope is explicitly ambiguous.
+    /// This one-snapshot read never admits, replays, claims, or dispatches.
+    pub fn lookup_command(
+        &mut self,
+        scope_id: &str,
+        principal: &VerifiedPrincipal,
+        selector: &CommandLookupSelector,
+    ) -> Result<CommandInspection, StoreError> {
+        valid_id(scope_id)?;
+        let (column, value) = match selector {
+            CommandLookupSelector::Id { command_id } => ("command_id", command_id.as_str()),
+            CommandLookupSelector::Key { key } => ("command_key", key.as_str()),
+        };
+        valid_id(value)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rows = {
+            let sql = format!(
+                "SELECT command_rowid,command_id,namespace,command_key,target_id,
+                        digest_version,request_digest,canonical_request,owner_epoch,
+                        target_epoch,event_sequence,outbox_id
+                 FROM commands WHERE principal=?1 AND scope_id=?2 AND {column}=?3
+                 ORDER BY command_rowid LIMIT 2"
+            );
+            let mut statement = transaction.prepare(&sql)?;
+            statement
+                .query_map(params![principal.as_str(), scope_id, value], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let [row] = rows.as_slice() else {
+            return if rows.is_empty() {
+                Err(StoreError::NotFound)
+            } else {
+                Err(StoreError::Conflict(
+                    "command key is ambiguous across namespaces",
+                ))
+            };
+        };
+        let (
+            command_rowid,
+            command_id,
+            namespace,
+            command_key,
+            target_id,
+            version,
+            request_digest,
+            canonical_request,
+            owner_epoch,
+            target_epoch,
+            event_sequence,
+            outbox_id,
+        ) = row;
+        if *command_rowid <= 0 || *owner_epoch < 0 || *target_epoch < 0 || version != DIGEST_VERSION
+        {
+            return Err(StoreError::Conflict(
+                "command admission lineage is malformed",
+            ));
+        }
+        let event_sequence = event_sequence
+            .filter(|sequence| *sequence > 0)
+            .ok_or(StoreError::Conflict("incomplete committed event"))?;
+        let outbox_id = outbox_id
+            .filter(|id| *id > 0)
+            .ok_or(StoreError::Conflict("incomplete committed outbox"))?;
+        let admission_event: Option<(String, Vec<u8>, String, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT kind,payload,scope_id,target_id,owner_epoch,target_epoch
+                 FROM events WHERE sequence=?1 AND command_rowid=?2",
+                params![event_sequence, command_rowid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (event_kind, event_payload, event_scope, event_target, event_owner, event_epoch) =
+            admission_event.ok_or(StoreError::Conflict("admission event is missing"))?;
+        if event_scope != scope_id
+            || event_target != *target_id
+            || event_owner != *owner_epoch
+            || event_epoch != *target_epoch
+        {
+            return Err(StoreError::Conflict("admission event lineage differs"));
+        }
+        let effect = transaction
+            .query_row(
+                "SELECT o.outbox_id,c.command_id,o.scope_id,o.target_id,o.owner_epoch,
+                        o.target_epoch,o.kind,o.payload,o.state,o.claim_key,
+                        o.claim_owner_epoch,o.observation_key,o.observation_payload,
+                        o.observation_stage,o.observation_event_sequence,o.effect_digest
+                 FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+                 WHERE o.outbox_id=?1 AND o.command_rowid=?2",
+                params![outbox_id, command_rowid],
+                stored_effect_from_row,
+            )
+            .optional()?
+            .ok_or(StoreError::Conflict("admitted outbox effect is missing"))?;
+        if effect.command_id != *command_id
+            || effect.scope_id != scope_id
+            || effect.target_id != *target_id
+            || effect.admission_owner_epoch != *owner_epoch as u64
+            || effect.admission_target_epoch != *target_epoch as u64
+        {
+            return Err(StoreError::Conflict("outbox command lineage differs"));
+        }
+        let reconstructed = CommandRequest {
+            principal: principal.clone(),
+            namespace: namespace.clone(),
+            command_key: command_key.clone(),
+            scope_id: scope_id.to_owned(),
+            target_id: target_id.clone(),
+            expected_owner_epoch: *owner_epoch as u64,
+            expected_target_epoch: *target_epoch as u64,
+            canonical_request: canonical_request.clone(),
+            event_kind,
+            event_payload,
+            effect_kind: effect.kind.clone(),
+            effect_payload: effect.payload.clone(),
+        };
+        validate_request(&reconstructed)?;
+        if stable_command_id(&reconstructed) != *command_id
+            || digest_request(&reconstructed) != *request_digest
+        {
+            return Err(StoreError::Conflict(
+                "stored command identity or digest changed",
+            ));
+        }
+        let claim = effect
+            .claim_key
+            .as_deref()
+            .is_some_and(|key| valid_id(key).is_ok())
+            && effect
+                .claim_owner_epoch
+                .is_some_and(|epoch| epoch > 0 && epoch <= i64::MAX as u64);
+        let observation = effect
+            .observation_key
+            .as_deref()
+            .is_some_and(|key| valid_id(key).is_ok())
+            && effect
+                .observation_payload
+                .as_ref()
+                .is_some_and(|payload| !payload.is_empty() && payload.len() <= MAX_BYTES)
+            && effect.observed_stage.is_some()
+            && effect
+                .observation_event_sequence
+                .is_some_and(|sequence| sequence > 0);
+        match effect.state {
+            EffectState::Prepared
+                if effect.claim_key.is_some()
+                    || effect.claim_owner_epoch.is_some()
+                    || effect.observation_key.is_some()
+                    || effect.observation_payload.is_some()
+                    || effect.observed_stage.is_some()
+                    || effect.observation_event_sequence.is_some() =>
+            {
+                return Err(StoreError::Conflict("prepared effect has later evidence"));
+            }
+            EffectState::ClaimedUncertain
+                if !claim
+                    || effect.observation_key.is_some()
+                    || effect.observation_payload.is_some()
+                    || effect.observed_stage.is_some()
+                    || effect.observation_event_sequence.is_some() =>
+            {
+                return Err(StoreError::Conflict(
+                    "claimed effect evidence is incomplete",
+                ));
+            }
+            EffectState::Observed if !claim || !observation => {
+                return Err(StoreError::Conflict(
+                    "observed effect evidence is incomplete",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(sequence) = effect.observation_event_sequence {
+            let observed: Option<(i64, String, String)> = transaction
+                .query_row(
+                    "SELECT command_rowid,kind,provenance FROM events WHERE sequence=?1
+                       AND scope_id=?2 AND target_id=?3",
+                    params![sequence, scope_id, target_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (observed_command, kind, provenance) =
+                observed.ok_or(StoreError::Conflict("observation event is missing"))?;
+            if observed_command != *command_rowid
+                || (effect.observed_stage == Some(ObservedStage::HostAccepted)
+                    && (kind != "effect.host_accepted"
+                        || provenance != "authenticated.host.acceptance"))
+            {
+                return Err(StoreError::Conflict("observation event lineage differs"));
+            }
+        }
+        let result = CommandInspection {
+            receipt: Receipt {
+                command_id: command_id.clone(),
+                event_sequence,
+                outbox_id,
+                digest_version: DIGEST_VERSION,
+                request_digest: request_digest.clone(),
+            },
+            effect_state: effect.state,
+            observed_stage: effect.observed_stage,
+            observation_event_sequence: effect.observation_event_sequence,
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// Inspection-only duplicate lookup. It performs SELECTs in one deferred

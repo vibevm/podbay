@@ -62,6 +62,24 @@ pub enum Admission {
     Duplicate(Receipt),
 }
 
+/// `commands.get` selector. The principal and scope come separately from the
+/// authenticated read boundary, never from this selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandLookupSelector {
+    Id { command_id: String },
+    Key { key: String },
+}
+
+/// One durable command receipt and its current outbox status. No effect
+/// payload or host action is exposed by this read-only inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandInspection {
+    pub receipt: Receipt,
+    pub effect_state: EffectState,
+    pub observed_stage: Option<ObservedStage>,
+    pub observation_event_sequence: Option<i64>,
+}
+
 /// A verified manager principal supplies these exact caller-intent bytes.
 /// Current launch-profile resolution is intentionally absent from lookup.
 #[derive(Clone, Debug)]

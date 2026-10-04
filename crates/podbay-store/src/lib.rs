@@ -19,8 +19,9 @@ pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
-    AuthoritySnapshot, CommandRequest, CommittedEvent, EffectClaim, EffectObservation, EffectState,
-    EventCursor, EventReference, HostAcceptanceProof, HostObservedPriorCheckpoint,
+    AuthoritySnapshot, CommandInspection, CommandLookupSelector, CommandRequest, CommittedEvent,
+    EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
+    HostObservedPriorCheckpoint,
     LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding, LaunchLookupRequest,
     LaunchPortResult, ManagerCredentialClaim, ObservedStage, QuarantinedSourceEvent, Receipt,
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
