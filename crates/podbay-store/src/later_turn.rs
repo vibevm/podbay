@@ -300,6 +300,58 @@ fn binding_digest(
 }
 
 impl PodBayStore {
+    /// Principal/scope/key lookup before the current writer exists. Compare
+    /// only immutable wire input; return the old native anchor from readback.
+    /// The host authenticates `principal` and `scope_id` before calling.
+    pub fn lookup_later_codex_send_for_envelope(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope_id: &ScopeId,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<LaterCodexSendRecord>, StoreError> {
+        valid_id(&envelope.key)?;
+        let Target::Session { session_id } = &envelope.target else {
+            return Err(StoreError::InvalidInput(
+                "later turn requires Session target",
+            ));
+        };
+        let session = SessionId::try_from(session_id.as_str())
+            .map_err(|_| StoreError::InvalidInput("later turn Session ID is invalid"))?;
+        let text = first_text(envelope, &session)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM commands WHERE principal=?1 AND namespace=?2
+             AND command_key=?3 AND scope_id=?4 AND target_id=?5",
+                params![
+                    principal.as_str(),
+                    NAMESPACE,
+                    envelope.key,
+                    scope_id.as_str(),
+                    session.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rowid) = rowid else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let record = read_later_record(&transaction, rowid)?;
+        if record.wire_payload_digest != envelope.payload_digest
+            || record.prompt_text != text
+            || record.deadline_at.as_deref() != envelope.deadline_at.as_deref()
+        {
+            return Err(StoreError::Conflict(
+                "later turn key changed canonical payload",
+            ));
+        }
+        transaction.commit()?;
+        Ok(Some(record))
+    }
+
     /// Authenticated-principal lookup before today's mutable grant and writer
     /// fences. A miss grants nothing. The returned prompt is protected input.
     pub fn lookup_later_codex_send_by_key(

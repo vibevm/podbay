@@ -459,6 +459,28 @@ pub(crate) fn check_host_accepted_launch(
 }
 
 impl PodBayStore {
+    /// Historical claimed bootstrap lineage for the one Session. A later
+    /// manager may have a different current writer lease after rebind; this
+    /// read does not treat the old lease or old provider result as current.
+    pub fn claimed_bootstrap_lineage_for_session(
+        &mut self,
+        scope_id: &ScopeId,
+        session_id: &SessionId,
+    ) -> Result<BootstrapSendRecord, StoreError> {
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction.query_row(
+            "SELECT command_rowid FROM codex_bootstrap_sends
+             WHERE scope_id=?1 AND session_id=?2",
+            params![scope_id.as_str(), session_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        let record = read_bootstrap_record(&transaction, rowid.ok_or(StoreError::NotFound)?)?;
+        if record.scope_id() != scope_id || record.native_target().session_id != *session_id
+            || record.effect_state() != EffectState::ClaimedUncertain
+        { return Err(StoreError::Conflict("bootstrap lineage is not claimed in this Session")); }
+        transaction.commit()?;
+        Ok(record)
+    }
+
     /// Resolve a claimed first-send command for its authenticated principal.
     /// This only supplies a selector for a separate, read-only pod inspection;
     /// it does not attest a live pod or authorize native input. Other command
