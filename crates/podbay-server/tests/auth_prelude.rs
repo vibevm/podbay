@@ -14,15 +14,15 @@ use podbay_core::{ActorId, PodId, Role, ScopeId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, CredentialGeneration, DurableAuthority,
-    HostDispatchPort, HostError, PodIncarnation, PodRegistration, PortDispatchError,
-    PortDispatchOutcome,
+    DurableAuthorityError, HostDispatchPort, HostError, PodIncarnation, PodRegistration,
+    PortDispatchError, PortDispatchOutcome,
 };
 use podbay_server::{
     AUTH_PRELUDE_PROTOCOL, LinuxAcceptedPeerEvidence, LinuxAuthPreludeError,
     LinuxAuthPreludeLimits, authenticate_accepted_linux_stream,
     authenticate_accepted_linux_stream_with_limits,
 };
-use podbay_store::PodBayStore;
+use podbay_store::{PodBayStore, StoreError};
 use serde_json::json;
 
 struct FixtureDir {
@@ -257,7 +257,7 @@ fn wrong_and_replayed_signatures_are_refused_with_new_challenges() {
 }
 
 #[test]
-fn verifier_rotation_fences_returned_transport_without_mutable_authority() {
+fn generic_owner_generation_change_refuses_without_invalidating_authenticated_transport() {
     let (server, client) = UnixStream::pair().unwrap();
     let observed = LinuxAcceptedPeerEvidence::from_accepted(&server).unwrap();
     let signer = KeyPair::from_seed(Seed::new([7; 32]));
@@ -269,26 +269,26 @@ fn verifier_rotation_fences_returned_transport_without_mutable_authority() {
     worker.join().unwrap();
     assert!(authenticated.verified_peer().is_ok());
 
-    authority
-        .advance_credential_generation_from_trusted_policy(
+    assert!(matches!(
+        authority.advance_credential_generation_from_trusted_policy(
             &actor,
             generation,
             CredentialGeneration::new(2).unwrap(),
-        )
-        .unwrap();
-    let next_record = authority.recorded_snapshot().actors[0].clone();
-    let next = KeyPair::from_seed(Seed::new([10; 32]));
+        ),
+        Err(DurableAuthorityError::Store(StoreError::Conflict(
+            "owner actor replacement requires atomic rotation"
+        )))
+    ));
+    assert!(authenticated.verified_peer().is_ok());
     let mut store = PodBayStore::open(&fixture.database).unwrap();
     let snapshot = store.authority_snapshot().unwrap();
-    store
-        .register_actor_verifier_from_trusted_host(
-            snapshot.owner_epoch,
-            snapshot.revision,
-            &next_record,
-            *next.pk,
-        )
-        .unwrap();
-    assert!(authenticated.verified_peer().is_err());
+    assert_eq!(snapshot.actors[0].credential_generation, generation.get());
+    assert_eq!(
+        store
+            .current_actor_verifier(snapshot.owner_epoch, snapshot.revision, &snapshot.actors[0],)
+            .unwrap(),
+        *signer.pk,
+    );
 }
 
 #[test]
