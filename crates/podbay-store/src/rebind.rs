@@ -12,6 +12,7 @@ use rusqlite::{
 
 use crate::model::{HostObservedPriorCheckpoint, StoreError};
 use crate::store::PodBayStore;
+use crate::supersession::recovered_abandoned_rowid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableRebindPhase {
@@ -249,13 +250,17 @@ impl PodBayStore {
         }
         verify_current_fences_with_mode(&transaction, proposal, &lineage, true)?;
         verify_current_manager_destination(&transaction, proposal, &lineage)?;
+        let superseded_rowid = recovered_abandoned_rowid(
+            &transaction, proposal, observed, &lineage,
+        )?.unwrap_or(-1);
         let unfinished: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM manager_rebinds WHERE scope_id=?1 AND pod_id=?2
-               AND pod_incarnation=?3 AND phase!='activated'",
+               AND pod_incarnation=?3 AND phase!='activated' AND rebind_rowid!=?4",
             params![
                 proposal.identity.scope_id.as_str(),
                 proposal.identity.pod_id.as_str(),
-                sqlite_counter(proposal.identity.incarnation.get())?
+                sqlite_counter(proposal.identity.incarnation.get())?,
+                superseded_rowid,
             ],
             |row| row.get(0),
         )?;
@@ -266,11 +271,13 @@ impl PodBayStore {
             .query_row(
                 "SELECT next_owner_epoch,next_credential_epoch FROM manager_rebinds
              WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3 AND phase='activated'
+               AND rebind_rowid!=?4
              ORDER BY next_owner_epoch DESC LIMIT 1",
                 params![
                     proposal.identity.scope_id.as_str(),
                     proposal.identity.pod_id.as_str(),
-                    sqlite_counter(proposal.identity.incarnation.get())?
+                    sqlite_counter(proposal.identity.incarnation.get())?,
+                    superseded_rowid,
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -502,7 +509,7 @@ fn decode_phase(value: &str) -> Result<DurableRebindPhase, StoreError> {
     }
 }
 
-fn sqlite_counter(value: u64) -> Result<i64, StoreError> {
+pub(crate) fn sqlite_counter(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value)
         .map_err(|_| StoreError::InvalidInput("rebind counter exceeds SQLite range"))
 }
@@ -672,7 +679,7 @@ fn verify_current_manager_destination(
     Ok(())
 }
 
-fn load_by_key(
+pub(crate) fn load_by_key(
     transaction: &Transaction<'_>,
     proposal: &RebindProposal,
 ) -> Result<Option<(i64, DurableRebindReceipt)>, StoreError> {
@@ -736,7 +743,7 @@ fn read_prior_observation(
         .map_err(StoreError::from)
 }
 
-fn verify_stored(
+pub(crate) fn verify_stored(
     transaction: &Transaction<'_>,
     rowid: i64,
     proposal: &RebindProposal,

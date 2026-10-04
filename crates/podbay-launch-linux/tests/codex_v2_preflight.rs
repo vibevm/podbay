@@ -542,7 +542,7 @@ fn setup_v3_wire_port(
     ).unwrap();
     let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
     PodBayStore::open_existing_read_only(&fixture.database)
-        .expect("native V3 fixture must start on a fresh v20 store");
+        .expect("native V3 fixture must start on a fresh v21 store");
     let actor = ActorId::try_from("actor.codex.preflight").unwrap();
     let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
         1000, 4242, 777, "/user.slice/preflight.scope",

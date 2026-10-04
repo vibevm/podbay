@@ -11,6 +11,7 @@ mod model;
 mod peer_witness;
 mod rebind;
 mod store;
+mod supersession;
 mod writer_lease;
 
 pub use authority::SqliteActorVerifierWitness;
@@ -43,4 +44,5 @@ pub use rebind::{
     DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection,
     SqlitePriorObservedPendingLedger, SqliteRebindLedger,
 };
+pub use supersession::{SqliteSupersessionLedger, SupersessionReceipt, SupersessionStage};
 pub use store::PodBayStore;

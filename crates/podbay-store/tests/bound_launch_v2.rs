@@ -1997,7 +1997,7 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
 }
 
 #[test]
@@ -2045,7 +2045,7 @@ fn v19_with_historical_v2_refuses_default_migration_without_changing_database() 
 }
 
 #[test]
-fn v19_without_launch_state_upgrades_to_v20_with_empty_policy_rows() {
+fn v19_without_launch_state_upgrades_to_v21_with_empty_policy_and_recovery_rows() {
     let fixture = Fixture::new();
     drop(fixture.open());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
@@ -2063,7 +2063,7 @@ fn v19_without_launch_state_upgrades_to_v20_with_empty_policy_rows() {
     let rows: i64 = connection.query_row(
         "SELECT COUNT(*) FROM launch_policy_fences", [], |row| row.get(0),
     ).unwrap();
-    assert_eq!((version, rows), (20, 0));
+    assert_eq!((version, rows), (21, 0));
 }
 
 #[test]

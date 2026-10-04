@@ -15,7 +15,7 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 const MAX_BYTES: usize = 1_048_576;
 // A V2 launch gains no policy assertion on migration. Only a future V3
 // atomic admission may insert this row beside its immutable launch binding.
@@ -25,6 +25,69 @@ const LAUNCH_POLICY_FENCES_V20: &str = "CREATE TABLE launch_policy_fences (
   policy_fence_epoch INTEGER NOT NULL CHECK(policy_fence_epoch>=1),
   admission_authority_revision INTEGER NOT NULL CHECK(admission_authority_revision>=1)
 ) STRICT";
+// Recovery attempts are append-only identities. A later manager appends a
+// successor instead of deleting or relabelling an abandoned rebind row.
+// Migration creates no supersession evidence for historical rebinds.
+const REBIND_SUPERSESSION_ATTEMPTS_V21: &str = "CREATE TABLE rebind_supersession_attempts (
+  supersession_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  abandoned_rebind_rowid INTEGER NOT NULL REFERENCES manager_rebinds(rebind_rowid),
+  abandoned_request_digest TEXT NOT NULL CHECK(length(abandoned_request_digest)=64
+    AND abandoned_request_digest NOT GLOB '*[^0-9a-f]*'),
+  abandoned_phase TEXT NOT NULL CHECK(abandoned_phase IN
+    ('pending','pod_acknowledged','activated')),
+  abandoned_checkpoint_ref TEXT,
+  prior_active_checkpoint_digest TEXT NOT NULL CHECK(length(prior_active_checkpoint_digest)=64
+    AND prior_active_checkpoint_digest NOT GLOB '*[^0-9a-f]*'),
+  observed_phase TEXT NOT NULL CHECK(observed_phase IN
+    ('active_prior','pending_store','pending_pod')),
+  observed_checkpoint_digest TEXT NOT NULL CHECK(length(observed_checkpoint_digest)=64
+    AND observed_checkpoint_digest NOT GLOB '*[^0-9a-f]*'),
+  supervisor_process_id TEXT NOT NULL CHECK(length(supervisor_process_id) BETWEEN 1 AND 256),
+  supervisor_birth_identity TEXT NOT NULL CHECK(length(supervisor_birth_identity) BETWEEN 1 AND 256),
+  child_process_id TEXT NOT NULL CHECK(length(child_process_id) BETWEEN 1 AND 256),
+  child_birth_identity TEXT NOT NULL CHECK(length(child_birth_identity) BETWEEN 1 AND 256),
+  boot_identity TEXT NOT NULL CHECK(length(boot_identity) BETWEEN 1 AND 256),
+  unit_name TEXT NOT NULL CHECK(length(unit_name) BETWEEN 1 AND 256),
+  cgroup_path TEXT NOT NULL CHECK(length(cgroup_path) BETWEEN 1 AND 4096),
+  recovering_owner_epoch INTEGER NOT NULL CHECK(recovering_owner_epoch>=1),
+  recovering_credential_epoch INTEGER NOT NULL CHECK(recovering_credential_epoch>=1),
+  recovering_os_identity TEXT NOT NULL CHECK(length(recovering_os_identity) BETWEEN 1 AND 256),
+  recovering_process_id TEXT NOT NULL CHECK(length(recovering_process_id) BETWEEN 1 AND 256),
+  recovering_boot_identity TEXT NOT NULL CHECK(length(recovering_boot_identity) BETWEEN 1 AND 256),
+  recovering_birth_identity TEXT NOT NULL CHECK(length(recovering_birth_identity) BETWEEN 1 AND 256),
+  recovering_containment TEXT NOT NULL CHECK(length(recovering_containment) BETWEEN 1 AND 4096),
+  command_key TEXT NOT NULL CHECK(length(command_key)>0),
+  request_digest TEXT NOT NULL CHECK(length(request_digest)=64
+    AND request_digest NOT GLOB '*[^0-9a-f]*'),
+  intent_bytes BLOB NOT NULL CHECK(length(intent_bytes) BETWEEN 64 AND 65536),
+  predecessor_rowid INTEGER REFERENCES rebind_supersession_attempts(supersession_rowid),
+  resource_count INTEGER NOT NULL CHECK(resource_count BETWEEN 1 AND 64),
+  phase TEXT NOT NULL CHECK(phase IN ('planned','pod_checkpointed','replaced')),
+  recovery_checkpoint_digest TEXT,
+  CHECK((phase='planned' AND recovery_checkpoint_digest IS NULL)
+    OR (phase='pod_checkpointed' AND length(recovery_checkpoint_digest)=64
+      AND recovery_checkpoint_digest NOT GLOB '*[^0-9a-f]*')
+    OR (phase='replaced' AND (recovery_checkpoint_digest IS NULL
+      OR (length(recovery_checkpoint_digest)=64
+        AND recovery_checkpoint_digest NOT GLOB '*[^0-9a-f]*')))),
+  UNIQUE(scope_id,pod_id,pod_incarnation,command_key),
+  UNIQUE(abandoned_rebind_rowid,recovering_owner_epoch),
+  UNIQUE(predecessor_rowid)
+) STRICT";
+const REBIND_SUPERSESSION_RESOURCES_V21: &str = "CREATE TABLE rebind_supersession_resources (
+  supersession_rowid INTEGER NOT NULL REFERENCES rebind_supersession_attempts(supersession_rowid),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  abandoned_input_epoch INTEGER NOT NULL CHECK(abandoned_input_epoch>=1),
+  recovering_input_epoch INTEGER NOT NULL CHECK(recovering_input_epoch>abandoned_input_epoch),
+  PRIMARY KEY(supersession_rowid,resource_id)
+) STRICT";
+const REBIND_SUPERSESSION_LATEST_INDEX_V21: &str = "CREATE INDEX rebind_supersession_latest_v21
+  ON rebind_supersession_attempts(abandoned_rebind_rowid,supersession_rowid DESC)";
 const CURRENT_SCOPE_SESSIONS_INDEX_V19: &str = "CREATE INDEX runtime_sessions_open_scope_v19
   ON runtime_sessions(scope_id,session_id) WHERE state='open'";
 const CURRENT_SCOPE_RESOURCES_INDEX_V19: &str = "CREATE INDEX authority_resources_pod_v19
@@ -316,6 +379,7 @@ impl PodBayStore {
         verify_owner_rotation_schema(&transaction)?;
         verify_current_scope_schema(&transaction)?;
         verify_policy_fence_schema(&transaction)?;
+        verify_supersession_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -339,10 +403,10 @@ impl PodBayStore {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let before_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        // A v19 pod may still be running against this file. Delay WAL mode
-        // changes until after the v19 launch-state gate has passed under the
+        // An older pod may still be running against this file. Delay WAL mode
+        // changes until after the launch-state gate has passed under the
         // same IMMEDIATE transaction as migration.
-        if before_version == 19 {
+        if matches!(before_version, 19 | 20) {
             connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         } else {
             connection.execute_batch(
@@ -354,8 +418,11 @@ impl PodBayStore {
         if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        if version == 19 {
+        if matches!(version, 19 | 20) {
             verify_runtime_schema(&transaction)?;
+            if version == 20 {
+                verify_policy_fence_schema(&transaction)?;
+            }
             let occupied: i64 = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM launch_bindings LIMIT 1)
                      OR EXISTS(SELECT 1 FROM launch_slots LIMIT 1)
@@ -368,7 +435,11 @@ impl PodBayStore {
             )?;
             if occupied != 0 {
                 return Err(StoreError::Conflict(
-                    "v19 launch state requires attested quiescence before v20 migration",
+                    if version == 19 {
+                        "v19 launch state requires attested quiescence before v20 migration"
+                    } else {
+                        "v20 launch state requires attested quiescence before v21 migration"
+                    },
                 ));
             }
         }
@@ -876,6 +947,44 @@ impl PodBayStore {
                 }
             }
         }
+        if version < 21 {
+            verify_rebind_schema(&transaction)?;
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('rebind_supersession_attempts','rebind_supersession_resources',
+                  'rebind_supersession_latest_v21')",
+                [],
+                |row| row.get(0),
+            )?;
+            match occupied {
+                0 => {
+                    for sql in [
+                        REBIND_SUPERSESSION_ATTEMPTS_V21,
+                        REBIND_SUPERSESSION_RESOURCES_V21,
+                        REBIND_SUPERSESSION_LATEST_INDEX_V21,
+                    ] {
+                        transaction.execute_batch(&format!("{sql};"))?;
+                    }
+                }
+                3 => {
+                    verify_supersession_schema(&transaction)?;
+                    let rows: i64 = transaction.query_row(
+                        "SELECT (SELECT COUNT(*) FROM rebind_supersession_attempts)
+                              + (SELECT COUNT(*) FROM rebind_supersession_resources)",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if rows != 0 {
+                        return Err(StoreError::Conflict(
+                            "v21 supersession rows exist under an older schema version",
+                        ));
+                    }
+                }
+                _ => return Err(StoreError::Conflict(
+                    "v21 supersession schema name already exists",
+                )),
+            }
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
@@ -888,9 +997,10 @@ impl PodBayStore {
         verify_owner_rotation_schema(&transaction)?;
         verify_current_scope_schema(&transaction)?;
         verify_policy_fence_schema(&transaction)?;
+        verify_supersession_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
-        if before_version == 19 {
+        if matches!(before_version, 19 | 20) {
             connection.execute_batch("PRAGMA journal_mode=WAL;")?;
         }
         let store_lineage: String = connection.query_row(
@@ -2709,6 +2819,24 @@ fn verify_policy_fence_schema(transaction: &rusqlite::Transaction<'_>) -> Result
         return Err(StoreError::Conflict(
             "v20 policy fence epoch is absent or invalid",
         ));
+    }
+    Ok(())
+}
+
+fn verify_supersession_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    for (kind, name, expected) in [
+        ("table", "rebind_supersession_attempts", REBIND_SUPERSESSION_ATTEMPTS_V21),
+        ("table", "rebind_supersession_resources", REBIND_SUPERSESSION_RESOURCES_V21),
+        ("index", "rebind_supersession_latest_v21", REBIND_SUPERSESSION_LATEST_INDEX_V21),
+    ] {
+        let actual: Option<String> = transaction.query_row(
+            "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![kind, name],
+            |row| row.get(0),
+        ).optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v21 supersession schema differs"));
+        }
     }
     Ok(())
 }

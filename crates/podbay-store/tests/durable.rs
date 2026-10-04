@@ -91,7 +91,10 @@ fn remove_v8_schema(connection: &rusqlite::Connection) {
     // user_version attached to the new tables.
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends;
+            "DROP INDEX rebind_supersession_latest_v21;
+             DROP TABLE rebind_supersession_resources;
+             DROP TABLE rebind_supersession_attempts;
+             DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
@@ -416,7 +419,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_twenty_has_empty_runtime_rebind_manager_and_verifier_tables() {
+fn fresh_schema_twenty_one_has_empty_runtime_rebind_manager_and_verifier_tables() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -424,7 +427,7 @@ fn fresh_schema_twenty_has_empty_runtime_rebind_manager_and_verifier_tables() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     for table in [
         "runtime_sessions",
         "runtime_runs",
@@ -435,6 +438,8 @@ fn fresh_schema_twenty_has_empty_runtime_rebind_manager_and_verifier_tables() {
         "launch_resources",
         "manager_rebinds",
         "manager_rebind_resources",
+        "rebind_supersession_attempts",
+        "rebind_supersession_resources",
         "manager_credential_claims",
         "manager_peer_bindings",
         "manager_rebind_prior_observations",
@@ -468,7 +473,10 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends;
+            "DROP INDEX rebind_supersession_latest_v21;
+             DROP TABLE rebind_supersession_resources;
+             DROP TABLE rebind_supersession_attempts;
+             DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
@@ -502,7 +510,7 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     for table in [
         "runtime_sessions",
         "runtime_runs",

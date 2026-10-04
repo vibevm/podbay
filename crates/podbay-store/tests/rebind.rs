@@ -5,12 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
     AttemptId, AttestedPeer, CommandKey, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch,
-    PodFenceIdentity, PodId, RebindLedger, RebindPhase, RebindProposal, RequestDigest, ResourceId,
-    ScopeId, StoreLineageId,
+    PendingPodProcessEvidence, PendingRebindSupersession, PodFenceIdentity, PodId, RebindLedger,
+    RebindPhase, RebindProposal, RequestDigest, ResourceId, ScopeId, StoreLineageId,
+    SupersessionLedger,
 };
 use podbay_store::{
     DurableRebindPhase, HostObservedPriorCheckpoint, PodBayStore, SqlitePriorObservedPendingLedger,
-    SqliteRebindLedger, StoreError,
+    SqliteRebindLedger, SqliteSupersessionLedger, StoreError, SupersessionStage,
 };
 
 struct Fixture {
@@ -110,6 +111,7 @@ const OLD_RESOURCES: &str = "CREATE TABLE manager_rebind_resources (
 ) STRICT";
 
 fn restore_v11_rebind_checks(connection: &rusqlite::Connection) {
+    remove_post_v13_schema(connection);
     connection
         .execute_batch("DROP TABLE manager_rebind_prior_observations;")
         .unwrap();
@@ -146,6 +148,25 @@ fn restore_v11_rebind_checks(connection: &rusqlite::Connection) {
          PRAGMA foreign_keys=ON;",
         )
         .unwrap();
+}
+
+fn remove_post_v13_schema(connection: &rusqlite::Connection) {
+    // Synthetic old-version fixtures must remove newer tables before the
+    // historical manager_rebinds rename can rewrite their foreign keys.
+    connection.execute_batch(
+        "DROP INDEX rebind_supersession_latest_v21;
+         DROP TABLE rebind_supersession_resources;
+         DROP TABLE rebind_supersession_attempts;
+         DROP TABLE launch_policy_fences;
+         DELETE FROM metadata WHERE key='policy_fence_epoch';
+         DROP INDEX runtime_sessions_open_scope_v19;
+         DROP INDEX authority_resources_pod_v19;
+         DROP TABLE codex_bootstrap_sends;
+         DROP TABLE native_writer_leases;
+         DROP TABLE run_child_budgets;
+         DROP TABLE owner_actor_rotations;
+         DROP TABLE actor_verifiers;",
+    ).unwrap();
 }
 
 fn table_rows(connection: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
@@ -287,6 +308,217 @@ fn skipped_rebind_after_live_pod_inspection(
     (proposal, observed)
 }
 
+fn pending_recovery_intent(
+    store: &mut PodBayStore,
+    proposal: RebindProposal,
+    observed: &HostObservedPriorCheckpoint,
+    recovering_owner: u64,
+    command_key: &str,
+    digest: char,
+) -> PendingRebindSupersession {
+    let recovering_manager = AttestedPeer::from_port(
+        "linux.uid.1000",
+        &format!("pid.{}", 900 + recovering_owner),
+        "boot.fixture",
+        &format!("birth.{}", 900 + recovering_owner),
+        "manager.unit",
+    ).unwrap();
+    let claim = store.current_manager_credential_claim(recovering_owner).unwrap();
+    store.register_current_manager_peer(&claim, &recovering_manager).unwrap();
+    let recovering_input_epochs = proposal.next_input_epochs.iter()
+        .map(|(id, _)| (id.clone(), input(recovering_owner)))
+        .collect();
+    PendingRebindSupersession {
+        abandoned: proposal,
+        pending_phase: RebindPhase::PendingStore,
+        pending_checkpoint_digest: RequestDigest::parse(&"d".repeat(64)).unwrap(),
+        pending_process: PendingPodProcessEvidence {
+            supervisor_process_id: observed.supervisor_pid.to_string(),
+            supervisor_birth_identity: observed.supervisor_start_ticks.to_string(),
+            child_process_id: "988".into(),
+            child_birth_identity: "124".into(),
+            boot_identity: observed.boot_id.clone(),
+            containment_identity: observed.cgroup_path.clone(),
+        },
+        recovering_owner_epoch: owner(recovering_owner),
+        recovering_credential_epoch: credential(recovering_owner),
+        recovering_input_epochs,
+        recovering_manager,
+        command_key: CommandKey::try_from(command_key).unwrap(),
+        digest: RequestDigest::parse(&digest.to_string().repeat(64)).unwrap(),
+    }
+}
+
+#[test]
+fn v21_pending_supersession_plans_once_and_pod_checkpoint_cas_is_exact() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store.prepare_manager_rebind_from_host_observation(&proposal, &observed).unwrap();
+    store.begin_authority_replay(4, 5).unwrap();
+    let intent = pending_recovery_intent(
+        &mut store, proposal.clone(), &observed, 5,
+        "supersede.pending.c", 'e',
+    );
+    let first = store.plan_pending_rebind_supersession(&intent, None).unwrap();
+    assert_eq!(first.stage, SupersessionStage::Planned);
+    assert_eq!(store.plan_pending_rebind_supersession(&intent, None).unwrap(), first);
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 1);
+    assert_eq!(fixture.count("rebind_supersession_resources"), 2);
+    let witness = SqliteSupersessionLedger::for_pod(&fixture.database, proposal.identity.clone());
+    assert!(witness.supersedes(&intent));
+    let missing = fixture.directory.join("missing-supersession.sqlite");
+    assert!(!SqliteSupersessionLedger::for_pod(&missing, proposal.identity.clone())
+        .supersedes(&intent));
+    assert!(!missing.exists());
+    let corrupt = fixture.directory.join("corrupt-supersession.sqlite");
+    std::fs::write(&corrupt, b"not sqlite").unwrap();
+    assert!(!SqliteSupersessionLedger::for_pod(&corrupt, proposal.identity.clone())
+        .supersedes(&intent));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute(
+        "UPDATE rebind_supersession_attempts SET child_birth_identity='999'
+         WHERE supersession_rowid=?1", [first.rowid],
+    ).unwrap();
+    assert!(!witness.supersedes(&intent));
+    assert!(matches!(store.plan_pending_rebind_supersession(&intent, None),
+        Err(StoreError::Conflict("supersession scalar proof differs"))));
+    connection.execute(
+        "UPDATE rebind_supersession_attempts SET child_birth_identity=?1
+         WHERE supersession_rowid=?2",
+        rusqlite::params![intent.pending_process.child_birth_identity.as_str(),first.rowid],
+    ).unwrap();
+    assert!(witness.supersedes(&intent));
+    drop(connection);
+    let mut changed = intent.clone();
+    changed.digest = RequestDigest::parse(&"f".repeat(64)).unwrap();
+    assert!(matches!(store.plan_pending_rebind_supersession(&changed, None),
+        Err(StoreError::Conflict("supersession key changed exact intent"))));
+    assert!(!witness.supersedes(&changed));
+    let acknowledged = store.acknowledge_pending_rebind_supersession(
+        &intent, &"a".repeat(64),
+    ).unwrap();
+    assert_eq!(acknowledged.stage, SupersessionStage::PodCheckpointed);
+    assert_eq!(acknowledged.recovery_checkpoint_digest.as_deref(), Some("a".repeat(64).as_str()));
+    assert_eq!(store.acknowledge_pending_rebind_supersession(
+        &intent, &"a".repeat(64),
+    ).unwrap(), acknowledged);
+    assert!(matches!(store.acknowledge_pending_rebind_supersession(
+        &intent, &"b".repeat(64),
+    ), Err(StoreError::Conflict("recovery checkpoint digest changed"))));
+    assert!(!witness.supersedes(&intent));
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+}
+
+#[test]
+fn v21_later_manager_supersedes_only_latest_planned_attempt() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store.prepare_manager_rebind_from_host_observation(&proposal, &observed).unwrap();
+    store.begin_authority_replay(4, 5).unwrap();
+    let c = pending_recovery_intent(&mut store, proposal.clone(), &observed, 5,
+        "supersede.pending.c", 'e');
+    let c_receipt = store.plan_pending_rebind_supersession(&c, None).unwrap();
+    store.begin_authority_replay(5, 6).unwrap();
+    let d = pending_recovery_intent(&mut store, proposal.clone(), &observed, 6,
+        "supersede.pending.d", 'f');
+    assert!(matches!(store.plan_pending_rebind_supersession(&d, None),
+        Err(StoreError::StaleEpoch)));
+    let d_receipt = store.plan_pending_rebind_supersession(&d, Some(c_receipt.rowid)).unwrap();
+    assert!(d_receipt.rowid > c_receipt.rowid);
+    let witness = SqliteSupersessionLedger::for_pod(&fixture.database, proposal.identity.clone());
+    assert!(!witness.supersedes(&c));
+    assert!(witness.supersedes(&d));
+    assert!(matches!(store.acknowledge_pending_rebind_supersession(&c, &"a".repeat(64)),
+        Err(StoreError::StaleEpoch)));
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 2);
+}
+
+#[test]
+fn v21_supersession_rejects_foreign_peer_stale_vector_and_rolls_back_fault() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let (proposal, observed) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+    store.prepare_manager_rebind_from_host_observation(&proposal, &observed).unwrap();
+    store.begin_authority_replay(4, 5).unwrap();
+    let intent = pending_recovery_intent(&mut store, proposal, &observed, 5,
+        "supersede.pending.fault", 'e');
+    let mut foreign = intent.clone();
+    foreign.recovering_manager = AttestedPeer::from_port(
+        "linux.uid.1000", "pid.999", "boot.fixture", "birth.999", "manager.unit",
+    ).unwrap();
+    assert!(matches!(store.plan_pending_rebind_supersession(&foreign, None),
+        Err(StoreError::StaleEpoch)));
+    let mut stale = intent.clone();
+    stale.recovering_input_epochs.insert(resource("resource.pty"), input(4));
+    assert!(matches!(store.plan_pending_rebind_supersession(&stale, None),
+        Err(StoreError::InvalidInput(_))));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "CREATE TRIGGER reject_supersession_child
+         BEFORE INSERT ON rebind_supersession_resources
+         BEGIN SELECT RAISE(ABORT,'fixture recovery rollback'); END;",
+    ).unwrap();
+    drop(connection);
+    assert!(matches!(store.plan_pending_rebind_supersession(&intent, None),
+        Err(StoreError::Storage(_))));
+    assert_eq!(fixture.count("rebind_supersession_attempts"), 0);
+    assert_eq!(fixture.count("rebind_supersession_resources"), 0);
+    assert_eq!(fixture.count("manager_rebinds"), 1);
+}
+
+#[test]
+fn v21_only_checkpointed_exact_recovery_excludes_abandoned_pending_or_activated_row() {
+    for activated_store_only in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let (abandoned, prior) = skipped_rebind_after_live_pod_inspection(&mut store, &fixture);
+        store.prepare_manager_rebind_from_host_observation(&abandoned, &prior).unwrap();
+        if activated_store_only {
+            store.acknowledge_prior_observed_pod_rebind(&abandoned, &"d".repeat(64)).unwrap();
+            store.activate_prior_observed_manager_rebind(&abandoned, &"d".repeat(64)).unwrap();
+        }
+        store.begin_authority_replay(4, 5).unwrap();
+        let mut intent = pending_recovery_intent(&mut store, abandoned.clone(), &prior, 5,
+            "supersede.pending.c", 'e');
+        if activated_store_only {
+            intent.pending_phase = RebindPhase::PendingPod;
+        }
+        let mut recovered = prior.clone();
+        recovered.input_epochs = abandoned.next_input_epochs.clone();
+        recovered.checkpoint_digest = "a".repeat(64);
+        let mut next = abandoned.clone();
+        next.next_owner_epoch = owner(5);
+        next.next_credential_epoch = credential(5);
+        next.expected_input_epochs = abandoned.next_input_epochs.clone();
+        next.next_input_epochs = intent.recovering_input_epochs.clone();
+        next.next_manager = intent.recovering_manager.clone();
+        next.command_key = CommandKey::try_from("rebind.after.recovery").unwrap();
+        next.digest = RequestDigest::parse(&"b".repeat(64)).unwrap();
+        assert!(store.prepare_manager_rebind_from_host_observation(&next, &recovered).is_err());
+        let planned = store.plan_pending_rebind_supersession(&intent, None).unwrap();
+        assert_eq!(planned.stage, SupersessionStage::Planned);
+        assert!(store.prepare_manager_rebind_from_host_observation(&next, &recovered).is_err());
+        store.acknowledge_pending_rebind_supersession(&intent, &recovered.checkpoint_digest)
+            .unwrap();
+        let mut wrong = recovered.clone();
+        wrong.checkpoint_digest = "c".repeat(64);
+        assert!(store.prepare_manager_rebind_from_host_observation(&next, &wrong).is_err());
+        let accepted = store.prepare_manager_rebind_from_host_observation(&next, &recovered)
+            .unwrap();
+        assert_eq!(accepted.phase, DurableRebindPhase::Pending);
+        let original = store.lookup_prior_observed_rebind(&abandoned).unwrap().unwrap();
+        assert_eq!(original.receipt.phase, if activated_store_only {
+            DurableRebindPhase::Activated
+        } else {
+            DurableRebindPhase::Pending
+        });
+        assert_eq!(fixture.count("manager_rebinds"), 2);
+    }
+}
+
 #[test]
 fn staged_rebind_reopens_at_every_phase_without_new_launch_or_child() {
     let fixture = Fixture::new();
@@ -380,6 +612,7 @@ fn v9_v11_v12_to_v13_preserve_legacy_rows_without_prior_observation() {
             drop(store);
             let connection = rusqlite::Connection::open(&fixture.database).unwrap();
             if old_version == 12 {
+                remove_post_v13_schema(&connection);
                 connection
                     .execute_batch("DROP TABLE manager_rebind_prior_observations;")
                     .unwrap();
@@ -413,7 +646,7 @@ fn v9_v11_v12_to_v13_preserve_legacy_rows_without_prior_observation() {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 13);
+            assert_eq!(version, 21);
             let prior_count: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM manager_rebind_prior_observations",
@@ -843,6 +1076,7 @@ fn malformed_v13_prior_observation_schema_refuses_migration_atomically() {
     store.prepare_manager_rebind(&proposal).unwrap();
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_post_v13_schema(&connection);
     connection
         .execute_batch(
             "DROP TABLE manager_rebind_prior_observations;
@@ -1007,6 +1241,7 @@ fn v8_to_v9_migration_preserves_existing_launch_without_inventing_rebind() {
     let owner_before = store.owner_epoch().unwrap();
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    remove_post_v13_schema(&connection);
     connection
         .execute_batch(
             "DROP TABLE manager_rebind_prior_observations;
@@ -1117,7 +1352,7 @@ fn prior_pending_ledger_exact_proof_is_read_only_and_never_activates() {
 
     // Emulate a future acknowledged row without opening today's ACK API.
     connection.execute("UPDATE manager_rebinds SET phase='pod_acknowledged',pod_checkpoint_ref='checkpoint.test'", []).unwrap();
-    assert!(ledger.pending(&proposal));
+    assert!(!ledger.pending(&proposal));
     assert!(!ledger.activated(&proposal));
     connection
         .execute("UPDATE manager_rebinds SET phase='activated'", [])
