@@ -35,6 +35,7 @@ impl PodBayStore {
             owner_epoch,
             manager_credential_epoch,
             authority_revision,
+            true,
         )?;
         check_current_target(&transaction, &self.store_lineage, target)?;
         let prior = read_lease(&transaction, &target.resource_id)?.ok_or(StoreError::NotFound)?;
@@ -108,7 +109,7 @@ impl PodBayStore {
             };
         };
         let launch = read_bound_record(&transaction, *rowid)?;
-        if launch.format != BoundLaunchFormat::CodexV2
+        if !matches!(launch.format, BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3)
             || launch.scope_id != scope_id.as_str()
             || launch.session_id != session_id.as_str()
             || launch.resources.len() != 1
@@ -168,6 +169,7 @@ impl PodBayStore {
             request.expected_owner_epoch,
             request.expected_manager_credential_epoch,
             request.expected_authority_revision,
+            true,
         )?;
         check_current_target(&transaction, &self.store_lineage, &request.target)?;
         check_actor(
@@ -272,14 +274,15 @@ impl PodBayStore {
         if &lease.target != target {
             return Err(StoreError::StaleEpoch);
         }
+        let format = check_current_target(&transaction, &self.store_lineage, target)?;
         check_manager(
             &transaction,
             &self.store_lineage,
             lease.owner_epoch,
             lease.manager_credential_epoch,
             lease.authority_revision,
+            format != BoundLaunchFormat::CodexV3,
         )?;
-        check_current_target(&transaction, &self.store_lineage, target)?;
         check_actor(
             &transaction,
             &target.scope_id,
@@ -309,14 +312,15 @@ pub(crate) fn checked_native_writer_lease(
     authority_revision: u64,
     writer_epoch: u64,
 ) -> Result<NativeWriterLease, StoreError> {
+    let format = check_current_target(transaction, cached_lineage, target)?;
     check_manager(
         transaction,
         cached_lineage,
         owner_epoch,
         manager_credential_epoch,
         authority_revision,
+        format != BoundLaunchFormat::CodexV3,
     )?;
-    check_current_target(transaction, cached_lineage, target)?;
     check_actor(
         transaction,
         &target.scope_id,
@@ -329,7 +333,11 @@ pub(crate) fn checked_native_writer_lease(
         || lease.holder_credential_generation != holder_generation
         || lease.owner_epoch != owner_epoch
         || lease.manager_credential_epoch != manager_credential_epoch
-        || lease.authority_revision != authority_revision
+        || (if format == BoundLaunchFormat::CodexV3 {
+            lease.authority_revision > authority_revision
+        } else {
+            lease.authority_revision != authority_revision
+        })
         || lease.writer_epoch != writer_epoch
         || lease.expires_at_unix_seconds <= current_unix_seconds(transaction)?
     {
@@ -364,6 +372,7 @@ fn check_manager(
     owner_epoch: u64,
     credential_epoch: u64,
     authority_revision: u64,
+    exact_revision: bool,
 ) -> Result<(), StoreError> {
     let (lineage, owner, revision): (String, i64, i64) = transaction.query_row(
         "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),
@@ -385,7 +394,11 @@ fn check_manager(
         || credential_epoch == 0
         || authority_revision == 0
         || owner != sql_integer(owner_epoch)?
-        || revision != sql_integer(authority_revision)?
+        || (if exact_revision {
+            revision != sql_integer(authority_revision)?
+        } else {
+            revision < sql_integer(authority_revision)?
+        })
         || claim
             != Some((
                 lineage,
@@ -432,7 +445,7 @@ fn check_current_target(
     transaction: &Transaction<'_>,
     cached_lineage: &str,
     target: &NativeWriterTarget,
-) -> Result<(), StoreError> {
+) -> Result<BoundLaunchFormat, StoreError> {
     if target.store_lineage.as_str() != cached_lineage
         || target.pod_incarnation == 0
         || target.resource_epoch == 0
@@ -462,7 +475,7 @@ fn check_current_target(
         )
         .optional()?;
     let record = read_bound_record(transaction, rowid.ok_or(StoreError::NotFound)?)?;
-    if record.format != BoundLaunchFormat::CodexV2
+    if !matches!(record.format, BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3)
         || record.scope_id != target.scope_id.as_str()
         || record.session_id != target.session_id.as_str()
         || record.run_id != target.run_id.as_str()
@@ -474,7 +487,26 @@ fn check_current_target(
         || record.resources[0].kind != "structured_provider"
         || record.resources[0].epoch != target.resource_epoch
     {
-        return Err(StoreError::Conflict("native writer V2 binding differs"));
+        return Err(StoreError::Conflict("native writer Codex binding differs"));
+    }
+    if record.format == BoundLaunchFormat::CodexV3 {
+        let policy: Option<(String, i64, i64)> = transaction.query_row(
+            "SELECT store_lineage,policy_fence_epoch,admission_authority_revision
+             FROM launch_policy_fences WHERE command_rowid=?1",
+            [rowid.expect("record rowid was checked")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let (lineage, epoch, admission_revision) = policy.ok_or(StoreError::StaleEpoch)?;
+        let (current_epoch, current_revision): (i64, i64) = transaction.query_row(
+            "SELECT (SELECT value FROM metadata WHERE key='policy_fence_epoch'),
+                    (SELECT value FROM metadata WHERE key='authority_revision')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if lineage != cached_lineage || epoch < 1 || admission_revision < 1
+            || admission_revision > current_revision || epoch != current_epoch {
+            return Err(StoreError::StaleEpoch);
+        }
     }
     let session: Option<(String, String, Option<String>)> = transaction
         .query_row(
@@ -569,7 +601,7 @@ fn check_current_target(
     {
         return Err(StoreError::StaleEpoch);
     }
-    Ok(())
+    Ok(record.format)
 }
 
 fn lease_params(lease: &NativeWriterLease) -> Result<Vec<rusqlite::types::Value>, StoreError> {

@@ -600,6 +600,17 @@ impl PodBayStore {
             transaction.commit()?;
             return Ok(Admission::Duplicate(record.receipt));
         }
+        // The command's global revision remains an admission CAS for V3.
+        // An older V3 writer lease may survive additive topology, but it
+        // cannot supply or silently relax this new command revision.
+        let current_revision: i64 = transaction.query_row(
+            "SELECT value FROM metadata WHERE key='authority_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_revision != integer(request.expected_authority_revision)? {
+            return Err(StoreError::StaleEpoch);
+        }
         let guard = request
             .envelope
             .guard

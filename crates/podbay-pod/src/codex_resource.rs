@@ -33,8 +33,9 @@ use crate::native_events::{
 };
 use crate::segmented_native_events::SegmentedNativeEventSpool;
 use crate::manifest::{
-    BoundPeerManifest, CODEX_V2_CAPABILITY, LaunchDescriptor, PEER_BINDING_V2_PROTOCOL, PodError,
-    manifest_path, private_directory, unit_name,
+    BoundPeerManifest, CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY, LaunchDescriptor,
+    PEER_BINDING_V2_PROTOCOL, PEER_BINDING_V3_PROTOCOL, PodError, manifest_path,
+    private_directory, unit_name,
 };
 use crate::ports::DurableFiles;
 use crate::runtime::LinuxBackend;
@@ -61,9 +62,12 @@ impl ValidatedCodexResourceLaunch {
         pod_directory: &Path,
     ) -> Result<Self, PodError> {
         private_directory(pod_directory)?;
-        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY
-        {
-            return Err(PodError::Unsupported("Codex V2 peer binding is required"));
+        if !matches!(
+            (binding.protocol.as_str(), binding.capability.as_str()),
+            (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY)
+                | (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY)
+        ) {
+            return Err(PodError::Unsupported("Codex peer binding is required"));
         }
         binding.validate(launch, pod_directory)?;
         let descriptor = ImmutableLaunchDescriptorV2::decode_json(&binding.wire_descriptor)

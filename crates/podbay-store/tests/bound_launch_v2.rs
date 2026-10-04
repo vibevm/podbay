@@ -9,7 +9,8 @@ use podbay_core::{
     RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_store::{
-    Admission, AuthorityActorRecord, AuthorityMutation, BootstrapSendSelector,
+    Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation,
+    AuthorityRightRecord, BootstrapSendSelector,
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
     LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
@@ -476,6 +477,200 @@ fn codex_v2_root_coordinator_and_root_worker_commit_with_exact_snapshot_and_dupl
             .unwrap();
         assert_eq!(slots, 1);
     }
+}
+
+#[test]
+fn v3_policy_row_commits_with_binding_and_survives_additive_global_revision() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let policy_epoch = store.policy_fence_epoch().unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let record = match store
+        .admit_bound_root_launch_v3(
+            proposal.request("key.codex.v3", b"intent.codex.v3"),
+            policy_epoch,
+        )
+        .unwrap()
+    {
+        BoundLaunchAdmission::Committed(record) => record,
+        other => panic!("expected V3 policy-bound commit: {other:?}"),
+    };
+    assert_eq!(record.format, BoundLaunchFormat::CodexV3);
+    let first = store.current_launch_policy_fence(&record).unwrap();
+    assert!(matches!(
+        store.lookup_bound_root_v2_by_command_id(
+            &principal(),
+            &ScopeId::try_from(record.scope_id.as_str()).unwrap(),
+            &CommandId::try_from(record.receipt.command_id.as_str()).unwrap(),
+        ),
+        Err(StoreError::Conflict("indexed V2 root binding differs"))
+    ));
+    assert_eq!(
+        store.lookup_bound_root_v3_by_command_id(
+            &principal(),
+            &ScopeId::try_from(record.scope_id.as_str()).unwrap(),
+            &CommandId::try_from(record.receipt.command_id.as_str()).unwrap(),
+        ).unwrap(),
+        Some(record.clone())
+    );
+    assert_eq!(first.policy_fence_epoch, policy_epoch);
+    assert_eq!(first.admission_authority_revision, 1);
+    assert_eq!(first.current_authority_revision, 1);
+    assert_eq!(
+        store
+            .current_bound_pod_snapshot(&record.scope_id, &record.pod_id)
+            .unwrap()
+            .current_policy_fence(),
+        Some(&first)
+    );
+    let next_revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(writer_actor("actor.additive.policy")),
+        )
+        .unwrap();
+    assert_eq!(next_revision, 2);
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
+    let after = store.current_launch_policy_fence(&record).unwrap();
+    assert_eq!(
+        after.admission_authority_revision,
+        first.admission_authority_revision
+    );
+    assert_eq!(after.current_authority_revision, 2);
+    assert_eq!(
+        store
+            .current_bound_pod_snapshot(&record.scope_id, &record.pod_id)
+            .unwrap()
+            .current_policy_fence(),
+        Some(&after)
+    );
+    let next_revision = store
+        .apply_authority_mutation(
+            1,
+            next_revision,
+            AuthorityMutation::PutGrant(AuthorityGrantRecord {
+                grant_id: 1,
+                scope_id: "scope.launch".into(),
+                actor_id: "actor.additive.policy".into(),
+                credential_generation: 1,
+                mode: "controller".into(),
+                remaining_delegation_depth: 0,
+                rights: vec![AuthorityRightRecord {
+                    operation: "launch_pod".into(),
+                    target_kind: "scope".into(),
+                    target_id: "scope.launch".into(),
+                }],
+            }),
+        )
+        .unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
+    assert_eq!(
+        store.current_launch_policy_fence(&record)
+            .unwrap()
+            .current_authority_revision,
+        next_revision
+    );
+    let mut duplicate = proposal.request("key.codex.v3", b"intent.codex.v3");
+    duplicate.proposal = None;
+    assert_eq!(
+        store
+            .admit_bound_root_launch_v3(duplicate, policy_epoch)
+            .unwrap(),
+        BoundLaunchAdmission::Duplicate(record.clone())
+    );
+    let mut wrong_version = proposal.request("key.codex.v3", b"intent.codex.v3");
+    wrong_version.proposal = None;
+    assert!(matches!(
+        store.admit_bound_root_launch_v2(wrong_version),
+        Err(StoreError::Conflict(
+            "command key changed bound launch format"
+        ))
+    ));
+    store
+        .apply_authority_mutation(1, next_revision, AuthorityMutation::RevokeGrant(1))
+        .unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch + 1);
+    assert!(matches!(
+        store.current_launch_policy_fence(&record),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert!(matches!(
+        store.current_bound_pod_snapshot(&record.scope_id, &record.pod_id),
+        Err(StoreError::StaleEpoch)
+    ));
+}
+
+#[test]
+fn historical_v2_duplicate_cannot_acquire_v3_policy_row() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let record = match store
+        .admit_bound_root_launch_v2(
+            proposal.request("key.codex.v2.history", b"intent.codex.v2.history"),
+        )
+        .unwrap()
+    {
+        BoundLaunchAdmission::Committed(record) => record,
+        other => panic!("expected V2 commit: {other:?}"),
+    };
+    assert!(matches!(
+        store.current_launch_policy_fence(&record),
+        Err(StoreError::NotFound)
+    ));
+    let mut duplicate = proposal.request("key.codex.v2.history", b"intent.codex.v2.history");
+    duplicate.proposal = None;
+    assert!(matches!(
+        store.admit_bound_root_launch_v3(duplicate, store.policy_fence_epoch().unwrap(),),
+        Err(StoreError::Conflict(
+            "command key changed bound launch format"
+        ))
+    ));
+}
+
+#[test]
+fn v3_policy_insert_fault_rolls_back_command_binding_event_and_outbox() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_v3_policy BEFORE INSERT ON launch_policy_fences
+         BEGIN SELECT RAISE(ABORT,'fixture rejects V3 policy row'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    assert!(matches!(
+        store.admit_bound_root_launch_v3(
+            proposal.request("key.codex.v3.rollback", b"intent.codex.v3.rollback"),
+            store.policy_fence_epoch().unwrap(),
+        ),
+        Err(StoreError::Storage(_))
+    ));
+    assert!(
+        store
+            .scope_snapshot("scope.launch")
+            .unwrap()
+            .receipts
+            .is_empty()
+    );
+    assert_eq!(store.authority_snapshot().unwrap().revision, 0);
+    assert_eq!(store.policy_fence_epoch().unwrap(), 2);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let bound: i64 = connection
+        .query_row("SELECT COUNT(*) FROM launch_bindings", [], |row| row.get(0))
+        .unwrap();
+    let policy: i64 = connection
+        .query_row("SELECT COUNT(*) FROM launch_policy_fences", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((bound, policy), (0, 0));
 }
 
 #[test]
@@ -1028,6 +1223,13 @@ fn writer_actor(id: &str) -> AuthorityActorRecord {
 }
 
 fn admitted_writer_target(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget, u64) {
+    admitted_writer_target_for_format(fixture, false)
+}
+
+fn admitted_writer_target_for_format(
+    fixture: &Fixture,
+    v3: bool,
+) -> (PodBayStore, NativeWriterTarget, u64) {
     let mut store = fixture.open();
     let replay = store.begin_authority_replay(0, 1).unwrap();
     let revision = store
@@ -1051,10 +1253,13 @@ fn admitted_writer_target(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget
         .as_mut()
         .unwrap()
         .expected_authority_revision = revision;
-    assert!(matches!(
-        store.admit_bound_root_launch_v2(request).unwrap(),
-        BoundLaunchAdmission::Committed(_)
-    ));
+    let admission = if v3 {
+        let epoch = store.policy_fence_epoch().unwrap();
+        store.admit_bound_root_launch_v3(request, epoch).unwrap()
+    } else {
+        store.admit_bound_root_launch_v2(request).unwrap()
+    };
+    assert!(matches!(admission, BoundLaunchAdmission::Committed(_)));
     let current = store
         .current_bound_pod_snapshot("scope.launch", "pod.launch")
         .unwrap();
@@ -1090,6 +1295,46 @@ fn writer_request(
         expected_writer_epoch: None,
         ttl_seconds: 60,
     }
+}
+
+#[test]
+fn v3_writer_lease_survives_additive_revision_and_revocation_fences_it() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) =
+        admitted_writer_target_for_format(&fixture, true);
+    let request = writer_request(&mut store, target.clone(), manager_credential);
+    let lease = store.acquire_native_writer_lease_from_trusted_host(&request).unwrap();
+    let policy_epoch = store.policy_fence_epoch().unwrap();
+    let current_revision = store.authority_snapshot().unwrap().revision;
+    let added_revision = store.apply_authority_mutation(
+        1,
+        current_revision,
+        AuthorityMutation::PutGrant(AuthorityGrantRecord {
+            grant_id: 17,
+            scope_id: "scope.launch".into(),
+            actor_id: "actor.codex.other".into(),
+            credential_generation: 1,
+            mode: "controller".into(),
+            remaining_delegation_depth: 0,
+            rights: vec![AuthorityRightRecord {
+                operation: "launch_pod".into(),
+                target_kind: "scope".into(),
+                target_id: "scope.launch".into(),
+            }],
+        }),
+    ).unwrap();
+    assert!(added_revision > lease.authority_revision());
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), lease);
+    assert_eq!(
+        store.current_native_writer_target_for_session(&target.scope_id, &target.session_id)
+            .unwrap().0,
+        target
+    );
+    store.apply_authority_mutation(1, added_revision, AuthorityMutation::RevokeGrant(17))
+        .unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch + 1);
+    assert!(matches!(store.inspect_native_writer_lease(&target), Err(StoreError::StaleEpoch)));
 }
 
 #[test]
@@ -1297,7 +1542,14 @@ fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() 
 }
 
 fn bootstrap_ready(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget, u64, u64) {
-    let (mut store, target, manager_credential) = admitted_writer_target(fixture);
+    bootstrap_ready_for_format(fixture, false)
+}
+
+fn bootstrap_ready_for_format(
+    fixture: &Fixture,
+    v3: bool,
+) -> (PodBayStore, NativeWriterTarget, u64, u64) {
+    let (mut store, target, manager_credential) = admitted_writer_target_for_format(fixture, v3);
     let launch = store
         .current_bound_pod_snapshot("scope.launch", "pod.launch")
         .unwrap();
@@ -1387,6 +1639,66 @@ fn bootstrap_request<'a>(
         expected_manager_credential_epoch: manager_credential,
         expected_authority_revision: store.authority_snapshot().unwrap().revision,
     }
+}
+
+#[test]
+fn v3_claimed_send_keeps_current_policy_after_additive_revision_and_refuses_revocation() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) =
+        bootstrap_ready_for_format(&fixture, true);
+    let lease = store.inspect_native_writer_lease(&target).unwrap();
+    let policy_epoch = store.policy_fence_epoch().unwrap();
+    let current_revision = store.authority_snapshot().unwrap().revision;
+    let next_revision = store.apply_authority_mutation(
+        1,
+        current_revision,
+        AuthorityMutation::PutGrant(AuthorityGrantRecord {
+            grant_id: 18,
+            scope_id: "scope.launch".into(),
+            actor_id: "actor.codex.other".into(),
+            credential_generation: 1,
+            mode: "controller".into(),
+            remaining_delegation_depth: 0,
+            rights: vec![AuthorityRightRecord {
+                operation: "launch_pod".into(),
+                target_kind: "scope".into(),
+                target_id: "scope.launch".into(),
+            }],
+        }),
+    ).unwrap();
+    assert!(next_revision > lease.authority_revision());
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), lease);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let session_revision: i64 = connection.query_row(
+        "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+        [], |row| row.get(0),
+    ).unwrap();
+    drop(connection);
+    let envelope = bootstrap_envelope(
+        "key.bootstrap.v3.additive", "request.bootstrap.v3.additive", "First turn",
+        session_revision as u64, writer_epoch,
+    );
+    let mut stale = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    stale.expected_authority_revision = lease.authority_revision();
+    assert!(matches!(store.admit_bootstrap_send(&stale), Err(StoreError::StaleEpoch)));
+    let fresh = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    let receipt = match store.admit_bootstrap_send(&fresh).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected V3 bootstrap command: {other:?}"),
+    };
+    let selector = BootstrapSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target.clone(),
+    };
+    assert_eq!(store.claim_bootstrap_send(&selector).unwrap(), EffectClaim::NewClaim);
+    let proof = store.inspect_claimed_bootstrap_send(&selector).unwrap();
+    assert_eq!(proof.authority_revision(), next_revision);
+    store.apply_authority_mutation(1, next_revision, AuthorityMutation::RevokeGrant(18))
+        .unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch + 1);
+    assert!(matches!(store.inspect_claimed_bootstrap_send(&selector), Err(StoreError::StaleEpoch)));
 }
 
 #[test]
@@ -1685,7 +1997,73 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
+    assert_eq!(version, 21);
+}
+
+#[test]
+fn v19_with_historical_v2_refuses_default_migration_without_changing_database() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let before = store
+        .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str())
+        .unwrap();
+    let revision = store.authority_snapshot().unwrap().revision;
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_policy_fences;
+         DELETE FROM metadata WHERE key='policy_fence_epoch';
+         PRAGMA user_version=19;",
+        )
+        .unwrap();
+    drop(connection);
+    let original_database = std::fs::read(&fixture.database).unwrap();
+    let wal_path = fixture.database.with_extension("sqlite-wal");
+    let original_wal = std::fs::read(&wal_path).ok();
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict(
+            "v19 launch state requires attested quiescence before v20 migration"
+        ))
+    ));
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), original_database);
+    assert_eq!(std::fs::read(&wal_path).ok(), original_wal);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let descriptor: Vec<u8> = connection.query_row(
+        "SELECT descriptor FROM launch_bindings LIMIT 1", [], |row| row.get(0),
+    ).unwrap();
+    let lease: i64 = connection.query_row(
+        "SELECT writer_epoch FROM native_writer_leases LIMIT 1", [], |row| row.get(0),
+    ).unwrap();
     assert_eq!(version, 19);
+    assert_eq!(descriptor, before.launch().descriptor);
+    assert_eq!(lease as u64, writer_epoch);
+    assert!(revision > 0 && manager_credential > 0);
+    assert_eq!(target.pod_id.as_str(), before.pod_id().as_str());
+}
+
+#[test]
+fn v19_without_launch_state_upgrades_to_v21_with_empty_policy_and_recovery_rows() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "DROP TABLE launch_policy_fences;
+         DELETE FROM metadata WHERE key='policy_fence_epoch';
+         PRAGMA user_version=19;",
+    ).unwrap();
+    drop(connection);
+    let reopened = fixture.open();
+    assert_eq!(reopened.policy_fence_epoch().unwrap(), 1);
+    drop(reopened);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM launch_policy_fences", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!((version, rows), (21, 0));
 }
 
 #[test]

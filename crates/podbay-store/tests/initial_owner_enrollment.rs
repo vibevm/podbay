@@ -92,6 +92,7 @@ fn grant() -> AuthorityGrantRecord {
 fn atomic_owner_enrollment_replays_exact_rows_without_new_revision() {
     let fixture = Fixture::new();
     let (mut store, lineage, revision) = fixture.opened();
+    let policy_epoch = store.policy_fence_epoch().unwrap();
     let actor = actor();
     let grant = grant();
     let (committed, duplicate) = store
@@ -105,6 +106,7 @@ fn atomic_owner_enrollment_replays_exact_rows_without_new_revision() {
     assert_eq!(snapshot.actors, vec![actor.clone()]);
     assert_eq!(snapshot.grants, vec![grant.clone()]);
     assert_eq!(snapshot.revision, committed);
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
     assert_eq!(
         store.current_actor_verifier(1, committed, &actor).unwrap(),
         [7; 32]
@@ -118,9 +120,11 @@ fn atomic_owner_enrollment_replays_exact_rows_without_new_revision() {
         (committed, true)
     );
     assert_eq!(store.authority_snapshot().unwrap(), snapshot);
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
     drop(store);
     let mut reopened = PodBayStore::open(&fixture.database).unwrap();
     assert_eq!(reopened.authority_snapshot().unwrap(), snapshot);
+    assert_eq!(reopened.policy_fence_epoch().unwrap(), policy_epoch);
 }
 
 #[test]

@@ -264,6 +264,7 @@ fn binding(fixture: &Fixture) -> (LaunchDescriptor, BoundPeerManifest) {
         owner_epoch: 1,
         credential_epoch: 1,
         authority_revision: Some(1),
+        policy_fence: None,
         resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
         manager_os_identity: manager.os_identity().into(),
         manager_process_id: manager.native_process_id().into(),

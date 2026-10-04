@@ -11,6 +11,7 @@ mod model;
 mod peer_witness;
 mod rebind;
 mod store;
+mod supersession;
 mod writer_lease;
 
 pub use authority::SqliteActorVerifierWitness;
@@ -21,7 +22,7 @@ pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
     CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot,
-    CurrentV2RebindCursor, CurrentV2RebindPage, RunChildBudget,
+    CurrentLaunchPolicyFence, CurrentV2RebindCursor, CurrentV2RebindPage, RunChildBudget,
 };
 pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use manager_peer::SqliteManagerPeerWitness;
@@ -41,6 +42,9 @@ pub use model::{
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{
     DurableRebindPhase, DurableRebindReceipt, PriorObservedRebindInspection,
-    SqlitePriorObservedPendingLedger, SqliteRebindLedger,
+    SqlitePriorObservedPendingLedger, SqliteRebindLedger, StoreOnlyPendingRebind,
+};
+pub use supersession::{
+    PriorPlannedRecovery, SqliteSupersessionLedger, SupersessionReceipt, SupersessionStage,
 };
 pub use store::PodBayStore;

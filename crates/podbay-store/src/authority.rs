@@ -449,6 +449,7 @@ impl PodBayStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_current_actor(&transaction, expected_owner_epoch, expected_revision, actor)?;
         let binding_digest = actor_binding_digest(actor);
+        let mut replacing_generation = false;
         if let Some(prior) = read_actor_verifier(&transaction, &actor.actor_id)? {
             if prior.scope_id != actor.scope_id {
                 return Err(StoreError::WrongScope);
@@ -476,6 +477,7 @@ impl PodBayStore {
                     "actor verifier key reused across generations",
                 ));
             }
+            replacing_generation = true;
             let changed = transaction.execute(
                 "UPDATE actor_verifiers SET scope_id=?1,credential_generation=?2,
                    verifier_version=?3,public_key=?4,binding_digest=?5,revoked=0
@@ -509,6 +511,9 @@ impl PodBayStore {
             )?;
         }
         let next = advance_authority_revision(&transaction, expected_revision)?;
+        if replacing_generation {
+            advance_policy_fence_epoch(&transaction)?;
+        }
         transaction.commit()?;
         Ok(next)
     }
@@ -539,6 +544,7 @@ impl PodBayStore {
             return Err(StoreError::StaleEpoch);
         }
         let next = advance_authority_revision(&transaction, expected_revision)?;
+        advance_policy_fence_epoch(&transaction)?;
         transaction.commit()?;
         Ok(next)
     }
@@ -753,6 +759,7 @@ impl PodBayStore {
             return Err(StoreError::Conflict("owner grant set changed during rotation"));
         }
         let revision = advance_authority_revision(&transaction, proof.expected_revision)?;
+        advance_policy_fence_epoch(&transaction)?;
         transaction.execute(
             "INSERT INTO owner_actor_rotations(
                scope_id,actor_id,rotation_key,intent_digest,prior_generation,next_generation,
@@ -894,6 +901,7 @@ impl PodBayStore {
             "UPDATE metadata SET value=value+1 WHERE key='authority_revision'",
             [],
         )?;
+        advance_policy_fence_epoch(&transaction)?;
         transaction.commit()?;
         self.authority_snapshot()
     }
@@ -928,11 +936,22 @@ impl PodBayStore {
         if actual_owner != owner || actual_revision != revision {
             return Err(StoreError::StaleEpoch);
         }
+        let mut policy_invalidation = false;
         match mutation {
             AuthorityMutation::PutPod(record) => {
                 valid_identity(&record.scope_id)?;
                 valid_identity(&record.pod_id)?;
                 let incarnation = positive(record.incarnation)?;
+                let prior: Option<(String, i64)> = transaction
+                    .query_row(
+                        "SELECT scope_id,incarnation FROM authority_pods WHERE pod_id=?1",
+                        [&record.pod_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                policy_invalidation |= prior
+                    .as_ref()
+                    .is_some_and(|(scope, old)| scope == &record.scope_id && *old != incarnation);
                 let changed = transaction.execute(
                     "INSERT INTO authority_pods(pod_id,scope_id,incarnation) VALUES(?1,?2,?3)
                      ON CONFLICT(pod_id) DO UPDATE SET incarnation=excluded.incarnation
@@ -967,6 +986,31 @@ impl PodBayStore {
                 let pod_incarnation = positive(record.pod_incarnation)?;
                 let resource_epoch = positive(record.resource_epoch)?;
                 let input_epoch = positive(record.input_epoch)?;
+                let prior: Option<(String, String, i64, i64, i64)> = transaction
+                    .query_row(
+                        "SELECT scope_id,pod_id,pod_incarnation,resource_epoch,input_epoch
+                         FROM authority_resources WHERE resource_id=?1",
+                        [&record.resource_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                policy_invalidation |= prior.as_ref().is_some_and(|old| {
+                    old != &(
+                        record.scope_id.clone(),
+                        record.pod_id.clone(),
+                        pod_incarnation,
+                        resource_epoch,
+                        input_epoch,
+                    )
+                });
                 let pod: Option<(String, i64)> = transaction
                     .query_row(
                         "SELECT scope_id,incarnation FROM authority_pods WHERE pod_id=?1",
@@ -1067,6 +1111,7 @@ impl PodBayStore {
                     )
                     .optional()?;
                 if let Some(prior) = existing {
+                    policy_invalidation |= prior != record;
                     if prior.scope_id != record.scope_id {
                         return Err(StoreError::WrongScope);
                     }
@@ -1228,6 +1273,7 @@ impl PodBayStore {
                 if changed != 1 {
                     return Err(StoreError::NotFound);
                 }
+                policy_invalidation = true;
             }
         }
         let changed = transaction.execute(
@@ -1236,6 +1282,9 @@ impl PodBayStore {
         )?;
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
+        }
+        if policy_invalidation {
+            advance_policy_fence_epoch(&transaction)?;
         }
         transaction.commit()?;
         Ok(next_revision as u64)
@@ -1562,6 +1611,30 @@ fn read_initial_grant(
             .map_err(|_| StoreError::Conflict("grant depth is invalid"))?,
         rights,
     }))
+}
+
+pub(crate) fn advance_policy_fence_epoch(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<u64, StoreError> {
+    let current: i64 = transaction.query_row(
+        "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 1 {
+        return Err(StoreError::Conflict("v20 policy fence epoch is invalid"));
+    }
+    let next = current
+        .checked_add(1)
+        .ok_or(StoreError::InvalidInput("policy fence epoch exhausted"))?;
+    let changed = transaction.execute(
+        "UPDATE metadata SET value=?1 WHERE key='policy_fence_epoch' AND value=?2",
+        params![next, current],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(next as u64)
 }
 
 fn advance_authority_revision(

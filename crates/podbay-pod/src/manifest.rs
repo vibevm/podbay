@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use podbay_core::AttestedPeer;
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId};
 #[cfg(target_os = "linux")]
+use podbay_store::{BoundLaunchFormat, PodBayStore};
+#[cfg(target_os = "linux")]
 use podbay_wire::{
     EffectiveLaunchContract, EffectiveLaunchContractV2, ImmutableLaunchDescriptor,
     ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
@@ -126,6 +128,8 @@ pub const PEER_BINDING_PROTOCOL: &str = "podbay.peer-binding/1";
 #[cfg(target_os = "linux")]
 pub const PEER_BINDING_V2_PROTOCOL: &str = "podbay.peer-binding/2";
 #[cfg(target_os = "linux")]
+pub const PEER_BINDING_V3_PROTOCOL: &str = "podbay.peer-binding/3";
+#[cfg(target_os = "linux")]
 pub const SYNTHETIC_CAPABILITY: &str = "synthetic_fixture_only";
 #[cfg(target_os = "linux")]
 pub const OPERATOR_PROCESS_CAPABILITY: &str = "operator_process_v1";
@@ -133,6 +137,18 @@ pub const OPERATOR_PROCESS_CAPABILITY: &str = "operator_process_v1";
 pub use podbay_wire::OPERATOR_PROCESS_PROFILE_REF;
 #[cfg(target_os = "linux")]
 pub const CODEX_V2_CAPABILITY: &str = "codex_app_server_v2";
+#[cfg(target_os = "linux")]
+pub const CODEX_V3_CAPABILITY: &str = "codex_app_server_v3";
+
+/// Historical admission revision and independently current policy fence.
+/// The global revision is never interpreted as a pod-lifetime policy epoch.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundPolicyFenceV3 {
+    pub policy_fence_epoch: u64,
+    pub admission_authority_revision: u64,
+}
 
 /// Host-reviewed inputs that cannot be inferred from a PB05 descriptor.
 /// The manager peer itself is observed from the launcher process, never passed
@@ -167,6 +183,8 @@ pub struct BoundPeerManifest {
     pub credential_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fence: Option<BoundPolicyFenceV3>,
     pub resource_input_epochs: BTreeMap<String, u64>,
     pub manager_os_identity: String,
     pub manager_process_id: String,
@@ -198,6 +216,7 @@ impl BoundPeerManifest {
         match self.protocol.as_str() {
             PEER_BINDING_PROTOCOL => hash.update(b"podbay.peer-binding/1\0"),
             PEER_BINDING_V2_PROTOCOL => hash.update(b"podbay.peer-binding/2\0"),
+            PEER_BINDING_V3_PROTOCOL => hash.update(b"podbay.peer-binding/3\0"),
             _ => return Err(PodError::Invalid("unknown peer binding version")),
         }
         hash.update(serde_json::to_vec(&copy)?);
@@ -205,6 +224,9 @@ impl BoundPeerManifest {
     }
 
     pub fn validate(&self, legacy: &LaunchDescriptor, directory: &Path) -> Result<(), PodError> {
+        if self.protocol == PEER_BINDING_V3_PROTOCOL || self.capability == CODEX_V3_CAPABILITY {
+            return self.validate_codex_v3(legacy, directory);
+        }
         if self.protocol == PEER_BINDING_V2_PROTOCOL || self.capability == CODEX_V2_CAPABILITY {
             return self.validate_codex_v2(legacy, directory);
         }
@@ -216,6 +238,7 @@ impl BoundPeerManifest {
             || self.owner_epoch == 0
             || self.credential_epoch == 0
             || self.authority_revision.is_some()
+            || self.policy_fence.is_some()
             || self.resource_input_epochs.len() != 1
         {
             return Err(PodError::Invalid(
@@ -323,11 +346,39 @@ impl BoundPeerManifest {
             || self.owner_epoch == 0
             || self.credential_epoch == 0
             || self.authority_revision.is_none_or(|revision| revision == 0)
+            || self.policy_fence.is_some()
             || self.resource_input_epochs.len() != 1
             || !directory.is_absolute()
         {
             return Err(PodError::Invalid("Codex V2 peer binding changed"));
         }
+        self.validate_codex_common(launch)
+    }
+
+    fn validate_codex_v3(
+        &self,
+        launch: &LaunchDescriptor,
+        directory: &Path,
+    ) -> Result<(), PodError> {
+        if self.protocol != PEER_BINDING_V3_PROTOCOL
+            || self.capability != CODEX_V3_CAPABILITY
+            || self.binding_digest != self.digest()?
+            || !self.store_path.is_absolute()
+            || self.owner_epoch == 0
+            || self.credential_epoch == 0
+            || self.authority_revision.is_some()
+            || self.policy_fence.as_ref().is_none_or(|fence| {
+                fence.policy_fence_epoch == 0 || fence.admission_authority_revision == 0
+            })
+            || self.resource_input_epochs.len() != 1
+            || !directory.is_absolute()
+        {
+            return Err(PodError::Invalid("Codex V3 peer binding changed"));
+        }
+        self.validate_codex_common(launch)
+    }
+
+    fn validate_codex_common(&self, launch: &LaunchDescriptor) -> Result<(), PodError> {
         self.manager_peer()?;
         let wire = ImmutableLaunchDescriptorV2::decode_json(&self.wire_descriptor)
             .map_err(|_| PodError::Invalid("Codex V2 descriptor is malformed"))?;
@@ -405,6 +456,63 @@ impl BoundPeerManifest {
         }
         Ok(())
     }
+
+    /// Read-only V3 policy and topology check for an already validated bound
+    /// manifest. The policy row and current Pod/Resource links are read in one
+    /// SQLite snapshot. The caller must separately attest the manager peer,
+    /// pod process and any effect-specific grant immediately before effect.
+    /// This helper does not enable a V3 launch or control route by itself.
+    pub fn check_current_codex_v3_policy(
+        &self,
+        launch: &LaunchDescriptor,
+    ) -> Result<(), PodError> {
+        if self.protocol != PEER_BINDING_V3_PROTOCOL || self.capability != CODEX_V3_CAPABILITY {
+            return Err(PodError::Unsupported("current Codex V3 policy unavailable"));
+        }
+        let expected = self
+            .policy_fence
+            .as_ref()
+            .ok_or(PodError::Refused("Codex V3 policy fence missing"))?;
+        let mut store = PodBayStore::open_existing_read_only(&self.store_path)
+            .map_err(|_| PodError::Refused("Codex V3 store witness unavailable"))?;
+        let current = store
+            .current_bound_pod_snapshot(&launch.scope_id, &launch.pod_id)
+            .map_err(|_| PodError::Refused("Codex V3 current Pod binding unavailable"))?;
+        let fence = current.current_policy_fence().ok_or(PodError::Refused(
+            "Codex V3 committed policy binding unavailable",
+        ))?;
+        let inputs = current
+            .resources()
+            .iter()
+            .map(|resource| {
+                (
+                    resource.id().as_str().to_owned(),
+                    resource.input_epoch().get(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if current.store_lineage().as_str() != self.store_lineage
+            || current.owner_epoch().get() != self.owner_epoch
+            || current.pod_incarnation().get() != launch.incarnation
+            || current.attempt_id().as_str() != launch.attempt_id
+            || current.launch().format != BoundLaunchFormat::CodexV3
+            || current.launch().descriptor != self.wire_descriptor
+            || current.launch().effective_spec != self.effective_spec
+            || current.launch().resources.len() != 1
+            || current.launch().resources[0].id != launch.resource_id
+            || current.launch().resources[0].epoch != self.resource_epoch
+            || current.resources().len() != 1
+            || inputs != self.resource_input_epochs
+            || fence.store_lineage != self.store_lineage
+            || fence.policy_fence_epoch != expected.policy_fence_epoch
+            || fence.admission_authority_revision != expected.admission_authority_revision
+        {
+            return Err(PodError::Refused(
+                "Codex V3 current policy or topology changed",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -443,6 +551,8 @@ pub struct BoundPodStatus {
     pub store_lineage: String,
     pub owner_epoch: u64,
     pub credential_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fence: Option<BoundPolicyFenceV3>,
     pub manager_os_identity: String,
     pub manager_process_id: String,
     pub manager_boot_identity: String,
@@ -463,6 +573,7 @@ impl BoundPeerManifest {
             store_lineage: self.store_lineage.clone(),
             owner_epoch: self.owner_epoch,
             credential_epoch: self.credential_epoch,
+            policy_fence: self.policy_fence.clone(),
             manager_os_identity: self.manager_os_identity.clone(),
             manager_process_id: self.manager_process_id.clone(),
             manager_boot_identity: self.manager_boot_identity.clone(),

@@ -13,7 +13,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
     ActorId, Attempt, AttestedPeer, CommandId, CommandKey, CredentialEpoch, Epoch, LaunchBinding,
-    OwnerEpoch, PlannedRootBinding, Pod, PodId, RebindProposal, RequestDigest, Resource,
+    OwnerEpoch, PendingPodProcessEvidence, PendingRebindSupersession,
+    PlannedRootBinding, Pod, PodId, RebindPhase,
+    RebindProposal, RequestDigest, Resource,
     ResourceId, ResourceKind, Role, Run, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
 use podbay_store::{
@@ -25,8 +27,9 @@ use podbay_store::{
     DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
-    ManagerCredentialClaim, NativeWriterLease, OwnerActorRotationReceipt, PodBayStore, Receipt,
-    SqliteActorVerifierWitness, StoreError, TrustedBootstrapSendRequest,
+    ManagerCredentialClaim, NativeWriterLease, OwnerActorRotationReceipt, PodBayStore,
+    PriorPlannedRecovery, Receipt, SqliteActorVerifierWitness, StoreError,
+    SupersessionReceipt, SupersessionStage, TrustedBootstrapSendRequest,
     TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
 };
 use podbay_wire::{
@@ -973,15 +976,198 @@ impl ResolvedOperatorProcessLaunch {
     pub fn executable_sha256(&self) -> &str { &self.paths.executable_sha256 }
 }
 
+/// Private host-created proof for a committed Codex V3 root. The immutable
+/// launch still uses the reviewed V2 typed bytes, while the lifetime policy
+/// fence is the committed V3 row and current policy epoch.
+pub struct ResolvedNativeCodexV3Launch {
+    record: BoundLaunchRecord,
+    effective: EffectiveLaunchContractV2,
+    descriptor: ImmutableLaunchDescriptorV2,
+    paths: ResolvedNativePaths,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    store_lineage: String,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    policy_fence_epoch: u64,
+    admission_authority_revision: u64,
+    manager_peer: AttestedPeer,
+    resource_input_epochs: BTreeMap<String, u64>,
+}
+
+impl ResolvedNativeCodexV3Launch {
+    pub fn committed_record(&self) -> &BoundLaunchRecord {
+        &self.record
+    }
+    pub fn effective(&self) -> &EffectiveLaunchContractV2 {
+        &self.effective
+    }
+    pub fn descriptor(&self) -> &ImmutableLaunchDescriptorV2 {
+        &self.descriptor
+    }
+    pub fn effective_spec_bytes(&self) -> &[u8] {
+        &self.record.effective_spec
+    }
+    pub fn descriptor_bytes(&self) -> &[u8] {
+        &self.record.descriptor
+    }
+    pub fn outbox_id(&self) -> i64 {
+        self.record.receipt.outbox_id
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
+    }
+    pub fn store_lineage(&self) -> &str {
+        &self.store_lineage
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+    }
+    pub fn policy_fence_epoch(&self) -> u64 {
+        self.policy_fence_epoch
+    }
+    pub fn admission_authority_revision(&self) -> u64 {
+        self.admission_authority_revision
+    }
+    pub fn manager_peer(&self) -> &AttestedPeer {
+        &self.manager_peer
+    }
+    pub fn resource_input_epochs(&self) -> &BTreeMap<String, u64> {
+        &self.resource_input_epochs
+    }
+    pub fn cwd(&self) -> &Path {
+        &self.paths.cwd
+    }
+    pub fn executable(&self) -> &Path {
+        &self.paths.executable
+    }
+    pub fn executable_sha256(&self) -> &str {
+        &self.paths.executable_sha256
+    }
+}
+
 /// A point-in-time observation returned only by the manager's installed,
 /// trusted platform port. Constructing this DTO is not authority: the host
 /// never accepts it from a request or public prepare method, and the store
 /// independently checks current destination/target fences before Pending.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortRebindObservation {
     prior: HostObservedPriorCheckpoint,
     descriptor_digest: String,
     child_pid: u32,
     child_start_ticks: u64,
+}
+
+/// Read-only observation from a trusted native port after one nonce-bound
+/// pending-recovery socket exchange and independent process-tree attestation.
+/// It cannot plan/ACK a v21 row or grant control by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortPendingRecoveryObservation {
+    abandoned: RebindProposal,
+    pending_phase: RebindPhase,
+    checkpoint_digest: String,
+    prior_checkpoint_digest: String,
+    pending_process: PendingPodProcessEvidence,
+    unit_name: String,
+    descriptor_digest: String,
+}
+
+impl PortPendingRecoveryObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trusted_port(
+        abandoned: RebindProposal,
+        pending_phase: RebindPhase,
+        checkpoint_digest: String,
+        prior_checkpoint_digest: String,
+        pending_process: PendingPodProcessEvidence,
+        unit_name: String,
+        descriptor_digest: String,
+    ) -> Result<Self, HostError> {
+        let valid_digest = |value: &str| value.len() == 64 && value.bytes().all(|byte|
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !matches!(pending_phase, RebindPhase::PendingStore | RebindPhase::PendingPod)
+            || !valid_digest(&checkpoint_digest)
+            || !valid_digest(&prior_checkpoint_digest)
+            || !valid_digest(&descriptor_digest)
+            || unit_name.is_empty()
+            || unit_name.len() > 256
+            || pending_process.supervisor_process_id.is_empty()
+            || pending_process.supervisor_birth_identity.is_empty()
+            || pending_process.child_process_id.is_empty()
+            || pending_process.child_birth_identity.is_empty()
+        {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            abandoned, pending_phase, checkpoint_digest, prior_checkpoint_digest,
+            pending_process, unit_name, descriptor_digest,
+        })
+    }
+    pub fn abandoned(&self) -> &RebindProposal { &self.abandoned }
+    pub fn pending_phase(&self) -> RebindPhase { self.pending_phase }
+    pub fn checkpoint_digest(&self) -> &str { &self.checkpoint_digest }
+    pub fn prior_checkpoint_digest(&self) -> &str { &self.prior_checkpoint_digest }
+    pub fn pending_process(&self) -> &PendingPodProcessEvidence { &self.pending_process }
+    pub fn unit_name(&self) -> &str { &self.unit_name }
+    pub fn descriptor_digest(&self) -> &str { &self.descriptor_digest }
+}
+
+/// Trusted port observation that an already recovered Active(A) checkpoint
+/// matches the exact reconstructed C Planned predecessor and the same live
+/// supervisor/child. It is read-only and is not itself a store ACK.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortRecoveredActiveObservation {
+    checkpoint_digest: String,
+    supervisor_pid: u32,
+    supervisor_start_ticks: u64,
+    child_pid: u32,
+    child_start_ticks: u64,
+    boot_id: String,
+    unit_name: String,
+    cgroup_path: String,
+}
+
+impl PortRecoveredActiveObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trusted_port(
+        checkpoint_digest: String,
+        supervisor_pid: u32,
+        supervisor_start_ticks: u64,
+        child_pid: u32,
+        child_start_ticks: u64,
+        boot_id: String,
+        unit_name: String,
+        cgroup_path: String,
+    ) -> Result<Self, HostError> {
+        if !valid_rebind_checkpoint_digest(&checkpoint_digest)
+            || supervisor_pid == 0 || supervisor_start_ticks == 0
+            || child_pid == 0 || child_start_ticks == 0
+            || boot_id.is_empty() || unit_name.is_empty()
+            || !cgroup_path.starts_with('/') || cgroup_path.len() > 4096
+        {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            checkpoint_digest,supervisor_pid,supervisor_start_ticks,child_pid,
+            child_start_ticks,boot_id,unit_name,cgroup_path,
+        })
+    }
+    pub fn checkpoint_digest(&self) -> &str { &self.checkpoint_digest }
+    pub fn supervisor_pid(&self) -> u32 { self.supervisor_pid }
+    pub fn supervisor_start_ticks(&self) -> u64 { self.supervisor_start_ticks }
+    pub fn child_pid(&self) -> u32 { self.child_pid }
+    pub fn child_start_ticks(&self) -> u64 { self.child_start_ticks }
+    pub fn boot_id(&self) -> &str { &self.boot_id }
+    pub fn unit_name(&self) -> &str { &self.unit_name }
+    pub fn cgroup_path(&self) -> &str { &self.cgroup_path }
 }
 
 /// Private host-created proof passed only to its installed Linux port after
@@ -1048,6 +1234,47 @@ impl PreparedOperatorProcessRebind {
     pub fn store_file_identity(&self) -> (u64, u64) { self.store_file_identity }
     pub fn manager_peer(&self) -> &AttestedPeer { &self.manager_peer }
     pub fn authority_revision(&self) -> u64 { self.authority_revision }
+}
+
+/// Private, host-created capability for one already planned v21 recovery.
+/// The port must still prove the current manager, B's death, exact pod birth,
+/// and the latest Planned side row before any pod checkpoint mutation.
+#[derive(Clone)]
+pub struct PreparedPendingRecovery {
+    intent: PendingRebindSupersession,
+    prior_checkpoint_digest: String,
+    planned: SupersessionReceipt,
+    record: BoundLaunchRecord,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    manager_peer: AttestedPeer,
+    authority_revision: u64,
+}
+
+impl PreparedPendingRecovery {
+    pub fn intent(&self) -> &PendingRebindSupersession { &self.intent }
+    pub fn prior_checkpoint_digest(&self) -> &str { &self.prior_checkpoint_digest }
+    pub fn planned(&self) -> &SupersessionReceipt { &self.planned }
+    pub fn record(&self) -> &BoundLaunchRecord { &self.record }
+    pub fn store_path(&self) -> &Path { &self.store_path }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64,u64) { self.store_file_identity }
+    pub fn manager_peer(&self) -> &AttestedPeer { &self.manager_peer }
+    pub fn authority_revision(&self) -> u64 { self.authority_revision }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryCompletionStage {
+    PodRecoveryUnknown,
+    PodCheckpointed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCompletionReceipt {
+    pub durable: SupersessionReceipt,
+    pub stage: RecoveryCompletionStage,
+    pub active_checkpoint_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1197,6 +1424,98 @@ fn digest_operator_process_rebind_intent(
         field(&mut hash, &current.get().to_be_bytes());
     }
     let digest = hash.finalize().iter().map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
+fn digest_pending_recovery_intent(
+    key: &CommandKey,
+    context: &ManagerRebindContext<'_>,
+    observed: &PortPendingRecoveryObservation,
+) -> Result<RequestDigest, HostError> {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let abandoned = observed.abandoned();
+    let process = observed.pending_process();
+    let manager = context.manager_peer();
+    let mut hash = Sha256::new();
+    field(&mut hash, b"podbay.rebind-recovery-intent/1");
+    for text in [
+        key.as_str(), abandoned.identity.store_lineage.as_str(),
+        abandoned.identity.scope_id.as_str(), abandoned.identity.pod_id.as_str(),
+        abandoned.identity.attempt_id.as_str(), abandoned.command_key.as_str(),
+        abandoned.digest.as_str(), observed.checkpoint_digest(),
+        observed.prior_checkpoint_digest(), observed.descriptor_digest(),
+        process.supervisor_process_id.as_str(),
+        process.supervisor_birth_identity.as_str(),
+        process.child_process_id.as_str(), process.child_birth_identity.as_str(),
+        process.boot_identity.as_str(), process.containment_identity.as_str(),
+        manager.os_identity(), manager.native_process_id(), manager.boot_identity(),
+        manager.birth_identity(), manager.containment_identity(),
+    ] {
+        field(&mut hash, text.as_bytes());
+    }
+    field(&mut hash, &abandoned.identity.incarnation.get().to_be_bytes());
+    field(&mut hash, &context.owner_epoch().to_be_bytes());
+    field(&mut hash, &context.credential_epoch().to_be_bytes());
+    field(&mut hash, &[match observed.pending_phase() {
+        RebindPhase::PendingStore => 1,
+        RebindPhase::PendingPod => 2,
+        RebindPhase::Active => return Err(HostError::StaleGuard),
+    }]);
+    for (id, next) in context.resource_input_epochs() {
+        let old = abandoned.next_input_epochs.get(id).ok_or(HostError::StaleGuard)?;
+        field(&mut hash, id.as_str().as_bytes());
+        field(&mut hash, &old.get().to_be_bytes());
+        field(&mut hash, &next.get().to_be_bytes());
+    }
+    let digest = hash.finalize().iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
+fn digest_recovered_active_successor(
+    key: &CommandKey,
+    prior: &PriorPlannedRecovery,
+    context: &ManagerRebindContext<'_>,
+    observed: &PortRecoveredActiveObservation,
+) -> Result<RequestDigest, HostError> {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let mut hash = Sha256::new();
+    field(&mut hash,b"podbay.rebind-recovery-active-successor/1");
+    for text in [
+        key.as_str(),prior.intent.abandoned.identity.store_lineage.as_str(),
+        prior.intent.abandoned.identity.scope_id.as_str(),
+        prior.intent.abandoned.identity.pod_id.as_str(),
+        prior.intent.abandoned.identity.attempt_id.as_str(),
+        prior.intent.digest.as_str(),observed.checkpoint_digest(),
+        context.manager_peer().os_identity(),context.manager_peer().native_process_id(),
+        context.manager_peer().boot_identity(),context.manager_peer().birth_identity(),
+        context.manager_peer().containment_identity(),
+    ] {
+        field(&mut hash,text.as_bytes());
+    }
+    for value in [
+        prior.receipt.rowid as u64,context.owner_epoch(),context.credential_epoch(),
+        u64::from(observed.supervisor_pid()),observed.supervisor_start_ticks(),
+        u64::from(observed.child_pid()),observed.child_start_ticks(),
+    ] {
+        field(&mut hash,&value.to_be_bytes());
+    }
+    for (id,epoch) in context.resource_input_epochs() {
+        let old = prior.intent.recovering_input_epochs.get(id)
+            .ok_or(HostError::StaleGuard)?;
+        field(&mut hash,id.as_str().as_bytes());
+        field(&mut hash,&old.get().to_be_bytes());
+        field(&mut hash,&epoch.get().to_be_bytes());
+    }
+    let digest = hash.finalize().iter().map(|byte|format!("{byte:02x}"))
         .collect::<String>();
     RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
 }
@@ -1390,6 +1709,18 @@ pub trait HostDispatchPort {
         false
     }
 
+    /// Distinct V3 capability. A V2-only port cannot receive a V3 launch.
+    fn launch_resolved_codex_v3(
+        &mut self,
+        _launch: ResolvedNativeCodexV3Launch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn accepts_resolved_codex_v3(&self) -> bool {
+        false
+    }
+
     /// Read-only V2 pod inspection over a fresh OS-attested socket. The host
     /// invokes only its installed port with a private committed launch proof;
     /// the returned DTO is never accepted from wire JSON or a caller.
@@ -1397,6 +1728,46 @@ pub trait HostDispatchPort {
         &self,
         _launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortRebindObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// The abandoned manager peer comes only from an exact durable B row.
+    /// The port must check that process birth is gone on the current boot;
+    /// a store row alone cannot establish liveness.
+    fn attest_abandoned_codex_v2_manager_dead(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+        _abandoned: &AttestedPeer,
+    ) -> Result<(), HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// No mutation or grant. A port must prove the surviving pod's kernel
+    /// peer, direct child birth, unit and exact Pending checkpoint.
+    fn inspect_pending_codex_v2_recovery(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortPendingRecoveryObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Mutating only after the v21 Planned row is durable. A lost pod reply
+    /// is uncertainty and may never be reported as Active from store intent.
+    fn prepare_pending_codex_v2_recovery(
+        &self,
+        _prepared: &PreparedPendingRecovery,
+    ) -> Result<String, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Read-only D proof after C lost its recovery ACK. The port must derive
+    /// the expected Active(A,B-next-inputs) checkpoint bytes from historical
+    /// A peer and B row, then compare to a fresh nonce-bound live pod reply.
+    fn inspect_recovered_active_codex_v2(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+        _prior: &PriorPlannedRecovery,
+    ) -> Result<PortRecoveredActiveObservation, HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -1454,6 +1825,19 @@ pub trait HostDispatchPort {
 
     /// Default-deny while the Linux selector-only pod IPC is unavailable.
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
+        false
+    }
+
+    /// V3 uses a distinct claimed selector carrying the exact current policy
+    /// fence. V2-only ports remain default-deny for it.
+    fn send_claimed_codex_v3_bootstrap(
+        &mut self,
+        _claimed: ResolvedClaimedCodexV3Bootstrap,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn accepts_claimed_codex_v3_bootstrap(&self) -> bool {
         false
     }
 
@@ -1604,6 +1988,51 @@ impl ResolvedClaimedBootstrap {
     /// Linux `(device, inode)` retained from the manager's already-open store.
     /// A port must compare this with the canonical path before contacting a
     /// pod, so a path swap cannot redirect a claimed command to another DB.
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
+    }
+}
+
+/// V3 selector admitted at the current command revision with an independently
+/// current policy row. Its earlier writer lease revision remains historical.
+pub struct ResolvedClaimedCodexV3Bootstrap {
+    selector: BootstrapSendSelector,
+    writer_epoch: u64,
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    authority_revision: u64,
+    policy_fence_epoch: u64,
+    admission_authority_revision: u64,
+    store_path: PathBuf,
+    store_file_identity: (u64, u64),
+}
+
+impl ResolvedClaimedCodexV3Bootstrap {
+    pub fn selector(&self) -> &BootstrapSendSelector {
+        &self.selector
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn manager_credential_epoch(&self) -> u64 {
+        self.manager_credential_epoch
+    }
+    /// Revision used for this command's admission CAS, not pod lifetime.
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn policy_fence_epoch(&self) -> u64 {
+        self.policy_fence_epoch
+    }
+    pub fn admission_authority_revision(&self) -> u64 {
+        self.admission_authority_revision
+    }
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
     pub fn store_file_identity(&self) -> (u64, u64) {
         self.store_file_identity
     }
@@ -2848,6 +3277,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     pending_codex_rebinds: HashMap<(ScopeId, PodId, String), PreparedCodexV2Rebind>,
     pending_operator_rebinds: HashMap<(ScopeId, PodId, String), PreparedOperatorProcessRebind>,
     active_codex_rebinds: HashSet<(ScopeId, PodId, String)>,
+    pending_recoveries: HashMap<(ScopeId, PodId, String), PreparedPendingRecovery>,
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
@@ -2980,6 +3410,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             pending_codex_rebinds: HashMap::new(),
             pending_operator_rebinds: HashMap::new(),
             active_codex_rebinds: HashSet::new(),
+            pending_recoveries: HashMap::new(),
         })
     }
 
@@ -3338,6 +3769,448 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         Ok(receipt)
     }
 
+    /// Read-only V3 inspection. Additive topology may advance the global
+    /// command revision; this proof follows only the exact Pod/Resource and
+    /// the launch's committed policy epoch.
+    pub fn inspect_committed_root_codex_v3(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<ResolvedNativeCodexV3Launch, RebindContextError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            let peer = recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )?;
+            let initial = self
+                .store
+                .current_bound_pod_snapshot(scope.as_str(), pod.as_str())?;
+            let record = initial.launch().clone();
+            if record.format != BoundLaunchFormat::CodexV3
+                || initial.store_lineage().as_str() != self.manager_claim.store_lineage()
+                || initial.owner_epoch().get() != self.manager_claim.owner_epoch()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let policy_fence = self.store.current_launch_policy_fence(&record)?;
+            if policy_fence.store_lineage != self.manager_claim.store_lineage() {
+                return Err(HostError::StaleGuard.into());
+            }
+            let effective = EffectiveLaunchContractV2::decode(&record.effective_spec)
+                .map_err(|_| HostError::StaleGuard)?;
+            let descriptor = ImmutableLaunchDescriptorV2::decode_json(&record.descriptor)
+                .map_err(|_| HostError::StaleGuard)?;
+            effective
+                .compare_with_descriptor(&descriptor)
+                .map_err(|_| HostError::StaleGuard)?;
+            if descriptor.scope_id() != record.scope_id
+                || descriptor.session_id() != record.session_id
+                || descriptor.run_id() != record.run_id
+                || descriptor.attempt_id() != record.attempt_id
+                || descriptor.pod_id() != record.pod_id
+                || descriptor.pod_incarnation() != record.pod_incarnation
+                || descriptor.parent_run_id().is_some()
+                || descriptor.resources_len() != record.resources.len()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            for (index, bound) in record.resources.iter().enumerate() {
+                let native = descriptor.resource(index).ok_or(HostError::StaleGuard)?;
+                if native.resource_id != bound.id || native.epoch != bound.epoch {
+                    return Err(HostError::StaleGuard.into());
+                }
+            }
+            let profile = self
+                .launch_profiles
+                .get(effective.base().profile_ref())
+                .cloned()
+                .ok_or(HostError::StaleGuard)?;
+            let host = self.native_host.clone().ok_or(HostError::StaleGuard)?;
+            let paths = profile
+                .revalidate_committed_codex_v2(&host, &effective, &descriptor)
+                .map_err(RebindContextError::Host)?;
+            let resource_input_epochs = initial
+                .resources()
+                .iter()
+                .map(|resource| {
+                    (
+                        resource.id().as_str().to_owned(),
+                        resource.input_epoch().get(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let final_snapshot = self
+                .store
+                .current_bound_pod_snapshot(scope.as_str(), pod.as_str())?;
+            let final_policy = self.store.current_launch_policy_fence(&record)?;
+            let final_inputs = final_snapshot
+                .resources()
+                .iter()
+                .map(|resource| {
+                    (
+                        resource.id().as_str().to_owned(),
+                        resource.input_epoch().get(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if final_snapshot.store_lineage() != initial.store_lineage()
+                || final_snapshot.owner_epoch() != initial.owner_epoch()
+                || final_snapshot.attempt_id() != initial.attempt_id()
+                || final_snapshot.pod_incarnation() != initial.pod_incarnation()
+                || final_snapshot.launch() != &record
+                || final_inputs != resource_input_epochs
+                || final_policy.store_lineage != policy_fence.store_lineage
+                || final_policy.policy_fence_epoch != policy_fence.policy_fence_epoch
+                || final_policy.admission_authority_revision
+                    != policy_fence.admission_authority_revision
+                || recheck_current_manager(
+                    &mut self.store,
+                    &self.canonical_database,
+                    self.database_identity,
+                    &self.manager_peer,
+                    &self.manager_claim,
+                )? != peer
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(ResolvedNativeCodexV3Launch {
+                record,
+                effective,
+                descriptor,
+                paths,
+                store_path: self.canonical_database.clone(),
+                store_file_identity: self.database_identity,
+                store_lineage: policy_fence.store_lineage,
+                owner_epoch: self.manager_claim.owner_epoch(),
+                credential_epoch: self.manager_claim.credential_epoch(),
+                policy_fence_epoch: policy_fence.policy_fence_epoch,
+                admission_authority_revision: policy_fence.admission_authority_revision,
+                manager_peer: peer,
+                resource_input_epochs,
+            })
+        }
+    }
+
+    /// Read-only candidate for a v21 Pending(B) recovery. The port proves
+    /// this exact surviving supervisor/child and fsynced checkpoint; the host
+    /// compares its abandoned proposal with the durable B row and current C
+    /// owner/Resource vector twice. No supersession attempt or ACK is written.
+    pub fn inspect_pending_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<PortPendingRecoveryObservation, RebindContextError> {
+        let reviewed = self.inspect_committed_root_codex_v2(scope, pod)?;
+        let observed = self.host.port().inspect_pending_codex_v2_recovery(&reviewed)?;
+        let abandoned = observed.abandoned();
+        let row = self.store.lookup_prior_observed_rebind(abandoned)?
+            .ok_or(StoreError::NotFound)?;
+        let mut current = self.rebind_context(scope, pod)?;
+        let original_inputs = current.resource_input_epochs().clone();
+        if abandoned.identity != *current.identity()
+            || current.launch() != reviewed.committed_record()
+            || current.manager_peer() != reviewed.manager_peer()
+            || current.owner_epoch() != reviewed.owner_epoch()
+            || current.credential_epoch() != reviewed.credential_epoch()
+            || current.authority_revision() != reviewed.authority_revision()
+            || observed.descriptor_digest() != reviewed.descriptor().digest()
+            || row.checkpoint_digest != observed.prior_checkpoint_digest()
+            || row.supervisor_pid.to_string()
+                != observed.pending_process().supervisor_process_id
+            || row.supervisor_start_ticks.to_string()
+                != observed.pending_process().supervisor_birth_identity
+            || row.boot_id != observed.pending_process().boot_identity
+            || row.unit_name != observed.unit_name()
+            || row.cgroup_path != observed.pending_process().containment_identity
+            || row.receipt.request_digest != abandoned.digest.as_str()
+            || row.receipt.pod_checkpoint_ref.as_deref().is_some_and(|digest|
+                digest != observed.checkpoint_digest())
+            || (row.receipt.phase != DurableRebindPhase::Pending
+                && observed.pending_phase() != RebindPhase::PendingPod)
+            || abandoned.next_owner_epoch.get() >= current.owner_epoch()
+            || abandoned.next_credential_epoch.get() >= current.credential_epoch()
+            || abandoned.next_manager == *current.manager_peer()
+            || abandoned.next_manager.containment_identity()
+                != current.manager_peer().containment_identity()
+            || abandoned.next_input_epochs.len() != original_inputs.len()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        for (id, old) in &abandoned.next_input_epochs {
+            if original_inputs.get(id).is_none_or(|current| current.get() <= old.get()) {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        current.recheck_current()?;
+        drop(current);
+        let fresh = self.store.lookup_prior_observed_rebind(abandoned)?
+            .ok_or(StoreError::NotFound)?;
+        let mut final_context = self.rebind_context(scope, pod)?;
+        if fresh != row
+            || final_context.launch() != reviewed.committed_record()
+            || final_context.owner_epoch() != reviewed.owner_epoch()
+            || final_context.credential_epoch() != reviewed.credential_epoch()
+            || final_context.authority_revision() != reviewed.authority_revision()
+            || final_context.manager_peer() != reviewed.manager_peer()
+            || final_context.resource_input_epochs() != &original_inputs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        final_context.recheck_current()?;
+        Ok(observed)
+    }
+
+    /// Plan C's exact recovery of Pending(B) only after two independent
+    /// trusted-port observations agree. The port attests B's process birth is
+    /// gone; SQLite atomically checks B, C and every Resource before writing
+    /// one Planned side row. No pod checkpoint changes in this method.
+    pub fn plan_current_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<SupersessionReceipt, RebindContextError> {
+        let key = CommandKey::try_from(command_key).map_err(|_| HostError::InvalidInput)?;
+        let first = self.inspect_pending_codex_v2_recovery(scope, pod)?;
+        let second = self.inspect_pending_codex_v2_recovery(scope, pod)?;
+        if second != first {
+            return Err(HostError::StaleGuard.into());
+        }
+        let reviewed = self.inspect_committed_root_codex_v2(scope, pod)?;
+        let mut context = self.rebind_context(scope, pod)?;
+        context.recheck_current()?;
+        if context.launch() != reviewed.committed_record()
+            || context.identity() != &first.abandoned().identity
+            || context.owner_epoch() <= first.abandoned().next_owner_epoch.get()
+            || context.credential_epoch() <= first.abandoned().next_credential_epoch.get()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let digest = digest_pending_recovery_intent(&key, &context, &first)?;
+        let intent = PendingRebindSupersession {
+            abandoned: first.abandoned().clone(),
+            pending_phase: first.pending_phase(),
+            pending_checkpoint_digest: RequestDigest::parse(first.checkpoint_digest())
+                .map_err(|_| HostError::StaleGuard)?,
+            pending_process: first.pending_process().clone(),
+            recovering_owner_epoch: OwnerEpoch::new(context.owner_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            recovering_credential_epoch: CredentialEpoch::new(context.credential_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            recovering_input_epochs: context.resource_input_epochs().clone(),
+            recovering_manager: context.manager_peer().clone(),
+            command_key: key,
+            digest,
+        };
+        let planned = context.store.plan_pending_rebind_supersession(&intent, None)?;
+        if planned.stage != SupersessionStage::Planned {
+            return Err(StoreError::Conflict("recovery is no longer Planned").into());
+        }
+        let prepared = PreparedPendingRecovery {
+            intent,
+            prior_checkpoint_digest: first.prior_checkpoint_digest().into(),
+            planned: planned.clone(),
+            record: reviewed.committed_record().clone(),
+            store_path: reviewed.store_path().to_path_buf(),
+            #[cfg(target_os = "linux")]
+            store_file_identity: reviewed.store_file_identity(),
+            manager_peer: reviewed.manager_peer().clone(),
+            authority_revision: reviewed.authority_revision(),
+        };
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        drop(context);
+        if self.pending_recoveries.get(&cache_key).is_some_and(|old| {
+            old.intent != prepared.intent || old.planned != prepared.planned
+                || old.record != prepared.record
+        }) {
+            return Err(StoreError::Conflict("cached recovery intent differs").into());
+        }
+        self.pending_recoveries.insert(cache_key, prepared);
+        Ok(planned)
+    }
+
+    /// Return `PodCheckpointed` only after the trusted port proves the
+    /// nonce-bound fsynced recovery Active(A) checkpoint. C's normal A→C
+    /// rebind is a separate command; this receipt never claims C is Active.
+    pub fn complete_current_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RecoveryCompletionReceipt, RebindContextError> {
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        if !self.pending_recoveries.contains_key(&cache_key) {
+            self.plan_current_codex_v2_recovery(scope, pod, command_key)?;
+        }
+        let prepared = self.pending_recoveries.get(&cache_key)
+            .ok_or(StoreError::Conflict("prepared recovery proof disappeared"))?.clone();
+        let fallback = |digest: Option<String>| RecoveryCompletionReceipt {
+            durable: prepared.planned.clone(),
+            stage: RecoveryCompletionStage::PodRecoveryUnknown,
+            active_checkpoint_digest: digest,
+        };
+        let current = match self.store.plan_pending_rebind_supersession(&prepared.intent, None) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(fallback(None)),
+        };
+        if current.stage == SupersessionStage::PodCheckpointed {
+            return Ok(RecoveryCompletionReceipt {
+                active_checkpoint_digest: current.recovery_checkpoint_digest.clone(),
+                durable: current,
+                stage: RecoveryCompletionStage::PodCheckpointed,
+            });
+        }
+        if current != prepared.planned || self.rebind_context(scope, pod)
+            .and_then(|mut context| {
+                context.recheck_current()?;
+                if context.launch() != &prepared.record
+                    || context.owner_epoch() != prepared.intent.recovering_owner_epoch.get()
+                    || context.credential_epoch()
+                        != prepared.intent.recovering_credential_epoch.get()
+                    || context.authority_revision() != prepared.authority_revision
+                    || context.manager_peer() != prepared.manager_peer()
+                    || context.resource_input_epochs() != &prepared.intent.recovering_input_epochs
+                {
+                    return Err(HostError::StaleGuard.into());
+                }
+                Ok(())
+            }).is_err()
+        {
+            return Ok(fallback(None));
+        }
+        let digest = match self.host.port().prepare_pending_codex_v2_recovery(&prepared) {
+            Ok(digest) if valid_rebind_checkpoint_digest(&digest) => digest,
+            _ => return Ok(fallback(None)),
+        };
+        if self.rebind_context(scope, pod).and_then(|mut context| {
+            context.recheck_current()?;
+            if context.launch() != &prepared.record
+                || context.owner_epoch() != prepared.intent.recovering_owner_epoch.get()
+                || context.credential_epoch()
+                    != prepared.intent.recovering_credential_epoch.get()
+                || context.authority_revision() != prepared.authority_revision
+                || context.manager_peer() != prepared.manager_peer()
+                || context.resource_input_epochs() != &prepared.intent.recovering_input_epochs
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(())
+        }).is_err() {
+            return Ok(fallback(Some(digest)));
+        }
+        let durable = match self.store.acknowledge_pending_rebind_supersession(
+            &prepared.intent, &digest,
+        ) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(Some(digest))),
+        };
+        Ok(RecoveryCompletionReceipt {
+            durable,
+            stage: RecoveryCompletionStage::PodCheckpointed,
+            active_checkpoint_digest: Some(digest),
+        })
+    }
+
+    /// D adopts a fsynced recovery Active A after C died before its ACK.
+    /// The port independently reconstructs exact Active bytes from A's
+    /// historical peer and B's next inputs, then compares a nonce-bound live
+    /// pod inspection twice. C's Planned row remains historical and never
+    /// becomes evidence that C was Active; only D's successor is ACKed.
+    pub fn adopt_recovered_active_codex_v2(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RecoveryCompletionReceipt, RebindContextError> {
+        let key = CommandKey::try_from(command_key).map_err(|_| HostError::InvalidInput)?;
+        let reviewed = self.inspect_committed_root_codex_v2(scope,pod)?;
+        let initial = self.rebind_context(scope,pod)?;
+        let identity = initial.identity().clone();
+        drop(initial);
+        let prior = self.store.latest_planned_recovery_for_pod(&identity)?
+            .ok_or(StoreError::NotFound)?;
+        let first = self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior)?;
+        let second = self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior)?;
+        if first != second {
+            return Err(HostError::StaleGuard.into());
+        }
+        let mut context = self.rebind_context(scope,pod)?;
+        context.recheck_current()?;
+        if context.launch() != reviewed.committed_record()
+            || context.identity() != &identity
+            || context.owner_epoch() <= prior.intent.recovering_owner_epoch.get()
+            || context.credential_epoch() <= prior.intent.recovering_credential_epoch.get()
+            || context.manager_peer() != reviewed.manager_peer()
+            || context.authority_revision() != reviewed.authority_revision()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let digest = digest_recovered_active_successor(&key,&prior,&context,&first)?;
+        let mut intent = prior.intent.clone();
+        intent.recovering_owner_epoch = OwnerEpoch::new(context.owner_epoch())
+            .map_err(|_| HostError::StaleGuard)?;
+        intent.recovering_credential_epoch = CredentialEpoch::new(context.credential_epoch())
+            .map_err(|_| HostError::StaleGuard)?;
+        intent.recovering_input_epochs = context.resource_input_epochs().clone();
+        intent.recovering_manager = context.manager_peer().clone();
+        intent.command_key = key;
+        intent.digest = digest;
+        let planned = context.store.plan_pending_rebind_supersession(
+            &intent,Some(prior.receipt.rowid),
+        )?;
+        if planned.stage != SupersessionStage::Planned {
+            return Err(StoreError::Conflict("D successor is no longer Planned").into());
+        }
+        drop(context);
+        let fallback = |digest: Option<String>| RecoveryCompletionReceipt {
+            durable: planned.clone(),
+            stage: RecoveryCompletionStage::PodRecoveryUnknown,
+            active_checkpoint_digest: digest,
+        };
+        if self.store.plan_pending_rebind_supersession(
+            &intent,Some(prior.receipt.rowid),
+        ).ok().as_ref() != Some(&planned) {
+            return Ok(fallback(None));
+        }
+        // The latest row is now D, so compare the same historical C proof
+        // directly through the trusted port, not a broad historical scan.
+        let after = match self.host.port().inspect_recovered_active_codex_v2(&reviewed,&prior) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(None)),
+        };
+        if after != first || self.rebind_context(scope,pod).and_then(|mut context| {
+            context.recheck_current()?;
+            if context.launch() != reviewed.committed_record()
+                || context.owner_epoch() != intent.recovering_owner_epoch.get()
+                || context.credential_epoch() != intent.recovering_credential_epoch.get()
+                || context.resource_input_epochs() != &intent.recovering_input_epochs
+                || context.manager_peer() != &intent.recovering_manager
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(())
+        }).is_err() {
+            return Ok(fallback(Some(first.checkpoint_digest().into())));
+        }
+        let durable = match self.store.acknowledge_pending_rebind_supersession(
+            &intent,first.checkpoint_digest(),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(Some(first.checkpoint_digest().into()))),
+        };
+        Ok(RecoveryCompletionReceipt {
+            durable,
+            stage: RecoveryCompletionStage::PodCheckpointed,
+            active_checkpoint_digest: Some(first.checkpoint_digest().into()),
+        })
+    }
+
     /// Prepare one existing Codex V2 pod for manager rebind. This calls only
     /// the installed trusted read-only port; callers supply a key and current
     /// Pod selector, never a checkpoint, manager peer, epoch or proof DTO.
@@ -3415,11 +4288,68 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             command_key,
             digest,
         };
+        // An already-fsynced pending-recovery Active A checkpoint is not a
+        // store-only B: its input vector has advanced to B's next epoch. Use
+        // the exact current C recovery proof first. Only if absent may the
+        // host classify a still-Active original A as an unapplied B Pending.
+        let recovered = context.store.has_current_checkpointed_recovery_for_rebind(
+            &proposal, &observed.prior,
+        )?;
+        let store_only = if recovered {
+            None
+        } else {
+            context.store.lookup_store_only_pending_rebind(&observed.prior.identity)?
+        };
+        drop(context);
+        if let Some(abandoned) = &store_only {
+            if abandoned.proposal.identity != observed.prior.identity
+                || abandoned.proposal.expected_owner_epoch != observed.prior.owner_epoch
+                || abandoned.proposal.expected_credential_epoch
+                    != observed.prior.credential_epoch
+                || abandoned.proposal.expected_input_epochs != observed.prior.input_epochs
+                || abandoned.prior.checkpoint_digest != observed.prior.checkpoint_digest
+                || abandoned.prior.supervisor_pid != observed.prior.supervisor_pid
+                || abandoned.prior.supervisor_start_ticks != observed.prior.supervisor_start_ticks
+                || abandoned.prior.boot_id != observed.prior.boot_id
+                || abandoned.prior.unit_name != observed.prior.unit_name
+                || abandoned.prior.cgroup_path != observed.prior.cgroup_path
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.host.port().attest_abandoned_codex_v2_manager_dead(
+                &reviewed, &abandoned.proposal.next_manager,
+            )?;
+            let second = self.host.port().inspect_existing_codex_v2_rebind(&reviewed)?;
+            if second != observed {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        let mut context = self.rebind_context(scope, pod)?;
+        context.recheck_current()?;
+        if context.identity() != &proposal.identity
+            || context.launch() != &reviewed.record
+            || context.store_path() != reviewed.store_path()
+            || context.store_lineage() != reviewed.store_lineage()
+            || context.owner_epoch() != proposal.next_owner_epoch.get()
+            || context.credential_epoch() != proposal.next_credential_epoch.get()
+            || context.authority_revision() != reviewed.authority_revision()
+            || context.manager_peer() != &proposal.next_manager
+            || context.resource_input_epochs() != &proposal.next_input_epochs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
         // SQLite verifies the current destination claim and exact target
         // epochs in the same IMMEDIATE transaction as the Pending insert.
-        let receipt = context
-            .store
-            .prepare_manager_rebind_from_host_observation(&proposal, &observed.prior)?;
+        let receipt = if let Some(abandoned) = &store_only {
+            context.store.prepare_manager_rebind_after_active_prior(
+                &proposal, &observed.prior, &abandoned.proposal,
+                observed.child_pid, observed.child_start_ticks,
+            )?
+        } else {
+            context.store.prepare_manager_rebind_from_host_observation(
+                &proposal, &observed.prior,
+            )?
+        };
         if receipt.phase != DurableRebindPhase::Pending {
             return Err(StoreError::Conflict("rebind is no longer Pending").into());
         }
@@ -4795,9 +5725,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     }
 
     /// Read back an existing initial writer guard for one exact authenticated
-    /// V2 launch CommandId. Every lookup is indexed by CommandId/principal and
+    /// V2 or V3 launch CommandId. Every lookup is indexed by CommandId/principal and
     /// then verified against today's Session→Run→Pod→Resource and lease. A
-    /// proof-bearing manager rebind may have advanced the writer epoch. This
+    /// proof-bearing V2 manager rebind may have advanced the writer epoch. This
     /// method never mints, renews or takes over a writer lease.
     pub fn read_current_initial_bootstrap_guard_for_launch<T: AuthenticatedTransport>(
         &mut self,
@@ -4838,13 +5768,21 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
             let Some(record) = self
                 .store
-                .lookup_bound_root_v2_by_command_id(&principal, scope, command_id)?
+                .lookup_bound_root_codex_by_command_id(&principal, scope, command_id)?
             else {
                 return Ok(None);
             };
             if record.receipt != inspected.receipt {
                 return Ok(None);
             }
+            let v3_policy = if record.format == BoundLaunchFormat::CodexV3 {
+                match self.store.current_launch_policy_fence(&record) {
+                    Ok(fence) => Some(fence),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                None
+            };
             let status = self.store.launch_dispatch_status(
                 record.receipt.outbox_id,
                 scope.as_str(),
@@ -4902,7 +5840,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 || lease.holder_credential_generation() != actor.credential_generation.get()
                 || lease.owner_epoch() != self.manager_claim.owner_epoch()
                 || lease.manager_credential_epoch() != self.manager_claim.credential_epoch()
-                || lease.authority_revision() != self.recorded.revision
+                || (if record.format == BoundLaunchFormat::CodexV3 {
+                    lease.authority_revision() > self.recorded.revision
+                } else {
+                    lease.authority_revision() != self.recorded.revision
+                })
+                || (record.format == BoundLaunchFormat::CodexV3 && lease.writer_epoch() != 1)
             {
                 return Ok(None);
             }
@@ -4919,6 +5862,17 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     .ok()
                     .as_ref()
                     != Some(&lease)
+                || v3_policy.as_ref().is_some_and(|expected| {
+                    !self
+                        .store
+                        .current_launch_policy_fence(&record)
+                        .is_ok_and(|fresh| {
+                            fresh.store_lineage == expected.store_lineage
+                                && fresh.policy_fence_epoch == expected.policy_fence_epoch
+                                && fresh.admission_authority_revision
+                                    == expected.admission_authority_revision
+                        })
+                })
             {
                 return Ok(None);
             }
@@ -5055,7 +6009,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         Ok(actor)
     }
 
-    /// Mint only the first exclusive writer lease for the current V2
+    /// Mint only the first exclusive writer lease for a current V2 or V3
     /// structured resource. An exact live same-holder replay returns the
     /// original writer epoch and expiry without extending either. Takeover or
     /// stale-lease recovery requires a separate reviewed protocol.
@@ -5088,12 +6042,18 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let bound = self
             .store
             .current_bound_pod_snapshot(actor.scope_id.as_str(), target.pod_id.as_str())?;
-        if bound.launch().format != BoundLaunchFormat::CodexV2
-            || bound.launch().session_id != session_id.as_str()
+        let format = bound.launch().format;
+        if !matches!(
+            format,
+            BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3
+        ) || bound.launch().session_id != session_id.as_str()
             || bound.launch().run_id != target.run_id.as_str()
             || bound.launch().attempt_id != target.attempt_id.as_str()
         {
             return Err(HostError::StaleGuard.into());
+        }
+        if format == BoundLaunchFormat::CodexV3 {
+            self.store.current_launch_policy_fence(bound.launch())?;
         }
         let launch_status = self.store.launch_dispatch_status(
             bound.launch().receipt.outbox_id,
@@ -5115,7 +6075,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 && lease.holder_credential_generation() == actor.credential_generation.get()
                 && lease.owner_epoch() == expected_owner
                 && lease.manager_credential_epoch() == expected_manager_credential
-                && lease.authority_revision() == expected_revision
+                && (if format == BoundLaunchFormat::CodexV3 {
+                    lease.authority_revision() <= expected_revision
+                } else {
+                    lease.authority_revision() == expected_revision
+                })
                 && lease.writer_epoch() == 1
         };
         let lease = match self.store.inspect_native_writer_lease(&target) {
@@ -5316,6 +6280,30 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         {
             return Err(preserve_known(HostError::StaleGuard.into()));
         }
+        let bound = self
+            .store
+            .current_bound_pod_snapshot(actor.scope_id.as_str(), target.pod_id.as_str())
+            .map_err(|error| preserve_known(error.into()))?;
+        let bound_record = bound.launch().clone();
+        let format = bound_record.format;
+        if !matches!(
+            format,
+            BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3
+        ) || bound_record.session_id != session_id.as_str()
+            || bound_record.run_id != target.run_id.as_str()
+            || bound_record.attempt_id != target.attempt_id.as_str()
+        {
+            return Err(preserve_known(HostError::StaleGuard.into()));
+        }
+        let v3_policy = if format == BoundLaunchFormat::CodexV3 {
+            Some(
+                self.store
+                    .current_launch_policy_fence(&bound_record)
+                    .map_err(|error| preserve_known(error.into()))?,
+            )
+        } else {
+            None
+        };
         let request = TrustedBootstrapSendRequest {
             principal: principal.clone(),
             scope_id: actor.scope_id.clone(),
@@ -5363,7 +6351,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             port_called: false,
             port_observation: None,
         };
-        if !self.host.port.accepts_claimed_codex_bootstrap() {
+        let port_accepts = match format {
+            BoundLaunchFormat::CodexV2 => self.host.port.accepts_claimed_codex_bootstrap(),
+            BoundLaunchFormat::CodexV3 => self.host.port.accepts_claimed_codex_v3_bootstrap(),
+            BoundLaunchFormat::V1 => false,
+        };
+        if !port_accepts {
             return Ok(prepared());
         }
         let selector = BootstrapSendSelector {
@@ -5378,7 +6371,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         };
         enum ClaimResult {
             Existing(EffectState),
-            New(ResolvedClaimedBootstrap),
+            NewV2(ResolvedClaimedBootstrap),
+            NewV3(ResolvedClaimedCodexV3Bootstrap),
         }
         let after_admission = (|| -> Result<ClaimResult, BootstrapSendError> {
             let fresh_actor = self.current_bootstrap_actor(transport)?;
@@ -5432,26 +6426,54 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             if claimed.receipt() != &receipt
                 || claimed.holder_actor_id() != &actor.actor_id
                 || claimed.holder_credential_generation() != actor.credential_generation.get()
+                || claimed.authority_revision() != self.recorded.revision
             {
                 return Err(HostError::StaleGuard.into());
             }
+            let fresh_bound = self.store.current_bound_pod_snapshot(
+                actor.scope_id.as_str(),
+                selector.native_target.pod_id.as_str(),
+            )?;
+            if fresh_bound.launch() != &bound_record {
+                return Err(HostError::StaleGuard.into());
+            }
             self.recheck_actor_resolution_manager()?;
-            Ok(ClaimResult::New(ResolvedClaimedBootstrap {
-                selector,
-                writer_epoch: claimed.writer_epoch(),
-                owner_epoch: claimed.owner_epoch(),
-                manager_credential_epoch: claimed.manager_credential_epoch(),
-                authority_revision: claimed.authority_revision(),
-                store_path: self.canonical_database.clone(),
-                store_file_identity: self.database_identity,
-            }))
+            if let Some(expected) = v3_policy.as_ref() {
+                let fresh = self.store.current_launch_policy_fence(&bound_record)?;
+                if fresh.store_lineage != expected.store_lineage
+                    || fresh.policy_fence_epoch != expected.policy_fence_epoch
+                    || fresh.admission_authority_revision != expected.admission_authority_revision
+                {
+                    return Err(HostError::StaleGuard.into());
+                }
+                Ok(ClaimResult::NewV3(ResolvedClaimedCodexV3Bootstrap {
+                    selector,
+                    writer_epoch: claimed.writer_epoch(),
+                    owner_epoch: claimed.owner_epoch(),
+                    manager_credential_epoch: claimed.manager_credential_epoch(),
+                    authority_revision: claimed.authority_revision(),
+                    policy_fence_epoch: fresh.policy_fence_epoch,
+                    admission_authority_revision: fresh.admission_authority_revision,
+                    store_path: self.canonical_database.clone(),
+                    store_file_identity: self.database_identity,
+                }))
+            } else {
+                Ok(ClaimResult::NewV2(ResolvedClaimedBootstrap {
+                    selector,
+                    writer_epoch: claimed.writer_epoch(),
+                    owner_epoch: claimed.owner_epoch(),
+                    manager_credential_epoch: claimed.manager_credential_epoch(),
+                    authority_revision: claimed.authority_revision(),
+                    store_path: self.canonical_database.clone(),
+                    store_file_identity: self.database_identity,
+                }))
+            }
         })()
         .map_err(|source| BootstrapSendError::PostAdmission {
             receipt: receipt.clone(),
             source: Box::new(source),
         })?;
         let claimed = match after_admission {
-            ClaimResult::New(claimed) => claimed,
             ClaimResult::Existing(effect_state) => {
                 return Ok(BootstrapSendReceipt {
                     scope_id: actor.scope_id.clone(),
@@ -5462,8 +6484,14 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     port_observation: None,
                 });
             }
+            claimed => claimed,
         };
-        let port_observation = match self.host.port.send_claimed_codex_bootstrap(claimed) {
+        let port_call = match claimed {
+            ClaimResult::NewV2(claimed) => self.host.port.send_claimed_codex_bootstrap(claimed),
+            ClaimResult::NewV3(claimed) => self.host.port.send_claimed_codex_v3_bootstrap(claimed),
+            ClaimResult::Existing(_) => unreachable!("handled existing claim above"),
+        };
+        let port_observation = match port_call {
             Ok(PortDispatchOutcome::Accepted(value) | PortDispatchOutcome::Settled(value)) => {
                 BootstrapPortObservation::PodAccepted(value.stable_reference().to_owned())
             }
@@ -5666,6 +6694,122 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         Ok(record)
     }
 
+    /// Commit a distinct V3 root with an exact policy row. The global
+    /// authority revision remains the transaction CAS, never the pod's
+    /// lifetime policy fence.
+    pub fn admit_bound_root_codex_v3<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal.clone());
+        if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
+            if record.format != BoundLaunchFormat::CodexV3 {
+                return Err(HostError::Unauthorised.into());
+            }
+            return self.bound_receipt(record, true);
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let planned = PlannedRootBinding::from_queued_snapshot(
+            &proposal.session,
+            &proposal.run,
+            &proposal.binding,
+        )
+        .map_err(|_| HostError::Unauthorised)?;
+        let (effective, descriptor) =
+            self.review_bound_root_codex_v2(&authorised, request.host_request.grant_id, proposal)?;
+        let policy_fence_epoch = self.store.policy_fence_epoch()?;
+        let admission = self.store.admit_bound_root_launch_v3(
+            BoundRootLaunchRequestV2 {
+                principal,
+                command_key: &request.host_request.command_key,
+                canonical_intent: &request.canonical_request,
+                scope_id: authorised.scope_id.as_str(),
+                pod_id: pod_id.as_str(),
+                proposal: Some(BoundRootLaunchProposalV2 {
+                    session: &proposal.session,
+                    run: &proposal.run,
+                    binding: &planned,
+                    effective_spec: &effective,
+                    descriptor: &descriptor,
+                    expected_owner_epoch: self.host.manager_epoch.get(),
+                    expected_authority_revision: self.recorded.revision,
+                }),
+            },
+            policy_fence_epoch,
+        )?;
+        let (record, duplicate) = match admission {
+            BoundLaunchAdmission::Committed(record) => (record, false),
+            BoundLaunchAdmission::Duplicate(record) => (record, true),
+        };
+        if record.format != BoundLaunchFormat::CodexV3 {
+            return Err(HostError::StaleGuard.into());
+        }
+        if !duplicate {
+            if record.effective_spec != effective.canonical_bytes()
+                || record.descriptor
+                    != descriptor
+                        .encode_json()
+                        .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let fence = self.store.current_launch_policy_fence(&record)?;
+            if fence.policy_fence_epoch != policy_fence_epoch
+                || fence.store_lineage != self.manager_claim.store_lineage()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.hydrate_new_bound(&record)?;
+        }
+        self.bound_receipt(record, duplicate)
+    }
+
+    /// Authenticated V3 key lookup; a V2 row cannot be recovered through it.
+    pub fn lookup_bound_root_codex_v3_by_key<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        scope_id: &ScopeId,
+        command_key: &str,
+        canonical_intent: &[u8],
+    ) -> Result<Option<BoundLaunchRecord>, LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let actor = self.host.authenticate(transport)?;
+        if &actor.scope_id != scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let record = self
+            .store
+            .lookup_bound_launch_by_key(&LaunchKeyLookupRequest {
+                principal,
+                command_key: command_key.to_owned(),
+                scope_id: scope_id.as_str().to_owned(),
+                canonical_intent: canonical_intent.to_vec(),
+            })?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.format != BoundLaunchFormat::CodexV3)
+        {
+            return Err(HostError::Unauthorised.into());
+        }
+        Ok(record)
+    }
+
     /// Plan one new Coordinator/Service root from an authenticated `launch`
     /// envelope. The key and verified semantic digest are looked up before any
     /// IDs are minted. Only trusted host state supplies actor, profile
@@ -5683,6 +6827,33 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     where
         P::Receipt: StablePortReceipt,
     {
+        self.launch_new_root_codex_from_wire(transport, request, policy, BoundLaunchFormat::CodexV2)
+    }
+
+    /// The V3 wire root keeps the same trusted typed planner and key intent,
+    /// but commits a V3 policy row and dispatches through the V3-only port.
+    pub fn launch_new_root_codex_v3_from_wire<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: CommandEnvelope,
+        policy: &TrustedWireRootLaunchPolicy,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.launch_new_root_codex_from_wire(transport, request, policy, BoundLaunchFormat::CodexV3)
+    }
+
+    fn launch_new_root_codex_from_wire<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: CommandEnvelope,
+        policy: &TrustedWireRootLaunchPolicy,
+        format: BoundLaunchFormat,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
         request.encode_json().map_err(|_| HostError::InvalidInput)?;
         let WireTarget::Scope { scope_id } = &request.target else {
             return Err(HostError::Unsupported.into());
@@ -5696,12 +6867,22 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
         let mut canonical_intent = b"podbay.wire-launch/1\0".to_vec();
         canonical_intent.extend_from_slice(request.payload_digest.as_bytes());
-        if let Some(record) = self.lookup_bound_root_codex_v2_by_key(
-            transport,
-            &scope,
-            &request.key,
-            &canonical_intent,
-        )? {
+        let existing = match format {
+            BoundLaunchFormat::CodexV2 => self.lookup_bound_root_codex_v2_by_key(
+                transport,
+                &scope,
+                &request.key,
+                &canonical_intent,
+            )?,
+            BoundLaunchFormat::CodexV3 => self.lookup_bound_root_codex_v3_by_key(
+                transport,
+                &scope,
+                &request.key,
+                &canonical_intent,
+            )?,
+            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+        };
+        if let Some(record) = existing {
             return self.bound_receipt(record, true);
         }
         if !matches!(body.session, SessionChoice::New)
@@ -5865,7 +7046,15 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 },
             }),
         };
-        let admitted = self.admit_bound_root_codex_v2(transport, planned_request.clone())?;
+        let admitted = match format {
+            BoundLaunchFormat::CodexV2 => {
+                self.admit_bound_root_codex_v2(transport, planned_request.clone())?
+            }
+            BoundLaunchFormat::CodexV3 => {
+                self.admit_bound_root_codex_v3(transport, planned_request.clone())?
+            }
+            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+        };
         if admitted.duplicate {
             return Ok(admitted);
         }
@@ -5873,7 +7062,16 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let key = planned_request.host_request.command_key.clone();
         let intent = planned_request.canonical_request.clone();
         let scope = planned_request.host_request.scope_id.clone();
-        match self.dispatch_prepared_bound_root_codex_v2(transport, planned_request) {
+        let dispatch = match format {
+            BoundLaunchFormat::CodexV2 => {
+                self.dispatch_prepared_bound_root_codex_v2(transport, planned_request)
+            }
+            BoundLaunchFormat::CodexV3 => {
+                self.dispatch_prepared_bound_root_codex_v3(transport, planned_request)
+            }
+            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+        };
+        match dispatch {
             Ok(mut dispatched) => {
                 // This is still the first wire admission. The dispatch API
                 // reads an already committed row internally, but that does
@@ -5882,9 +7080,16 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 Ok(dispatched)
             }
             Err(source) => {
-                if let Ok(Some(record)) =
-                    self.lookup_bound_root_codex_v2_by_key(transport, &scope, &key, &intent)
-                {
+                let original = match format {
+                    BoundLaunchFormat::CodexV2 => {
+                        self.lookup_bound_root_codex_v2_by_key(transport, &scope, &key, &intent)
+                    }
+                    BoundLaunchFormat::CodexV3 => {
+                        self.lookup_bound_root_codex_v3_by_key(transport, &scope, &key, &intent)
+                    }
+                    BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+                };
+                if let Ok(Some(record)) = original {
                     if let Ok(mut current) = self.bound_receipt(record, true) {
                         current.duplicate = false;
                         return Ok(current);
@@ -6038,6 +7243,181 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             }
         };
         let port_call = self.host.port.launch_resolved_codex_v2(resolved);
+        let observed = match port_call {
+            Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Ok(PortDispatchOutcome::Settled(receipt)) => LaunchPortResult::PortSettled {
+                receipt_ref: Some(receipt.stable_reference().to_owned()),
+            },
+            Err(PortDispatchError::RefusedBeforeEffect) => LaunchPortResult::RefusedBeforeEffect,
+            Err(PortDispatchError::UncertainAfterPossibleEffect { receipt_ref }) => {
+                LaunchPortResult::UncertainAfterPossibleEffect {
+                    receipt_ref: receipt_ref.map(|receipt| receipt.as_str().to_owned()),
+                }
+            }
+        };
+        let status = self
+            .store
+            .record_launch_port_result(
+                record.receipt.outbox_id,
+                &record.scope_id,
+                &record.pod_id,
+                self.host.manager_epoch.get(),
+                &claim_key,
+                observed.clone(),
+            )
+            .map_err(|source| LaunchPodError::OutcomeNotRecorded {
+                receipt: record.receipt.clone(),
+                observed,
+                source,
+            })?;
+        Ok(LaunchPodReceipt {
+            receipt: record.receipt,
+            status,
+            duplicate: true,
+            port_called: true,
+        })
+    }
+
+    /// Dispatch only an exact still-Prepared V3 row. The global revision is
+    /// used for the one command claim CAS; the private port proof carries the
+    /// independent lifetime policy epoch.
+    pub fn dispatch_prepared_bound_root_codex_v3<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.ensure_current_owner_epoch()?;
+        self.recheck_manager_binding()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let actor_id = actor.actor_id.clone();
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal);
+        let record = self
+            .store
+            .lookup_bound_launch(&lookup)?
+            .ok_or(StoreError::NotFound)?;
+        if record.format != BoundLaunchFormat::CodexV3 {
+            return Err(HostError::Unauthorised.into());
+        }
+        let status = self.store.launch_dispatch_status(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+        )?;
+        if status.stage != LaunchDispatchStage::Prepared {
+            return self.bound_receipt(record, true);
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        if authorised.actor_id != actor_id || authorised.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthenticated.into());
+        }
+        let reviewed =
+            self.inspect_committed_root_codex_v3(&request.host_request.scope_id, pod_id)?;
+        if reviewed.committed_record() != &record {
+            return Err(HostError::StaleGuard.into());
+        }
+        let HostAction::LaunchPod {
+            pod_id: authorised_pod,
+            role,
+            credential,
+        } = &authorised.action
+        else {
+            return Err(HostError::InvalidInput.into());
+        };
+        let selected_credential = credential.as_ref().ok_or(HostError::Unauthorised)?;
+        let effective = reviewed.effective().base();
+        let policy = reviewed.effective().codex_policy();
+        if authorised.actor_id.as_str() != reviewed.descriptor().actor_id()
+            || authorised_pod.as_str() != reviewed.descriptor().pod_id()
+            || reviewed.descriptor().role() != (*role).into()
+            || request.host_request.grant_id.get() != effective.authority_grant_id()
+            || selected_credential.scope_id() != &authorised.scope_id
+            || selected_credential.as_str() != policy.credential_ref()
+            || policy.credential_scope() != authorised.scope_id.as_str()
+            || effective.credential_refs().len() != 1
+            || effective.credential_refs()[0].reference() != selected_credential.as_str()
+        {
+            return Err(HostError::Unauthorised.into());
+        }
+        if let Some(proposal) = request.proposal.as_ref() {
+            let (proposed_effective, proposed_descriptor) = self.review_bound_root_codex_v2(
+                &authorised,
+                request.host_request.grant_id,
+                proposal,
+            )?;
+            if record.effective_spec != proposed_effective.canonical_bytes()
+                || record.descriptor
+                    != proposed_descriptor
+                        .encode_json()
+                        .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        if !self.host.port.accepts_resolved_codex_v3() {
+            return Err(HostError::NativeResolutionUnverified.into());
+        }
+        let claim_key = format!("claim.{}", record.receipt.command_id);
+        let claim = self.store.claim_effect(
+            record.receipt.outbox_id,
+            &record.scope_id,
+            &record.pod_id,
+            self.host.manager_epoch.get(),
+            record.pod_incarnation,
+            self.recorded.revision,
+            &claim_key,
+        )?;
+        if claim != EffectClaim::NewClaim {
+            return self.bound_receipt(record, true);
+        }
+        let postclaim = (|| -> Result<ResolvedNativeCodexV3Launch, LaunchPodError> {
+            self.ensure_current_owner_epoch()?;
+            if self.recheck_manager_binding()? != *reviewed.manager_peer() {
+                return Err(HostError::StaleGuard.into());
+            }
+            let fresh =
+                self.inspect_committed_root_codex_v3(&request.host_request.scope_id, pod_id)?;
+            if fresh.committed_record() != &record
+                || fresh.store_path() != reviewed.store_path()
+                || fresh.store_lineage() != reviewed.store_lineage()
+                || fresh.owner_epoch() != reviewed.owner_epoch()
+                || fresh.credential_epoch() != reviewed.credential_epoch()
+                || fresh.policy_fence_epoch() != reviewed.policy_fence_epoch()
+                || fresh.admission_authority_revision() != reviewed.admission_authority_revision()
+                || fresh.manager_peer() != reviewed.manager_peer()
+                || fresh.resource_input_epochs() != reviewed.resource_input_epochs()
+                || fresh.cwd() != reviewed.cwd()
+                || fresh.executable() != reviewed.executable()
+                || fresh.executable_sha256() != reviewed.executable_sha256()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            #[cfg(target_os = "linux")]
+            if fresh.store_file_identity() != reviewed.store_file_identity() {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(fresh)
+        })();
+        let resolved = match postclaim {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return self.refuse_claimed_launch(record, true, &claim_key, failure);
+            }
+        };
+        let port_call = self.host.port.launch_resolved_codex_v3(resolved);
         let observed = match port_call {
             Ok(PortDispatchOutcome::Accepted(receipt)) => LaunchPortResult::HostAccepted {
                 receipt_ref: Some(receipt.stable_reference().to_owned()),

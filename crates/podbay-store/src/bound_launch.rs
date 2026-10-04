@@ -109,24 +109,37 @@ pub struct BoundRootLaunchRequestV2<'a> {
     pub proposal: Option<BoundRootLaunchProposalV2<'a>>,
 }
 
+/// Read-only current V3 policy proof for one exact immutable bound launch.
+/// The admission revision is historical; the current global revision may
+/// advance from additive topology while the policy epoch holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentLaunchPolicyFence {
+    pub store_lineage: String,
+    pub policy_fence_epoch: u64,
+    pub admission_authority_revision: u64,
+    pub current_authority_revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundLaunchFormat {
     V1,
     CodexV2,
+    /// V2 typed descriptor bytes with a distinct committed V3 policy row.
+    CodexV3,
 }
 
 impl BoundLaunchFormat {
     fn effective_version(self) -> &'static str {
         match self {
             Self::V1 => EFFECTIVE_LAUNCH_VERSION,
-            Self::CodexV2 => EFFECTIVE_LAUNCH_V2_VERSION,
+            Self::CodexV2 | Self::CodexV3 => EFFECTIVE_LAUNCH_V2_VERSION,
         }
     }
 
     fn descriptor_version(self) -> &'static str {
         match self {
             Self::V1 => LAUNCH_DESCRIPTOR_SCHEMA,
-            Self::CodexV2 => LAUNCH_DESCRIPTOR_V2_SCHEMA,
+            Self::CodexV2 | Self::CodexV3 => LAUNCH_DESCRIPTOR_V2_SCHEMA,
         }
     }
 }
@@ -144,6 +157,7 @@ struct AdmissionRequest<'a> {
     pod_id: &'a str,
     proposal: Option<ProposalKind<'a>>,
     format: BoundLaunchFormat,
+    policy_fence_epoch: Option<u64>,
 }
 
 struct CheckedProposal<'a> {
@@ -290,6 +304,7 @@ pub struct CurrentBoundPodSnapshot {
     attempt_epoch: Epoch,
     launch: BoundLaunchRecord,
     resources: Vec<CurrentBoundResource>,
+    policy_fence: Option<CurrentLaunchPolicyFence>,
 }
 
 pub struct CurrentBoundResource {
@@ -370,6 +385,11 @@ impl CurrentBoundPodSnapshot {
     }
     pub fn resources(&self) -> &[CurrentBoundResource] {
         &self.resources
+    }
+    /// Present only for an explicitly policy-bound V3 admission. This value
+    /// and the current Pod/Resource links come from the same SQLite snapshot.
+    pub fn current_policy_fence(&self) -> Option<&CurrentLaunchPolicyFence> {
+        self.policy_fence.as_ref()
     }
 }
 
@@ -828,6 +848,43 @@ impl PodBayStore {
         scope: &ScopeId,
         command_id: &CommandId,
     ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(
+            principal, scope, command_id, Some(BoundLaunchFormat::CodexV2),
+        )
+    }
+
+    /// Indexed V3 root selector. A historical V2 command cannot become V3
+    /// through this read, and a V3 command cannot enter a V2-only guard path.
+    pub fn lookup_bound_root_v3_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(
+            principal, scope, command_id, Some(BoundLaunchFormat::CodexV3),
+        )
+    }
+
+    /// Indexed version-aware Codex root readback for an authenticated caller.
+    /// The returned explicit format must be checked before constructing any
+    /// version-specific capability or current guard.
+    pub fn lookup_bound_root_codex_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(principal, scope, command_id, None)
+    }
+
+    fn lookup_bound_root_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+        format: Option<BoundLaunchFormat>,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -849,16 +906,93 @@ impl PodBayStore {
             return Ok(None);
         };
         let record = read_bound_record(&transaction, rowid)?;
-        if record.format != BoundLaunchFormat::CodexV2
+        if (if let Some(format) = format {
+            record.format != format
+        } else {
+            !matches!(record.format, BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3)
+        })
             || record.scope_id != scope.as_str()
             || record.receipt.command_id != command_id.as_str()
             || record.resources.len() != 1
             || record.resources[0].kind != "structured_provider"
         {
-            return Err(StoreError::Conflict("indexed V2 root binding differs"));
+            return Err(StoreError::Conflict(if format == Some(BoundLaunchFormat::CodexV2) {
+                "indexed V2 root binding differs"
+            } else if format == Some(BoundLaunchFormat::CodexV3) {
+                "indexed V3 root binding differs"
+            } else {
+                "indexed Codex root binding differs"
+            }));
         }
         transaction.commit()?;
         Ok(Some(record))
+    }
+
+    /// Current V3 policy fence for an exact reviewed launch record. This is
+    /// database evidence only: the caller must still authenticate its actor,
+    /// manager peer and live Pod/Resource. A V2 record has no row and refuses.
+    pub fn current_launch_policy_fence(
+        &mut self,
+        record: &BoundLaunchRecord,
+    ) -> Result<CurrentLaunchPolicyFence, StoreError> {
+        if record.format != BoundLaunchFormat::CodexV3 {
+            return Err(StoreError::NotFound);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT c.command_rowid FROM commands AS c
+                 JOIN launch_bindings AS b ON b.command_rowid=c.command_rowid
+                 WHERE c.command_id=?1 AND b.scope_id=?2 AND b.pod_id=?3
+                   AND b.attempt_id=?4 AND b.pod_incarnation=?5",
+                params![
+                    record.receipt.command_id,
+                    record.scope_id,
+                    record.pod_id,
+                    record.attempt_id,
+                    integer(record.pod_incarnation)?,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let rowid = rowid.ok_or(StoreError::NotFound)?;
+        if read_bound_record(&transaction, rowid)? != *record {
+            return Err(StoreError::Conflict("V3 bound launch changed"));
+        }
+        let row: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT store_lineage,policy_fence_epoch,admission_authority_revision
+                 FROM launch_policy_fences WHERE command_rowid=?1",
+                [rowid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (lineage, epoch, admission_revision) = row.ok_or(StoreError::NotFound)?;
+        let (current_epoch, current_revision): (i64, i64) = transaction.query_row(
+            "SELECT (SELECT value FROM metadata WHERE key='policy_fence_epoch'),
+                    (SELECT value FROM metadata WHERE key='authority_revision')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if lineage != self.store_lineage
+            || epoch < 1
+            || admission_revision < 1
+            || admission_revision > current_revision
+        {
+            return Err(StoreError::Conflict("V3 launch policy row differs"));
+        }
+        if epoch != current_epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(CurrentLaunchPolicyFence {
+            store_lineage: lineage,
+            policy_fence_epoch: epoch as u64,
+            admission_authority_revision: admission_revision as u64,
+            current_authority_revision: current_revision as u64,
+        })
     }
 
     /// Read an existing bound launch before a manager mints any Session, Run,
@@ -1000,7 +1134,7 @@ impl PodBayStore {
                     .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
                 (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
             }
-            BoundLaunchFormat::CodexV2 => {
+            BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3 => {
                 let descriptor = ImmutableLaunchDescriptorV2::decode_json(&launch.descriptor)
                     .map_err(|_| StoreError::Conflict("stored V2 descriptor is malformed"))?;
                 (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
@@ -1118,6 +1252,40 @@ impl PodBayStore {
             });
         }
         drop(statement);
+        let policy_row: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT store_lineage,policy_fence_epoch,admission_authority_revision
+                 FROM launch_policy_fences WHERE command_rowid=?1",
+                [binding_rowid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let policy_fence = if let Some((row_lineage, epoch, admission_revision)) = policy_row {
+            let current_epoch: i64 = transaction.query_row(
+                "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+                [],
+                |row| row.get(0),
+            )?;
+            if row_lineage != lineage
+                || epoch < 1
+                || admission_revision < 1
+                || admission_revision > revision
+                || current_epoch < 1
+            {
+                return Err(StoreError::Conflict("V3 current policy row differs"));
+            }
+            if epoch != current_epoch {
+                return Err(StoreError::StaleEpoch);
+            }
+            Some(CurrentLaunchPolicyFence {
+                store_lineage: row_lineage,
+                policy_fence_epoch: epoch as u64,
+                admission_authority_revision: admission_revision as u64,
+                current_authority_revision: authority_revision,
+            })
+        } else {
+            None
+        };
         transaction.commit()?;
         Ok(CurrentBoundPodSnapshot {
             store_lineage: StoreLineageId::try_from(lineage.as_str())
@@ -1135,6 +1303,7 @@ impl PodBayStore {
                 .map_err(|_| StoreError::Conflict("bound attempt epoch is invalid"))?,
             launch,
             resources,
+            policy_fence,
         })
     }
 
@@ -1195,6 +1364,7 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::V1),
             format: BoundLaunchFormat::V1,
+            policy_fence_epoch: None,
         })
     }
 
@@ -1212,6 +1382,30 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::CodexV2),
             format: BoundLaunchFormat::CodexV2,
+            policy_fence_epoch: None,
+        })
+    }
+
+    /// V3 uses the same reviewed V2 effective and descriptor bytes, but adds
+    /// an atomic policy-fence row. A historical V2 launch can never become V3
+    /// through duplicate admission or migration.
+    pub fn admit_bound_root_launch_v3(
+        &mut self,
+        request: BoundRootLaunchRequestV2<'_>,
+        expected_policy_fence_epoch: u64,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
+        if expected_policy_fence_epoch == 0 {
+            return Err(StoreError::InvalidInput("V3 policy fence epoch is zero"));
+        }
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::CodexV2),
+            format: BoundLaunchFormat::CodexV3,
+            policy_fence_epoch: Some(expected_policy_fence_epoch),
         })
     }
 
@@ -1253,6 +1447,24 @@ impl PodBayStore {
                 return Err(StoreError::Conflict(
                     "command key changed bound launch format",
                 ));
+            }
+            let policy_row: Option<(String, i64, i64)> = transaction
+                .query_row(
+                    "SELECT store_lineage,policy_fence_epoch,admission_authority_revision
+                     FROM launch_policy_fences WHERE command_rowid=?1",
+                    [rowid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if policy_row.is_some() != request.policy_fence_epoch.is_some() {
+                return Err(StoreError::Conflict(
+                    "command key changed versioned policy binding",
+                ));
+            }
+            if policy_row.is_some_and(|(lineage, epoch, revision)| {
+                lineage != self.store_lineage || epoch < 1 || revision < 1
+            }) {
+                return Err(StoreError::Conflict("V3 policy row is malformed"));
             }
             transaction.commit()?;
             return Ok(BoundLaunchAdmission::Duplicate(record));
@@ -1300,6 +1512,19 @@ impl PodBayStore {
         if actual != (owner, authority_revision) || owner == 0 {
             return Err(StoreError::StaleEpoch);
         }
+        let policy_epoch = if let Some(expected) = request.policy_fence_epoch {
+            let current: i64 = transaction.query_row(
+                "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+                [],
+                |row| row.get(0),
+            )?;
+            if current < 1 || current != integer(expected)? {
+                return Err(StoreError::StaleEpoch);
+            }
+            Some(current)
+        } else {
+            None
+        };
         let prior_target: Option<i64> = transaction
             .query_row(
                 "SELECT epoch FROM target_epochs WHERE scope_id=?1 AND target_id=?2",
@@ -1322,9 +1547,9 @@ impl PodBayStore {
         }
         let digest = digest_request(&command);
         let command_id = stable_command_id(&command);
-        // V2 needs a real row before Run::admit. V1 keeps its original SQL
-        // ordering; both formats still commit all rows in one transaction.
-        let early_command_rowid = (checked.format == BoundLaunchFormat::CodexV2)
+        // Typed V2/V3 roots need a real row before Run::admit. V1 keeps its
+        // original SQL ordering; every format commits in one transaction.
+        let early_command_rowid = (checked.format != BoundLaunchFormat::V1)
             .then(|| {
                 insert_launch_command(
                     &transaction,
@@ -1336,7 +1561,7 @@ impl PodBayStore {
                 )
             })
             .transpose()?;
-        let admitted_run = if checked.format == BoundLaunchFormat::CodexV2 {
+        let admitted_run = if checked.format != BoundLaunchFormat::V1 {
             let command_identity = CommandId::try_from(command_id.as_str())
                 .map_err(|_| StoreError::Conflict("V2 command identity is invalid"))?;
             let witness = InsertedRootCommand {
@@ -1549,6 +1774,19 @@ impl PodBayStore {
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
         }
+        if let Some(policy_epoch) = policy_epoch {
+            transaction.execute(
+                "INSERT INTO launch_policy_fences(command_rowid,store_lineage,
+                   policy_fence_epoch,admission_authority_revision)
+                 VALUES(?1,?2,?3,?4)",
+                params![
+                    command_rowid,
+                    self.store_lineage,
+                    policy_epoch,
+                    next_authority_revision
+                ],
+            )?;
+        }
         let record = read_bound_record(&transaction, command_rowid)?;
         transaction.commit()?;
         Ok(BoundLaunchAdmission::Committed(record))
@@ -1683,7 +1921,7 @@ fn check_proposal<'a>(
                 descriptor,
                 spec_digest: effective.digest().to_owned(),
                 descriptor_digest: proposal.descriptor.digest().to_owned(),
-                format: BoundLaunchFormat::CodexV2,
+                format: request.format,
                 max_children: effective.base().max_children(),
                 expected_owner_epoch: proposal.expected_owner_epoch,
                 expected_authority_revision: proposal.expected_authority_revision,
@@ -1871,7 +2109,7 @@ fn stored_launch_facts(
                 resources,
             })
         }
-        BoundLaunchFormat::CodexV2 => {
+        BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3 => {
             let effective = EffectiveLaunchContractV2::decode(effective_bytes)
                 .map_err(|_| StoreError::Conflict("stored V2 effective launch is malformed"))?;
             let descriptor = ImmutableLaunchDescriptorV2::decode_json(descriptor_bytes)
@@ -2016,9 +2254,25 @@ pub(crate) fn read_bound_record(
             ))
         },
     )?;
-    let format = match (binding_facts.5.as_str(), binding_facts.6.as_str()) {
-        (EFFECTIVE_LAUNCH_VERSION, LAUNCH_DESCRIPTOR_SCHEMA) => BoundLaunchFormat::V1,
-        (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA) => BoundLaunchFormat::CodexV2,
+    let policy_bound: Option<i64> = transaction
+        .query_row(
+            "SELECT command_rowid FROM launch_policy_fences WHERE command_rowid=?1",
+            [rowid],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let format = match (
+        binding_facts.5.as_str(),
+        binding_facts.6.as_str(),
+        policy_bound.is_some(),
+    ) {
+        (EFFECTIVE_LAUNCH_VERSION, LAUNCH_DESCRIPTOR_SCHEMA, false) => BoundLaunchFormat::V1,
+        (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA, false) => {
+            BoundLaunchFormat::CodexV2
+        }
+        (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA, true) => {
+            BoundLaunchFormat::CodexV3
+        }
         _ => return Err(StoreError::Conflict("bound launch version pair differs")),
     };
     if binding_facts.0 != scope_id

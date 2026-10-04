@@ -24,6 +24,8 @@ mod ports;
 #[cfg(target_os = "linux")]
 mod rebind_protocol;
 #[cfg(target_os = "linux")]
+mod rebind_recovery_protocol;
+#[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
 mod segmented_native_events;
@@ -50,7 +52,7 @@ pub use codex_journal::{
     CodexJournalView,
 };
 #[cfg(target_os = "linux")]
-pub use codex_launch::launch_bound_codex_v2;
+pub use codex_launch::{launch_bound_codex_v2, launch_bound_codex_v3};
 #[cfg(target_os = "linux")]
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 pub use codex_turn_journal::{
@@ -60,8 +62,9 @@ pub use codex_turn_journal::{
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
 pub use manifest::{
-    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, OPERATOR_PROCESS_CAPABILITY,
-    OPERATOR_PROCESS_PROFILE_REF, PodManifest, PodPeerBootstrap, PodStatus,
+    BoundPeerManifest, BoundPodStatus, BoundPolicyFenceV3, CODEX_V2_CAPABILITY,
+    CODEX_V3_CAPABILITY, OPERATOR_PROCESS_CAPABILITY, OPERATOR_PROCESS_PROFILE_REF,
+    PEER_BINDING_V3_PROTOCOL, PodManifest, PodPeerBootstrap, PodStatus,
 };
 pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
@@ -77,7 +80,10 @@ pub use native_segment_checkpoint::{
     IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint, NativeSegmentMeta,
     NativeSegmentOffset,
 };
-pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
+pub use peer_checkpoint::{
+    PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint,
+    peer_checkpoint_observation_digest,
+};
 #[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
@@ -90,6 +96,8 @@ pub use runtime::{
     LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
     launch_bound, serve,
 };
+#[cfg(target_os = "linux")]
+pub use rebind_recovery_protocol::{PendingRecoveryInspection, RECOVER_INSPECT_PROTOCOL};
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
     TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,
