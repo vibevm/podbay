@@ -522,6 +522,7 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
@@ -600,7 +601,8 @@ fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets;
+            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+             DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations; DROP TABLE actor_verifiers;
              PRAGMA user_version=13;",
         )
@@ -631,7 +633,8 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets;
+            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+             DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations; PRAGMA user_version=14;",
         )
         .unwrap();
@@ -657,7 +660,7 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, count), (17, 0));
+    assert_eq!((version, count), (18, 0));
 }
 
 #[test]

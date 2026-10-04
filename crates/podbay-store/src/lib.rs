@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod bootstrap_send;
 mod bound_launch;
 mod launch;
 mod manager_peer;
@@ -12,6 +13,9 @@ mod store;
 mod writer_lease;
 
 pub use authority::SqliteActorVerifierWitness;
+pub use bootstrap_send::{
+    BootstrapSendRecord, BootstrapSendSelector, TrustedBootstrapSendRequest,
+};
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,

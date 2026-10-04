@@ -9,16 +9,18 @@ use podbay_core::{
     RunId, ScopeId, Session, SessionId, WorkKind,
 };
 use podbay_store::{
-    AuthorityActorRecord, AuthorityMutation, BoundLaunchAdmission, BoundLaunchFormat,
-    BoundLaunchProposal, BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
-    CommandLookupSelector, EffectClaim, LaunchDispatchStage, LaunchKeyLookupRequest,
-    LaunchLookupRequest, LaunchPortResult, NativeWriterTarget, PodBayStore, StoreError,
+    Admission, AuthorityActorRecord, AuthorityMutation, BootstrapSendSelector,
+    BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
+    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
+    LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
+    NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
-    CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
-    ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, ResourceDriver, ReviewedNativePolicy,
-    ReviewedResource, TargetOs,
+    CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
+    EffectiveLaunchContract, EffectiveLaunchContractV2, Guard, ImmutableLaunchDescriptor,
+    ImmutableLaunchDescriptorV2, ResourceDriver, ReviewedNativePolicy, ReviewedResource,
+    SendPolicy, SessionSendBody, Target, TargetOs,
 };
 
 struct Fixture {
@@ -821,7 +823,8 @@ fn v15_existing_v2_run_migrates_to_default_deny_budget() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases; DROP TABLE run_child_budgets; PRAGMA user_version=15;",
+            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+             DROP TABLE run_child_budgets; PRAGMA user_version=15;",
         )
         .unwrap();
     drop(connection);
@@ -1146,7 +1149,8 @@ fn v17_writer_lease_schema_is_verified_exactly() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases;
+            "DROP TABLE codex_bootstrap_sends;
+             DROP TABLE native_writer_leases;
              CREATE TABLE native_writer_leases(resource_id TEXT PRIMARY KEY) STRICT;",
         )
         .unwrap();
@@ -1190,7 +1194,7 @@ fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() 
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE native_writer_leases; PRAGMA user_version=16;")
+        .execute_batch("DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases; PRAGMA user_version=16;")
         .unwrap();
     drop(connection);
     let mut migrated = fixture.open();
@@ -1200,4 +1204,502 @@ fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() 
     ));
     let read_only = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
     drop(read_only);
+}
+
+fn bootstrap_ready(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget, u64, u64) {
+    let (mut store, target, manager_credential) = admitted_writer_target(fixture);
+    let launch = store
+        .current_bound_pod_snapshot("scope.launch", "pod.launch")
+        .unwrap();
+    let launch_receipt = launch.launch().receipt.clone();
+    let revision = launch.authority_revision();
+    assert_eq!(
+        store
+            .claim_effect(
+                launch_receipt.outbox_id,
+                "scope.launch",
+                "pod.launch",
+                1,
+                1,
+                revision,
+                &format!("claim.{}", launch_receipt.command_id),
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+    store
+        .record_launch_port_result(
+            launch_receipt.outbox_id,
+            "scope.launch",
+            "pod.launch",
+            1,
+            &format!("claim.{}", launch_receipt.command_id),
+            LaunchPortResult::HostAccepted {
+                receipt_ref: Some("receipt.pod.running".into()),
+            },
+        )
+        .unwrap();
+    let lease_request = writer_request(&mut store, target.clone(), manager_credential);
+    let lease = store
+        .acquire_native_writer_lease_from_trusted_host(&lease_request)
+        .unwrap();
+    (store, target, manager_credential, lease.writer_epoch())
+}
+
+fn decimal(value: u64) -> DecimalString {
+    DecimalString::new(value)
+}
+
+fn bootstrap_envelope(
+    key: &str,
+    request_id: &str,
+    text: &str,
+    session_revision: u64,
+    writer_epoch: u64,
+) -> CommandEnvelope {
+    CommandEnvelope::new(
+        request_id,
+        key,
+        Target::Session {
+            session_id: "session.codex.fixture".into(),
+        },
+        Some(Guard {
+            manager_epoch: Some(decimal(1)),
+            pod_epoch: Some(decimal(1)),
+            resource_epoch: Some(decimal(1)),
+            writer_epoch: Some(decimal(writer_epoch)),
+            lease_epoch: None,
+            target_revision: Some(decimal(session_revision)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap()
+}
+
+fn bootstrap_request<'a>(
+    store: &mut PodBayStore,
+    target: NativeWriterTarget,
+    manager_credential: u64,
+    envelope: &'a CommandEnvelope,
+) -> TrustedBootstrapSendRequest<'a> {
+    TrustedBootstrapSendRequest {
+        principal: VerifiedPrincipal::from_authenticated_boundary("actor.codex.fixture").unwrap(),
+        scope_id: target.scope_id.clone(),
+        envelope,
+        native_target: target,
+        holder_actor_id: ActorId::try_from("actor.codex.fixture").unwrap(),
+        holder_credential_generation: 1,
+        expected_owner_epoch: 1,
+        expected_manager_credential_epoch: manager_credential,
+        expected_authority_revision: store.authority_snapshot().unwrap().revision,
+    }
+}
+
+#[test]
+fn v18_bootstrap_send_commits_once_claims_once_and_pod_reads_exact_proof() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let envelope = bootstrap_envelope(
+        "key.bootstrap.one",
+        "request.bootstrap.one",
+        "First real turn",
+        revision as u64,
+        writer_epoch,
+    );
+    let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    let receipt = match store.admit_bootstrap_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected committed bootstrap: {other:?}"),
+    };
+    let selector = BootstrapSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target.clone(),
+    };
+    let inspection = store
+        .lookup_command(
+            "scope.launch",
+            &VerifiedPrincipal::from_authenticated_boundary("actor.codex.fixture").unwrap(),
+            &CommandLookupSelector::Id {
+                command_id: receipt.command_id.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(inspection.receipt, receipt);
+    assert_eq!(inspection.effect_state, podbay_store::EffectState::Prepared);
+    assert!(matches!(
+        store.inspect_claimed_bootstrap_send(&selector),
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store.claim_bootstrap_send(&selector).unwrap(),
+        EffectClaim::NewClaim
+    );
+    assert_eq!(
+        store.claim_bootstrap_send(&selector).unwrap(),
+        EffectClaim::ExistingUncertain
+    );
+    let mut pod_read = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    let proof = pod_read.inspect_claimed_bootstrap_send(&selector).unwrap();
+    assert_eq!(proof.receipt(), &receipt);
+    assert_eq!(proof.prompt_text(), "First real turn");
+    assert_eq!(proof.native_target(), &target);
+    assert_eq!(proof.writer_epoch(), writer_epoch);
+    assert_eq!(proof.wire_payload_digest(), envelope.payload_digest);
+    drop(pod_read);
+    let retry = bootstrap_envelope(
+        "key.bootstrap.one",
+        "request.bootstrap.retry",
+        "First real turn",
+        revision as u64,
+        writer_epoch,
+    );
+    let duplicate = bootstrap_request(&mut store, target.clone(), manager_credential, &retry);
+    assert_eq!(
+        store.admit_bootstrap_send(&duplicate).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
+    let changed = bootstrap_envelope(
+        "key.bootstrap.one",
+        "request.bootstrap.changed",
+        "Changed turn",
+        revision as u64,
+        writer_epoch,
+    );
+    let changed_request =
+        bootstrap_request(&mut store, target.clone(), manager_credential, &changed);
+    assert!(matches!(
+        store.admit_bootstrap_send(&changed_request),
+        Err(StoreError::Conflict(_))
+    ));
+    let second_key = bootstrap_envelope(
+        "key.bootstrap.two",
+        "request.bootstrap.two",
+        "Another turn",
+        revision as u64,
+        writer_epoch,
+    );
+    let second_request = bootstrap_request(&mut store, target, manager_credential, &second_key);
+    assert!(matches!(
+        store.admit_bootstrap_send(&second_request),
+        Err(StoreError::Conflict("Session already has a bootstrap send"))
+    ));
+}
+
+#[test]
+fn v18_bootstrap_requires_host_accepted_launch_and_current_writer() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let lease_request = writer_request(&mut store, target.clone(), manager_credential);
+    store
+        .acquire_native_writer_lease_from_trusted_host(&lease_request)
+        .unwrap();
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let envelope = bootstrap_envelope(
+        "key.before.accepted",
+        "request.before.accepted",
+        "Prompt",
+        revision as u64,
+        1,
+    );
+    let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    assert!(matches!(
+        store.admit_bootstrap_send(&request),
+        Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"))
+    ));
+    drop(store);
+    let second_fixture = Fixture::new();
+    let (mut store, target, manager_credential, _) = bootstrap_ready(&second_fixture);
+    // A fresh key with a stale native writer epoch cannot be admitted.
+    let mut takeover = writer_request(&mut store, target.clone(), manager_credential);
+    takeover.expected_writer_epoch = Some(1);
+    store
+        .acquire_native_writer_lease_from_trusted_host(&takeover)
+        .unwrap();
+    let envelope = bootstrap_envelope(
+        "key.stale.writer",
+        "request.stale.writer",
+        "Prompt",
+        revision as u64,
+        1,
+    );
+    let request = bootstrap_request(&mut store, target, manager_credential, &envelope);
+    assert!(matches!(
+        store.admit_bootstrap_send(&request),
+        Err(StoreError::StaleEpoch)
+    ));
+}
+
+#[test]
+fn v18_bootstrap_rollback_and_prepared_reopen_are_truthful() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_bootstrap_binding AFTER INSERT ON codex_bootstrap_sends
+         BEGIN SELECT RAISE(ABORT,'injected bootstrap failure'); END;",
+        )
+        .unwrap();
+    let envelope = bootstrap_envelope(
+        "key.bootstrap.rollback",
+        "request.rollback.one",
+        "Prompt",
+        revision as u64,
+        writer_epoch,
+    );
+    let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    assert!(matches!(
+        store.admit_bootstrap_send(&request),
+        Err(StoreError::Storage(_))
+    ));
+    for table in ["codex_bootstrap_sends", "commands", "events", "outbox"] {
+        let expected = if table == "codex_bootstrap_sends" {
+            0
+        } else {
+            1
+        };
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "{table} escaped failed bootstrap transaction"
+        );
+    }
+    connection
+        .execute_batch("DROP TRIGGER fail_bootstrap_binding")
+        .unwrap();
+    let receipt = match store.admit_bootstrap_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected committed bootstrap: {other:?}"),
+    };
+    drop(connection);
+    drop(store);
+    let mut reopened = fixture.open();
+    let retry = bootstrap_envelope(
+        "key.bootstrap.rollback",
+        "request.rollback.retry",
+        "Prompt",
+        revision as u64,
+        writer_epoch,
+    );
+    let duplicate = bootstrap_request(&mut reopened, target.clone(), manager_credential, &retry);
+    assert_eq!(
+        reopened.admit_bootstrap_send(&duplicate).unwrap(),
+        Admission::Duplicate(receipt.clone())
+    );
+    let selector = BootstrapSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target,
+    };
+    assert_eq!(
+        reopened.claim_bootstrap_send(&selector).unwrap(),
+        EffectClaim::NewClaim
+    );
+    drop(reopened);
+    let mut pod_read = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(
+        pod_read
+            .inspect_claimed_bootstrap_send(&selector)
+            .unwrap()
+            .prompt_text(),
+        "Prompt"
+    );
+}
+
+#[test]
+fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
+    let fixture = Fixture::new();
+    let (store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE codex_bootstrap_sends; PRAGMA user_version=17;")
+        .unwrap();
+    drop(connection);
+    let mut reopened = fixture.open();
+    let lease = reopened.inspect_native_writer_lease(&target).unwrap();
+    assert_eq!(lease.manager_credential_epoch(), manager_credential);
+    assert_eq!(lease.writer_epoch(), writer_epoch);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM codex_bootstrap_sends", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 18);
+}
+
+#[test]
+fn v18_bootstrap_schema_is_verified_exactly() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE codex_bootstrap_sends;
+         CREATE TABLE codex_bootstrap_sends(command_rowid INTEGER PRIMARY KEY) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::Conflict("v18 bootstrap schema differs"))
+    ));
+    assert!(matches!(
+        PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v18 bootstrap schema differs"))
+    ));
+}
+
+#[test]
+fn v18_bootstrap_binding_tamper_refuses_claim_and_exact_lookup() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let envelope = bootstrap_envelope(
+        "key.bootstrap.tamper",
+        "request.bootstrap.tamper",
+        "Prompt",
+        revision as u64,
+        writer_epoch,
+    );
+    let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    let receipt = match store.admit_bootstrap_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected committed bootstrap: {other:?}"),
+    };
+    connection
+        .execute(
+            "UPDATE codex_bootstrap_sends SET resource_input_epoch=2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let selector = BootstrapSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target,
+    };
+    assert!(matches!(
+        store.claim_bootstrap_send(&selector),
+        Err(StoreError::Conflict("bootstrap binding digest differs"))
+    ));
+    assert!(matches!(
+        store.inspect_claimed_bootstrap_send(&selector),
+        Err(StoreError::Conflict("bootstrap binding digest differs"))
+    ));
+    assert_eq!(
+        store.effect_state(receipt.outbox_id).unwrap(),
+        podbay_store::EffectState::Prepared
+    );
+}
+
+#[test]
+fn v18_bootstrap_rejects_artifact_and_steering_before_admission() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM runtime_sessions WHERE session_id='session.codex.fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let base = bootstrap_envelope(
+        "key.unsupported.base",
+        "request.unsupported.base",
+        "Prompt",
+        revision as u64,
+        writer_epoch,
+    );
+    for (key, body) in [
+        (
+            "key.unsupported.artifact",
+            SessionSendBody {
+                content: vec![ContentBlock::Artifact {
+                    artifact_ref: "artifact.fixture".into(),
+                }],
+                policy: SendPolicy::WhenIdle,
+            },
+        ),
+        (
+            "key.unsupported.steer",
+            SessionSendBody {
+                content: vec![ContentBlock::Text {
+                    text: "Prompt".into(),
+                }],
+                policy: SendPolicy::Steer {
+                    expected_interval_id: "interval.fixture".into(),
+                },
+            },
+        ),
+    ] {
+        let envelope = CommandEnvelope::new(
+            "request.unsupported",
+            key,
+            base.target.clone(),
+            base.guard.clone(),
+            None,
+            CommandBody::SessionSend(body),
+        )
+        .unwrap();
+        let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+        assert!(matches!(
+            store.admit_bootstrap_send(&request),
+            Err(StoreError::InvalidInput(_))
+        ));
+    }
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM codex_bootstrap_sends", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
 }

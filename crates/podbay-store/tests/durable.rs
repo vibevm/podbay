@@ -91,7 +91,8 @@ fn remove_v8_schema(connection: &rusqlite::Connection) {
     // user_version attached to the new tables.
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases;
+            "DROP TABLE codex_bootstrap_sends;
+             DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
              DROP TABLE actor_verifiers;
@@ -415,7 +416,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_seventeen_has_empty_runtime_rebind_manager_and_verifier_tables() {
+fn fresh_schema_eighteen_has_empty_runtime_rebind_manager_and_verifier_tables() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -423,12 +424,13 @@ fn fresh_schema_seventeen_has_empty_runtime_rebind_manager_and_verifier_tables()
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     for table in [
         "runtime_sessions",
         "runtime_runs",
         "run_child_budgets",
         "native_writer_leases",
+        "codex_bootstrap_sends",
         "launch_bindings",
         "launch_resources",
         "manager_rebinds",
@@ -466,7 +468,8 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases;
+            "DROP TABLE codex_bootstrap_sends;
+             DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations;
              DROP TABLE actor_verifiers;
@@ -499,12 +502,13 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     for table in [
         "runtime_sessions",
         "runtime_runs",
         "run_child_budgets",
         "native_writer_leases",
+        "codex_bootstrap_sends",
         "launch_bindings",
         "launch_resources",
         "manager_rebinds",
@@ -535,7 +539,8 @@ fn schema_eight_refuses_preexisting_or_malformed_runtime_tables() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE native_writer_leases;
+            "DROP TABLE codex_bootstrap_sends;
+             DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE launch_resources;
              DROP TABLE launch_bindings;

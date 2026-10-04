@@ -14,7 +14,7 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -71,6 +71,33 @@ const NATIVE_WRITER_LEASES_V17: &str = "CREATE TABLE native_writer_leases (
   authority_revision INTEGER NOT NULL CHECK(authority_revision>=1),
   writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
   expires_at_unix_seconds INTEGER NOT NULL CHECK(expires_at_unix_seconds>=1)
+) STRICT";
+// Historical sessions gain no bootstrap command. One Session may have only
+// one first native turn; a changed key cannot create another bootstrap.
+const CODEX_BOOTSTRAP_SENDS_V18: &str = "CREATE TABLE codex_bootstrap_sends (
+  command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL UNIQUE REFERENCES runtime_sessions(session_id),
+  session_revision INTEGER NOT NULL CHECK(session_revision>=1),
+  run_id TEXT NOT NULL CHECK(length(run_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  resource_input_epoch INTEGER NOT NULL CHECK(resource_input_epoch>=1),
+  holder_actor_id TEXT NOT NULL CHECK(length(holder_actor_id)>0),
+  holder_credential_generation INTEGER NOT NULL CHECK(holder_credential_generation>=1),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  manager_credential_epoch INTEGER NOT NULL CHECK(manager_credential_epoch>=1),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision>=1),
+  writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
+  lease_expires_at_unix_seconds INTEGER NOT NULL CHECK(lease_expires_at_unix_seconds>=1),
+  wire_payload_digest TEXT NOT NULL CHECK(length(wire_payload_digest)=64),
+  prompt_digest TEXT NOT NULL CHECK(length(prompt_digest)=64),
+  binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64),
+  UNIQUE(resource_id,resource_epoch)
 ) STRICT";
 const LAUNCH_BINDINGS_V8: &str = "CREATE TABLE launch_bindings (
   command_rowid INTEGER PRIMARY KEY,
@@ -267,6 +294,7 @@ impl PodBayStore {
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
+        verify_codex_bootstrap_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
@@ -698,9 +726,22 @@ impl PodBayStore {
             }
             transaction.execute_batch(&format!("{NATIVE_WRITER_LEASES_V17};"))?;
         }
+        if version < 18 {
+            verify_writer_lease_schema(&transaction)?;
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='codex_bootstrap_sends'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict("v18 bootstrap schema name already exists"));
+            }
+            transaction.execute_batch(&format!("{CODEX_BOOTSTRAP_SENDS_V18};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
+        verify_codex_bootstrap_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
         verify_manager_peer_schema(&transaction)?;
@@ -2412,6 +2453,20 @@ fn verify_writer_lease_schema(transaction: &rusqlite::Transaction<'_>) -> Result
         .optional()?;
     if actual.as_deref() != Some(NATIVE_WRITER_LEASES_V17) {
         return Err(StoreError::Conflict("v17 writer lease schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_codex_bootstrap_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='codex_bootstrap_sends'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(CODEX_BOOTSTRAP_SENDS_V18) {
+        return Err(StoreError::Conflict("v18 bootstrap schema differs"));
     }
     Ok(())
 }

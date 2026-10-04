@@ -165,6 +165,45 @@ impl PodBayStore {
     }
 }
 
+/// Same-snapshot durable lease witness for a future typed command. This is
+/// only database evidence; a host/pod must still authenticate its transport,
+/// grant, live child and fresh process before any native write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_native_writer_lease(
+    transaction: &Transaction<'_>,
+    cached_lineage: &str,
+    target: &NativeWriterTarget,
+    holder_actor_id: &ActorId,
+    holder_generation: u64,
+    owner_epoch: u64,
+    manager_credential_epoch: u64,
+    authority_revision: u64,
+    writer_epoch: u64,
+) -> Result<NativeWriterLease, StoreError> {
+    check_manager(
+        transaction,
+        cached_lineage,
+        owner_epoch,
+        manager_credential_epoch,
+        authority_revision,
+    )?;
+    check_current_target(transaction, cached_lineage, target)?;
+    check_actor(transaction, &target.scope_id, holder_actor_id, holder_generation)?;
+    let lease = read_lease(transaction, &target.resource_id)?.ok_or(StoreError::NotFound)?;
+    if lease.target != *target
+        || lease.holder_actor_id != *holder_actor_id
+        || lease.holder_credential_generation != holder_generation
+        || lease.owner_epoch != owner_epoch
+        || lease.manager_credential_epoch != manager_credential_epoch
+        || lease.authority_revision != authority_revision
+        || lease.writer_epoch != writer_epoch
+        || lease.expires_at_unix_seconds <= current_unix_seconds(transaction)?
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(lease)
+}
+
 fn positive(value: i64, reason: &'static str) -> Result<u64, StoreError> {
     if value <= 0 {
         Err(StoreError::Conflict(reason))
