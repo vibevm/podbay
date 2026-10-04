@@ -5,6 +5,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ed25519_compact::{PublicKey, Signature};
+
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -432,6 +434,168 @@ impl ActorRegistration {
             credential_generation,
         }
     }
+}
+
+/// Manager-owned policy for the first process-bound owner only. Neither the
+/// setup peer nor a PodBay request chooses these rights or the credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedInitialOwnerPolicy {
+    actor_id: ActorId,
+    scope_id: ScopeId,
+    credential: CredentialRef,
+}
+
+impl TrustedInitialOwnerPolicy {
+    pub fn from_trusted_manager_policy(
+        actor_id: ActorId,
+        scope_id: ScopeId,
+        credential: CredentialRef,
+    ) -> Result<Self, HostError> {
+        if credential.scope_id() != &scope_id {
+            return Err(HostError::Unauthorised);
+        }
+        Ok(Self {
+            actor_id,
+            scope_id,
+            credential,
+        })
+    }
+
+    fn grant_spec(&self) -> GrantSpec {
+        GrantSpec {
+            scope_id: self.scope_id.clone(),
+            mode: GrantMode::Controller,
+            rights: BTreeSet::from([
+                Right::new(Operation::LaunchPod, Target::Scope(self.scope_id.clone())),
+                Right::new(Operation::SendSession, Target::Scope(self.scope_id.clone())),
+                Right::new(
+                    Operation::UseCredential,
+                    Target::Credential(self.credential.clone()),
+                ),
+            ]),
+            remaining_delegation_depth: 0,
+        }
+    }
+}
+
+/// Fresh manager nonce and exact setup-context bytes. Only a trusted setup
+/// transport may supply `process`; the ordinary auth/1 listener cannot mint
+/// this challenge from a request selector.
+pub struct PendingInitialOwnerEnrollment {
+    policy: TrustedInitialOwnerPolicy,
+    process: AuthenticatedProcessSubject,
+    public_key: [u8; 32],
+    store_lineage: String,
+    owner_epoch: u64,
+    authority_revision: u64,
+    challenge: Vec<u8>,
+}
+
+impl PendingInitialOwnerEnrollment {
+    pub fn challenge_bytes(&self) -> &[u8] {
+        &self.challenge
+    }
+
+    /// Consumes one challenge and verifies the new key's possession. This is
+    /// a separate domain from normal auth/1; a normal login signature cannot
+    /// become an enrollment proof.
+    pub fn verify(self, signature: &[u8]) -> Result<ProvenInitialOwnerEnrollment, HostError> {
+        let public_key =
+            PublicKey::from_slice(&self.public_key).map_err(|_| HostError::InvalidInput)?;
+        public_key.validate().map_err(|_| HostError::InvalidInput)?;
+        let signature = Signature::from_slice(signature).map_err(|_| HostError::Unauthenticated)?;
+        public_key
+            .verify(&self.challenge, &signature)
+            .map_err(|_| HostError::Unauthenticated)?;
+        Ok(ProvenInitialOwnerEnrollment {
+            policy: self.policy,
+            process: self.process,
+            public_key: self.public_key,
+            store_lineage: self.store_lineage,
+            owner_epoch: self.owner_epoch,
+            authority_revision: self.authority_revision,
+        })
+    }
+}
+
+/// Constructible only by a verified, single-use domain-separated challenge.
+/// The later host commit still requires a fresh kernel reattestation of the
+/// same setup socket peer before any durable mutation.
+pub struct ProvenInitialOwnerEnrollment {
+    policy: TrustedInitialOwnerPolicy,
+    process: AuthenticatedProcessSubject,
+    public_key: [u8; 32],
+    store_lineage: String,
+    owner_epoch: u64,
+    authority_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialOwnerEnrollmentReceipt {
+    pub actor_id: ActorId,
+    pub scope_id: ScopeId,
+    pub grant_id: GrantId,
+    pub owner_epoch: u64,
+    pub authority_revision: u64,
+    pub duplicate: bool,
+}
+
+struct InitialEnrollmentRuntime {
+    receipt: InitialOwnerEnrollmentReceipt,
+    process: AuthenticatedProcessSubject,
+    public_key: [u8; 32],
+    credential: CredentialRef,
+}
+
+fn initial_owner_field(output: &mut Vec<u8>, tag: u8, value: &[u8]) -> Result<(), HostError> {
+    let length = u16::try_from(value.len()).map_err(|_| HostError::InvalidInput)?;
+    if length == 0 || output.len() + value.len() + 3 > 8192 {
+        return Err(HostError::InvalidInput);
+    }
+    output.push(tag);
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn initial_owner_challenge(
+    nonce: &[u8; 32],
+    policy: &TrustedInitialOwnerPolicy,
+    process: &AuthenticatedProcessSubject,
+    public_key: &[u8; 32],
+    lineage: &str,
+    owner_epoch: u64,
+    revision: u64,
+) -> Result<Vec<u8>, HostError> {
+    if process.platform() != HostPlatform::Linux || owner_epoch == 0 || revision == 0 {
+        return Err(HostError::InvalidInput);
+    }
+    let owner_bytes = owner_epoch.to_be_bytes();
+    let revision_bytes = revision.to_be_bytes();
+    let start_bytes = process.start_identity().to_be_bytes();
+    let mut bytes = b"podbay.owner-initial-enrollment/1\0".to_vec();
+    for (tag, field) in [
+        (1, nonce.as_slice()),
+        (2, lineage.as_bytes()),
+        (3, owner_bytes.as_slice()),
+        (4, revision_bytes.as_slice()),
+        (5, policy.actor_id.as_str().as_bytes()),
+        (6, policy.scope_id.as_str().as_bytes()),
+        (7, b"owner_cli.coordinator.generation1".as_slice()),
+        (8, process.os_identity().as_bytes()),
+        (9, process.process_identity().as_bytes()),
+        (10, start_bytes.as_slice()),
+        (11, process.containment_identity().as_bytes()),
+        (12, public_key.as_slice()),
+        (13, policy.credential.as_str().as_bytes()),
+        (
+            14,
+            b"launch_pod.scope+use_credential.exact+send_session.scope".as_slice(),
+        ),
+    ] {
+        initial_owner_field(&mut bytes, tag, field)?;
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -2292,6 +2456,8 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     host: HostAuthority<P>,
     store: PodBayStore,
     recorded: AuthoritySnapshot,
+    initial_owner_enrollments: HashMap<ActorId, InitialEnrollmentRuntime>,
+    initial_owner_projection_failed: bool,
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
     native_host: Option<TrustedNativeHostConfig>,
 }
@@ -2399,6 +2565,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             host,
             store,
             recorded,
+            initial_owner_enrollments: HashMap::new(),
+            initial_owner_projection_failed: false,
             launch_profiles: HashMap::new(),
             native_host: None,
         })
@@ -2558,6 +2726,244 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     pub fn recorded_snapshot(&self) -> &AuthoritySnapshot {
         &self.recorded
+    }
+
+    /// Begin one owner enrollment on a trusted one-use setup connection.
+    /// `observed_process` must come from fresh kernel peer evidence; neither
+    /// ordinary auth/1 nor a request body can supply that trusted observation.
+    pub fn begin_initial_owner_enrollment(
+        &mut self,
+        policy: TrustedInitialOwnerPolicy,
+        observed_process: AuthenticatedProcessSubject,
+        public_key: [u8; 32],
+    ) -> Result<PendingInitialOwnerEnrollment, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            if observed_process.platform() != HostPlatform::Linux {
+                return Err(HostError::Unsupported.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if current.owner_epoch != self.manager_claim.owner_epoch()
+                || current.revision != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            if self.recorded.actors.iter().any(|record| {
+                record.actor_id == policy.actor_id.as_str()
+                    && !self
+                        .initial_owner_enrollments
+                        .contains_key(&policy.actor_id)
+            }) || self.recorded.actors.iter().any(|record| {
+                record.scope_id == policy.scope_id.as_str()
+                    && record.origin == "owner_cli"
+                    && record.actor_id != policy.actor_id.as_str()
+            }) {
+                return Err(HostError::Unauthorised.into());
+            }
+            let mut nonce = [0_u8; 32];
+            getrandom::fill(&mut nonce).map_err(|_| {
+                DurableAuthorityError::Io(std::io::Error::other(
+                    "initial owner challenge entropy unavailable",
+                ))
+            })?;
+            if nonce == [0; 32] {
+                return Err(HostError::AuthorityStoreUnavailable.into());
+            }
+            let store_lineage = self.manager_claim.store_lineage().to_owned();
+            let challenge = initial_owner_challenge(
+                &nonce,
+                &policy,
+                &observed_process,
+                &public_key,
+                &store_lineage,
+                current.owner_epoch,
+                current.revision,
+            )?;
+            self.recheck_actor_resolution_manager()?;
+            let final_snapshot = self.store.authority_snapshot()?;
+            if final_snapshot.owner_epoch != current.owner_epoch
+                || final_snapshot.revision != current.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(PendingInitialOwnerEnrollment {
+                policy,
+                process: observed_process,
+                public_key,
+                store_lineage,
+                owner_epoch: current.owner_epoch,
+                authority_revision: current.revision,
+                challenge,
+            })
+        }
+    }
+
+    /// Commit only a freshly signed setup proof whose exact process has been
+    /// kernel-reattested immediately before this call. A fresh manager may
+    /// not reinterpret an old recorded owner as a new enrollment.
+    pub fn commit_initial_owner_enrollment(
+        &mut self,
+        proof: ProvenInitialOwnerEnrollment,
+        freshly_observed_process: &AuthenticatedProcessSubject,
+    ) -> Result<InitialOwnerEnrollmentReceipt, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            if freshly_observed_process != &proof.process {
+                return Err(HostError::Unauthenticated.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if proof.store_lineage != self.manager_claim.store_lineage()
+                || proof.owner_epoch != self.manager_claim.owner_epoch()
+                || proof.owner_epoch != self.host.manager_epoch.get()
+                || proof.authority_revision != self.recorded.revision
+                || current.owner_epoch != proof.owner_epoch
+                || current.revision != proof.authority_revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            let registration = ActorRegistration::owner_cli_from_trusted_policy(
+                proof.policy.actor_id.clone(),
+                proof.policy.scope_id.clone(),
+                proof.process.clone(),
+                CredentialGeneration::new(1)?,
+            );
+            let actor_record = durable_actor(&registration);
+            if let Some(previous) = self.initial_owner_enrollments.get(&proof.policy.actor_id) {
+                if previous.process != proof.process
+                    || previous.public_key != proof.public_key
+                    || previous.credential != proof.policy.credential
+                    || previous.receipt.authority_revision != current.revision
+                {
+                    return Err(HostError::Unauthorised.into());
+                }
+                let grant_record = self
+                    .recorded
+                    .grants
+                    .iter()
+                    .find(|grant| grant.grant_id == previous.receipt.grant_id.get())
+                    .ok_or(DurableAuthorityError::Corrupt("enrollment grant missing"))?
+                    .clone();
+                let (revision, duplicate) =
+                    self.store.enroll_initial_owner_actor_from_trusted_host(
+                        &proof.store_lineage,
+                        proof.owner_epoch,
+                        proof.authority_revision,
+                        &actor_record,
+                        proof.public_key,
+                        &grant_record,
+                    )?;
+                if !duplicate || revision != previous.receipt.authority_revision {
+                    return Err(DurableAuthorityError::Corrupt("enrollment replay changed"));
+                }
+                let mut receipt = previous.receipt.clone();
+                receipt.duplicate = true;
+                return Ok(receipt);
+            }
+            if self.recorded.actors.iter().any(|record| {
+                record.actor_id == proof.policy.actor_id.as_str()
+                    || (record.scope_id == proof.policy.scope_id.as_str()
+                        && record.origin == "owner_cli")
+            }) {
+                return Err(HostError::Unauthorised.into());
+            }
+            // Validate the in-memory projection without activating it. The
+            // store transaction must be the first moment this actor/grant
+            // exists anywhere in the live manager.
+            let grant_spec = proof.policy.grant_spec();
+            let grant_id = GrantId(self.host.next_grant_id);
+            let next_grant_id = self
+                .host
+                .next_grant_id
+                .checked_add(1)
+                .ok_or(HostError::InvalidInput)?;
+            let next_revision = proof
+                .authority_revision
+                .checked_add(1)
+                .ok_or(HostError::InvalidInput)?;
+            if self.host.actors.contains_key(&registration.actor_id)
+                || self
+                    .host
+                    .actors
+                    .values()
+                    .any(|actor| actor.process == registration.process)
+                || self.host.grants.contains_key(&grant_id)
+                || !grant_spec.valid()
+                || !self.host.rights_match_scope(&grant_spec)
+            {
+                return Err(HostError::Unauthorised.into());
+            }
+            let grant = Grant {
+                actor_id: proof.policy.actor_id.clone(),
+                scope_id: proof.policy.scope_id.clone(),
+                credential_generation: CredentialGeneration::new(1)?,
+                spec: grant_spec,
+            };
+            let grant_record = durable_grant(grant_id, &grant);
+            let (revision, duplicate) = self.store.enroll_initial_owner_actor_from_trusted_host(
+                &proof.store_lineage,
+                proof.owner_epoch,
+                proof.authority_revision,
+                &actor_record,
+                proof.public_key,
+                &grant_record,
+            )?;
+            if duplicate || revision != next_revision {
+                self.initial_owner_projection_failed = true;
+                return Err(DurableAuthorityError::Corrupt(
+                    "initial owner commit had unexpected revision",
+                ));
+            }
+            if self
+                .host
+                .register_actor_from_trusted_policy(registration)
+                .is_err()
+            {
+                self.initial_owner_projection_failed = true;
+                return Err(DurableAuthorityError::Corrupt(
+                    "initial owner actor activation failed",
+                ));
+            }
+            if self.host.grants.insert(grant_id, grant).is_some() {
+                self.initial_owner_projection_failed = true;
+                return Err(DurableAuthorityError::Corrupt(
+                    "initial owner grant activation failed",
+                ));
+            }
+            self.host.next_grant_id = next_grant_id;
+            self.recorded.revision = revision;
+            apply_recorded_mutation(
+                &mut self.recorded,
+                AuthorityMutation::PutActor(actor_record),
+            );
+            apply_recorded_mutation(
+                &mut self.recorded,
+                AuthorityMutation::PutGrant(grant_record),
+            );
+            let receipt = InitialOwnerEnrollmentReceipt {
+                actor_id: proof.policy.actor_id.clone(),
+                scope_id: proof.policy.scope_id,
+                grant_id,
+                owner_epoch: proof.owner_epoch,
+                authority_revision: revision,
+                duplicate: false,
+            };
+            self.initial_owner_enrollments.insert(
+                receipt.actor_id.clone(),
+                InitialEnrollmentRuntime {
+                    receipt: receipt.clone(),
+                    process: proof.process,
+                    public_key: proof.public_key,
+                    credential: proof.policy.credential,
+                },
+            );
+            Ok(receipt)
+        }
     }
 
     /// Treats `actor_selector` only as a lookup hint. The process must come
@@ -2768,6 +3174,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     #[cfg(target_os = "linux")]
     fn recheck_actor_resolution_manager(&mut self) -> Result<(), DurableAuthorityError> {
+        if self.initial_owner_projection_failed {
+            return Err(DurableAuthorityError::Corrupt(
+                "initial owner projection failed",
+            ));
+        }
         recheck_current_manager(
             &mut self.store,
             &self.canonical_database,
@@ -4129,6 +4540,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         return Err(HostError::Unsupported.into());
         #[cfg(target_os = "linux")]
         {
+            if self.initial_owner_projection_failed {
+                return Err(HostError::StaleGuard.into());
+            }
             recheck_current_manager(
                 &mut self.store,
                 &self.canonical_database,
@@ -4485,6 +4899,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     }
 
     fn ensure_current_owner_epoch(&self) -> Result<(), HostError> {
+        if self.initial_owner_projection_failed {
+            return Err(HostError::StaleGuard);
+        }
         match self.store.owner_epoch() {
             Ok(epoch) if epoch == self.host.manager_epoch.get() => Ok(()),
             Ok(_) => Err(HostError::StaleGuard),

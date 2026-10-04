@@ -1,4 +1,5 @@
 //! Durable authority facts. Transport attestations are deliberately not restored as live grants.
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -111,6 +112,160 @@ impl SqliteActorVerifierWitness {
 }
 
 impl PodBayStore {
+    /// One trusted-host initial owner admission. The host must already have
+    /// kernel-attested the process and verified possession of `public_key` on
+    /// a fresh, domain-separated challenge. These Rust arguments are not that
+    /// proof. Actor, verifier, fixed scope grant and revision commit together;
+    /// an exact repeat under the same current owner/revision writes nothing.
+    pub fn enroll_initial_owner_actor_from_trusted_host(
+        &mut self,
+        expected_lineage: &str,
+        expected_owner_epoch: u64,
+        expected_revision: u64,
+        actor: &AuthorityActorRecord,
+        public_key: [u8; 32],
+        grant: &AuthorityGrantRecord,
+    ) -> Result<(u64, bool), StoreError> {
+        validate_initial_owner_enrollment(actor, public_key, grant)?;
+        let mut grant = grant.clone();
+        grant.rights.sort_by(|left, right| {
+            (&left.operation, &left.target_kind, &left.target_id).cmp(&(
+                &right.operation,
+                &right.target_kind,
+                &right.target_id,
+            ))
+        });
+        if expected_lineage != self.store_lineage {
+            return Err(StoreError::WrongScope);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (lineage, owner, revision): (String, i64, i64) = transaction.query_row(
+            "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),
+                    (SELECT value FROM metadata WHERE key='owner_epoch'),
+                    (SELECT value FROM metadata WHERE key='authority_revision')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let claim: Option<(String, i64, i64)> = transaction
+            .query_row(
+                "SELECT store_lineage,owner_epoch,credential_epoch
+                 FROM manager_credential_claims WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if lineage != self.store_lineage
+            || owner != sqlite_integer(expected_owner_epoch)?
+            || revision != sqlite_integer(expected_revision)?
+            || claim
+                .as_ref()
+                .is_none_or(|(stored_lineage, stored_owner, credential)| {
+                    stored_lineage != &lineage || *stored_owner != owner || *credential < owner
+                })
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        let existing = read_initial_owner_actor(&transaction, &actor.actor_id)?;
+        let owner_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authority_actors WHERE scope_id=?1 AND origin='owner_cli'",
+            [&actor.scope_id],
+            |row| row.get(0),
+        )?;
+        if let Some(existing) = existing {
+            if existing != *actor || owner_count != 1 {
+                return Err(StoreError::Conflict("initial owner binding differs"));
+            }
+            let verifier = require_matching_verifier(&transaction, actor)?;
+            if verifier.revoked || verifier.public_key != public_key {
+                return Err(StoreError::Conflict("initial owner verifier differs"));
+            }
+            if read_initial_grant(&transaction, grant.grant_id)? != Some(grant.clone()) {
+                return Err(StoreError::Conflict("initial owner grant differs"));
+            }
+            transaction.commit()?;
+            return Ok((expected_revision, true));
+        }
+        if owner_count != 0
+            || read_initial_grant(&transaction, grant.grant_id)?.is_some()
+            || read_actor_verifier(&transaction, &actor.actor_id)?.is_some()
+        {
+            return Err(StoreError::Conflict(
+                "initial owner identity already exists",
+            ));
+        }
+        let same_process: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authority_actors WHERE platform=?1
+               AND process_identity=?2 AND start_identity=?3",
+            params![
+                actor.platform,
+                actor.process_identity,
+                sqlite_integer(actor.start_identity)?,
+            ],
+            |row| row.get(0),
+        )?;
+        if same_process != 0 {
+            return Err(StoreError::Conflict("process already binds another actor"));
+        }
+        transaction.execute(
+            "INSERT INTO authority_actors(actor_id,scope_id,role,origin,parent_actor_id,
+               pod_id,pod_incarnation,credential_generation,platform,os_identity,
+               process_identity,start_identity,containment_identity)
+             VALUES(?1,?2,'coordinator','owner_cli',NULL,NULL,NULL,1,'linux',?3,?4,?5,?6)",
+            params![
+                actor.actor_id,
+                actor.scope_id,
+                actor.os_identity,
+                actor.process_identity,
+                sqlite_integer(actor.start_identity)?,
+                actor.containment_identity
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO actor_verifiers(actor_id,scope_id,credential_generation,
+               verifier_version,public_key,binding_digest,revoked)
+             VALUES(?1,?2,1,?3,?4,?5,0)",
+            params![
+                actor.actor_id,
+                actor.scope_id,
+                ACTOR_VERIFIER_VERSION,
+                public_key.as_slice(),
+                actor_binding_digest(actor).as_slice()
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO authority_grants(grant_id,scope_id,actor_id,credential_generation,
+               mode,remaining_depth) VALUES(?1,?2,?3,1,'controller',0)",
+            params![
+                sqlite_integer(grant.grant_id)?,
+                grant.scope_id,
+                grant.actor_id
+            ],
+        )?;
+        for right in &grant.rights {
+            transaction.execute(
+                "INSERT INTO authority_grant_rights(grant_id,operation,target_kind,target_id)
+                 VALUES(?1,?2,?3,?4)",
+                params![
+                    sqlite_integer(grant.grant_id)?,
+                    right.operation,
+                    right.target_kind,
+                    right.target_id
+                ],
+            )?;
+        }
+        if read_initial_owner_actor(&transaction, &actor.actor_id)? != Some(actor.clone())
+            || require_matching_verifier(&transaction, actor)?.public_key != public_key
+            || read_initial_grant(&transaction, grant.grant_id)? != Some(grant.clone())
+        {
+            return Err(StoreError::Conflict("initial owner readback differs"));
+        }
+        let next_revision = advance_authority_revision(&transaction, expected_revision)?;
+        transaction.commit()?;
+        Ok((next_revision, false))
+    }
+
     /// Reads only a current v10 manager claim. A migrated v9 owner has no row
     /// until a new owner replay mints one; an actor generation is never used.
     pub fn current_manager_credential_claim(
@@ -1216,6 +1371,169 @@ fn require_current_actor_at_revision(
         return Err(StoreError::StaleEpoch);
     }
     Ok(())
+}
+
+fn validate_initial_owner_enrollment(
+    actor: &AuthorityActorRecord,
+    public_key: [u8; 32],
+    grant: &AuthorityGrantRecord,
+) -> Result<(), StoreError> {
+    for value in [
+        &actor.actor_id,
+        &actor.scope_id,
+        &actor.os_identity,
+        &actor.process_identity,
+    ] {
+        valid_identity(value)?;
+    }
+    let uid = actor
+        .os_identity
+        .strip_prefix("linux.uid.")
+        .and_then(|value| value.parse::<u32>().ok());
+    let pid = actor
+        .process_identity
+        .strip_prefix("linux.pid.")
+        .and_then(|value| value.parse::<u32>().ok());
+    if actor.role != "coordinator"
+        || actor.origin != "owner_cli"
+        || actor.parent_actor_id.is_some()
+        || actor.pod_id.is_some()
+        || actor.pod_incarnation.is_some()
+        || actor.credential_generation != 1
+        || actor.platform != "linux"
+        || uid.is_none()
+        || pid.is_none_or(|pid| pid == 0)
+        || actor.start_identity == 0
+        || !actor.containment_identity.starts_with('/')
+        || actor.containment_identity.len() > 4096
+        || actor.containment_identity.chars().any(char::is_control)
+        || public_key == [0; 32]
+        || grant.actor_id != actor.actor_id
+        || grant.scope_id != actor.scope_id
+        || grant.credential_generation != 1
+        || grant.mode != "controller"
+        || grant.remaining_delegation_depth != 0
+        || grant.grant_id == 0
+    {
+        return Err(StoreError::InvalidInput(
+            "initial owner enrollment binding is invalid",
+        ));
+    }
+    let rights = grant
+        .rights
+        .iter()
+        .map(|right| {
+            (
+                right.operation.clone(),
+                right.target_kind.clone(),
+                right.target_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if rights.len() != 3
+        || grant.rights.len() != 3
+        || !rights.contains(&("launch_pod".into(), "scope".into(), actor.scope_id.clone()))
+        || !rights.contains(&(
+            "send_session".into(),
+            "scope".into(),
+            actor.scope_id.clone(),
+        ))
+    {
+        return Err(StoreError::InvalidInput(
+            "initial owner grant rights are invalid",
+        ));
+    }
+    let credential = grant
+        .rights
+        .iter()
+        .find(|right| right.operation == "use_credential" && right.target_kind == "credential");
+    if credential.is_none_or(|right| valid_identity(&right.target_id).is_err()) {
+        return Err(StoreError::InvalidInput(
+            "initial credential right is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn read_initial_owner_actor(
+    transaction: &rusqlite::Transaction<'_>,
+    actor_id: &str,
+) -> Result<Option<AuthorityActorRecord>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT scope_id,role,origin,parent_actor_id,pod_id,pod_incarnation,
+                    credential_generation,platform,os_identity,process_identity,
+                    start_identity,containment_identity FROM authority_actors WHERE actor_id=?1",
+            [actor_id],
+            |row| {
+                Ok(AuthorityActorRecord {
+                    actor_id: actor_id.to_owned(),
+                    scope_id: row.get(0)?,
+                    role: row.get(1)?,
+                    origin: row.get(2)?,
+                    parent_actor_id: row.get(3)?,
+                    pod_id: row.get(4)?,
+                    pod_incarnation: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                    credential_generation: row.get::<_, i64>(6)? as u64,
+                    platform: row.get(7)?,
+                    os_identity: row.get(8)?,
+                    process_identity: row.get(9)?,
+                    start_identity: row.get::<_, i64>(10)? as u64,
+                    containment_identity: row.get(11)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn read_initial_grant(
+    transaction: &rusqlite::Transaction<'_>,
+    grant_id: u64,
+) -> Result<Option<AuthorityGrantRecord>, StoreError> {
+    let header: Option<(String, String, i64, String, i64)> = transaction
+        .query_row(
+            "SELECT scope_id,actor_id,credential_generation,mode,remaining_depth
+             FROM authority_grants WHERE grant_id=?1",
+            [sqlite_integer(grant_id)?],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((scope_id, actor_id, generation, mode, depth)) = header else {
+        return Ok(None);
+    };
+    let mut statement = transaction.prepare(
+        "SELECT operation,target_kind,target_id FROM authority_grant_rights
+         WHERE grant_id=?1 ORDER BY operation,target_kind,target_id",
+    )?;
+    let rights = statement
+        .query_map([sqlite_integer(grant_id)?], |row| {
+            Ok(AuthorityRightRecord {
+                operation: row.get(0)?,
+                target_kind: row.get(1)?,
+                target_id: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(AuthorityGrantRecord {
+        grant_id,
+        scope_id,
+        actor_id,
+        credential_generation: u64::try_from(generation)
+            .map_err(|_| StoreError::Conflict("grant generation is invalid"))?,
+        mode,
+        remaining_delegation_depth: u8::try_from(depth)
+            .map_err(|_| StoreError::Conflict("grant depth is invalid"))?,
+        rights,
+    }))
 }
 
 fn advance_authority_revision(
