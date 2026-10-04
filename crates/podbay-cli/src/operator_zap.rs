@@ -34,7 +34,7 @@ use podbay_pod::{
     PodManifest, manifest_path_for_identity,
 };
 use podbay_store::{CommandLookupSelector, LaunchDispatchStage, StoreError};
-use podbay_wire::ResourceDriver;
+use podbay_wire::{LifetimeLimit, ResourceDriver};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -69,7 +69,7 @@ struct RawPolicy {
     workspace_basis_ref: String,
     host_id: String,
     command_key: String,
-    wall_seconds: u64,
+    lifetime: LifetimeLimit,
 }
 
 struct Policy {
@@ -215,7 +215,8 @@ impl Policy {
             || path
                 .file_name()
                 .is_none_or(|name| name != "operator-zap-policy.json")
-            || !(30..=3600).contains(&raw.wall_seconds)
+            || !matches!(raw.lifetime,
+                LifetimeLimit::UntilStopped | LifetimeLimit::Finite { seconds: 30..=3600 })
             || !valid_token(&raw.workspace_basis_ref)
             || !valid_token(&raw.host_id)
             || !valid_token(&raw.command_key)
@@ -959,15 +960,18 @@ fn open_operator(
     )
     .map_err(|error| format!("trusted Pod executable refused: {error}"))?;
     let mut port = LinuxLaunchPort::new(port_config);
-    let process_profile = TrustedOperatorProcessProfile::from_trusted_policy(
-        1,
-        policy.raw.node_executable.clone(),
-        policy.raw.node_executable_sha256.clone(),
-        policy.raw.zap_root.clone(),
-        policy.arguments.clone(),
-        policy.raw.zap_state_directory.clone(),
-        policy.raw.wall_seconds,
-    )
+    let process_profile = match policy.raw.lifetime {
+        LifetimeLimit::Finite { seconds } => TrustedOperatorProcessProfile::from_trusted_policy(
+            1, policy.raw.node_executable.clone(), policy.raw.node_executable_sha256.clone(),
+            policy.raw.zap_root.clone(), policy.arguments.clone(),
+            policy.raw.zap_state_directory.clone(), seconds,
+        ),
+        LifetimeLimit::UntilStopped => TrustedOperatorProcessProfile::from_trusted_policy_until_stopped(
+            1, policy.raw.node_executable.clone(), policy.raw.node_executable_sha256.clone(),
+            policy.raw.zap_root.clone(), policy.arguments.clone(),
+            policy.raw.zap_state_directory.clone(),
+        ),
+    }
     .and_then(|profile| profile.with_verified_artifact(policy.artifact.clone()))
     .map_err(|error| format!("trusted Zap process profile refused: {error}"))?;
     port.register_operator_process_from_trusted_policy(process_profile)
@@ -1166,7 +1170,7 @@ fn launch(policy: Policy) -> Result<(), String> {
         "artifactEntries": policy.artifact_receipt.entries,
         "artifactBytes": policy.artifact_receipt.bytes,
         "artifactHashMillis": policy.artifact_receipt.elapsed.as_millis(),
-        "wallSeconds": policy.raw.wall_seconds,
+        "lifetime": policy.raw.lifetime,
     });
     println!("{output}");
     Ok(())
@@ -1359,11 +1363,18 @@ fn register_operator_policy(
         allowed_tool_bundle_refs: BTreeSet::new(),
         environment_refs: vec![],
         credential_refs: vec![],
-        max_wall_seconds: policy.raw.wall_seconds,
+        max_wall_seconds: match policy.raw.lifetime {
+            LifetimeLimit::Finite { seconds } => seconds,
+            LifetimeLimit::UntilStopped => 30,
+        },
         max_children: 0,
         allow_fallback: false,
     })
     .map_err(|error| format!("operator launch profile refused: {error:?}"))?;
+    let profile = if policy.raw.lifetime == LifetimeLimit::UntilStopped {
+        profile.with_until_stopped_operator_service()
+            .map_err(|error| format!("operator Service lifetime refused: {error:?}"))?
+    } else { profile };
     host.register_launch_profile_from_trusted_policy(profile)
         .map_err(|error| format!("operator launch profile registration failed: {error:?}"))?;
     host.register_native_host_from_trusted_policy(
@@ -1464,7 +1475,10 @@ fn bound_request(
                 arguments: vec![],
                 tool_bundle_refs: vec![],
                 authority_ref: format!("grant.{}", grant.get()),
-                wall_seconds: policy.raw.wall_seconds,
+                wall_seconds: match policy.raw.lifetime {
+                    LifetimeLimit::Finite { seconds } => seconds,
+                    LifetimeLimit::UntilStopped => 30,
+                },
                 max_children: 0,
                 parent_run_id: None,
             },

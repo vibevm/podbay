@@ -7,9 +7,11 @@ use podbay_core::{
     SessionState, StoreLineageId, WorkKind,
 };
 use podbay_wire::{
-    EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract,
+    EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION,
+    EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION, EffectiveLaunchContract,
     EffectiveLaunchContractV2, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
-    LAUNCH_DESCRIPTOR_SCHEMA, LAUNCH_DESCRIPTOR_V2_SCHEMA, NativeResourceKind, NativeRole,
+    LAUNCH_DESCRIPTOR_SCHEMA, LAUNCH_DESCRIPTOR_V2_SCHEMA,
+    LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA, LifetimeLimit, NativeResourceKind, NativeRole,
     NativeWorkKind, OPERATOR_PROCESS_PROFILE_REF, ResourceDriver,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -145,6 +147,7 @@ pub struct CurrentLaunchPolicyFence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundLaunchFormat {
     V1,
+    OperatorUntilStopped,
     CodexV2,
     /// V2 typed descriptor bytes with a distinct committed V3 policy row.
     CodexV3,
@@ -154,6 +157,7 @@ impl BoundLaunchFormat {
     fn effective_version(self) -> &'static str {
         match self {
             Self::V1 => EFFECTIVE_LAUNCH_VERSION,
+            Self::OperatorUntilStopped => EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION,
             Self::CodexV2 | Self::CodexV3 => EFFECTIVE_LAUNCH_V2_VERSION,
         }
     }
@@ -161,6 +165,7 @@ impl BoundLaunchFormat {
     fn descriptor_version(self) -> &'static str {
         match self {
             Self::V1 => LAUNCH_DESCRIPTOR_SCHEMA,
+            Self::OperatorUntilStopped => LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA,
             Self::CodexV2 | Self::CodexV3 => LAUNCH_DESCRIPTOR_V2_SCHEMA,
         }
     }
@@ -1153,7 +1158,7 @@ impl PodBayStore {
             positive_stored_epoch(bound_attempt_epoch, "bound attempt epoch is invalid")?;
         let launch = read_bound_record(&transaction, binding_rowid)?;
         let (attempt_ordinal, attempt_epoch) = match launch.format {
-            BoundLaunchFormat::V1 => {
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped => {
                 let descriptor = ImmutableLaunchDescriptor::decode_json(&launch.descriptor)
                     .map_err(|_| StoreError::Conflict("stored descriptor is malformed"))?;
                 (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
@@ -1407,6 +1412,23 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::OperatorRoot),
             format: BoundLaunchFormat::V1,
+            operator_root: true,
+            policy_fence_epoch: None,
+        })
+    }
+
+    pub fn admit_bound_operator_root_until_stopped_launch(
+        &mut self,
+        request: BoundOperatorRootLaunchRequest<'_>,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::OperatorRoot),
+            format: BoundLaunchFormat::OperatorUntilStopped,
             operator_root: true,
             policy_fence_epoch: None,
         })
@@ -1950,6 +1972,11 @@ fn check_proposal<'a>(
             effective
                 .compare_with_descriptor(proposal.descriptor)
                 .map_err(|_| StoreError::Conflict("operator effective launch differs from descriptor"))?;
+            if (request.format == BoundLaunchFormat::OperatorUntilStopped)
+                != (effective.lifetime() == LifetimeLimit::UntilStopped)
+            {
+                return Err(StoreError::Conflict("operator lifetime format differs"));
+            }
             Ok(CheckedProposal {
                 session: proposal.session,
                 run: proposal.run,
@@ -1959,7 +1986,7 @@ fn check_proposal<'a>(
                 descriptor,
                 spec_digest: effective.digest().to_owned(),
                 descriptor_digest: proposal.descriptor.digest().to_owned(),
-                format: BoundLaunchFormat::V1,
+                format: request.format,
                 max_children: 0,
                 expected_owner_epoch: proposal.expected_owner_epoch,
                 expected_authority_revision: proposal.expected_authority_revision,
@@ -2038,7 +2065,8 @@ fn operator_root_shape(descriptor: &ImmutableLaunchDescriptor) -> bool {
 }
 
 fn is_operator_root_record(record: &BoundLaunchRecord) -> Result<bool, StoreError> {
-    if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+    if !matches!(record.format, BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
+        || record.resources.len() != 1 {
         return Ok(false);
     }
     let descriptor = ImmutableLaunchDescriptor::decode_json(&record.descriptor)
@@ -2186,7 +2214,7 @@ fn stored_launch_facts(
     descriptor_bytes: &[u8],
 ) -> Result<StoredLaunchFacts, StoreError> {
     match format {
-        BoundLaunchFormat::V1 => {
+        BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped => {
             let effective = EffectiveLaunchContract::decode(effective_bytes)
                 .map_err(|_| StoreError::Conflict("stored effective launch is malformed"))?;
             let descriptor = ImmutableLaunchDescriptor::decode_json(descriptor_bytes)
@@ -2383,6 +2411,9 @@ pub(crate) fn read_bound_record(
         policy_bound.is_some(),
     ) {
         (EFFECTIVE_LAUNCH_VERSION, LAUNCH_DESCRIPTOR_SCHEMA, false) => BoundLaunchFormat::V1,
+        (EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION,
+            LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA, false) =>
+            BoundLaunchFormat::OperatorUntilStopped,
         (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA, false) => {
             BoundLaunchFormat::CodexV2
         }
@@ -2403,7 +2434,8 @@ pub(crate) fn read_bound_record(
     }
     let facts = stored_launch_facts(format, &effective_spec, &descriptor)?;
     if facts.effective_digest != spec_digest
-        || (format == BoundLaunchFormat::V1 && sha256_hex(&effective_spec) != spec_digest)
+        || (matches!(format, BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
+            && sha256_hex(&effective_spec) != spec_digest)
         || pod_incarnation != target_epoch
     {
         return Err(StoreError::Conflict(

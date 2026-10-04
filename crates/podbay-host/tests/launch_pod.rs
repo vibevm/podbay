@@ -3189,6 +3189,16 @@ fn codex_v2_root_rejects_v1_duplicate_and_stale_owner() {
 }
 
 #[test]
+fn unrelated_trusted_profile_cannot_opt_into_unlimited_operator_service() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    assert!(matches!(
+        profile(&who).with_until_stopped_operator_service(),
+        Err(HostError::Unauthorised)
+    ));
+}
+
+#[test]
 fn queued_operator_root_dispatches_once_from_store_backed_admission() {
     let fixture = Fixture::new();
     let who = identity(&fixture);

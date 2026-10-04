@@ -20,7 +20,7 @@ use podbay_store::{
     LaterCodexSendSelector, NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
     SqlitePriorObservedPendingLedger, SqliteSupersessionLedger,
 };
-use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole, NativeWorkKind};
+use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, LifetimeLimit, NativeRole, NativeWorkKind};
 use serde::{Deserialize, Serialize};
 
 use crate::codex_credential::prepare_codex_home_from_systemd_credential;
@@ -1922,7 +1922,10 @@ pub fn launch_bound(
     write_manifest(&path, &manifest)?;
     let operator_process = manifest.peer_binding.as_ref()
         .is_some_and(|binding| binding.capability == OPERATOR_PROCESS_CAPABILITY);
-    let runtime_max = format!("--property=RuntimeMaxSec={}s", wire.wall_seconds());
+    let runtime_max = match wire.lifetime() {
+        LifetimeLimit::Finite { seconds } => format!("--property=RuntimeMaxSec={seconds}s"),
+        LifetimeLimit::UntilStopped => "--property=RuntimeMaxSec=infinity".to_owned(),
+    };
     let tasks_max = if operator_process { "--property=TasksMax=128" } else { "--property=TasksMax=2" };
     let started = Command::new("systemd-run")
         .args([
@@ -1947,6 +1950,19 @@ pub fn launch_bound(
         return Err(PodError::Uncertain(
             "systemd bound admission not attested; manifest retained",
         ));
+    }
+    if wire.lifetime() == LifetimeLimit::UntilStopped {
+        let shown = Command::new("systemctl")
+            .args(["--user", "show", "--property=RuntimeMaxUSec", "--value", &manifest.unit_name])
+            .output()?;
+        if !shown.status.success()
+            || shown.stdout.len() > 128
+            || String::from_utf8_lossy(&shown.stdout).trim() != "infinity"
+        {
+            return Err(PodError::Uncertain(
+                "operator Service unit has no proved unlimited runtime",
+            ));
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -2173,7 +2189,8 @@ fn active_operator_process_binding(manifest: &PodManifest) -> Result<BoundPeerMa
         || current.pod_id() != &identity.pod_id
         || current.attempt_id() != &identity.attempt_id
         || current.pod_incarnation() != identity.incarnation
-        || current.launch().format != BoundLaunchFormat::V1
+        || !matches!(current.launch().format,
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
         || current.launch().descriptor != original.wire_descriptor
         || current.launch().effective_spec != original.effective_spec
         || current.launch().resources.len() != 1
@@ -2252,7 +2269,8 @@ fn current_operator_rebind_target(
         || current.pod_id() != &proposal.identity.pod_id
         || current.attempt_id() != &proposal.identity.attempt_id
         || current.pod_incarnation() != proposal.identity.incarnation
-        || current.launch().format != BoundLaunchFormat::V1
+        || !matches!(current.launch().format,
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
         || current.launch().descriptor != binding.wire_descriptor
         || current.launch().effective_spec != binding.effective_spec
         || current.launch().resources.len() != 1

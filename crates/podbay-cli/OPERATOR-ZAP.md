@@ -17,7 +17,9 @@ owner-owned, singly linked 0600 `operator-zap-policy.json` in its canonical
 - `zapRoot`, `zapArtifactSha256`, `zapStateDirectory`;
 - stable `actorId`, `scopeId`, `podId`, `sessionId`, `runId`, `attemptId`,
   `resourceId`, `workspaceBasisRef`, `hostId`, and `commandKey`;
-- `wallSeconds` from 30 through 3600;
+- `lifetime` as exactly `{ "kind": "finite", "seconds": N }` with N from 30
+  through 3600, or `{ "kind": "untilStopped" }` for this trusted local
+  Auxiliary Coordinator/Service Pod;
 - optionally, both `headlessConfig` and `headlessConfigSha256` for Zap's
   `--podbay-config` path. The config must be a private 0600 file directly in
   `zapStateDirectory`.
@@ -58,6 +60,11 @@ generic PodBay command/event ledger. A live Pod with an uncertain intent needs
 explicit operator reconciliation; this CLI will not retry the stop blindly.
 Install an updated artifact with a new outer state directory, store, IDs, and key
 custody; this command provides no seamless upgrade or migration. The current
-`RuntimeMaxSec` is at most 3600 seconds, so this is a bounded service launch,
-not indefinite Zap hosting. Disposable fixtures prove outer A→B rebind and one
-nested fake Codex coordinator with native output and cursor acknowledgement.
+finite mode keeps its `RuntimeMaxSec` bound. `untilStopped` sets and verifies
+an unlimited systemd `RuntimeMaxUSec` for the outer Zap Service while retaining
+`KillMode=control-group`, `TasksMax=128`, and the signed exact-Pod stop path.
+It does not restart a crashed process or persist a transient unit across a
+machine reboot. Worker/Task Pods and the inner Codex Pod retain their own
+finite trusted budgets. Disposable fixtures prove outer A→B rebind, one nested
+fake Codex coordinator with native output and cursor acknowledgement, and an
+explicit terminal stop of the unlimited outer Service.

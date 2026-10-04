@@ -34,6 +34,7 @@ pub use cursor::EventCursor;
 pub use decimal::DecimalString;
 pub use effective_launch::{
     CredentialLocator, EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION,
+    EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION,
     EffectiveLaunchContract, EffectiveLaunchContractV2, EffectiveLaunchError,
     EffectiveWorkspaceAccess,
 };
@@ -41,7 +42,8 @@ pub use error::WireError;
 pub use frame::{MAX_FRAME_BYTES, decode_frame_bytes, encode_frame};
 pub use launch_descriptor::{
     ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LAUNCH_DESCRIPTOR_SCHEMA,
-    LAUNCH_DESCRIPTOR_V2_SCHEMA, OPERATOR_PROCESS_PROFILE_REF, LaunchDescriptorError,
+    LAUNCH_DESCRIPTOR_V2_SCHEMA, LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA,
+    OPERATOR_PROCESS_PROFILE_REF, LaunchDescriptorError, LifetimeLimit,
     NativeResourceKind, NativeResourceView,
     NativeRole, NativeWorkKind, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
 };

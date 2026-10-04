@@ -14,12 +14,23 @@ use sha2::{Digest, Sha256};
 use crate::{CodexAppServerPolicyV2, MAX_FRAME_BYTES, ProtocolVersion};
 
 pub const LAUNCH_DESCRIPTOR_SCHEMA: &str = "podbay.launch-descriptor/1";
+pub const LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA: &str =
+    "podbay.launch-descriptor/operator-until-stopped/1";
 /// Operator-installed V1 Auxiliary process profile; a request cannot define
 /// its executable, argv, cwd or private data directory.
 pub const OPERATOR_PROCESS_PROFILE_REF: &str = "podbay.operator.process.exec.v1";
 const DIGEST_DOMAIN: &[u8] = b"podbay.launch-descriptor/1\0";
+const DIGEST_DOMAIN_OPERATOR_UNTIL_STOPPED: &[u8] =
+    b"podbay.launch-descriptor/operator-until-stopped/1\0";
 pub const LAUNCH_DESCRIPTOR_V2_SCHEMA: &str = "podbay.launch-descriptor/2";
 const DIGEST_DOMAIN_V2: &[u8] = b"podbay.launch-descriptor/2\0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LifetimeLimit {
+    Finite { seconds: u64 },
+    UntilStopped,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -227,7 +238,10 @@ struct DescriptorBody {
     arguments: Vec<String>,
     environment_refs: Vec<String>,
     credential_refs: Vec<String>,
-    wall_seconds: Counter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wall_seconds: Option<Counter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifetime: Option<LifetimeLimit>,
     max_children: Counter,
 }
 
@@ -324,12 +338,28 @@ impl ImmutableLaunchDescriptor {
             arguments: policy.arguments,
             environment_refs: policy.environment_refs,
             credential_refs: policy.credential_refs,
-            wall_seconds: Counter(policy.wall_seconds),
+            wall_seconds: Some(Counter(policy.wall_seconds)),
+            lifetime: None,
             max_children: Counter(u64::from(policy.max_children)),
         };
         validate_body(&body)?;
         let digest = digest_body(&body)?;
         Ok(Self { body, digest })
+    }
+
+    /// The installed operator-only Service has no wall-clock expiry. This
+    /// distinct immutable schema carries a tagged lifetime, never a numeric
+    /// zero or maximum sentinel.
+    pub fn from_planned_operator_root_until_stopped(
+        planned: &PlannedRootBinding,
+        policy: ReviewedNativePolicy,
+    ) -> Result<Self, LaunchDescriptorError> {
+        let mut descriptor = Self::from_identity(planned.identity(), policy)?;
+        descriptor.body.wall_seconds = None;
+        descriptor.body.lifetime = Some(LifetimeLimit::UntilStopped);
+        validate_body(&descriptor.body)?;
+        descriptor.digest = digest_body(&descriptor.body)?;
+        Ok(descriptor)
     }
 
     /// Structural decode only. Before any OS effect, compare the separately
@@ -340,7 +370,8 @@ impl ImmutableLaunchDescriptor {
         }
         let envelope: DescriptorEnvelope =
             serde_json::from_slice(bytes).map_err(|_| LaunchDescriptorError::Malformed)?;
-        if envelope.protocol != ProtocolVersion::V1 || envelope.schema != LAUNCH_DESCRIPTOR_SCHEMA {
+        let expected_schema = descriptor_schema(&envelope.descriptor);
+        if envelope.protocol != ProtocolVersion::V1 || envelope.schema != expected_schema {
             return Err(LaunchDescriptorError::UnsupportedVersion);
         }
         validate_body(&envelope.descriptor)?;
@@ -439,7 +470,7 @@ impl ImmutableLaunchDescriptor {
     pub fn encode_json(&self) -> Result<Vec<u8>, LaunchDescriptorError> {
         let bytes = serde_json::to_vec(&DescriptorEnvelope {
             protocol: ProtocolVersion::V1,
-            schema: LAUNCH_DESCRIPTOR_SCHEMA.into(),
+            schema: descriptor_schema(&self.body).into(),
             digest: self.digest.clone(),
             descriptor: self.body.clone(),
         })
@@ -527,8 +558,13 @@ impl ImmutableLaunchDescriptor {
     pub fn credential_refs(&self) -> &[String] {
         &self.body.credential_refs
     }
-    pub fn wall_seconds(&self) -> u64 {
-        self.body.wall_seconds.get()
+    pub fn lifetime(&self) -> LifetimeLimit {
+        self.body.lifetime.unwrap_or_else(|| LifetimeLimit::Finite {
+            seconds: self.body.wall_seconds.expect("finite descriptor has seconds").get(),
+        })
+    }
+    pub fn wall_seconds(&self) -> Option<u64> {
+        self.body.wall_seconds.map(Counter::get)
     }
     pub fn max_children(&self) -> u64 {
         self.body.max_children.get()
@@ -558,13 +594,25 @@ fn digest_body(body: &DescriptorBody) -> Result<String, LaunchDescriptorError> {
         return Err(LaunchDescriptorError::TooLarge);
     }
     let mut hash = Sha256::new();
-    hash.update(DIGEST_DOMAIN);
+    hash.update(if body.lifetime == Some(LifetimeLimit::UntilStopped) {
+        DIGEST_DOMAIN_OPERATOR_UNTIL_STOPPED
+    } else {
+        DIGEST_DOMAIN
+    });
     hash.update(&bytes);
     Ok(hash
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn descriptor_schema(body: &DescriptorBody) -> &'static str {
+    if body.lifetime == Some(LifetimeLimit::UntilStopped) {
+        LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA
+    } else {
+        LAUNCH_DESCRIPTOR_SCHEMA
+    }
 }
 
 fn valid_id(value: &str) -> bool {
@@ -749,10 +797,24 @@ fn validate_body(body: &DescriptorBody) -> Result<(), LaunchDescriptorError> {
             "environment/credential refs",
         ));
     }
-    if body.wall_seconds.get() == 0
-        || body.wall_seconds.get() > 604_800
-        || body.max_children.get() > 4096
-    {
+    match (body.wall_seconds, body.lifetime) {
+        (Some(seconds), None) if (1..=604_800).contains(&seconds.get()) => {}
+        (None, Some(LifetimeLimit::UntilStopped))
+            if body.target_os == TargetOs::Linux
+                && body.profile_ref == OPERATOR_PROCESS_PROFILE_REF
+                && body.role == NativeRole::Coordinator
+                && body.work_kind == NativeWorkKind::Service
+                && body.parent_run_id.is_none()
+                && body.resources.len() == 1
+                && body.resources[0].kind == NativeResourceKind::Auxiliary
+                && matches!(&body.resources[0].driver,
+                    ResourceDriver::Auxiliary { driver_ref } if driver_ref == "process.exec")
+                && body.environment_refs.is_empty()
+                && body.credential_refs.is_empty()
+                && body.max_children.get() == 0 => {}
+        _ => return Err(LaunchDescriptorError::InvalidField("lifetime")),
+    }
+    if body.max_children.get() > 4096 {
         return Err(LaunchDescriptorError::InvalidField("budget"));
     }
     Ok(())
@@ -1007,7 +1069,7 @@ impl ImmutableLaunchDescriptorV2 {
         &self.body.base.workspace_basis_ref
     }
     pub fn wall_seconds(&self) -> u64 {
-        self.body.base.wall_seconds.get()
+        self.body.base.wall_seconds.expect("V2 Codex lifetime is finite").get()
     }
     pub fn max_children(&self) -> u64 {
         self.body.base.max_children.get()
@@ -1074,6 +1136,9 @@ fn require_planned_child_identity(
 
 fn validate_body_v2(body: &DescriptorBodyV2) -> Result<(), LaunchDescriptorError> {
     validate_body(&body.base)?;
+    if body.base.lifetime.is_some() || body.base.wall_seconds.is_none() {
+        return Err(LaunchDescriptorError::InvalidField("Codex lifetime must be finite"));
+    }
     body.codex_policy
         .validate()
         .map_err(|_| LaunchDescriptorError::InvalidField("codexPolicy"))?;

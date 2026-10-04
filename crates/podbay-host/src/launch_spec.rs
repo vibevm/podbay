@@ -6,7 +6,8 @@ use podbay_core::{LaunchBinding, PodId, ResourceKind, Role, ScopeId};
 use podbay_wire::{
     CodexAppServerPolicyV2, EffectiveLaunchContract, EffectiveLaunchContractV2,
     EffectiveWorkspaceAccess, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
-    NativeResourceKind, NativeRole, ResourceDriver, ReviewedNativePolicy, ReviewedResource,
+    LifetimeLimit, NativeResourceKind, NativeRole, OPERATOR_PROCESS_PROFILE_REF,
+    ResourceDriver, ReviewedNativePolicy, ReviewedResource,
     TargetOs,
 };
 use sha2::{Digest, Sha256};
@@ -162,6 +163,7 @@ pub struct TrustedLaunchProfileInput {
 pub struct RegisteredLaunchProfile {
     input: TrustedLaunchProfileInput,
     codex_policy: Option<CodexAppServerPolicyV2>,
+    operator_until_stopped: bool,
 }
 
 impl RegisteredLaunchProfile {
@@ -235,7 +237,32 @@ impl RegisteredLaunchProfile {
         Ok(Self {
             input,
             codex_policy: None,
+            operator_until_stopped: false,
         })
+    }
+
+    pub fn with_until_stopped_operator_service(mut self) -> Result<Self, HostError> {
+        let input = &self.input;
+        if self.codex_policy.is_some()
+            || input.profile_ref != OPERATOR_PROCESS_PROFILE_REF
+            || input.resource_layout.len() != 1
+            || input.resource_layout[0].kind != ResourceKind::Auxiliary
+            || !matches!(&input.resource_layout[0].driver,
+                ResourceDriver::Auxiliary { driver_ref } if driver_ref == "process.exec")
+            || input.default_model != "none"
+            || input.default_effort != "none"
+            || input.max_children != 0
+            || !input.environment_refs.is_empty()
+            || !input.credential_refs.is_empty()
+        {
+            return Err(HostError::Unauthorised);
+        }
+        self.operator_until_stopped = true;
+        Ok(self)
+    }
+
+    pub(crate) fn operator_until_stopped(&self) -> bool {
+        self.operator_until_stopped
     }
 
     /// Explicit trusted-policy opt-in for the internal Codex V2 launch shape.
@@ -246,7 +273,7 @@ impl RegisteredLaunchProfile {
         mut self,
         policy: CodexAppServerPolicyV2,
     ) -> Result<Self, HostError> {
-        if self.codex_policy.is_some() {
+        if self.codex_policy.is_some() || self.operator_until_stopped {
             return Err(HostError::InvalidInput);
         }
         let input = &self.input;
@@ -411,6 +438,8 @@ impl RegisteredLaunchProfile {
             || descriptor.resources_len() != self.input.resource_layout.len()
             || descriptor.executable_generation() != self.input.binary_generation
             || effective.executable() != self.input.executable
+            || matches!(effective.lifetime(), LifetimeLimit::UntilStopped)
+                != self.operator_until_stopped
         {
             return Err(HostError::StaleGuard);
         }
@@ -492,7 +521,7 @@ impl RegisteredLaunchProfile {
             arguments,
             tool_bundle_refs: base.tool_bundle_refs().to_vec(),
             authority_ref: format!("grant.{}", base.authority_grant_id()),
-            wall_seconds: base.wall_seconds(),
+            wall_seconds: base.wall_seconds().ok_or(HostError::StaleGuard)?,
             max_children: base.max_children(),
             parent_run_id: None,
         };
@@ -659,6 +688,8 @@ impl RegisteredLaunchProfile {
             tool_bundle_refs,
             authority_grant_id: grant_id,
             wall_seconds: selection.wall_seconds,
+            operator_until_stopped: profile.profile_ref == OPERATOR_PROCESS_PROFILE_REF
+                && self.operator_until_stopped,
             max_children: selection.max_children,
             environment_refs,
             credential_refs,
@@ -684,6 +715,7 @@ pub struct EffectiveLaunchSpec {
     tool_bundle_refs: Vec<String>,
     authority_grant_id: u64,
     wall_seconds: u64,
+    operator_until_stopped: bool,
     max_children: u32,
     environment_refs: Vec<String>,
     credential_refs: Vec<CredentialRef>,
@@ -727,7 +759,11 @@ impl EffectiveLaunchSpec {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, HostError> {
-        let mut output = b"podbay.effective-launch/1\0".to_vec();
+        let mut output = if self.operator_until_stopped {
+            b"podbay.effective-launch/operator-until-stopped/1\0".to_vec()
+        } else {
+            b"podbay.effective-launch/1\0".to_vec()
+        };
         append_string(&mut output, self.pod_id.as_str())?;
         append_string(
             &mut output,
@@ -755,7 +791,9 @@ impl EffectiveLaunchSpec {
         });
         append_list(&mut output, &self.tool_bundle_refs)?;
         output.extend_from_slice(&self.authority_grant_id.to_be_bytes());
-        output.extend_from_slice(&self.wall_seconds.to_be_bytes());
+        if !self.operator_until_stopped {
+            output.extend_from_slice(&self.wall_seconds.to_be_bytes());
+        }
         output.extend_from_slice(&self.max_children.to_be_bytes());
         append_list(&mut output, &self.environment_refs)?;
         output.extend_from_slice(

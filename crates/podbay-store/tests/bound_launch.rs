@@ -256,7 +256,7 @@ fn policy_with_digest(proposal: &ProposalFixture, digest: String) -> ReviewedNat
         arguments: descriptor.arguments().to_vec(),
         environment_refs: descriptor.environment_refs().to_vec(),
         credential_refs: descriptor.credential_refs().to_vec(),
-        wall_seconds: descriptor.wall_seconds(),
+        wall_seconds: descriptor.wall_seconds().expect("V1 fixture lifetime is finite"),
         max_children: descriptor.max_children() as u32,
         resources: proposal
             .binding

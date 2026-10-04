@@ -652,7 +652,7 @@ fn installed_operator_cli_launches_one_zap_and_rebinds_same_http_child_across_pr
         "workspaceBasisRef":"basis.zap.installed.one",
         "hostId":"host.zap.installed.one",
         "commandKey":"launch.zap.installed.one",
-        "wallSeconds":120
+        "lifetime":{"kind":"untilStopped"}
     });
     let policy_path = fixture.outer.join("operator-zap-policy.json");
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -828,7 +828,7 @@ fn installed_outer_zap_pod_nests_one_fake_codex_coordinator_without_resend() {
         "workspaceBasisRef":"basis.zap.nested.one",
         "hostId":"host.zap.nested.one",
         "commandKey":"launch.zap.nested.one",
-        "wallSeconds":120
+        "lifetime":{"kind":"untilStopped"}
     });
     let policy_path = fixture.outer.join("operator-zap-policy.json");
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -981,7 +981,7 @@ fn setup_disposable_stop() -> (Fixture, PathBuf, serde_json::Value, PodManifest)
         "workspaceBasisRef":"basis.zap.stop.one",
         "hostId":"host.zap.stop.one",
         "commandKey":"launch.zap.stop.one",
-        "wallSeconds":120
+        "lifetime":{"kind":"untilStopped"}
     });
     let policy_path = fixture.outer.join("operator-zap-policy.json");
     fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
@@ -1040,6 +1040,45 @@ fn assert_unit_unloaded(unit: &str) {
         .unwrap();
     assert!(shown.status.success());
     assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "not-found");
+}
+
+fn unit_runtime_limit(unit: &str) -> String {
+    let shown = Command::new("systemctl")
+        .args(["--user", "show", "--property=RuntimeMaxUSec", "--value", unit])
+        .output().unwrap();
+    assert!(shown.status.success());
+    String::from_utf8(shown.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+#[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
+fn installed_operator_until_stopped_service_has_unlimited_unit_and_exact_stop() {
+    let (fixture, policy_path, first, manifest) = setup_disposable_stop();
+    assert_eq!(first["lifetime"]["kind"], "untilStopped");
+    let unit = fixture.unit.as_deref().unwrap();
+    assert_eq!(unit_runtime_limit(unit), "infinity");
+    let pid = first["childPid"].as_u64().unwrap() as u32;
+    let birth = first["childStartTicks"].as_u64().unwrap();
+    // This deliberately exceeds a short finite comparison budget while the
+    // actual unit has no RuntimeMaxSec deadline; it does not wait an hour.
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(process_birth(pid), birth);
+    assert_eq!(unit_runtime_limit(unit), "infinity");
+    let second = run_operator(&policy_path);
+    assert_eq!(second["duplicate"], true);
+    assert_eq!(second["commandId"], first["commandId"]);
+    for field in ["podId", "supervisorPid", "supervisorStartTicks", "childPid", "childStartTicks"] {
+        assert_eq!(second[field], first[field], "{field} changed on reattach");
+    }
+    let stopped = successful_operator_stop(&policy_path);
+    assert_eq!(stopped["terminal"], true);
+    assert_eq!(stopped["duplicate"], false);
+    assert_unit_unloaded(unit);
+    assert!(!manifest.socket_path.exists());
+    assert!(!Path::new(&format!("/proc/{pid}/stat")).exists());
+    let repeated = successful_operator_stop(&policy_path);
+    assert_eq!(repeated["duplicate"], true);
+    assert_eq!(repeated["intentDigest"], stopped["intentDigest"]);
 }
 
 #[test]

@@ -1,11 +1,12 @@
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
+    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding,
+    PlannedRootBinding, Pod, PodId,
     Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
     SessionId, WorkKind,
 };
 use podbay_wire::{
-    ImmutableLaunchDescriptor, LaunchDescriptorError, ResourceDriver, ReviewedNativePolicy,
-    ReviewedResource, TargetOs,
+    ImmutableLaunchDescriptor, LaunchDescriptorError, LifetimeLimit,
+    OPERATOR_PROCESS_PROFILE_REF, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -305,6 +306,94 @@ fn reviewed_policy_changes_digest_and_malformed_unknown_or_noncanonical_input_re
                 .as_bytes()
         ),
         Err(LaunchDescriptorError::UnsupportedVersion)
+    );
+}
+
+fn planned_aux_root(role: Role, work: WorkKind) -> PlannedRootBinding {
+    let actor = ActorId::try_from("actor.operator.lifetime").unwrap();
+    let scope = ScopeId::try_from("scope.operator.lifetime").unwrap();
+    let mut session = Session::new(
+        SessionId::try_from("session.operator.lifetime").unwrap(), actor, scope,
+    );
+    let run = Run::new(
+        RunId::try_from("run.operator.lifetime").unwrap(), &session, role, work, None,
+    );
+    session.bind_run(session.revision(), &run).unwrap();
+    let mut attempt = Attempt::new(
+        AttemptId::try_from("attempt.operator.lifetime").unwrap(),
+        run.id().clone(), 1, Epoch::new(1).unwrap(),
+    ).unwrap();
+    let mut pod = Pod::new(
+        PodId::try_from("pod.operator.lifetime").unwrap(), attempt.id().clone(),
+        Epoch::new(1).unwrap(),
+    );
+    attempt.attach_pod(attempt.revision(), &pod).unwrap();
+    let resource = Resource::new(
+        ResourceId::try_from("resource.operator.lifetime").unwrap(), pod.id().clone(),
+        ResourceKind::Auxiliary, Epoch::new(1).unwrap(),
+    );
+    pod.attach_resource(pod.revision(), &resource).unwrap();
+    LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource]).unwrap()
+}
+
+fn operator_lifetime_policy(planned: &PlannedRootBinding, profile_ref: &str) -> ReviewedNativePolicy {
+    let resource = &planned.identity().resources()[0];
+    ReviewedNativePolicy {
+        target_os: TargetOs::Linux,
+        host_id: "host.operator.lifetime".into(),
+        profile_ref: profile_ref.into(),
+        profile_generation: 1,
+        model_id: "none".into(),
+        reasoning_effort: "none".into(),
+        executable_generation: "sha256.fixture".into(),
+        effective_spec_digest: "a".repeat(64),
+        workspace_basis_ref: "basis.operator.lifetime".into(),
+        executable: "/bin/true".into(),
+        cwd: "/tmp".into(),
+        arguments: vec!["zap-server".into()],
+        environment_refs: vec![],
+        credential_refs: vec![],
+        wall_seconds: 30,
+        max_children: 0,
+        resources: vec![ReviewedResource {
+            resource_id: resource.id().clone(), kind: ResourceKind::Auxiliary,
+            epoch: resource.epoch(),
+            driver: ResourceDriver::Auxiliary { driver_ref: "process.exec".into() },
+        }],
+    }
+}
+
+#[test]
+fn tagged_until_stopped_is_only_an_operator_coordinator_service() {
+    let service = planned_aux_root(Role::Coordinator, WorkKind::Service);
+    let descriptor = ImmutableLaunchDescriptor::from_planned_operator_root_until_stopped(
+        &service, operator_lifetime_policy(&service, OPERATOR_PROCESS_PROFILE_REF),
+    ).unwrap();
+    assert_eq!(descriptor.lifetime(), LifetimeLimit::UntilStopped);
+    assert_eq!(descriptor.wall_seconds(), None);
+    let encoded = descriptor.encode_json().unwrap();
+    let raw: Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(raw["schema"], "podbay.launch-descriptor/operator-until-stopped/1");
+    assert_eq!(raw["descriptor"]["lifetime"]["kind"], "untilStopped");
+    assert!(raw["descriptor"].get("wallSeconds").is_none());
+    assert_eq!(ImmutableLaunchDescriptor::decode_json(&encoded).unwrap(), descriptor);
+    let finite = ImmutableLaunchDescriptor::from_planned_root(
+        &service, operator_lifetime_policy(&service, OPERATOR_PROCESS_PROFILE_REF),
+    ).unwrap();
+    assert_eq!(finite.lifetime(), LifetimeLimit::Finite { seconds: 30 });
+    assert_ne!(finite.digest(), descriptor.digest());
+    let task = planned_aux_root(Role::Worker, WorkKind::Task);
+    assert_eq!(
+        ImmutableLaunchDescriptor::from_planned_operator_root_until_stopped(
+            &task, operator_lifetime_policy(&task, OPERATOR_PROCESS_PROFILE_REF),
+        ),
+        Err(LaunchDescriptorError::InvalidField("lifetime")),
+    );
+    assert_eq!(
+        ImmutableLaunchDescriptor::from_planned_operator_root_until_stopped(
+            &service, operator_lifetime_policy(&service, "profile.other"),
+        ),
+        Err(LaunchDescriptorError::InvalidField("lifetime")),
     );
 }
 

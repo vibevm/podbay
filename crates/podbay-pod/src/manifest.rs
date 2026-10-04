@@ -270,8 +270,10 @@ impl BoundPeerManifest {
             || !wire.credential_refs().is_empty()
             || !effective.tool_bundle_refs().is_empty()
             || wire.max_children() != 0
-            || (operator_process && !(30..=3_600).contains(&wire.wall_seconds()))
-            || (!operator_process && (wire.wall_seconds() != 60 || wire.arguments() != ["60"]))
+            || (operator_process && !matches!(wire.lifetime(),
+                podbay_wire::LifetimeLimit::UntilStopped
+                    | podbay_wire::LifetimeLimit::Finite { seconds: 30..=3_600 }))
+            || (!operator_process && (wire.wall_seconds() != Some(60) || wire.arguments() != ["60"]))
             || self
                 .resource_input_epochs
                 .get(resource.resource_id)

@@ -41,7 +41,7 @@ use podbay_store::{
     SqliteSupersessionLedger,
 };
 use podbay_wire::{
-    EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole,
+    EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, LifetimeLimit, NativeResourceKind, NativeRole,
     NativeWorkKind, ResourceDriver, TargetOs,
 };
 use sha2::{Digest, Sha256};
@@ -305,7 +305,7 @@ pub struct TrustedOperatorProcessProfile {
     cwd: PathBuf,
     arguments: Vec<String>,
     private_data_dir: PathBuf,
-    wall_seconds: u64,
+    lifetime: LifetimeLimit,
     cwd_identity: (u64, u64),
     data_identity: (u64, u64),
     executable_identity: (u64, u64),
@@ -327,7 +327,7 @@ impl TrustedOperatorProcessProfile {
         let executable_meta = fs::symlink_metadata(&executable)?;
         let result = Self {
             profile_generation, executable, executable_sha256, cwd, arguments, private_data_dir,
-            wall_seconds,
+            lifetime: LifetimeLimit::Finite { seconds: wall_seconds },
             cwd_identity: (cwd_meta.dev(), cwd_meta.ino()),
             data_identity: (data_meta.dev(), data_meta.ino()),
             executable_identity: (executable_meta.dev(), executable_meta.ino()),
@@ -335,6 +335,23 @@ impl TrustedOperatorProcessProfile {
         };
         result.recheck()?;
         Ok(result)
+    }
+
+    pub fn from_trusted_policy_until_stopped(
+        profile_generation: u64,
+        executable: PathBuf,
+        executable_sha256: String,
+        cwd: PathBuf,
+        arguments: Vec<String>,
+        private_data_dir: PathBuf,
+    ) -> Result<Self, PodError> {
+        let mut profile = Self::from_trusted_policy(
+            profile_generation, executable, executable_sha256, cwd, arguments,
+            private_data_dir, 30,
+        )?;
+        profile.lifetime = LifetimeLimit::UntilStopped;
+        profile.recheck()?;
+        Ok(profile)
     }
 
     fn recheck(&self) -> Result<(), PodError> {
@@ -362,7 +379,8 @@ impl TrustedOperatorProcessProfile {
             || executable.mode() & 0o111 == 0
             || (executable.dev(), executable.ino()) != self.executable_identity
             || sha256_file(&self.executable)? != self.executable_sha256
-            || !(30..=3_600).contains(&self.wall_seconds)
+            || !matches!(self.lifetime,
+                LifetimeLimit::UntilStopped | LifetimeLimit::Finite { seconds: 30..=3_600 })
             || self.arguments.is_empty()
             || self.arguments.len() > 64
             || self.arguments.iter().any(|arg| arg.is_empty()
@@ -485,7 +503,7 @@ impl LinuxLaunchPort {
                 || wire.cwd() != self.config.directory.to_string_lossy()
                 || wire.role() != NativeRole::Worker
                 || wire.work_kind() != NativeWorkKind::Task
-                || wire.wall_seconds() != 60
+                || wire.wall_seconds() != Some(60)
                 || wire.arguments() != ["60"]
             {
                 return Err(PodError::Unsupported("synthetic process.exec profile differs"));
@@ -501,7 +519,7 @@ impl LinuxLaunchPort {
                 || wire.cwd() != profile.cwd.to_string_lossy()
                 || launch.executable() != profile.executable
                 || wire.arguments() != profile.arguments
-                || wire.wall_seconds() != profile.wall_seconds
+                || wire.lifetime() != profile.lifetime
             {
                 return Err(PodError::Unsupported("operator process profile differs"));
             }
@@ -2517,7 +2535,8 @@ impl LinuxLaunchPort {
         let record = launch.committed_record();
         let resource = wire.resource(0).ok_or(PodError::Refused(
             "operator process Resource is absent"))?;
-        if record.format != BoundLaunchFormat::V1
+        if !matches!(record.format,
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
             || record.resources.len() != 1
             || wire.profile_ref() != OPERATOR_PROCESS_PROFILE_REF
             || wire.profile_generation() != profile.profile_generation
@@ -2538,7 +2557,7 @@ impl LinuxLaunchPort {
             || launch.executable() != profile.executable
             || launch.executable_sha256() != profile.executable_sha256
             || wire.arguments() != profile.arguments
-            || wire.wall_seconds() != profile.wall_seconds
+            || wire.lifetime() != profile.lifetime
             || launch.effective().compare_with_descriptor(wire).is_err()
         {
             return Err(PodError::Refused("operator process committed policy differs"));
@@ -2705,7 +2724,8 @@ impl LinuxLaunchPort {
         let wire = podbay_wire::ImmutableLaunchDescriptor::decode_json(
             &prepared.record().descriptor,
         ).map_err(|_| PodError::Refused("operator rebind descriptor is malformed"))?;
-        if prepared.record().format != BoundLaunchFormat::V1
+        if !matches!(prepared.record().format,
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
             || wire.profile_ref() != OPERATOR_PROCESS_PROFILE_REF
             || wire.profile_generation() != profile.profile_generation
             || wire.role() != NativeRole::Coordinator
@@ -2713,7 +2733,7 @@ impl LinuxLaunchPort {
             || wire.executable() != profile.executable.to_string_lossy()
             || wire.cwd() != profile.cwd.to_string_lossy()
             || wire.arguments() != profile.arguments
-            || wire.wall_seconds() != profile.wall_seconds
+            || wire.lifetime() != profile.lifetime
         {
             return Err(PodError::Refused("operator rebind trusted profile differs"));
         }

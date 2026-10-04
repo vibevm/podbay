@@ -8,11 +8,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CodexAppServerPolicyV2, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
-    MAX_FRAME_BYTES, NativeRole,
+    LifetimeLimit, MAX_FRAME_BYTES, NativeRole, OPERATOR_PROCESS_PROFILE_REF,
 };
 
 pub const EFFECTIVE_LAUNCH_VERSION: &str = "podbay.effective-launch/1";
 const PREFIX: &[u8] = b"podbay.effective-launch/1\0";
+pub const EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION: &str =
+    "podbay.effective-launch/operator-until-stopped/1";
+const PREFIX_OPERATOR_UNTIL_STOPPED: &[u8] =
+    b"podbay.effective-launch/operator-until-stopped/1\0";
 pub const EFFECTIVE_LAUNCH_V2_VERSION: &str = "podbay.effective-launch/2";
 const PREFIX_V2: &[u8] = b"podbay.effective-launch/2\0";
 const DIGEST_DOMAIN_V2: &[u8] = b"podbay.effective-launch/2\0";
@@ -83,7 +87,7 @@ pub struct EffectiveLaunchContract {
     workspace_access: EffectiveWorkspaceAccess,
     tool_bundle_refs: Vec<String>,
     authority_grant_id: u64,
-    wall_seconds: u64,
+    lifetime: LifetimeLimit,
     max_children: u32,
     environment_refs: Vec<String>,
     credential_refs: Vec<CredentialLocator>,
@@ -95,7 +99,9 @@ impl EffectiveLaunchContract {
             return Err(EffectiveLaunchError::TooLarge);
         }
         let mut reader = Reader { bytes, at: 0 };
-        if reader.take(PREFIX.len())? != PREFIX {
+        let until_stopped = bytes.starts_with(PREFIX_OPERATOR_UNTIL_STOPPED);
+        let prefix = if until_stopped { PREFIX_OPERATOR_UNTIL_STOPPED } else { PREFIX };
+        if reader.take(prefix.len())? != prefix {
             return Err(EffectiveLaunchError::InvalidField("version"));
         }
         let pod_id = PodId::try_from(reader.string(256)?.as_str())
@@ -152,10 +158,15 @@ impl EffectiveLaunchContract {
         if authority_grant_id == 0 {
             return Err(EffectiveLaunchError::InvalidField("authorityGrantId"));
         }
-        let wall_seconds = reader.u64()?;
-        if wall_seconds == 0 {
-            return Err(EffectiveLaunchError::InvalidField("wallSeconds"));
-        }
+        let lifetime = if until_stopped {
+            LifetimeLimit::UntilStopped
+        } else {
+            let seconds = reader.u64()?;
+            if seconds == 0 || seconds > 604_800 {
+                return Err(EffectiveLaunchError::InvalidField("wallSeconds"));
+            }
+            LifetimeLimit::Finite { seconds }
+        };
         let max_children = reader.u32()?;
         let environment_refs = reader.list(64, 256, "environmentRefs", valid_label)?;
         if !sorted_unique(&environment_refs) {
@@ -181,6 +192,15 @@ impl EffectiveLaunchContract {
                 reference,
             });
         }
+        if until_stopped && (role != NativeRole::Coordinator
+            || parent_run_id.is_some()
+            || profile_ref != OPERATOR_PROCESS_PROFILE_REF
+            || max_children != 0
+            || !environment_refs.is_empty()
+            || !credential_refs.is_empty())
+        {
+            return Err(EffectiveLaunchError::InvalidField("operator Service lifetime"));
+        }
         if reader.at != bytes.len() {
             return Err(EffectiveLaunchError::TrailingBytes);
         }
@@ -204,7 +224,7 @@ impl EffectiveLaunchContract {
             workspace_access,
             tool_bundle_refs,
             authority_grant_id,
-            wall_seconds,
+            lifetime,
             max_children,
             environment_refs,
             credential_refs,
@@ -272,8 +292,14 @@ impl EffectiveLaunchContract {
     pub fn authority_grant_id(&self) -> u64 {
         self.authority_grant_id
     }
-    pub fn wall_seconds(&self) -> u64 {
-        self.wall_seconds
+    pub fn lifetime(&self) -> LifetimeLimit {
+        self.lifetime
+    }
+    pub fn wall_seconds(&self) -> Option<u64> {
+        match self.lifetime {
+            LifetimeLimit::Finite { seconds } => Some(seconds),
+            LifetimeLimit::UntilStopped => None,
+        }
     }
     pub fn max_children(&self) -> u32 {
         self.max_children
@@ -328,8 +354,8 @@ impl EffectiveLaunchContract {
                 "workspace.basisRef",
             ),
             (
-                descriptor.wall_seconds() == self.wall_seconds,
-                "wallSeconds",
+                descriptor.lifetime() == self.lifetime,
+                "lifetime",
             ),
             (
                 descriptor.max_children() == u64::from(self.max_children),
@@ -362,7 +388,10 @@ impl EffectiveLaunchContract {
     }
 
     pub fn reencode(&self) -> Vec<u8> {
-        let mut output = PREFIX.to_vec();
+        let mut output = match self.lifetime {
+            LifetimeLimit::Finite { .. } => PREFIX.to_vec(),
+            LifetimeLimit::UntilStopped => PREFIX_OPERATOR_UNTIL_STOPPED.to_vec(),
+        };
         append_string(&mut output, self.pod_id.as_str());
         append_string(
             &mut output,
@@ -396,7 +425,9 @@ impl EffectiveLaunchContract {
         });
         append_list(&mut output, &self.tool_bundle_refs);
         output.extend_from_slice(&self.authority_grant_id.to_be_bytes());
-        output.extend_from_slice(&self.wall_seconds.to_be_bytes());
+        if let LifetimeLimit::Finite { seconds } = self.lifetime {
+            output.extend_from_slice(&seconds.to_be_bytes());
+        }
         output.extend_from_slice(&self.max_children.to_be_bytes());
         append_list(&mut output, &self.environment_refs);
         output.extend_from_slice(&(self.credential_refs.len() as u32).to_be_bytes());
@@ -652,7 +683,7 @@ impl EffectiveLaunchContractV2 {
                 "workspace.basisRef",
             ),
             (
-                descriptor.wall_seconds() == base.wall_seconds(),
+                descriptor.wall_seconds() == base.wall_seconds().expect("Codex effective lifetime finite"),
                 "wallSeconds",
             ),
             (
@@ -699,6 +730,7 @@ fn validate_codex_effective(
         .map_err(|_| EffectiveLaunchError::InvalidField("codexPolicy"))?;
     let credentials = base.credential_refs();
     if !matches!(base.role(), NativeRole::Coordinator | NativeRole::Worker)
+        || !matches!(base.lifetime(), LifetimeLimit::Finite { .. })
         || base.workspace_access() != EffectiveWorkspaceAccess::ReadWrite
         || credentials.len() != 1
         || credentials[0].scope_id().as_str() != codex_policy.credential_scope()

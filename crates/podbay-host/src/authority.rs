@@ -38,7 +38,7 @@ use podbay_store::{
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
     FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole, SendPolicy,
-    NativeEventCursor, OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
+    NativeEventCursor, LifetimeLimit, OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
     SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
     WorkspaceAccess as WireWorkspaceAccess,
 };
@@ -1951,7 +1951,8 @@ pub struct BoundLaunchPodRequest {
 }
 
 fn operator_root_record(record: &BoundLaunchRecord) -> bool {
-    if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+    if !matches!(record.format, BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
+        || record.resources.len() != 1 {
         return false;
     }
     let Ok(descriptor) = ImmutableLaunchDescriptor::decode_json(&record.descriptor) else {
@@ -3895,7 +3896,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let initial = self.rebind_context(scope, pod)?;
         let record = initial.launch().clone();
         drop(initial);
-        if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+        if !matches!(record.format, BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped)
+            || record.resources.len() != 1 {
             return Err(HostError::Unsupported.into());
         }
         let effective = EffectiveLaunchContract::decode(&record.effective_spec)
@@ -7062,7 +7064,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let port_accepts = match format {
             BoundLaunchFormat::CodexV2 => self.host.port.accepts_claimed_codex_bootstrap(),
             BoundLaunchFormat::CodexV3 => self.host.port.accepts_claimed_codex_v3_bootstrap(),
-            BoundLaunchFormat::V1 => false,
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped => false,
         };
         if !port_accepts {
             return Ok(prepared());
@@ -7827,7 +7829,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 &request.key,
                 &canonical_intent,
             )?,
-            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+                return Err(HostError::Unsupported.into()),
         };
         if let Some(record) = existing {
             return self.bound_receipt(record, true);
@@ -8000,7 +8003,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchFormat::CodexV3 => {
                 self.admit_bound_root_codex_v3(transport, planned_request.clone())?
             }
-            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+                return Err(HostError::Unsupported.into()),
         };
         if admitted.duplicate {
             return Ok(admitted);
@@ -8016,7 +8020,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchFormat::CodexV3 => {
                 self.dispatch_prepared_bound_root_codex_v3(transport, planned_request)
             }
-            BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+                return Err(HostError::Unsupported.into()),
         };
         match dispatch {
             Ok(mut dispatched) => {
@@ -8034,7 +8039,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     BoundLaunchFormat::CodexV3 => {
                         self.lookup_bound_root_codex_v3_by_key(transport, &scope, &key, &intent)
                     }
-                    BoundLaunchFormat::V1 => return Err(HostError::Unsupported.into()),
+                    BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+                        return Err(HostError::Unsupported.into()),
                 };
                 if let Ok(Some(record)) = original {
                     if let Ok(mut current) = self.bound_receipt(record, true) {
@@ -8634,7 +8640,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 expected_authority_revision: self.recorded.revision,
             }),
         };
-        let (record, duplicate) = match self.store.admit_bound_operator_root_launch(store_request)? {
+        let admitted = if descriptor.lifetime() == LifetimeLimit::UntilStopped {
+            self.store.admit_bound_operator_root_until_stopped_launch(store_request)?
+        } else {
+            self.store.admit_bound_operator_root_launch(store_request)?
+        };
+        let (record, duplicate) = match admitted {
             BoundLaunchAdmission::Committed(record) => (record, false),
             BoundLaunchAdmission::Duplicate(record) => (record, true),
         };
@@ -9026,8 +9037,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let (native, _) = profile.resolve_native_policy(
             host, &spec, &proposal.binding, decoded.digest(),
         )?;
-        let descriptor = ImmutableLaunchDescriptor::from_planned_root(planned, native)
-            .map_err(|_| HostError::Unauthorised)?;
+        let descriptor = if profile.operator_until_stopped() {
+            ImmutableLaunchDescriptor::from_planned_operator_root_until_stopped(planned, native)
+        } else {
+            ImmutableLaunchDescriptor::from_planned_root(planned, native)
+        }.map_err(|_| HostError::Unauthorised)?;
         decoded.compare_with_descriptor(&descriptor)
             .map_err(|_| HostError::Unauthorised)?;
         let Some(resource) = descriptor.resource(0) else {
