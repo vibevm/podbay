@@ -24,7 +24,7 @@ use podbay_host::{
     DurableAuthority, ExecutionMode, GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
     HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
     PortDispatchError, PortDispatchOutcome, PortRebindObservation, PortReceiptRef,
-    PreparedCodexV2Rebind, RebindCompletionStage,
+    PreparedCodexV2Rebind, RebindCompletionStage, RecoveryCompletionStage,
     RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy,
     TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
     TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
@@ -1644,7 +1644,7 @@ fn rebind_second_pending_manager_process_helper() {
 
 #[test]
 #[ignore = "helper for disposable three-manager pending recovery inspect fixture"]
-fn rebind_third_inspect_manager_process_helper() {
+fn rebind_third_recover_manager_process_helper() {
     let fixture = Fixture::from_shared();
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let mut port = port_for(&fixture, &binary);
@@ -1663,10 +1663,34 @@ fn rebind_third_inspect_manager_process_helper() {
     assert_eq!(proof.abandoned().identity.pod_id, fixture.pod);
     assert_eq!(proof.pending_process().child_process_id,
         fs::read_to_string(fixture.directory.join("rebind.first.pid")).unwrap());
+    let planned = host.plan_current_codex_v2_recovery(
+        &fixture.scope, &fixture.pod, "recover.native.v21.c",
+    ).unwrap();
+    assert_eq!(planned.stage, podbay_store::SupersessionStage::Planned);
+    let completed = host.complete_current_codex_v2_recovery(
+        &fixture.scope, &fixture.pod, "recover.native.v21.c",
+    ).unwrap();
+    assert_eq!(completed.stage, RecoveryCompletionStage::PodCheckpointed);
+    assert_eq!(completed.durable.stage, podbay_store::SupersessionStage::PodCheckpointed);
+    assert!(completed.active_checkpoint_digest.is_some());
+    let context = host.rebind_context(&fixture.scope, &fixture.pod).unwrap();
+    let recovered = podbay_pod::read_peer_checkpoint(&fixture.directory, context.identity())
+        .unwrap().checkpoint();
+    assert_eq!(recovered.phase(), RebindPhase::Active);
+    assert_eq!(recovered.owner_epoch().get(), 1);
+    assert_eq!(recovered.credential_epoch().get(), 1);
+    assert_eq!(recovered.input_epochs().values().next().unwrap().get(), 2);
+    assert!(recovered.pending_rebind().is_none());
+    assert!(recovered.last_rebind().is_none());
+    drop(context);
+    let next = host.prepare_current_codex_v2_rebind(
+        &fixture.scope, &fixture.pod, "rebind.after.recovery.c",
+    ).unwrap();
+    assert_eq!(next.phase, podbay_store::DurableRebindPhase::Pending);
     let store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
     assert_eq!(store.owner_epoch().unwrap(), 3);
     fs::write(fixture.directory.join("rebind.third.inspected"),
-        proof.checkpoint_digest()).unwrap();
+        completed.active_checkpoint_digest.as_deref().unwrap()).unwrap();
     drop(store);
     drop(host);
     std::mem::forget(fixture);
@@ -1741,7 +1765,7 @@ fn disposable_v2_rebind_keeps_exact_pod_and_child_across_two_manager_processes()
 
 #[test]
 #[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
-fn disposable_v21_pending_recovery_inspection_keeps_same_child_across_three_managers() {
+fn disposable_v21_pending_recovery_checkpoint_keeps_same_child_across_three_managers() {
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let fixture = Fixture::new();
     run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
@@ -1753,7 +1777,7 @@ fn disposable_v21_pending_recovery_inspection_keeps_same_child_across_three_mana
     assert_eq!(fs::read_to_string(fixture.directory.join("rebind.second.pending")).unwrap(),
         "pending_pod");
     assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
-    run_rebind_manager_helper("rebind_third_inspect_manager_process_helper", &fixture, &binary);
+    run_rebind_manager_helper("rebind_third_recover_manager_process_helper", &fixture, &binary);
     let digest = fs::read_to_string(fixture.directory.join("rebind.third.inspected")).unwrap();
     assert_eq!(digest.len(), 64);
     assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());

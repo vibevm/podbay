@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use podbay_core::{
     AttemptId, AttestedPeer, CommandId, CredentialEpoch, FenceOperation, FenceTarget, GrantKind, InputEpoch,
     ManagerLiveness, OwnerEpoch, OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest,
+    PendingRebindSupersession,
     PodFenceCheckpoint,
     PodFenceIdentity, PodId, PodPeerFence, RebindLedger, RebindPhase, RebindProposal, ResourceId, ScopeId,
     StoreLineageId,
@@ -17,7 +18,7 @@ use podbay_core::{
 use podbay_store::{
     BootstrapSendSelector, BoundLaunchFormat, BoundLaunchRecord, HostObservedPriorCheckpoint,
     NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
-    SqlitePriorObservedPendingLedger,
+    SqlitePriorObservedPendingLedger, SqliteSupersessionLedger,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,8 @@ use crate::rebind_recovery_protocol::{
     decode_pending_reply as decode_recovery_pending_reply,
     encode_inspect_request as encode_recovery_inspect_request,
     encode_pending_reply as encode_recovery_pending_reply,
+    decode_recovery_prepare, decode_recovery_active_reply,
+    encode_recovery_prepare, encode_recovery_active_reply,
 };
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
@@ -803,6 +806,66 @@ impl PodClient {
             return Err(PodError::Refused("recovery inspect OS peer differs"));
         }
         Ok(response)
+    }
+
+    /// Apply only an already-planned exact v21 supersession. A reply may be
+    /// lost after fsync; the caller receives Uncertain and must reconcile the
+    /// same Pod/checkpoint, never launch a replacement child or resend input.
+    pub fn prepare_pending_recovery(
+        manifest_path: impl AsRef<Path>,
+        intent: &PendingRebindSupersession,
+        prior_checkpoint_digest: &str,
+    ) -> Result<String, PodError> {
+        let path = manifest_path.as_ref();
+        let manifest = read_manifest(path)?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "unbound rebind recovery is unavailable",
+        ))?;
+        if binding.protocol != PEER_BINDING_V2_PROTOCOL
+            || binding.capability != CODEX_V2_CAPABILITY
+            || bound_identity(&manifest.descriptor, binding)? != intent.abandoned.identity
+        {
+            return Err(PodError::Refused("recovery Pod identity differs"));
+        }
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let request = encode_recovery_prepare(intent, prior_checkpoint_digest, &nonce)?;
+        let (response, peer) = inspect_exchange(&manifest.socket_path, &request)
+            .map_err(|_| PodError::Uncertain("recovery reply lost after possible fsync"))?;
+        if !unit_cgroup_exact(peer.cgroup(), &manifest.unit_name)
+            || peer.attested_peer().os_identity() != binding.manager_os_identity
+            || peer.attested_peer().boot_identity() != binding.manager_boot_identity
+        {
+            return Err(PodError::Uncertain("recovery server OS identity differs"));
+        }
+        let digest = decode_recovery_active_reply(
+            &response, &intent.abandoned.identity, &nonce,
+        ).map_err(|_| PodError::Uncertain("recovery reply is not exact Active proof"))?;
+        let active = Self::inspect_rebind(
+            path, &intent.abandoned.identity,
+            intent.recovering_owner_epoch.get(),
+            intent.recovering_credential_epoch.get(),
+        ).map_err(|_| PodError::Uncertain("recovery Active checkpoint readback unavailable"))?;
+        if active.checkpoint_digest != digest
+            || active.prior_owner_epoch != intent.abandoned.expected_owner_epoch.get()
+            || active.prior_credential_epoch != intent.abandoned.expected_credential_epoch.get()
+            || active.prior_input_epochs != intent.abandoned.next_input_epochs.iter()
+                .map(|(id, epoch)| (id.as_str().to_owned(), epoch.get()))
+                .collect::<BTreeMap<_, _>>()
+            || active.supervisor_pid.to_string()
+                != intent.pending_process.supervisor_process_id
+            || active.supervisor_start_ticks.to_string()
+                != intent.pending_process.supervisor_birth_identity
+            || active.child_pid.to_string() != intent.pending_process.child_process_id
+            || active.child_start_ticks.to_string()
+                != intent.pending_process.child_birth_identity
+            || active.boot_id != intent.pending_process.boot_identity
+            || active.cgroup_path != intent.pending_process.containment_identity
+        {
+            return Err(PodError::Uncertain("recovery Active checkpoint differs"));
+        }
+        Ok(digest)
     }
 
     /// A trusted manager sends only the exact already-Pending proposal; the
@@ -2108,6 +2171,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     }
     let mut native_pump_available = codex_pump;
     let mut prior_rebind_observation: Option<HostObservedPriorCheckpoint> = None;
+    let mut completed_recovery: Option<(PendingRebindSupersession, String)> = None;
     loop {
         // One native frame before each accept keeps control traffic from
         // starving completion observation. An idle tick does constant work.
@@ -2258,6 +2322,130 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         status: None,
                         error: Some("pending recovery inspection refused".into()),
                         error_code: Some("refused".into()),
+                        terminal: None,
+                    })?,
+                }
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(recover) = decode_recovery_prepare(&bytes)
+            {
+                let result = (|| -> Result<Vec<u8>, PodError> {
+                    let intent = &recover.intent;
+                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                        || intent.abandoned.identity != identity
+                    {
+                        return Err(PodError::Refused("V2 recovery preparation unavailable"));
+                    }
+                    let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "recovery manager OS peer unavailable",
+                    ))?;
+                    let manager = observed.attested_peer();
+                    let owner = OwnerEpoch::new(intent.recovering_owner_epoch.get())
+                        .map_err(|_| PodError::Refused("recovery owner invalid"))?;
+                    if manager != &intent.recovering_manager
+                        || manager == &manager_peer
+                        || manager == &intent.abandoned.next_manager
+                        || manager.containment_identity() != manager_peer.containment_identity()
+                        || witness.current_owner_epoch(&identity.store_lineage, &identity.scope_id)
+                            != Some(owner)
+                        || !manager_witness.matches_current(
+                            intent.recovering_owner_epoch.get(),
+                            intent.recovering_credential_epoch.get(), manager,
+                        )
+                        || observed.recheck_before_effect(&stream, manager).is_err()
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                        || intent.pending_process.supervisor_process_id != std::process::id().to_string()
+                        || intent.pending_process.supervisor_birth_identity
+                            != start_ticks(std::process::id())?.to_string()
+                        || intent.pending_process.child_process_id != child_pid.to_string()
+                        || intent.pending_process.child_birth_identity != child_start_ticks.to_string()
+                        || intent.pending_process.boot_identity != boot_id
+                        || intent.pending_process.containment_identity != cgroup_path
+                        || crate::runtime::cgroup_path().ok().as_deref() != Some(cgroup_path.as_str())
+                    {
+                        return Err(PodError::Refused("recovery manager or child differs"));
+                    }
+                    abandoned_manager_birth_absent(&intent.abandoned.next_manager, &boot_id)?;
+                    let directory = manifest_path.as_ref().parent().ok_or(PodError::Invalid(
+                        "recovery checkpoint directory is absent",
+                    ))?;
+                    let durable = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Refused("recovery checkpoint unavailable"))?;
+                    let active_digest = if fence.phase() == RebindPhase::Active {
+                        let (prior_intent, prior_digest) = completed_recovery.as_ref().ok_or(
+                            PodError::Refused("recovery Active state lacks exact retry proof"),
+                        )?;
+                        if prior_intent != intent
+                            || durable.checkpoint() != &fence.checkpoint()
+                            || durable.digest() != prior_digest
+                        {
+                            return Err(PodError::Refused("recovery Active retry differs"));
+                        }
+                        prior_digest.clone()
+                    } else {
+                        let prior = prior_rebind_observation.as_ref().ok_or(PodError::Refused(
+                            "prior Active checkpoint observation was lost",
+                        ))?;
+                        if prior.identity != identity
+                            || prior.checkpoint_digest != recover.prior_checkpoint_digest
+                            || fence.phase() != intent.pending_phase
+                            || fence.checkpoint().pending_rebind() != Some(&intent.abandoned)
+                            || fence.checkpoint().last_rebind() != Some(&intent.abandoned)
+                        {
+                            return Err(PodError::Refused("recovery Pending association differs"));
+                        }
+                        let ledger = SqliteSupersessionLedger::for_pod(
+                            &binding.store_path, identity.clone(),
+                        );
+                        let mut recovered = fence.clone();
+                        let now = u64::try_from(fence_clock.elapsed().as_millis())
+                            .unwrap_or(u64::MAX).saturating_add(1);
+                        recovered.supersede_pending_rebind(
+                            intent, &intent.pending_checkpoint_digest,
+                            &intent.pending_process, manager,
+                            ManagerLiveness::DeadAttested, &witness, &ledger, now,
+                        ).map_err(|_| PodError::Refused("recovery fence refused supersession"))?;
+                        let next_checkpoint = recovered.checkpoint();
+                        if durable.checkpoint() != &next_checkpoint {
+                            if durable.checkpoint() != &fence.checkpoint()
+                                || durable.digest() != intent.pending_checkpoint_digest.as_str()
+                            {
+                                return Err(PodError::Refused("recovery Pending file differs"));
+                            }
+                            write_peer_checkpoint(directory, &identity, &next_checkpoint)
+                                .map_err(|_| PodError::Uncertain("recovery Active fsync unknown"))?;
+                        }
+                        let saved = read_peer_checkpoint_observation(directory, &identity)
+                            .map_err(|_| PodError::Uncertain("recovery Active readback unavailable"))?;
+                        if saved.checkpoint() != &next_checkpoint {
+                            return Err(PodError::Uncertain("recovery Active readback differs"));
+                        }
+                        let digest = saved.digest().to_owned();
+                        fence = recovered;
+                        completed_recovery = Some((intent.clone(), digest.clone()));
+                        digest
+                    };
+                    abandoned_manager_birth_absent(&intent.abandoned.next_manager, &boot_id)?;
+                    if observed.recheck_before_effect(&stream, manager).is_err()
+                        || !manager_witness.matches_current(
+                            intent.recovering_owner_epoch.get(),
+                            intent.recovering_credential_epoch.get(), manager,
+                        )
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                    {
+                        return Err(PodError::Uncertain("recovery post-fsync guard changed"));
+                    }
+                    encode_recovery_active_reply(&identity, &recover.nonce, &active_digest)
+                })();
+                match result {
+                    Ok(encoded) => stream.write_all(&encoded)?,
+                    Err(_) => respond(&mut stream, Response {
+                        ok: false,
+                        status: None,
+                        error: Some("recovery preparation refused or uncertain".into()),
+                        error_code: Some("uncertain".into()),
                         terminal: None,
                     })?,
                 }
@@ -3152,6 +3340,38 @@ fn start_ticks(pid: u32) -> Result<u64, PodError> {
         .nth(19)
         .and_then(|value| value.parse().ok())
         .ok_or(PodError::Invalid("child start identity"))
+}
+
+fn abandoned_manager_birth_absent(
+    peer: &AttestedPeer,
+    current_boot: &str,
+) -> Result<(), PodError> {
+    if peer.boot_identity() != format!("linux.boot.{current_boot}") {
+        return Err(PodError::Refused("abandoned manager boot differs"));
+    }
+    let pid_text = peer.native_process_id().strip_prefix("linux.pid.")
+        .ok_or(PodError::Refused("abandoned manager PID is malformed"))?;
+    let birth_text = peer.birth_identity().strip_prefix("linux.start.")
+        .ok_or(PodError::Refused("abandoned manager birth is malformed"))?;
+    let pid: u32 = pid_text.parse().map_err(|_| PodError::Refused(
+        "abandoned manager PID is malformed"))?;
+    let birth: u64 = birth_text.parse().map_err(|_| PodError::Refused(
+        "abandoned manager birth is malformed"))?;
+    if pid == 0 || birth == 0 || pid.to_string() != pid_text || birth.to_string() != birth_text {
+        return Err(PodError::Refused("abandoned manager process identity is malformed"));
+    }
+    for _ in 0..2 {
+        match start_ticks(pid) {
+            Ok(current) if current == birth => {
+                return Err(PodError::Refused("abandoned manager process is still alive"));
+            }
+            Ok(_) => {}
+            Err(PodError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PodError::Refused(
+                "abandoned manager process state is unknown")),
+        }
+    }
+    Ok(())
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {

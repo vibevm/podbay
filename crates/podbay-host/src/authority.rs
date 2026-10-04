@@ -13,7 +13,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
     ActorId, Attempt, AttestedPeer, CommandId, CommandKey, CredentialEpoch, Epoch, LaunchBinding,
-    OwnerEpoch, PendingPodProcessEvidence, PlannedRootBinding, Pod, PodId, RebindPhase,
+    OwnerEpoch, PendingPodProcessEvidence, PendingRebindSupersession,
+    PlannedRootBinding, Pod, PodId, RebindPhase,
     RebindProposal, RequestDigest, Resource,
     ResourceId, ResourceKind, Role, Run, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
@@ -26,7 +27,8 @@ use podbay_store::{
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     ManagerCredentialClaim, NativeWriterLease, PodBayStore, Receipt, SqliteActorVerifierWitness,
-    StoreError, TrustedBootstrapSendRequest, TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
+    StoreError, SupersessionReceipt, SupersessionStage, TrustedBootstrapSendRequest,
+    TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
@@ -1021,6 +1023,7 @@ pub struct PortRebindObservation {
 /// Read-only observation from a trusted native port after one nonce-bound
 /// pending-recovery socket exchange and independent process-tree attestation.
 /// It cannot plan/ACK a v21 row or grant control by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortPendingRecoveryObservation {
     abandoned: RebindProposal,
     pending_phase: RebindPhase,
@@ -1109,6 +1112,47 @@ impl PreparedCodexV2Rebind {
     pub fn authority_revision(&self) -> u64 {
         self.authority_revision
     }
+}
+
+/// Private, host-created capability for one already planned v21 recovery.
+/// The port must still prove the current manager, B's death, exact pod birth,
+/// and the latest Planned side row before any pod checkpoint mutation.
+#[derive(Clone)]
+pub struct PreparedPendingRecovery {
+    intent: PendingRebindSupersession,
+    prior_checkpoint_digest: String,
+    planned: SupersessionReceipt,
+    record: BoundLaunchRecord,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    manager_peer: AttestedPeer,
+    authority_revision: u64,
+}
+
+impl PreparedPendingRecovery {
+    pub fn intent(&self) -> &PendingRebindSupersession { &self.intent }
+    pub fn prior_checkpoint_digest(&self) -> &str { &self.prior_checkpoint_digest }
+    pub fn planned(&self) -> &SupersessionReceipt { &self.planned }
+    pub fn record(&self) -> &BoundLaunchRecord { &self.record }
+    pub fn store_path(&self) -> &Path { &self.store_path }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64,u64) { self.store_file_identity }
+    pub fn manager_peer(&self) -> &AttestedPeer { &self.manager_peer }
+    pub fn authority_revision(&self) -> u64 { self.authority_revision }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryCompletionStage {
+    PodRecoveryUnknown,
+    PodCheckpointed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCompletionReceipt {
+    pub durable: SupersessionReceipt,
+    pub stage: RecoveryCompletionStage,
+    pub active_checkpoint_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1213,6 +1257,55 @@ fn digest_codex_v2_rebind_intent(
     let digest = hash
         .finalize()
         .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
+fn digest_pending_recovery_intent(
+    key: &CommandKey,
+    context: &ManagerRebindContext<'_>,
+    observed: &PortPendingRecoveryObservation,
+) -> Result<RequestDigest, HostError> {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let abandoned = observed.abandoned();
+    let process = observed.pending_process();
+    let manager = context.manager_peer();
+    let mut hash = Sha256::new();
+    field(&mut hash, b"podbay.rebind-recovery-intent/1");
+    for text in [
+        key.as_str(), abandoned.identity.store_lineage.as_str(),
+        abandoned.identity.scope_id.as_str(), abandoned.identity.pod_id.as_str(),
+        abandoned.identity.attempt_id.as_str(), abandoned.command_key.as_str(),
+        abandoned.digest.as_str(), observed.checkpoint_digest(),
+        observed.prior_checkpoint_digest(), observed.descriptor_digest(),
+        process.supervisor_process_id.as_str(),
+        process.supervisor_birth_identity.as_str(),
+        process.child_process_id.as_str(), process.child_birth_identity.as_str(),
+        process.boot_identity.as_str(), process.containment_identity.as_str(),
+        manager.os_identity(), manager.native_process_id(), manager.boot_identity(),
+        manager.birth_identity(), manager.containment_identity(),
+    ] {
+        field(&mut hash, text.as_bytes());
+    }
+    field(&mut hash, &abandoned.identity.incarnation.get().to_be_bytes());
+    field(&mut hash, &context.owner_epoch().to_be_bytes());
+    field(&mut hash, &context.credential_epoch().to_be_bytes());
+    field(&mut hash, &[match observed.pending_phase() {
+        RebindPhase::PendingStore => 1,
+        RebindPhase::PendingPod => 2,
+        RebindPhase::Active => return Err(HostError::StaleGuard),
+    }]);
+    for (id, next) in context.resource_input_epochs() {
+        let old = abandoned.next_input_epochs.get(id).ok_or(HostError::StaleGuard)?;
+        field(&mut hash, id.as_str().as_bytes());
+        field(&mut hash, &old.get().to_be_bytes());
+        field(&mut hash, &next.get().to_be_bytes());
+    }
+    let digest = hash.finalize().iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
@@ -1435,6 +1528,15 @@ pub trait HostDispatchPort {
         &self,
         _launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortPendingRecoveryObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// Mutating only after the v21 Planned row is durable. A lost pod reply
+    /// is uncertainty and may never be reported as Active from store intent.
+    fn prepare_pending_codex_v2_recovery(
+        &self,
+        _prepared: &PreparedPendingRecovery,
+    ) -> Result<String, HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -2914,6 +3016,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
     native_host: Option<TrustedNativeHostConfig>,
     pending_codex_rebinds: HashMap<(ScopeId, PodId, String), PreparedCodexV2Rebind>,
+    pending_recoveries: HashMap<(ScopeId, PodId, String), PreparedPendingRecovery>,
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
@@ -3024,6 +3127,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             launch_profiles: HashMap::new(),
             native_host: None,
             pending_codex_rebinds: HashMap::new(),
+            pending_recoveries: HashMap::new(),
         })
     }
 
@@ -3360,6 +3464,157 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
         final_context.recheck_current()?;
         Ok(observed)
+    }
+
+    /// Plan C's exact recovery of Pending(B) only after two independent
+    /// trusted-port observations agree. The port attests B's process birth is
+    /// gone; SQLite atomically checks B, C and every Resource before writing
+    /// one Planned side row. No pod checkpoint changes in this method.
+    pub fn plan_current_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<SupersessionReceipt, RebindContextError> {
+        let key = CommandKey::try_from(command_key).map_err(|_| HostError::InvalidInput)?;
+        let first = self.inspect_pending_codex_v2_recovery(scope, pod)?;
+        let second = self.inspect_pending_codex_v2_recovery(scope, pod)?;
+        if second != first {
+            return Err(HostError::StaleGuard.into());
+        }
+        let reviewed = self.inspect_committed_root_codex_v2(scope, pod)?;
+        let mut context = self.rebind_context(scope, pod)?;
+        context.recheck_current()?;
+        if context.launch() != reviewed.committed_record()
+            || context.identity() != &first.abandoned().identity
+            || context.owner_epoch() <= first.abandoned().next_owner_epoch.get()
+            || context.credential_epoch() <= first.abandoned().next_credential_epoch.get()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let digest = digest_pending_recovery_intent(&key, &context, &first)?;
+        let intent = PendingRebindSupersession {
+            abandoned: first.abandoned().clone(),
+            pending_phase: first.pending_phase(),
+            pending_checkpoint_digest: RequestDigest::parse(first.checkpoint_digest())
+                .map_err(|_| HostError::StaleGuard)?,
+            pending_process: first.pending_process().clone(),
+            recovering_owner_epoch: OwnerEpoch::new(context.owner_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            recovering_credential_epoch: CredentialEpoch::new(context.credential_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            recovering_input_epochs: context.resource_input_epochs().clone(),
+            recovering_manager: context.manager_peer().clone(),
+            command_key: key,
+            digest,
+        };
+        let planned = context.store.plan_pending_rebind_supersession(&intent, None)?;
+        if planned.stage != SupersessionStage::Planned {
+            return Err(StoreError::Conflict("recovery is no longer Planned").into());
+        }
+        let prepared = PreparedPendingRecovery {
+            intent,
+            prior_checkpoint_digest: first.prior_checkpoint_digest().into(),
+            planned: planned.clone(),
+            record: reviewed.committed_record().clone(),
+            store_path: reviewed.store_path().to_path_buf(),
+            #[cfg(target_os = "linux")]
+            store_file_identity: reviewed.store_file_identity(),
+            manager_peer: reviewed.manager_peer().clone(),
+            authority_revision: reviewed.authority_revision(),
+        };
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        drop(context);
+        if self.pending_recoveries.get(&cache_key).is_some_and(|old| {
+            old.intent != prepared.intent || old.planned != prepared.planned
+                || old.record != prepared.record
+        }) {
+            return Err(StoreError::Conflict("cached recovery intent differs").into());
+        }
+        self.pending_recoveries.insert(cache_key, prepared);
+        Ok(planned)
+    }
+
+    /// Return `PodCheckpointed` only after the trusted port proves the
+    /// nonce-bound fsynced recovery Active(A) checkpoint. C's normal A→C
+    /// rebind is a separate command; this receipt never claims C is Active.
+    pub fn complete_current_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RecoveryCompletionReceipt, RebindContextError> {
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        if !self.pending_recoveries.contains_key(&cache_key) {
+            self.plan_current_codex_v2_recovery(scope, pod, command_key)?;
+        }
+        let prepared = self.pending_recoveries.get(&cache_key)
+            .ok_or(StoreError::Conflict("prepared recovery proof disappeared"))?.clone();
+        let fallback = |digest: Option<String>| RecoveryCompletionReceipt {
+            durable: prepared.planned.clone(),
+            stage: RecoveryCompletionStage::PodRecoveryUnknown,
+            active_checkpoint_digest: digest,
+        };
+        let current = match self.store.plan_pending_rebind_supersession(&prepared.intent, None) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(fallback(None)),
+        };
+        if current.stage == SupersessionStage::PodCheckpointed {
+            return Ok(RecoveryCompletionReceipt {
+                active_checkpoint_digest: current.recovery_checkpoint_digest.clone(),
+                durable: current,
+                stage: RecoveryCompletionStage::PodCheckpointed,
+            });
+        }
+        if current != prepared.planned || self.rebind_context(scope, pod)
+            .and_then(|mut context| {
+                context.recheck_current()?;
+                if context.launch() != &prepared.record
+                    || context.owner_epoch() != prepared.intent.recovering_owner_epoch.get()
+                    || context.credential_epoch()
+                        != prepared.intent.recovering_credential_epoch.get()
+                    || context.authority_revision() != prepared.authority_revision
+                    || context.manager_peer() != prepared.manager_peer()
+                    || context.resource_input_epochs() != &prepared.intent.recovering_input_epochs
+                {
+                    return Err(HostError::StaleGuard.into());
+                }
+                Ok(())
+            }).is_err()
+        {
+            return Ok(fallback(None));
+        }
+        let digest = match self.host.port().prepare_pending_codex_v2_recovery(&prepared) {
+            Ok(digest) if valid_rebind_checkpoint_digest(&digest) => digest,
+            _ => return Ok(fallback(None)),
+        };
+        if self.rebind_context(scope, pod).and_then(|mut context| {
+            context.recheck_current()?;
+            if context.launch() != &prepared.record
+                || context.owner_epoch() != prepared.intent.recovering_owner_epoch.get()
+                || context.credential_epoch()
+                    != prepared.intent.recovering_credential_epoch.get()
+                || context.authority_revision() != prepared.authority_revision
+                || context.manager_peer() != prepared.manager_peer()
+                || context.resource_input_epochs() != &prepared.intent.recovering_input_epochs
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(())
+        }).is_err() {
+            return Ok(fallback(Some(digest)));
+        }
+        let durable = match self.store.acknowledge_pending_rebind_supersession(
+            &prepared.intent, &digest,
+        ) {
+            Ok(value) => value,
+            Err(_) => return Ok(fallback(Some(digest))),
+        };
+        Ok(RecoveryCompletionReceipt {
+            durable,
+            stage: RecoveryCompletionStage::PodCheckpointed,
+            active_checkpoint_digest: Some(digest),
+        })
     }
 
     /// Prepare one existing Codex V2 pod for manager rebind. This calls only

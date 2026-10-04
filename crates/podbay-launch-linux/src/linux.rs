@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use podbay_core::{
     AttemptId, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PendingPodProcessEvidence,
     PodFenceIdentity, PodId,
-    RebindPhase, ResourceId, ScopeId, StoreLineageId,
+    RebindPhase, ResourceId, ScopeId, StoreLineageId, SupersessionLedger,
 };
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
     PortDispatchOutcome, PortPendingRecoveryObservation, PortRebindObservation,
-    PortReceiptRef, PreparedCodexV2Rebind,
+    PortReceiptRef, PreparedCodexV2Rebind, PreparedPendingRecovery,
     ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection,
     ResolvedClaimedCodexV3Bootstrap, ResolvedNativeCodexLaunch, ResolvedNativeCodexV3Launch,
     ResolvedNativeLaunch,
@@ -28,6 +28,7 @@ use podbay_pod::{
 use podbay_store::{
     BootstrapSendSelector, BoundLaunchRecord, DurableRebindPhase, EffectState,
     HostObservedPriorCheckpoint, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
+    SqliteSupersessionLedger,
 };
 use podbay_wire::{
     EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole,
@@ -1057,6 +1058,13 @@ impl HostDispatchPort for LinuxLaunchPort {
             .map_err(|_| podbay_host::HostError::StaleGuard)
     }
 
+    fn prepare_pending_codex_v2_recovery(
+        &self,
+        prepared: &PreparedPendingRecovery,
+    ) -> Result<String, podbay_host::HostError> {
+        self.prepare_codex_v2_pending_recovery(prepared)
+    }
+
     fn prepare_existing_codex_v2_rebind(
         &self,
         prepared: &PreparedCodexV2Rebind,
@@ -1347,6 +1355,38 @@ fn read_rebind_process(pid: u32) -> Result<RebindProcessEvidence, PodError> {
         uid: status.0,
         gid: status.1,
     })
+}
+
+fn attest_abandoned_manager_dead(
+    peer: &podbay_core::AttestedPeer,
+    current_boot: &str,
+) -> Result<(), PodError> {
+    if peer.boot_identity() != format!("linux.boot.{current_boot}") {
+        return Err(PodError::Refused("abandoned manager boot differs"));
+    }
+    let pid_text = peer.native_process_id().strip_prefix("linux.pid.")
+        .ok_or(PodError::Refused("abandoned manager PID is malformed"))?;
+    let birth_text = peer.birth_identity().strip_prefix("linux.start.")
+        .ok_or(PodError::Refused("abandoned manager birth is malformed"))?;
+    let pid: u32 = pid_text.parse().map_err(|_| PodError::Refused(
+        "abandoned manager PID is malformed"))?;
+    let birth: u64 = birth_text.parse().map_err(|_| PodError::Refused(
+        "abandoned manager birth is malformed"))?;
+    if pid == 0 || birth == 0 || pid.to_string() != pid_text || birth.to_string() != birth_text {
+        return Err(PodError::Refused("abandoned manager process identity is malformed"));
+    }
+    for _ in 0..2 {
+        match read_rebind_process(pid) {
+            Ok(current) if current.start_ticks == birth => {
+                return Err(PodError::Refused("abandoned manager process is still alive"));
+            }
+            Ok(_) => {}
+            Err(PodError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PodError::Refused(
+                "abandoned manager process state is unknown")),
+        }
+    }
+    Ok(())
 }
 
 fn attest_rebind_process_pair(
@@ -2020,6 +2060,7 @@ impl LinuxLaunchPort {
         attest_rebind_systemd_unit(
             &second.unit_name, second.supervisor_pid, &second.cgroup_path,
         )?;
+        attest_abandoned_manager_dead(&second.abandoned.next_manager, &second.boot_id)?;
         PortPendingRecoveryObservation::from_trusted_port(
             second.abandoned,
             second.phase,
@@ -2036,6 +2077,136 @@ impl LinuxLaunchPort {
             second.unit_name,
             wire.digest().into(),
         ).map_err(|_| PodError::Refused("recovery port evidence is malformed"))
+    }
+
+    fn prepare_codex_v2_pending_recovery(
+        &self,
+        prepared: &PreparedPendingRecovery,
+    ) -> Result<String, podbay_host::HostError> {
+        fn refused<E>(_: E) -> podbay_host::HostError {
+            podbay_host::HostError::StaleGuard
+        }
+        let uncertain = || podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.intent().command_key.as_str().into(),
+            receipt_ref: None,
+        };
+        self.config.recheck().map_err(refused)?;
+        let intent = prepared.intent();
+        let identity = &intent.abandoned.identity;
+        let manager = LinuxPeerEvidence::for_current_process().map_err(refused)?;
+        if manager.attested_peer() != prepared.manager_peer()
+            || checked_store_file(prepared.store_path(), manager.uid()).map_err(refused)?
+                != prepared.store_file_identity()
+        {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory, &identity.pod_id, &identity.attempt_id,
+            identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path).map_err(refused)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != manager.uid()
+            || metadata.mode() & 0o077 != 0
+            || !(1..=1_048_576).contains(&metadata.len())
+            || fs::canonicalize(&path).map_err(refused)? != path
+        {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        let bytes = read_rebind_manifest_bytes(&path).map_err(refused)?;
+        let manifest: PodManifest = serde_json::from_slice(&bytes).map_err(refused)?;
+        let binding = manifest.peer_binding.as_ref()
+            .ok_or(podbay_host::HostError::StaleGuard)?;
+        if binding.protocol != "podbay.peer-binding/2"
+            || binding.capability != CODEX_V2_CAPABILITY
+            || binding.wire_descriptor != prepared.record().descriptor
+            || binding.effective_spec != prepared.record().effective_spec
+            || binding.store_path != prepared.store_path()
+            || binding.store_lineage != identity.store_lineage.as_str()
+            || manifest.descriptor.pod_id != identity.pod_id.as_str()
+            || manifest.descriptor.attempt_id != identity.attempt_id.as_str()
+            || manifest.descriptor.incarnation != identity.incarnation.get()
+        {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        let ledger = SqliteSupersessionLedger::for_pod(
+            prepared.store_path(), identity.clone(),
+        );
+        if !ledger.supersedes(intent) {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        attest_abandoned_manager_dead(&intent.abandoned.next_manager,
+            &intent.pending_process.boot_identity).map_err(refused)?;
+        let supervisor_pid: u32 = intent.pending_process.supervisor_process_id.parse()
+            .map_err(refused)?;
+        let supervisor_birth: u64 = intent.pending_process.supervisor_birth_identity.parse()
+            .map_err(refused)?;
+        let child_pid: u32 = intent.pending_process.child_process_id.parse()
+            .map_err(refused)?;
+        let child_birth: u64 = intent.pending_process.child_birth_identity.parse()
+            .map_err(refused)?;
+        attest_rebind_process_pair_fields(
+            supervisor_pid, supervisor_birth, child_pid, child_birth,
+            &intent.pending_process.boot_identity,
+            &intent.pending_process.containment_identity,
+            manager.uid(), manager.gid(),
+        ).map_err(refused)?;
+        attest_rebind_systemd_unit(&manifest.unit_name, supervisor_pid,
+            &intent.pending_process.containment_identity).map_err(refused)?;
+        self.config.recheck().map_err(refused)?;
+        if fs::symlink_metadata(&path).map_err(refused)?.ino() != metadata.ino()
+            || checked_store_file(prepared.store_path(), manager.uid()).map_err(refused)?
+                != prepared.store_file_identity()
+            || !ledger.supersedes(intent)
+        {
+            return Err(podbay_host::HostError::StaleGuard);
+        }
+        // From this call onward an exact fsynced Pod checkpoint may exist.
+        let digest = PodClient::prepare_pending_recovery(
+            &path, intent, prepared.prior_checkpoint_digest(),
+        ).map_err(|_| uncertain())?;
+        let active = PodClient::inspect_rebind(
+            &path, identity, intent.recovering_owner_epoch.get(),
+            intent.recovering_credential_epoch.get(),
+        ).map_err(|_| uncertain())?;
+        let inputs = intent.abandoned.next_input_epochs.iter()
+            .map(|(id, epoch)| (id.as_str().to_owned(), epoch.get()))
+            .collect::<BTreeMap<_, _>>();
+        if active.checkpoint_digest != digest
+            || active.prior_owner_epoch != intent.abandoned.expected_owner_epoch.get()
+            || active.prior_credential_epoch
+                != intent.abandoned.expected_credential_epoch.get()
+            || active.prior_input_epochs != inputs
+            || active.supervisor_pid != supervisor_pid
+            || active.supervisor_start_ticks != supervisor_birth
+            || active.child_pid != child_pid
+            || active.child_start_ticks != child_birth
+            || active.boot_id != intent.pending_process.boot_identity
+            || active.cgroup_path != intent.pending_process.containment_identity
+            || active.unit_name != manifest.unit_name
+            || attest_rebind_process_pair_fields(
+                active.supervisor_pid, active.supervisor_start_ticks,
+                active.child_pid, active.child_start_ticks, &active.boot_id,
+                &active.cgroup_path, manager.uid(), manager.gid(),
+            ).is_err()
+            || attest_rebind_systemd_unit(
+                &active.unit_name, active.supervisor_pid, &active.cgroup_path,
+            ).is_err()
+            || !ledger.supersedes(intent)
+            || self.config.recheck().is_err()
+            || !LinuxPeerEvidence::for_current_process()
+                .is_ok_and(|peer| peer == manager)
+            || fs::symlink_metadata(&path).ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+                != Some((metadata.dev(), metadata.ino()))
+            || read_rebind_manifest_bytes(&path).ok().as_deref() != Some(bytes.as_slice())
+            || checked_store_file(prepared.store_path(), manager.uid()).map_err(|_| uncertain())?
+                != prepared.store_file_identity()
+        {
+            return Err(uncertain());
+        }
+        Ok(digest)
     }
 
     /// Inspect an already-running pod without its old bearer. The path comes

@@ -18,12 +18,12 @@ const MAX_RESOURCES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PeerWire {
-    os_identity: String,
-    process_identity: String,
-    boot_identity: String,
-    birth_identity: String,
-    containment_identity: String,
+pub(crate) struct PeerWire {
+    pub os_identity: String,
+    pub process_identity: String,
+    pub boot_identity: String,
+    pub birth_identity: String,
+    pub containment_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -152,7 +152,7 @@ fn boot_uuid(value: &str) -> bool {
         })
 }
 
-fn peer_from_wire(value: &PeerWire) -> Result<AttestedPeer, PodError> {
+pub(crate) fn peer_from_wire(value: &PeerWire) -> Result<AttestedPeer, PodError> {
     let uid = value
         .os_identity
         .strip_prefix("linux.uid.")
@@ -196,7 +196,7 @@ fn peer_from_wire(value: &PeerWire) -> Result<AttestedPeer, PodError> {
     .map_err(|_| invalid())
 }
 
-fn peer_to_wire(value: &AttestedPeer) -> PeerWire {
+pub(crate) fn peer_to_wire(value: &AttestedPeer) -> PeerWire {
     PeerWire {
         os_identity: value.os_identity().into(),
         process_identity: value.native_process_id().into(),
