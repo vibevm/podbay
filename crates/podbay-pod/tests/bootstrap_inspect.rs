@@ -15,7 +15,8 @@ use podbay_core::{
 };
 use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CodexCommandJournal, CodexJournalIdentity,
-    CodexJournalStage, LinuxBackend, LinuxPeerEvidence, NativeEventKind, NativeEventStatus,
+    CodexJournalStage, LinuxBackend, LinuxNativeSegmentDirectory, LinuxPeerEvidence,
+    NativeEventKind, NativeEventStatus,
     PodError, PodPeerBootstrap, codex_private_slot_directory,
     launch_bound_codex_v2,
 };
@@ -574,8 +575,11 @@ fn inspect_claimed_bootstrap_is_read_only_and_recovers_submitted_reply() {
     let public = serde_json::to_string(&native).unwrap();
     assert!(!public.contains("private fixture output"));
     assert!(!public.contains("fixture prompt"));
-    assert!(String::from_utf8_lossy(&fs::read(private_slot.join("codex.native-events.log")).unwrap())
-        .contains("private fixture output"));
+    let segment_reader = LinuxNativeSegmentDirectory::from_private_slot(private_slot.clone()).unwrap();
+    let checkpoint = segment_reader.read_checkpoint(&native.snapshot.identity).unwrap();
+    let (private, _) = segment_reader.read_indexed_page(&checkpoint, 0, 64).unwrap();
+    assert!(private.iter().any(|frame|
+        String::from_utf8_lossy(frame.private_payload()).contains("private fixture output")));
     let methods: Vec<_> = fs::read_to_string(&frames).unwrap().lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
             .as_str().unwrap().to_owned())

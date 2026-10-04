@@ -1,7 +1,9 @@
-//! Versioned, bounded private segment/checkpoint foundation. The current
-//! Codex event source still uses its v1 held log; this module is deliberately
-//! not wired until both pod writer and manager reader can cut over together.
+//! Versioned private segment/checkpoint backend for new Linux Codex V2 slots.
+//! Historical held logs retain their v1 decoder. A pod writer fsyncs each
+//! frame and checkpoint; a manager reader verifies one bounded attachment,
+//! then only new suffixes and requested indexed frames.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -13,15 +15,18 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{PodError, private_directory};
 use crate::native_events::{
-    NativeEventFidelity, NativeEventIdentity, NativeEventSnapshot, native_event_id,
+    NativeEventCursor, NativeEventFidelity, NativeEventGap, NativeEventIdentity, NativeEventKind,
+    NativeEventRead, NativeEventSnapshot, NativeEventStatus, PrivateNativeEvidence,
+    PublicNativeEvent, apply_public, native_event_id, public_event, validate_private_jsonl,
 };
 
-const CHECKPOINT_DOMAIN: &[u8] = b"podbay.native-segment-checkpoint/1\0";
+const CHECKPOINT_DOMAIN: &[u8] = b"podbay.native-segment-checkpoint/2\0";
 const FRAME_DOMAIN: &[u8] = b"podbay.native-segment-frame/1\0";
 const CHAIN_DOMAIN: &[u8] = b"podbay.native-segment-chain/1\0";
 const MAX_SEGMENTS: usize = 4;
 const MAX_SEGMENT_BYTES: u64 = 1_048_576;
 const MAX_FRAME_PAYLOAD: usize = 65_536;
+pub(crate) const MAX_SEGMENT_FRAME_BYTES: u64 = (MAX_FRAME_PAYLOAD + 4 + 32) as u64;
 const MAX_OFFSETS: usize = 64;
 const MAX_CHECKPOINT_BYTES: usize = 65_536;
 const FRAME_HEADER: usize = 4 + 32;
@@ -49,6 +54,19 @@ pub struct NativeSegmentOffset {
     pub frame_digest: String,
 }
 
+/// Exact public event facts without repeating seven potentially long scope
+/// identifiers in every retained entry. Identity, EventId and provenance are
+/// reconstructed from the checkpoint's checked resource identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSegmentEventProjection {
+    pub source_sequence: u64,
+    pub recorded_at_unix_millis: u64,
+    pub kind: NativeEventKind,
+    pub status: Option<NativeEventStatus>,
+    pub external_conflict: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSegmentCheckpoint {
@@ -57,8 +75,12 @@ pub struct NativeSegmentCheckpoint {
     pub generation: u64,
     pub watermark: u64,
     pub pruned_through: u64,
+    /// Fsynced before taking one native notification. Reopen with this marker
+    /// quarantines rather than silently skipping a possibly consumed frame.
+    pub pending_source_sequence: Option<u64>,
     pub segments: Vec<NativeSegmentMeta>,
     pub retained_offsets: Vec<NativeSegmentOffset>,
+    pub redacted_events: Vec<NativeSegmentEventProjection>,
     /// Typed public projection; native JSONL cannot be placed here.
     pub redacted_snapshot: NativeEventSnapshot,
 }
@@ -103,19 +125,30 @@ impl IndexedPrivateFrame {
     pub fn private_payload(&self) -> &[u8] {
         &self.private_payload
     }
+    pub fn into_private_evidence(self) -> Result<PrivateNativeEvidence, PodError> {
+        validate_private_jsonl(&self.private_payload)
+            .map_err(|_| PodError::Uncertain("indexed native JSONL is malformed"))?;
+        Ok(PrivateNativeEvidence::from_verified_segment(
+            self.source_sequence,
+            self.event_id,
+            self.private_payload,
+        ))
+    }
 }
 
 impl NativeSegmentCheckpoint {
     pub fn initial(identity: NativeEventIdentity) -> Result<Self, PodError> {
         identity.validate()?;
         Ok(Self {
-            version: 1,
+            version: 2,
             identity: identity.clone(),
             generation: 1,
             watermark: 0,
             pruned_through: 0,
+            pending_source_sequence: None,
             segments: vec![new_segment(1, 1, &"0".repeat(64))],
             retained_offsets: Vec::new(),
+            redacted_events: Vec::new(),
             redacted_snapshot: NativeEventSnapshot {
                 identity: identity.clone(),
                 watermark: 0,
@@ -136,26 +169,138 @@ impl NativeSegmentCheckpoint {
         self.segments.last().expect("validated checkpoint")
     }
 
+    pub fn can_hold_max_frame(&self) -> bool {
+        self.active()
+            .byte_len
+            .saturating_add(MAX_SEGMENT_FRAME_BYTES)
+            <= MAX_SEGMENT_BYTES
+    }
+
+    pub fn redacted_read_after(
+        &self,
+        cursor: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<NativeEventRead, PodError> {
+        self.validate()?;
+        if self.pending_source_sequence.is_some() || !(1..=MAX_OFFSETS).contains(&limit) {
+            return Err(PodError::Uncertain(
+                "native segment snapshot is pending or unbounded",
+            ));
+        }
+        let snapshot = self.redacted_snapshot.clone();
+        let after = match cursor {
+            Some(cursor)
+                if cursor.identity == self.identity && cursor.sequence <= snapshot.watermark =>
+            {
+                cursor.sequence
+            }
+            Some(_) => {
+                return Err(PodError::Refused(
+                    "native event cursor is foreign or future",
+                ));
+            }
+            None => snapshot.watermark,
+        };
+        let first = self
+            .redacted_events
+            .first()
+            .map_or(snapshot.watermark.saturating_add(1), |event| {
+                event.source_sequence
+            });
+        let gap = (after.saturating_add(1) < first).then(|| NativeEventGap {
+            missing_from: after + 1,
+            missing_through: first - 1,
+            earliest_available: first,
+        });
+        let events: Vec<_> = self
+            .redacted_events
+            .iter()
+            .filter(|event| event.source_sequence > after)
+            .take(limit)
+            .map(|event| {
+                public_event(
+                    &self.identity,
+                    event.source_sequence,
+                    event.recorded_at_unix_millis,
+                    event.kind,
+                    event.status,
+                    event.external_conflict,
+                )
+            })
+            .collect();
+        let next_cursor = NativeEventCursor {
+            identity: self.identity.clone(),
+            sequence: events.last().map_or(after, |event| event.source_sequence),
+        };
+        Ok(NativeEventRead {
+            snapshot,
+            events,
+            next_cursor,
+            gap,
+        })
+    }
+
+    pub fn reserve_native_take(&self) -> Result<Self, PodError> {
+        self.validate()?;
+        if self.pending_source_sequence.is_some() || self.redacted_snapshot.quarantined {
+            return Err(PodError::Refused(
+                "native event source is pending or quarantined",
+            ));
+        }
+        let mut next = self.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(PodError::Invalid("checkpoint generation exhausted"))?;
+        next.pending_source_sequence = Some(
+            self.watermark
+                .checked_add(1)
+                .ok_or(PodError::Invalid("native source sequence exhausted"))?,
+        );
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub fn mark_continuity_unknown(&self) -> Result<Self, PodError> {
+        self.validate()?;
+        let mut next = self.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(PodError::Invalid("checkpoint generation exhausted"))?;
+        next.pending_source_sequence = None;
+        next.redacted_snapshot.fidelity = NativeEventFidelity::Unknown;
+        next.redacted_snapshot.quarantined = true;
+        next.validate()?;
+        Ok(next)
+    }
+
     /// A caller may advance the index only after the exact frame append has
     /// returned from fsync. The new checkpoint must then be durably replaced;
     /// a crash between those steps is detected as an unmatched segment tail.
     pub fn after_synced_append(
         &self,
         source_sequence: u64,
-        event_id: &str,
+        event: PublicNativeEvent,
         receipt: &SegmentAppendReceipt,
-        redacted_snapshot: NativeEventSnapshot,
     ) -> Result<Self, PodError> {
         self.validate()?;
-        if redacted_snapshot.identity != self.identity
-            || redacted_snapshot.watermark != source_sequence
-            || source_sequence == 0
+        if source_sequence == 0
             || source_sequence
                 != self
                     .watermark
                     .checked_add(1)
                     .ok_or(PodError::Invalid("segment watermark exhausted"))?
-            || event_id != native_event_id(&self.identity, source_sequence)
+            || self.pending_source_sequence != Some(source_sequence)
+            || event.identity != self.identity
+            || event.source_sequence != source_sequence
+            || event.committed_cursor != source_sequence
+            || event.event_id != native_event_id(&self.identity, source_sequence)
+            || event.schema_version != 1
+            || event.provenance != "codex.app-server.pod-observed/1"
+            || event.occurred_at_unix_millis.is_some()
+            || event.correlation_id.is_some()
+            || event.causation_id.is_some()
             || receipt.segment_id != self.active().id
             || receipt.offset != self.active().byte_len
             || receipt.frame_len == 0
@@ -171,13 +316,14 @@ impl NativeSegmentCheckpoint {
             .checked_add(1)
             .ok_or(PodError::Invalid("segment checkpoint generation exhausted"))?;
         next.watermark = source_sequence;
+        next.pending_source_sequence = None;
         let active = next.segments.last_mut().expect("validated checkpoint");
         active.end_sequence = source_sequence;
         active.byte_len += receipt.frame_len as u64;
         active.chain_digest = chain_digest(&active.chain_digest, &receipt.frame_digest);
         next.retained_offsets.push(NativeSegmentOffset {
             source_sequence,
-            event_id: event_id.into(),
+            event_id: event.event_id.clone(),
             segment_id: receipt.segment_id,
             offset: receipt.offset,
             frame_len: receipt.frame_len,
@@ -186,7 +332,33 @@ impl NativeSegmentCheckpoint {
         if next.retained_offsets.len() > MAX_OFFSETS {
             next.retained_offsets.remove(0);
         }
-        next.redacted_snapshot = redacted_snapshot;
+        next.redacted_events.push(NativeSegmentEventProjection {
+            source_sequence,
+            recorded_at_unix_millis: event.recorded_at_unix_millis,
+            kind: event.kind,
+            status: event.status,
+            external_conflict: event.external_conflict,
+        });
+        if next.redacted_events.len() > MAX_OFFSETS {
+            next.redacted_events.remove(0);
+        }
+        let mut snapshot = self.redacted_snapshot.clone();
+        let mut retained: VecDeque<_> = self
+            .redacted_events
+            .iter()
+            .map(|item| {
+                public_event(
+                    &self.identity,
+                    item.source_sequence,
+                    item.recorded_at_unix_millis,
+                    item.kind,
+                    item.status,
+                    item.external_conflict,
+                )
+            })
+            .collect();
+        apply_public(&mut snapshot, &mut retained, event)?;
+        next.redacted_snapshot = snapshot;
         next.redacted_snapshot.earliest_retained = next
             .retained_offsets
             .first()
@@ -202,7 +374,7 @@ impl NativeSegmentCheckpoint {
     pub fn rollover_plan(&self) -> Result<SegmentRolloverPlan, PodError> {
         self.validate()?;
         let active = self.active();
-        if active.byte_len == 0 {
+        if active.byte_len == 0 || self.pending_source_sequence.is_some() {
             return Err(PodError::Invalid("empty segment cannot roll over"));
         }
         let id = active
@@ -225,6 +397,12 @@ impl NativeSegmentCheckpoint {
             next.pruned_through = removed.end_sequence;
             next.retained_offsets
                 .retain(|offset| offset.segment_id != removed.id);
+            let first = next
+                .retained_offsets
+                .first()
+                .map(|offset| offset.source_sequence);
+            next.redacted_events
+                .retain(|event| first.is_some_and(|first| event.source_sequence >= first));
             Some(removed)
         } else {
             None
@@ -288,11 +466,16 @@ impl NativeSegmentCheckpoint {
 
     fn validate(&self) -> Result<(), PodError> {
         self.identity.validate()?;
-        if self.version != 1
+        if self.version != 2
             || self.generation == 0
             || self.segments.is_empty()
             || self.segments.len() > MAX_SEGMENTS
             || self.retained_offsets.len() > MAX_OFFSETS
+            || self.redacted_events.len() != self.retained_offsets.len()
+            || self.pending_source_sequence.is_some_and(|sequence| {
+                self.watermark.checked_add(1) != Some(sequence)
+                    || self.redacted_snapshot.quarantined
+            })
             || self.redacted_snapshot.identity != self.identity
             || self.redacted_snapshot.watermark != self.watermark
             || self.redacted_snapshot.earliest_retained
@@ -341,8 +524,15 @@ impl NativeSegmentCheckpoint {
         if self.active().end_sequence != self.watermark || self.pruned_through > self.watermark {
             return Err(PodError::Invalid("native segment watermark differs"));
         }
+        if self
+            .retained_offsets
+            .last()
+            .is_some_and(|last| last.source_sequence != self.watermark)
+        {
+            return Err(PodError::Invalid("native segment indexed tail differs"));
+        }
         let mut prior_offset_sequence = 0;
-        for offset in &self.retained_offsets {
+        for (offset, event) in self.retained_offsets.iter().zip(&self.redacted_events) {
             let segment = self
                 .segments
                 .iter()
@@ -354,6 +544,7 @@ impl NativeSegmentCheckpoint {
                 || offset.source_sequence < segment.start_sequence
                 || offset.source_sequence > segment.end_sequence
                 || offset.event_id != native_event_id(&self.identity, offset.source_sequence)
+                || event.source_sequence != offset.source_sequence
                 || !hex_digest(&offset.frame_digest)
                 || offset.frame_len < FRAME_HEADER as u32
                 || offset.offset.saturating_add(offset.frame_len as u64) > segment.byte_len
@@ -410,8 +601,8 @@ fn hex_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Independent Linux file port. It is not yet the active Codex event source.
-/// Every open is no-follow, owner/mode/link checked, and parent inode-pinned.
+/// Linux file port for the active segmented Codex event source. Every open is
+/// no-follow, owner/mode/link checked, and parent inode-pinned.
 pub struct LinuxNativeSegmentDirectory {
     root: PathBuf,
     held_root: File,
@@ -473,6 +664,74 @@ impl LinuxNativeSegmentDirectory {
 
     fn checkpoint_path(&self) -> PathBuf {
         self.held_root_path().join("native-events.checkpoint")
+    }
+
+    /// The pod writer is the only caller. A checkpoint-less empty first
+    /// segment is the harmless crash window after durable creation; any
+    /// nonempty first segment without a checkpoint is ambiguous.
+    pub fn open_or_initialize_writer(
+        &self,
+        identity: &NativeEventIdentity,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
+        self.recheck()?;
+        self.recover_fsynced_temporary_checkpoint(identity)?;
+        match fs::symlink_metadata(self.checkpoint_path()) {
+            Ok(_) => self.read_checkpoint(identity),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let first = self.segment_path(1)?;
+                match fs::symlink_metadata(&first) {
+                    Ok(metadata) if self.safe_file(&first, &metadata) && metadata.len() == 0 => {}
+                    Ok(_) => return Err(PodError::Uncertain("checkpoint-less segment differs")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.create_empty_segment(1)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let initial = NativeSegmentCheckpoint::initial(identity.clone())?;
+                self.commit_checkpoint(&initial)?;
+                self.read_checkpoint(identity)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Complete a verified fsynced checkpoint that crashed before rename.
+    /// An incomplete or conflicting temporary file remains uncertain.
+    fn recover_fsynced_temporary_checkpoint(
+        &self,
+        identity: &NativeEventIdentity,
+    ) -> Result<(), PodError> {
+        let path = self.checkpoint_path();
+        let temporary = path.with_extension("checkpoint-new");
+        match fs::symlink_metadata(&temporary) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let candidate = self.read_checkpoint_payload_at(&temporary, identity)?;
+        let previous = match fs::symlink_metadata(&path) {
+            Ok(_) => Some(self.read_checkpoint_payload(identity)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if !matches!(&previous, Some(old) if old.generation.checked_add(1) == Some(candidate.generation))
+            && !(previous.is_none()
+                && candidate == NativeSegmentCheckpoint::initial(identity.clone())?)
+        {
+            return Err(PodError::Uncertain(
+                "temporary checkpoint generation differs",
+            ));
+        }
+        self.verify_retained_segments(&candidate)?;
+        self.verify_segment_inventory(&candidate)?;
+        fs::rename(&temporary, &path)
+            .map_err(|_| PodError::Uncertain("temporary checkpoint recovery rename unknown"))?;
+        self.held_root
+            .sync_all()
+            .map_err(|_| PodError::Uncertain("temporary checkpoint recovery sync unknown"))?;
+        self.recheck()
+            .map_err(|_| PodError::Uncertain("checkpoint parent changed after recovery"))?;
+        Ok(())
     }
 
     /// Durable creation occurs before a rollover checkpoint may name the new
@@ -597,6 +856,105 @@ impl LinuxNativeSegmentDirectory {
         Ok(checkpoint)
     }
 
+    /// A retained reader first performs the bounded full attach above. Later
+    /// checkpoints verify only newly appended frames and metadata for the
+    /// unchanged prefix. Falling behind all retained segments performs one
+    /// bounded reattach; the checkpoint's indexed gap remains explicit.
+    pub fn read_checkpoint_incremental(
+        &self,
+        previous: &NativeSegmentCheckpoint,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
+        self.recheck()?;
+        previous.validate()?;
+        if fs::symlink_metadata(self.checkpoint_path().with_extension("checkpoint-new")).is_ok() {
+            return Err(PodError::Uncertain(
+                "native checkpoint temporary file remains",
+            ));
+        }
+        let current = self.read_checkpoint_payload(&previous.identity)?;
+        if current == *previous {
+            for segment in &current.segments {
+                self.checked_segment_length(segment)?;
+            }
+            self.verify_segment_inventory(&current)?;
+            return Ok(current);
+        }
+        if current.generation <= previous.generation
+            || current.watermark < previous.watermark
+            || current.pruned_through < previous.pruned_through
+        {
+            return Err(PodError::Uncertain("native checkpoint moved backward"));
+        }
+        let overlap = current
+            .segments
+            .iter()
+            .any(|segment| previous.segments.iter().any(|old| old.id == segment.id));
+        if !overlap {
+            self.verify_retained_segments(&current)?;
+        } else {
+            for segment in &current.segments {
+                let old = previous.segments.iter().find(|old| old.id == segment.id);
+                if let Some(old) = old {
+                    if segment.start_sequence != old.start_sequence
+                        || segment.prior_segment_digest != old.prior_segment_digest
+                        || segment.end_sequence < old.end_sequence
+                        || segment.byte_len < old.byte_len
+                    {
+                        return Err(PodError::Uncertain(
+                            "retained native segment moved backward",
+                        ));
+                    }
+                }
+                self.verify_segment_suffix(segment, old)?;
+            }
+        }
+        self.verify_segment_inventory(&current)?;
+        self.recheck()?;
+        Ok(current)
+    }
+
+    fn checked_segment_length(&self, segment: &NativeSegmentMeta) -> Result<(), PodError> {
+        let path = self.segment_path(segment.id)?;
+        let file = self.open_checked(&path, false)?;
+        if file.metadata()?.len() != segment.byte_len {
+            return Err(PodError::Uncertain("native segment length changed"));
+        }
+        Ok(())
+    }
+
+    fn verify_segment_suffix(
+        &self,
+        segment: &NativeSegmentMeta,
+        previous: Option<&NativeSegmentMeta>,
+    ) -> Result<(), PodError> {
+        let path = self.segment_path(segment.id)?;
+        let mut file = self.open_checked(&path, false)?;
+        if file.metadata()?.len() != segment.byte_len {
+            return Err(PodError::Uncertain("native segment length changed"));
+        }
+        let from = previous.map_or(0, |old| old.byte_len);
+        let mut chain = previous.map_or_else(
+            || initial_chain_digest(segment.id, &segment.prior_segment_digest),
+            |old| old.chain_digest.clone(),
+        );
+        file.seek(SeekFrom::Start(from))?;
+        let mut bytes = vec![0; (segment.byte_len - from) as usize];
+        file.read_exact(&mut bytes)?;
+        let mut at = 0usize;
+        let mut frames = 0u64;
+        while at < bytes.len() {
+            let (_, frame_len, digest) = checked_frame(&bytes[at..])?;
+            chain = chain_digest(&chain, &digest);
+            at += frame_len;
+            frames += 1;
+        }
+        let old_end = previous.map_or(segment.start_sequence - 1, |old| old.end_sequence);
+        if chain != segment.chain_digest || frames != segment.end_sequence - old_end {
+            return Err(PodError::Uncertain("native segment suffix chain differs"));
+        }
+        Ok(())
+    }
+
     fn verify_segment_inventory(
         &self,
         checkpoint: &NativeSegmentCheckpoint,
@@ -675,11 +1033,53 @@ impl LinuxNativeSegmentDirectory {
         Ok(true)
     }
 
+    /// The checkpoint may be durable while the old segment's unlink was lost
+    /// to a crash. Its predecessor is outside the retained range and can be
+    /// pruned only after rereading that exact current checkpoint.
+    pub fn prune_durable_predecessor_after_reopen(
+        &self,
+        expected: &NativeEventIdentity,
+    ) -> Result<bool, PodError> {
+        let checkpoint = self.read_checkpoint(expected)?;
+        if checkpoint.pruned_through == 0 {
+            return Ok(false);
+        }
+        let id = checkpoint.segments[0]
+            .id
+            .checked_sub(1)
+            .ok_or(PodError::Invalid("native predecessor ID underflow"))?;
+        let path = self.segment_path(id)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !self.safe_file(&path, &metadata) || metadata.len() > MAX_SEGMENT_BYTES {
+            return Err(PodError::Uncertain("native predecessor identity differs"));
+        }
+        fs::remove_file(&path)
+            .map_err(|_| PodError::Uncertain("native predecessor prune unknown"))?;
+        self.held_root
+            .sync_all()
+            .map_err(|_| PodError::Uncertain("native predecessor prune sync unknown"))?;
+        self.recheck()
+            .map_err(|_| PodError::Uncertain("segment parent changed after predecessor prune"))?;
+        Ok(true)
+    }
+
     fn read_checkpoint_payload(
         &self,
         expected: &NativeEventIdentity,
     ) -> Result<NativeSegmentCheckpoint, PodError> {
-        let mut file = self.open_checked(&self.checkpoint_path(), false)?;
+        self.read_checkpoint_payload_at(&self.checkpoint_path(), expected)
+    }
+
+    fn read_checkpoint_payload_at(
+        &self,
+        path: &Path,
+        expected: &NativeEventIdentity,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
+        let mut file = self.open_checked(path, false)?;
         if file.metadata()?.len() as usize > MAX_CHECKPOINT_BYTES + CHECKPOINT_HEADER {
             return Err(PodError::Uncertain("checkpoint file exceeds bound"));
         }
@@ -903,20 +1303,30 @@ mod tests {
 
         fn append(&mut self, private_payload: &[u8]) {
             let sequence = self.checkpoint.watermark + 1;
+            self.checkpoint = self.checkpoint.reserve_native_take().unwrap();
+            self.files.commit_checkpoint(&self.checkpoint).unwrap();
             let receipt = self
                 .files
                 .append_frame_synced(self.checkpoint.active(), private_payload)
                 .unwrap();
-            let mut snapshot = self.checkpoint.redacted_snapshot.clone();
-            snapshot.watermark = sequence;
+            let event = PublicNativeEvent {
+                event_id: native_event_id(&self.checkpoint.identity, sequence),
+                schema_version: 1,
+                identity: self.checkpoint.identity.clone(),
+                committed_cursor: sequence,
+                source_sequence: sequence,
+                recorded_at_unix_millis: 1,
+                occurred_at_unix_millis: None,
+                provenance: "codex.app-server.pod-observed/1".into(),
+                correlation_id: None,
+                causation_id: None,
+                kind: crate::native_events::NativeEventKind::Output,
+                status: None,
+                external_conflict: false,
+            };
             self.checkpoint = self
                 .checkpoint
-                .after_synced_append(
-                    sequence,
-                    &native_event_id(&self.checkpoint.identity, sequence),
-                    &receipt,
-                    snapshot,
-                )
+                .after_synced_append(sequence, event, &receipt)
                 .unwrap();
             self.files.commit_checkpoint(&self.checkpoint).unwrap();
         }
@@ -1077,6 +1487,88 @@ mod tests {
     }
 
     #[test]
+    fn compact_checkpoint_accepts_maximal_escaped_valid_identity() {
+        let field = "\"".repeat(256);
+        let identity = NativeEventIdentity {
+            store_lineage: field.clone(),
+            scope_id: field.clone(),
+            session_id: field.clone(),
+            run_id: field.clone(),
+            attempt_id: field.clone(),
+            pod_id: field.clone(),
+            pod_incarnation: 1,
+            resource_id: field,
+            resource_epoch: 1,
+        };
+        let mut checkpoint = NativeSegmentCheckpoint::initial(identity.clone()).unwrap();
+        for sequence in 1..=64 {
+            checkpoint = checkpoint.reserve_native_take().unwrap();
+            let receipt = SegmentAppendReceipt {
+                segment_id: checkpoint.active().id,
+                offset: checkpoint.active().byte_len,
+                frame_len: 37,
+                frame_digest: "0".repeat(64),
+            };
+            let event = public_event(&identity, sequence, 1, NativeEventKind::Output, None, false);
+            checkpoint = checkpoint
+                .after_synced_append(sequence, event, &receipt)
+                .unwrap();
+        }
+        assert!(checkpoint.encode().unwrap().len() <= MAX_CHECKPOINT_BYTES + CHECKPOINT_HEADER);
+    }
+
+    #[test]
+    fn incremental_reader_verifies_new_suffix_and_refuses_corruption() {
+        let mut fixture = Fixture::new();
+        let initial = fixture.checkpoint.clone();
+        fixture.append(b"private first frame");
+        assert_eq!(
+            fixture.files.read_checkpoint_incremental(&initial).unwrap(),
+            fixture.checkpoint,
+        );
+        let previous = fixture.checkpoint.clone();
+        fixture.append(b"private second frame");
+        assert_eq!(
+            fixture
+                .files
+                .read_checkpoint_incremental(&previous)
+                .unwrap(),
+            fixture.checkpoint,
+        );
+        let path = fixture
+            .files
+            .segment_path(fixture.checkpoint.active().id)
+            .unwrap();
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"!").unwrap();
+        file.sync_data().unwrap();
+        assert!(matches!(
+            fixture.files.read_checkpoint_incremental(&previous),
+            Err(PodError::Uncertain(_)),
+        ));
+    }
+
+    #[test]
+    fn incremental_reader_tracks_durable_rollover_and_pruned_prefix() {
+        let mut fixture = Fixture::new();
+        for sequence in 1..=4 {
+            fixture.append(format!("private-{sequence}").as_bytes());
+            if sequence < 4 {
+                fixture.rollover();
+            }
+        }
+        let prior = fixture.checkpoint.clone();
+        fixture.rollover();
+        fixture.append(b"private after rollover");
+        assert_eq!(fixture.checkpoint.pruned_through, 1);
+        assert_eq!(
+            fixture.files.read_checkpoint_incremental(&prior).unwrap(),
+            fixture.checkpoint
+        );
+    }
+
+    #[test]
     fn stale_generation_cannot_replace_current_checkpoint() {
         let mut fixture = Fixture::new();
         let original = fixture.checkpoint.clone();
@@ -1110,6 +1602,38 @@ mod tests {
             Err(PodError::Refused(_)),
         ));
         assert!(fixture.files.segment_path(1).unwrap().exists());
+    }
+
+    #[test]
+    fn durable_successor_reopen_prunes_crash_left_predecessor() {
+        let mut fixture = Fixture::new();
+        for sequence in 1..=4 {
+            fixture.append(format!("private-{sequence}").as_bytes());
+            if sequence < 4 {
+                fixture.rollover();
+            }
+        }
+        fixture.files.create_empty_segment(5).unwrap();
+        let plan = fixture.checkpoint.rollover_plan().unwrap();
+        fixture.files.commit_checkpoint(&plan.checkpoint).unwrap();
+        assert!(fixture.files.segment_path(1).unwrap().exists());
+        let reopened =
+            LinuxNativeSegmentDirectory::from_private_slot(fixture.root.clone()).unwrap();
+        assert!(
+            reopened
+                .prune_durable_predecessor_after_reopen(&identity())
+                .unwrap()
+        );
+        assert!(!reopened.segment_path(1).unwrap().exists());
+        assert!(
+            !reopened
+                .prune_durable_predecessor_after_reopen(&identity())
+                .unwrap()
+        );
+        assert_eq!(
+            reopened.read_checkpoint(&identity()).unwrap(),
+            plan.checkpoint
+        );
     }
 
     #[test]

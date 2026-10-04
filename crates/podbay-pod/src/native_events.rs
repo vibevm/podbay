@@ -230,6 +230,13 @@ impl std::fmt::Debug for PrivateNativeEvidence {
 }
 
 impl PrivateNativeEvidence {
+    pub(crate) fn from_verified_segment(
+        source_sequence: u64,
+        event_id: String,
+        private_jsonl: Vec<u8>,
+    ) -> Self {
+        Self { source_sequence, event_id, private_jsonl }
+    }
     pub fn source_sequence(&self) -> u64 {
         self.source_sequence
     }
@@ -363,10 +370,10 @@ struct PrivateRecord {
     body: PrivateBody,
 }
 
-/// Reads are O(retained events), never O(lifetime log). Open/reopen alone
-/// replays bounded private evidence; every append syncs before projection.
-/// Exact private JSONL remains in the held log for a future separately
-/// authenticated evidence bridge; the public snapshot never serializes it.
+/// Historical v1 held-log source for already-running pods. Reads are
+/// O(retained events); reopen replays its bounded private log. New Linux V2
+/// slots use the segmented source. Private JSONL never enters this public
+/// snapshot.
 pub struct NativeEventSpool {
     log: Box<dyn DurableAppendLog>,
     identity: NativeEventIdentity,
@@ -632,7 +639,7 @@ impl NativeEventSpool {
     }
 }
 
-fn validate_private_jsonl(bytes: &[u8]) -> Result<(), PodError> {
+pub(crate) fn validate_private_jsonl(bytes: &[u8]) -> Result<(), PodError> {
     if bytes.is_empty()
         || bytes.len() > MAX_RAW_BYTES
         || bytes.last() != Some(&b'\n')
@@ -654,7 +661,7 @@ fn validate_private_jsonl(bytes: &[u8]) -> Result<(), PodError> {
     Ok(())
 }
 
-fn public_event(
+pub(crate) fn public_event(
     identity: &NativeEventIdentity,
     sequence: u64,
     recorded_at: u64,
@@ -689,7 +696,7 @@ pub(crate) fn native_event_id(identity: &NativeEventIdentity, sequence: u64) -> 
     format!("native.{}", hex(hash.finalize().as_slice()))
 }
 
-fn apply_public(
+pub(crate) fn apply_public(
     snapshot: &mut NativeEventSnapshot,
     retained: &mut VecDeque<PublicNativeEvent>,
     event: PublicNativeEvent,

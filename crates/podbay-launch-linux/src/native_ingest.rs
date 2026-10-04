@@ -5,12 +5,14 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId};
 use podbay_host::ResolvedNativeCodexLaunch;
 use podbay_pod::{
     CODEX_V2_CAPABILITY, LinuxPeerEvidence, MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES, NativeEventCursor,
-    NativeEventIdentity, NativeEventRead, PodClient, PodError, PrivateNativeEvidence,
+    LinuxNativeSegmentDirectory, NativeEventIdentity, NativeEventRead, NativeSegmentCheckpoint,
+    PodClient, PodError, PrivateNativeEvidence,
     codex_private_slot_directory, decode_private_native_evidence_for_trusted_reader,
     manifest_path_for_identity,
 };
@@ -20,6 +22,14 @@ use crate::codex_v2::{TrustedCodexCredentialSource, preflight_committed_codex_v2
 pub struct TrustedNativeEventDirectory {
     path: PathBuf,
     identity: (u64, u64),
+    segment_readers: Mutex<Vec<CachedSegmentReader>>,
+}
+
+struct CachedSegmentReader {
+    path: PathBuf,
+    identity: NativeEventIdentity,
+    files: LinuxNativeSegmentDirectory,
+    checkpoint: NativeSegmentCheckpoint,
 }
 
 impl TrustedNativeEventDirectory {
@@ -27,7 +37,7 @@ impl TrustedNativeEventDirectory {
         let peer = LinuxPeerEvidence::for_current_process()
             .map_err(|_| PodError::Refused("manager OS identity unavailable"))?;
         let identity = checked_private_directory(&path, peer.uid())?;
-        Ok(Self { path, identity })
+        Ok(Self { path, identity, segment_readers: Mutex::new(Vec::new()) })
     }
 
     fn recheck(&self, uid: u32) -> Result<(), PodError> {
@@ -68,8 +78,10 @@ impl ManagerNativeEvidenceRead {
 
 /// Requires a host-minted committed proof, today's trusted credential source,
 /// the same manager OS process, exact store inode/revision and an attested pod
-/// socket before and after reading a no-follow private log copy. A concurrent
-/// append with a torn copy refuses; the caller may retry this read-only path.
+/// socket around private evidence readback. New V2 slots use an indexed,
+/// incrementally verified segment reader; historical v1 slots retain one
+/// bounded full-copy diagnostic read. A concurrent change refuses for a
+/// read-only retry.
 pub fn read_committed_codex_native_evidence(
     launch: &ResolvedNativeCodexLaunch,
     credential: &TrustedCodexCredentialSource,
@@ -133,22 +145,46 @@ pub fn read_committed_codex_native_evidence(
     if !status_matches(&before, launch, &expected, resource.epoch) {
         return Err(PodError::Refused("current Codex pod status differs"));
     }
-    let redacted = client.read_codex_native_events(cursor, limit)?;
-    if redacted.snapshot.identity != expected {
-        return Err(PodError::Refused(
-            "native event snapshot belongs to another Resource",
-        ));
+    let checkpoint = private_slot.join("native-events.checkpoint");
+    let historical = private_slot.join("codex.native-events.log");
+    let segmented_present = path_entry_exists(&checkpoint)?;
+    let historical_present = path_entry_exists(&historical)?;
+    if historical_present && segment_file_present(&private_slot)? {
+        return Err(PodError::Refused("historical and segmented native evidence coexist"));
     }
-    let private = if redacted.events.is_empty() {
-        Vec::new()
-    } else {
-        let raw = read_private_log_copy(&private_slot.join("codex.native-events.log"), peer.uid())?;
-        decode_private_native_evidence_for_trusted_reader(&raw, &expected, &redacted.events)?
+    if !matches!((segmented_present, historical_present), (true, false) | (false, true)) {
+        return Err(PodError::Refused("native evidence format is missing or ambiguous"));
+    }
+    let mut snapshot_race_attempts = 0;
+    let (redacted, private) = loop {
+        let redacted = client.read_codex_native_events(cursor, limit)?;
+        if redacted.snapshot.identity != expected {
+            return Err(PodError::Refused("native event snapshot belongs to another Resource"));
+        }
+        let private = if segmented_present {
+            match directory.read_segmented_page(&private_slot, &expected, &redacted, cursor, limit)? {
+                Some(private) => private,
+                None if snapshot_race_attempts < 2 => {
+                    snapshot_race_attempts += 1;
+                    continue;
+                }
+                None => return Err(PodError::Uncertain("pod snapshot kept moving during bounded private read")),
+            }
+        } else if redacted.events.is_empty() {
+            Vec::new()
+        } else {
+            let raw = read_private_log_copy(&historical, peer.uid())?;
+            decode_private_native_evidence_for_trusted_reader(&raw, &expected, &redacted.events)?
+        };
+        break (redacted, private);
     };
     let after = client.attested_status()?;
     directory.recheck(peer.uid())?;
     preflight_committed_codex_v2(launch, credential)?;
     if checked_store_file(launch.store_path(), peer.uid())? != store_identity
+        || path_entry_exists(&checkpoint)? != segmented_present
+        || path_entry_exists(&historical)? != historical_present
+        || (historical_present && segment_file_present(&private_slot)?)
         || !LinuxPeerEvidence::for_current_process()
             .is_ok_and(|current| current.attested_peer() == peer.attested_peer())
         || !status_matches(&after, launch, &expected, resource.epoch)
@@ -165,6 +201,70 @@ pub fn read_committed_codex_native_evidence(
         ));
     }
     Ok(ManagerNativeEvidenceRead { redacted, private })
+}
+
+impl TrustedNativeEventDirectory {
+    fn read_segmented_page(
+        &self,
+        private_slot: &Path,
+        expected: &NativeEventIdentity,
+        redacted: &NativeEventRead,
+        cursor: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<Option<Vec<PrivateNativeEvidence>>, PodError> {
+        let mut readers = self.segment_readers.lock()
+            .map_err(|_| PodError::Uncertain("native reader cache lock is poisoned"))?;
+        let index = readers.iter().position(|reader|
+            reader.path == private_slot && reader.identity == *expected);
+        let mut reader = if let Some(index) = index {
+            readers.remove(index)
+        } else {
+            let files = LinuxNativeSegmentDirectory::from_private_slot(private_slot.to_path_buf())?;
+            let checkpoint = files.read_checkpoint(expected)?;
+            CachedSegmentReader {
+                path: private_slot.to_path_buf(), identity: expected.clone(), files, checkpoint,
+            }
+        };
+        reader.checkpoint = reader.files.read_checkpoint_incremental(&reader.checkpoint)?;
+        if reader.checkpoint.redacted_read_after(cursor, limit)? != *redacted {
+            readers.push(reader);
+            if readers.len() > 64 { readers.remove(0); }
+            return Ok(None);
+        }
+        let after = cursor.map_or(reader.checkpoint.watermark, |cursor| cursor.sequence);
+        let (frames, _) = reader.files.read_indexed_page(&reader.checkpoint, after, limit)?;
+        if frames.len() != redacted.events.len() {
+            return Err(PodError::Uncertain("indexed private page differs from pod reply"));
+        }
+        let mut evidence = Vec::with_capacity(frames.len());
+        for (frame, event) in frames.into_iter().zip(&redacted.events) {
+            if frame.source_sequence() != event.source_sequence || frame.event_id() != event.event_id {
+                return Err(PodError::Uncertain("private segment EventId differs from pod reply"));
+            }
+            evidence.push(frame.into_private_evidence()?);
+        }
+        readers.push(reader);
+        if readers.len() > 64 { readers.remove(0); }
+        Ok(Some(evidence))
+    }
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, PodError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn segment_file_present(slot: &Path) -> Result<bool, PodError> {
+    let mut found = false;
+    for entry in fs::read_dir(slot)? {
+        let name = entry?.file_name();
+        let name = name.to_str().ok_or(PodError::Refused("native slot filename is invalid"))?;
+        found |= name.starts_with("native-events-") && name.ends_with(".segment");
+    }
+    Ok(found)
 }
 
 fn status_matches(

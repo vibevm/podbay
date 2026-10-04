@@ -31,6 +31,7 @@ use crate::native_events::{
     NativeEventAppend, NativeEventCursor, NativeEventIdentity, NativeEventKind, NativeEventRead,
     NativeEventSpool, NativeEventStatus,
 };
+use crate::segmented_native_events::SegmentedNativeEventSpool;
 use crate::manifest::{
     BoundPeerManifest, CODEX_V2_CAPABILITY, LaunchDescriptor, PEER_BINDING_V2_PROTOCOL, PodError,
     manifest_path, private_directory, unit_name,
@@ -94,10 +95,77 @@ pub struct PodCodexResource {
     resource: CodexResource<ProcessJsonlTransport>,
     journal: Option<CodexCommandJournal>,
     journal_path: PathBuf,
-    native_events: NativeEventSpool,
+    native_events: CodexNativeEventSource,
     child_birth: KernelChildBirthObservation,
     pod_boot_id: String,
     pod_cgroup: String,
+}
+
+enum CodexNativeEventSource {
+    HistoricalLog(NativeEventSpool),
+    Segmented(SegmentedNativeEventSpool),
+}
+
+impl CodexNativeEventSource {
+    fn open(private_slot: &Path, identity: NativeEventIdentity) -> Result<Self, PodError> {
+        let historical = private_slot.join("codex.native-events.log");
+        let checkpoint = private_slot.join("native-events.checkpoint");
+        let has_historical = path_entry_exists(&historical)?;
+        let has_checkpoint = path_entry_exists(&checkpoint)?;
+        let mut has_segment = false;
+        for entry in fs::read_dir(private_slot)? {
+            let name = entry?.file_name();
+            let name = name.to_str().ok_or(PodError::Refused("native event slot filename is invalid"))?;
+            has_segment |= name.starts_with("native-events-") && name.ends_with(".segment");
+        }
+        if has_historical && (has_checkpoint || has_segment) {
+            return Err(PodError::Conflict("historical and segmented native event formats coexist"));
+        }
+        if has_historical {
+            Ok(Self::HistoricalLog(NativeEventSpool::open(&LinuxBackend, &historical, identity)?))
+        } else {
+            Ok(Self::Segmented(SegmentedNativeEventSpool::open(private_slot.to_path_buf(), identity)?))
+        }
+    }
+
+    fn reserve_before_take(&mut self) -> Result<u64, PodError> {
+        match self {
+            Self::HistoricalLog(source) => source.next_source_sequence(),
+            Self::Segmented(source) => source.reserve_native_take(),
+        }
+    }
+
+    fn append_applied(
+        &mut self, sequence: u64, raw: &[u8], kind: NativeEventKind,
+        status: Option<NativeEventStatus>, conflict: bool,
+    ) -> Result<NativeEventAppend, PodError> {
+        match self {
+            Self::HistoricalLog(source) => source.append_applied(sequence, raw, kind, status, conflict),
+            Self::Segmented(source) => source.append_applied(sequence, raw, kind, status, conflict),
+        }
+    }
+
+    fn mark_continuity_unknown(&mut self) -> Result<(), PodError> {
+        match self {
+            Self::HistoricalLog(source) => source.mark_continuity_unknown(),
+            Self::Segmented(source) => source.mark_continuity_unknown(),
+        }
+    }
+
+    fn read_after(&self, cursor: Option<&NativeEventCursor>, limit: usize) -> Result<NativeEventRead, PodError> {
+        match self {
+            Self::HistoricalLog(source) => source.read_after(cursor, limit),
+            Self::Segmented(source) => source.read_after(cursor, limit),
+        }
+    }
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, PodError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl PodCodexResource {
@@ -189,11 +257,7 @@ impl PodCodexResource {
             &identity.resource_id,
             identity.resource_epoch,
         );
-        let native_events = NativeEventSpool::open(
-            &LinuxBackend,
-            &private_slot.join("codex.native-events.log"),
-            event_identity,
-        )?;
+        let native_events = CodexNativeEventSource::open(&private_slot, event_identity)?;
         let config = PinnedCodexConfig::new(
             descriptor.model_id(),
             descriptor.reasoning_effort(),
@@ -266,7 +330,15 @@ impl PodCodexResource {
     /// facts have crossed a held fsynced append. A failed append stops native
     /// publication and leaves the pod's control channel available.
     fn flush_native_events(&mut self) -> Result<(), PodError> {
-        while let Some(observed) = self.resource.take_applied_native_notification() {
+        while self.resource.has_unspooled_native_notifications() {
+            let sequence = self.native_events.reserve_before_take()?;
+            let observed = match self.resource.take_applied_native_notification() {
+                Some(observed) => observed,
+                None => {
+                    self.mark_native_events_unknown();
+                    return Err(PodError::Uncertain("native notification disappeared after take reservation"));
+                }
+            };
             let kind = match observed.kind() {
                 NativeObservationKind::Status => NativeEventKind::Status,
                 NativeObservationKind::Output => NativeEventKind::Output,
@@ -283,14 +355,14 @@ impl PodCodexResource {
                 NativeObservationStatus::Interrupted => NativeEventStatus::Interrupted,
                 NativeObservationStatus::SystemError => NativeEventStatus::SystemError,
             });
-            let sequence = self.native_events.next_source_sequence()?;
-            if !matches!(
-                self.native_events.append_applied(
-                    sequence, observed.private_jsonl(), kind, status,
-                    observed.external_conflict(),
-                )?,
-                NativeEventAppend::Committed(_)
-            ) {
+            let appended = self.native_events.append_applied(
+                sequence, observed.private_jsonl(), kind, status,
+                observed.external_conflict(),
+            );
+            if appended.is_err() {
+                self.mark_native_events_unknown();
+            }
+            if !matches!(appended?, NativeEventAppend::Committed(_)) {
                 return Err(PodError::Conflict("native event source sequence repeated"));
             }
         }
@@ -964,5 +1036,42 @@ mod bootstrap_stage_tests {
                 native_turn_id: "turn.fixture".into(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod native_format_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn identity() -> NativeEventIdentity {
+        NativeEventIdentity {
+            store_lineage: "lineage.fixture".into(), scope_id: "scope.fixture".into(),
+            session_id: "session.fixture".into(), run_id: "run.fixture".into(),
+            attempt_id: "attempt.fixture".into(), pod_id: "pod.fixture".into(),
+            pod_incarnation: 1, resource_id: "resource.fixture".into(), resource_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn historical_native_log_is_preserved_and_mixed_format_refuses() {
+        let root = std::env::temp_dir().join(format!(
+            "podbay-native-format-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let old = root.join("codex.native-events.log");
+        fs::write(&old, []).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(CodexNativeEventSource::open(&root, identity()).unwrap(), CodexNativeEventSource::HistoricalLog(_)));
+        let segment = root.join("native-events-0000000000000001.segment");
+        fs::write(&segment, []).unwrap();
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(CodexNativeEventSource::open(&root, identity()), Err(PodError::Conflict(_))));
+        fs::remove_dir_all(root).unwrap();
     }
 }

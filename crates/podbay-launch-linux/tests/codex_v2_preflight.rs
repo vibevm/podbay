@@ -1527,10 +1527,18 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
     assert_eq!(evidence.redacted().events[0].kind, NativeEventKind::Output);
     assert!(evidence.redacted().gap.is_none());
     assert_eq!(evidence.private_evidence().len(), 1);
+    let slot = fixture_codex_slot(&fixture);
+    assert!(slot.join("native-events.checkpoint").is_file());
+    assert!(!slot.join("codex.native-events.log").exists());
     assert!(
         String::from_utf8_lossy(evidence.private_evidence()[0].private_jsonl())
             .contains("private manager evidence")
     );
+    let repeated = read_committed_codex_native_evidence(
+        &proof, &source, &trusted_directory, Some(&cursor), 16,
+    ).unwrap();
+    assert_eq!(repeated.redacted(), evidence.redacted());
+    assert_eq!(repeated.private_evidence().len(), 1);
     assert!(!format!("{evidence:?}").contains("private manager evidence"));
     assert!(
         !serde_json::to_string(evidence.redacted())

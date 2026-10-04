@@ -15,8 +15,9 @@ mod linux_peer;
 mod manifest;
 mod native_events;
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // Writer and trusted reader switch together after the rebind runtime settles.
 mod native_segment_checkpoint;
+#[cfg(target_os = "linux")]
+mod segmented_native_events;
 mod peer_checkpoint;
 mod ports;
 #[cfg(target_os = "linux")]
@@ -64,6 +65,11 @@ pub use native_events::{
     NativeEventFidelity, NativeEventGap, NativeEventIdentity, NativeEventKind, NativeEventRead,
     NativeEventSnapshot, NativeEventSpool, NativeEventStatus, PrivateNativeEvidence,
     PublicNativeEvent, decode_private_native_evidence_for_trusted_reader,
+};
+#[cfg(target_os = "linux")]
+pub use native_segment_checkpoint::{
+    IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint,
+    NativeSegmentMeta, NativeSegmentOffset,
 };
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};
 #[cfg(target_os = "linux")]
