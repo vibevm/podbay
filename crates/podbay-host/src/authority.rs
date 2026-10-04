@@ -1026,6 +1026,7 @@ pub struct ResolvedClaimedBootstrap {
     manager_credential_epoch: u64,
     authority_revision: u64,
     store_path: PathBuf,
+    store_file_identity: (u64, u64),
 }
 
 impl ResolvedClaimedBootstrap {
@@ -1046,6 +1047,12 @@ impl ResolvedClaimedBootstrap {
     }
     pub fn store_path(&self) -> &Path {
         &self.store_path
+    }
+    /// Linux `(device, inode)` retained from the manager's already-open store.
+    /// A port must compare this with the canonical path before contacting a
+    /// pod, so a path swap cannot redirect a claimed command to another DB.
+    pub fn store_file_identity(&self) -> (u64, u64) {
+        self.store_file_identity
     }
 }
 
@@ -3060,6 +3067,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 manager_credential_epoch: claimed.manager_credential_epoch(),
                 authority_revision: claimed.authority_revision(),
                 store_path: self.canonical_database.clone(),
+                store_file_identity: self.database_identity,
             }))
         })()
         .map_err(|source| BootstrapSendError::PostAdmission {

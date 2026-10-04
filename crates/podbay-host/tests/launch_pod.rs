@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -208,6 +208,11 @@ impl HostDispatchPort for FakeLaunchPort {
         claimed: ResolvedClaimedBootstrap,
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
         assert!(self.bootstrap_opt_in.load(Ordering::SeqCst));
+        let database = std::fs::symlink_metadata(claimed.store_path()).unwrap();
+        assert_eq!(
+            claimed.store_file_identity(),
+            (database.dev(), database.ino()),
+        );
         let mut store = PodBayStore::open(claimed.store_path()).unwrap();
         let record = store
             .inspect_claimed_bootstrap_send(claimed.selector())
