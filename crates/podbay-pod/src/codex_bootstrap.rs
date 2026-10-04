@@ -4,13 +4,16 @@
 use podbay_core::{
     AttemptId, CommandId, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId,
 };
-use podbay_store::{BootstrapSendSelector, NativeWriterTarget};
+use podbay_store::{BootstrapSendSelector, LaterCodexSendSelector, NativeWriterTarget};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{BoundPeerManifest, LaunchDescriptor, PodError};
 
 pub const CODEX_BOOTSTRAP_PROTOCOL: &str = "podbay.codex-bootstrap/1";
 pub const CODEX_BOOTSTRAP_INSPECT_PROTOCOL: &str = "podbay.codex-bootstrap.inspect/1";
+pub const CODEX_LATER_TURN_PROTOCOL: &str = "podbay.codex-turn/1";
+pub const CODEX_LATER_TURN_INSPECT_PROTOCOL: &str = "podbay.codex-turn.inspect/1";
+pub const CODEX_ANCHOR_INSPECT_PROTOCOL: &str = "podbay.codex-anchor.inspect/1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,8 @@ pub(crate) struct BootstrapControlRequest {
     pub resource_epoch: u64,
     pub resource_input_epoch: u64,
     pub writer_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 impl BootstrapControlRequest {
@@ -55,6 +60,7 @@ impl BootstrapControlRequest {
             resource_epoch: target.resource_epoch,
             resource_input_epoch: target.resource_input_epoch,
             writer_epoch,
+            nonce: None,
         }
     }
 
@@ -66,6 +72,45 @@ impl BootstrapControlRequest {
         let mut request = Self::from_selector(selector, writer_epoch, token);
         request.protocol = CODEX_BOOTSTRAP_INSPECT_PROTOCOL.into();
         request.operation = "codex.bootstrap.inspect".into();
+        request
+    }
+
+    pub(crate) fn from_later_selector(
+        selector: &LaterCodexSendSelector,
+        writer_epoch: u64,
+        token: &str,
+    ) -> Self {
+        let bootstrap = BootstrapSendSelector {
+            scope_id: selector.scope_id.clone(), command_id: selector.command_id.clone(),
+            native_target: selector.native_target.clone(),
+        };
+        let mut request = Self::from_selector(&bootstrap, writer_epoch, token);
+        request.protocol = CODEX_LATER_TURN_PROTOCOL.into();
+        request.operation = "codex.turn".into();
+        request
+    }
+
+    pub(crate) fn for_later_inspection(
+        selector: &LaterCodexSendSelector,
+        writer_epoch: u64,
+        token: &str,
+    ) -> Self {
+        let mut request = Self::from_later_selector(selector, writer_epoch, token);
+        request.protocol = CODEX_LATER_TURN_INSPECT_PROTOCOL.into();
+        request.operation = "codex.turn.inspect".into();
+        request
+    }
+
+    pub(crate) fn for_anchor_inspection(
+        bootstrap: &BootstrapSendSelector,
+        writer_epoch: u64,
+        token: &str,
+        nonce: String,
+    ) -> Self {
+        let mut request = Self::from_selector(bootstrap, writer_epoch, token);
+        request.protocol = CODEX_ANCHOR_INSPECT_PROTOCOL.into();
+        request.operation = "codex.anchor.inspect".into();
+        request.nonce = Some(nonce);
         request
     }
 
@@ -92,6 +137,47 @@ impl BootstrapControlRequest {
         )
     }
 
+    pub(crate) fn checked_later_selector(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+    ) -> Result<(LaterCodexSendSelector, u64), PodError> {
+        self.checked_later_selector_for(binding, launch, CODEX_LATER_TURN_PROTOCOL, "codex.turn")
+    }
+
+    pub(crate) fn checked_later_inspection_selector(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+    ) -> Result<(LaterCodexSendSelector, u64), PodError> {
+        self.checked_later_selector_for(
+            binding, launch, CODEX_LATER_TURN_INSPECT_PROTOCOL, "codex.turn.inspect",
+        )
+    }
+
+    pub(crate) fn checked_anchor_inspection_selector(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+    ) -> Result<(BootstrapSendSelector, u64), PodError> {
+        self.checked_selector_for(binding, launch, CODEX_ANCHOR_INSPECT_PROTOCOL,
+            "codex.anchor.inspect")
+    }
+
+    fn checked_later_selector_for(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+        protocol: &str,
+        operation: &str,
+    ) -> Result<(LaterCodexSendSelector, u64), PodError> {
+        let (bootstrap, epoch) = self.checked_selector_for(binding, launch, protocol, operation)?;
+        Ok((LaterCodexSendSelector {
+            scope_id: bootstrap.scope_id, command_id: bootstrap.command_id,
+            native_target: bootstrap.native_target,
+        }, epoch))
+    }
+
     fn checked_selector_for(
         &self,
         binding: &BoundPeerManifest,
@@ -101,6 +187,10 @@ impl BootstrapControlRequest {
     ) -> Result<(BootstrapSendSelector, u64), PodError> {
         if self.protocol != protocol
             || self.operation != operation
+            || (if protocol == CODEX_ANCHOR_INSPECT_PROTOCOL {
+                !self.nonce.as_deref().is_some_and(|value| value.len() == 64
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            } else { self.nonce.is_some() })
             || self.store_lineage != binding.store_lineage
             || self.scope_id != launch.scope_id
             || self.session_id != launch.session_id
@@ -270,6 +360,28 @@ mod tests {
         let mut extra: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         extra["prompt"] = serde_json::Value::String("must refuse".into());
         assert!(serde_json::from_value::<BootstrapControlRequest>(extra).is_err());
+    }
+
+    #[test]
+    fn later_turn_frame_carries_only_claimed_selectors() {
+        let bootstrap = selector();
+        let later = LaterCodexSendSelector {
+            scope_id: bootstrap.scope_id,
+            command_id: bootstrap.command_id,
+            native_target: bootstrap.native_target,
+        };
+        let request = BootstrapControlRequest::from_later_selector(&later, 3, "bearer.fixture");
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(request.protocol, CODEX_LATER_TURN_PROTOCOL);
+        assert_eq!(request.operation, "codex.turn");
+        assert!(!encoded.windows(6).any(|window| window == b"prompt"));
+        assert!(!encoded.windows(4).any(|window| window == b"text"));
+        let mut extra: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        extra["prompt"] = serde_json::Value::String("must refuse".into());
+        assert!(serde_json::from_value::<BootstrapControlRequest>(extra).is_err());
+        let inspect = BootstrapControlRequest::for_later_inspection(&later, 3, "bearer.fixture");
+        assert_eq!(inspect.protocol, CODEX_LATER_TURN_INSPECT_PROTOCOL);
+        assert_eq!(inspect.operation, "codex.turn.inspect");
     }
 
     #[test]

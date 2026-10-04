@@ -14,6 +14,8 @@ mod codex_launch;
 mod codex_resource;
 mod codex_turn_journal;
 #[cfg(target_os = "linux")]
+mod codex_turn_control;
+#[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
 mod native_events;
@@ -57,6 +59,8 @@ pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 pub use codex_turn_journal::{
     CodexLaterTurnJournal, LaterTurnIntentResult, LaterTurnStage, LaterTurnTerminal, LaterTurnView,
 };
+#[cfg(target_os = "linux")]
+pub use codex_turn_control::{CodexAnchorInspectReceipt, LaterTurnControlReceipt, LaterTurnControlStage};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
