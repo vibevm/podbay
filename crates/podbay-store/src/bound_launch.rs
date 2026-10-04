@@ -24,6 +24,7 @@ use crate::store::{
 };
 
 const NAMESPACE: &str = "podbay.launch";
+const CURRENT_V2_REBIND_LIMIT: usize = 128;
 
 fn positive_stored_epoch(value: i64, reason: &'static str) -> Result<u64, StoreError> {
     if value <= 0 {
@@ -590,6 +591,69 @@ pub enum BoundLaunchAdmission {
 }
 
 impl PodBayStore {
+    /// Bounded readback of current V2 launch selectors. The authority Pod
+    /// table drives indexed target/binding lookups; no command or event log is
+    /// scanned. Host revalidates each complete binding and live OS pod before
+    /// any rebind effect. A malformed mixed-version binding is not skipped.
+    pub fn current_codex_v2_rebind_candidates(
+        &mut self,
+    ) -> Result<Vec<(ScopeId, PodId)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let mut statement = transaction.prepare(
+            "SELECT p.scope_id,p.pod_id,b.effective_spec_version,b.descriptor_version
+             FROM authority_pods AS p
+             CROSS JOIN target_epochs AS t
+             CROSS JOIN launch_bindings AS b
+             WHERE t.scope_id=p.scope_id AND t.target_id=p.pod_id
+               AND t.epoch=p.incarnation
+               AND b.scope_id=p.scope_id AND b.pod_id=p.pod_id
+               AND b.pod_incarnation=p.incarnation
+               AND (b.effective_spec_version=?1 OR b.descriptor_version=?2)
+             ORDER BY p.pod_id LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                EFFECTIVE_LAUNCH_V2_VERSION,
+                LAUNCH_DESCRIPTOR_V2_SCHEMA,
+                (CURRENT_V2_REBIND_LIMIT + 1) as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (scope, pod, effective, descriptor) = row?;
+            if effective != EFFECTIVE_LAUNCH_V2_VERSION || descriptor != LAUNCH_DESCRIPTOR_V2_SCHEMA
+            {
+                return Err(StoreError::Conflict(
+                    "current V2 launch version pair differs",
+                ));
+            }
+            candidates.push((
+                ScopeId::try_from(scope.as_str())
+                    .map_err(|_| StoreError::Conflict("current V2 scope ID is malformed"))?,
+                PodId::try_from(pod.as_str())
+                    .map_err(|_| StoreError::Conflict("current V2 Pod ID is malformed"))?,
+            ));
+        }
+        if candidates.len() > CURRENT_V2_REBIND_LIMIT {
+            return Err(StoreError::Conflict(
+                "current V2 pod inventory exceeds bound",
+            ));
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(candidates)
+    }
+
     /// Read the exact current parent Run/Pod in a validated store snapshot,
     /// then pin its mutable rows under an IMMEDIATE transaction. This is not
     /// process liveness, an actor grant or a child reservation.

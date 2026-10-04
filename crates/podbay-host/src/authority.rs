@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -2583,6 +2583,12 @@ impl From<StoreError> for RebindContextError {
         Self::Store(value)
     }
 }
+fn durable_rebind_error(value: RebindContextError) -> DurableAuthorityError {
+    match value {
+        RebindContextError::Host(error) => DurableAuthorityError::Host(error),
+        RebindContextError::Store(error) => DurableAuthorityError::Store(error),
+    }
+}
 impl From<RebindContextError> for LaunchPodError {
     fn from(value: RebindContextError) -> Self {
         match value {
@@ -2708,6 +2714,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
     native_host: Option<TrustedNativeHostConfig>,
     pending_codex_rebinds: HashMap<(ScopeId, PodId, String), PreparedCodexV2Rebind>,
+    active_codex_rebinds: HashSet<(ScopeId, PodId, String)>,
 }
 
 impl<P: HostDispatchPort> DurableAuthority<P> {
@@ -2838,6 +2845,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             launch_profiles: HashMap::new(),
             native_host: None,
             pending_codex_rebinds: HashMap::new(),
+            active_codex_rebinds: HashSet::new(),
         })
     }
 
@@ -2899,6 +2907,35 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 input_epochs,
                 peer,
             })
+        }
+    }
+
+    /// Read only bounded current V2 selectors under the same manager lease
+    /// used by proof-bearing rebind. Each selector still needs complete
+    /// store, policy, OS and pod inspection before any effect.
+    pub fn current_codex_v2_rebind_candidates(
+        &mut self,
+    ) -> Result<Vec<(ScopeId, PodId)>, RebindContextError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(HostError::Unsupported.into());
+        #[cfg(target_os = "linux")]
+        {
+            recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )?;
+            let candidates = self.store.current_codex_v2_rebind_candidates()?;
+            recheck_current_manager(
+                &mut self.store,
+                &self.canonical_database,
+                self.database_identity,
+                &self.manager_peer,
+                &self.manager_claim,
+            )?;
+            Ok(candidates)
         }
     }
 
@@ -3276,12 +3313,130 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 None,
             ));
         }
+        self.active_codex_rebinds.insert(cache_key);
         Ok(outcome(
             durable,
             RebindCompletionStage::PodActive,
             Some(digest),
             Some(active),
         ))
+    }
+
+    /// Take over only the initial structured writer of a Pod whose exact
+    /// proof-bearing rebind reached PodActive in this manager. No native input
+    /// is sent. The old writer epoch is read as fenced CAS evidence; the
+    /// current store target, owner actor, grant and manager claim are checked
+    /// again before returning a usable lease.
+    pub fn takeover_initial_writer_after_active_rebind(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+        policy: &TrustedInitialOwnerPolicy,
+        grant_id: GrantId,
+        ttl_seconds: u64,
+    ) -> Result<NativeWriterLease, DurableAuthorityError> {
+        if !(1..=3_600).contains(&ttl_seconds)
+            || policy.scope_id() != scope
+            || !self.active_codex_rebinds.contains(&(
+                scope.clone(),
+                pod.clone(),
+                command_key.to_owned(),
+            ))
+            || self.current_owner_grant_from_trusted_policy(policy)? != grant_id
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let actor = self
+            .host
+            .actors
+            .get(policy.actor_id())
+            .cloned()
+            .ok_or(HostError::Unauthenticated)?;
+        self.host.check_grant(
+            &actor,
+            grant_id,
+            scope,
+            &Right::new(Operation::SendSession, Target::Scope(scope.clone())),
+        )?;
+        let record = {
+            let mut context = self
+                .rebind_context(scope, pod)
+                .map_err(durable_rebind_error)?;
+            context.recheck_current().map_err(durable_rebind_error)?;
+            context.launch().clone()
+        };
+        if record.format != BoundLaunchFormat::CodexV2 || record.resources.len() != 1 {
+            return Err(HostError::StaleGuard.into());
+        }
+        let session = SessionId::try_from(record.session_id.as_str())
+            .map_err(|_| DurableAuthorityError::Corrupt("rebound Session ID is malformed"))?;
+        let (target, _) = self
+            .store
+            .current_native_writer_target_for_session(scope, &session)?;
+        if target.pod_id != *pod
+            || target.attempt_id.as_str() != record.attempt_id
+            || target.pod_incarnation != record.pod_incarnation
+            || target.resource_id.as_str() != record.resources[0].id
+            || target.resource_epoch != record.resources[0].epoch
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let current_owner = self.manager_claim.owner_epoch();
+        let current_credential = self.manager_claim.credential_epoch();
+        let revision = self.recorded.revision;
+        let matches_current = |lease: &NativeWriterLease| {
+            lease.target() == &target
+                && lease.holder_actor_id() == &actor.actor_id
+                && lease.holder_credential_generation() == actor.credential_generation.get()
+                && lease.owner_epoch() == current_owner
+                && lease.manager_credential_epoch() == current_credential
+                && lease.authority_revision() == revision
+        };
+        let lease = match self.store.inspect_native_writer_lease(&target) {
+            Ok(existing) if matches_current(&existing) => existing,
+            Ok(_) => return Err(HostError::LeaseHeld.into()),
+            Err(StoreError::NotFound | StoreError::StaleEpoch) => {
+                let old = match self.store.prior_native_writer_lease_for_rebind(
+                    &target,
+                    current_owner,
+                    current_credential,
+                    revision,
+                ) {
+                    Ok(prior) if prior.holder_actor_id() == policy.actor_id()
+                        && prior.holder_credential_generation() < actor.credential_generation.get() =>
+                    {
+                        Some(prior.writer_epoch())
+                    }
+                    Ok(_) => return Err(HostError::LeaseHeld.into()),
+                    Err(StoreError::NotFound) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let request = TrustedNativeWriterLeaseRequest {
+                    target: target.clone(),
+                    holder_actor_id: actor.actor_id.clone(),
+                    holder_credential_generation: actor.credential_generation.get(),
+                    expected_owner_epoch: current_owner,
+                    expected_manager_credential_epoch: current_credential,
+                    expected_authority_revision: revision,
+                    expected_writer_epoch: old,
+                    ttl_seconds,
+                };
+                self.store
+                    .acquire_native_writer_lease_from_trusted_host(&request)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !matches_current(&lease)
+            || self.store.inspect_native_writer_lease(&target)? != lease
+            || self.current_owner_grant_from_trusted_policy(policy)? != grant_id
+            || !self
+                .rebind_context(scope, pod)
+                .is_ok_and(|mut context| context.recheck_current().is_ok())
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(lease)
     }
 
     pub fn port(&self) -> &P {
@@ -4136,7 +4291,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     /// Read back an existing initial writer guard for one exact authenticated
     /// V2 launch CommandId. Every lookup is indexed by CommandId/principal and
-    /// then verified against today's Session→Run→Pod→Resource and lease. This
+    /// then verified against today's Session→Run→Pod→Resource and lease. A
+    /// proof-bearing manager rebind may have advanced the writer epoch. This
     /// method never mints, renews or takes over a writer lease.
     pub fn read_current_initial_bootstrap_guard_for_launch<T: AuthenticatedTransport>(
         &mut self,
@@ -4242,7 +4398,6 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 || lease.owner_epoch() != self.manager_claim.owner_epoch()
                 || lease.manager_credential_epoch() != self.manager_claim.credential_epoch()
                 || lease.authority_revision() != self.recorded.revision
-                || lease.writer_epoch() != 1
             {
                 return Ok(None);
             }

@@ -17,6 +17,48 @@ use crate::store::PodBayStore;
 const MAX_TTL_SECONDS: u64 = 3_600;
 
 impl PodBayStore {
+    /// Read the fenced prior writer only for a host-proven current rebind.
+    /// This is a CAS input, never a usable current lease or a send permit.
+    pub fn prior_native_writer_lease_for_rebind(
+        &mut self,
+        target: &NativeWriterTarget,
+        owner_epoch: u64,
+        manager_credential_epoch: u64,
+        authority_revision: u64,
+    ) -> Result<NativeWriterLease, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        check_manager(
+            &transaction,
+            &self.store_lineage,
+            owner_epoch,
+            manager_credential_epoch,
+            authority_revision,
+        )?;
+        check_current_target(&transaction, &self.store_lineage, target)?;
+        let prior = read_lease(&transaction, &target.resource_id)?.ok_or(StoreError::NotFound)?;
+        let old = prior.target();
+        if old.store_lineage != target.store_lineage || old.scope_id != target.scope_id {
+            return Err(StoreError::WrongScope);
+        }
+        if old.session_id != target.session_id
+            || old.run_id != target.run_id
+            || old.attempt_id != target.attempt_id
+            || old.pod_id != target.pod_id
+            || old.pod_incarnation != target.pod_incarnation
+            || old.resource_id != target.resource_id
+            || old.resource_epoch != target.resource_epoch
+            || old.resource_input_epoch >= target.resource_input_epoch
+            || prior.owner_epoch() >= owner_epoch
+            || prior.manager_credential_epoch() >= manager_credential_epoch
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(prior)
+    }
+
     /// Resolve the one current V2 structured child of a Session without
     /// trusting a wire-supplied Run, Pod or Resource ID. This is database
     /// evidence only; actor, grant and live pod checks belong to the host.

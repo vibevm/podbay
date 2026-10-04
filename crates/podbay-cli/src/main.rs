@@ -25,6 +25,7 @@ mod linux {
     use crate::manager_policy::PreparedManagerPolicy;
     use crate::socket_reconcile::reconcile_abandoned_sockets;
     use podbay_core::{ActorId, ScopeId};
+    use podbay_host::RebindCompletionStage;
     use podbay_host::{
         CredentialRef, DurableAuthority, DurableAuthorityError, TrustedInitialOwnerPolicy,
     };
@@ -36,6 +37,7 @@ mod linux {
         OWNER_RECOVERY_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME, TrustedBootstrapSendTemplate,
         TrustedWireRootLaunchTemplate,
     };
+    use sha2::{Digest, Sha256};
     use signal_hook::{
         consts::signal::{SIGINT, SIGTERM},
         flag,
@@ -237,6 +239,12 @@ mod linux {
                 }
             }
         }
+        let current_v2 = authority
+            .current_codex_v2_rebind_candidates()
+            .map_err(|error| format!("current V2 Pod inventory unavailable: {error:?}"))?;
+        if !current_v2.is_empty() && prepared.is_none() {
+            return Err("current V2 Pods require the original trusted policy for recovery".into());
+        }
         let templates = if let Some(policy) = prepared {
             let grant = enrolled_grant
                 .ok_or_else(|| "trusted policy lacks an enrolled owner grant".to_owned())?;
@@ -248,6 +256,42 @@ mod linux {
                 .map_err(|error| {
                     format!("trusted launch profile registration refused: {error:?}")
                 })?;
+            for (scope, pod) in current_v2 {
+                let key =
+                    auto_rebind_key(authority.owner_epoch().get(), scope.as_str(), pod.as_str());
+                let pending = authority
+                    .prepare_current_codex_v2_rebind(&scope, &pod, &key)
+                    .map_err(|error| format!(
+                        "current V2 Pod {pod} in {scope} is unverified; manager not ready: {error:?}"
+                    ))?;
+                eprintln!(
+                    "podbay V2 rebind: pod={} scope={} key={} phase={:?}",
+                    pod, scope, key, pending.phase
+                );
+                let completed = authority
+                    .complete_current_codex_v2_rebind(&scope, &pod, &key)
+                    .map_err(|error| format!(
+                        "current V2 Pod {pod} in {scope} rebind failed; manager not ready: {error:?}"
+                    ))?;
+                if completed.stage != RebindCompletionStage::PodActive {
+                    return Err(format!(
+                        "current V2 Pod {pod} in {scope} rebind remains {:?}; manager not ready",
+                        completed.stage
+                    ));
+                }
+                let writer = authority.takeover_initial_writer_after_active_rebind(
+                    &scope, &pod, &key, &policy.owner, grant, policy.writer_lease_seconds,
+                ).map_err(|error| format!(
+                    "current V2 Pod {pod} in {scope} writer takeover unavailable; manager not ready: {error:?}"
+                ))?;
+                eprintln!(
+                    "podbay V2 rebind active: pod={} scope={} key={} writerEpoch={}",
+                    pod,
+                    scope,
+                    key,
+                    writer.writer_epoch()
+                );
+            }
             let launch = TrustedWireRootLaunchTemplate::from_trusted_policy(
                 grant,
                 policy.launch_deadline,
@@ -418,6 +462,22 @@ mod linux {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("manager socket path inspection failed: {error}")),
         }
+    }
+
+    fn auto_rebind_key(owner_epoch: u64, scope: &str, pod: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"podbay.manager-auto-rebind/1\0");
+        hash.update(owner_epoch.to_be_bytes());
+        for value in [scope, pod] {
+            hash.update((value.len() as u16).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        let digest = hash.finalize();
+        let mut key = format!("rebind.owner.{owner_epoch}.");
+        for byte in digest {
+            key.push_str(&format!("{byte:02x}"));
+        }
+        key
     }
 
     fn check_owner_setup_socket_path(path: &Path) -> Result<(), String> {
