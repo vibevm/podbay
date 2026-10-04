@@ -32,6 +32,7 @@ use podbay_store::{
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
     FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole, SendPolicy,
+    OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
     SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
     WorkspaceAccess as WireWorkspaceAccess,
 };
@@ -934,6 +935,44 @@ impl ResolvedNativeCodexLaunch {
     }
 }
 
+/// Host-created read-only proof for one current V1 operator process. It is
+/// distinct from the Codex V2 resource and carries no model-turn authority.
+pub struct ResolvedOperatorProcessLaunch {
+    record: BoundLaunchRecord,
+    effective: EffectiveLaunchContract,
+    descriptor: ImmutableLaunchDescriptor,
+    paths: ResolvedNativePaths,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    store_lineage: String,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    authority_revision: u64,
+    manager_peer: AttestedPeer,
+    resource_input_epochs: BTreeMap<String, u64>,
+}
+
+impl ResolvedOperatorProcessLaunch {
+    pub fn committed_record(&self) -> &BoundLaunchRecord { &self.record }
+    pub fn effective(&self) -> &EffectiveLaunchContract { &self.effective }
+    pub fn descriptor(&self) -> &ImmutableLaunchDescriptor { &self.descriptor }
+    pub fn descriptor_bytes(&self) -> &[u8] { &self.record.descriptor }
+    pub fn effective_spec_bytes(&self) -> &[u8] { &self.record.effective_spec }
+    pub fn store_path(&self) -> &Path { &self.store_path }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64, u64) { self.store_file_identity }
+    pub fn store_lineage(&self) -> &str { &self.store_lineage }
+    pub fn owner_epoch(&self) -> u64 { self.owner_epoch }
+    pub fn credential_epoch(&self) -> u64 { self.credential_epoch }
+    pub fn authority_revision(&self) -> u64 { self.authority_revision }
+    pub fn manager_peer(&self) -> &AttestedPeer { &self.manager_peer }
+    pub fn resource_input_epochs(&self) -> &BTreeMap<String, u64> { &self.resource_input_epochs }
+    pub fn cwd(&self) -> &Path { &self.paths.cwd }
+    pub fn executable(&self) -> &Path { &self.paths.executable }
+    pub fn executable_sha256(&self) -> &str { &self.paths.executable_sha256 }
+}
+
 /// A point-in-time observation returned only by the manager's installed,
 /// trusted platform port. Constructing this DTO is not authority: the host
 /// never accepts it from a request or public prepare method, and the store
@@ -983,6 +1022,32 @@ impl PreparedCodexV2Rebind {
     pub fn authority_revision(&self) -> u64 {
         self.authority_revision
     }
+}
+
+/// Exact V1 operator-process Pending proof, created only after durable store
+/// admission. A copied manifest, wire request or PID cannot construct it.
+#[derive(Clone)]
+pub struct PreparedOperatorProcessRebind {
+    proposal: RebindProposal,
+    pending_receipt: DurableRebindReceipt,
+    prior_checkpoint_digest: String,
+    record: BoundLaunchRecord,
+    store_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    store_file_identity: (u64, u64),
+    manager_peer: AttestedPeer,
+    authority_revision: u64,
+}
+
+impl PreparedOperatorProcessRebind {
+    pub fn proposal(&self) -> &RebindProposal { &self.proposal }
+    pub fn prior_checkpoint_digest(&self) -> &str { &self.prior_checkpoint_digest }
+    pub fn record(&self) -> &BoundLaunchRecord { &self.record }
+    pub fn store_path(&self) -> &Path { &self.store_path }
+    #[cfg(target_os = "linux")]
+    pub fn store_file_identity(&self) -> (u64, u64) { self.store_file_identity }
+    pub fn manager_peer(&self) -> &AttestedPeer { &self.manager_peer }
+    pub fn authority_revision(&self) -> u64 { self.authority_revision }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1088,6 +1153,50 @@ fn digest_codex_v2_rebind_intent(
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
+}
+
+fn digest_operator_process_rebind_intent(
+    key: &CommandKey,
+    context: &ManagerRebindContext<'_>,
+    reviewed: &ResolvedOperatorProcessLaunch,
+    observed: &PortRebindObservation,
+) -> Result<RequestDigest, HostError> {
+    fn field(hash: &mut Sha256, value: &[u8]) {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let identity = context.identity();
+    let prior = &observed.prior;
+    let peer = context.manager_peer();
+    let mut hash = Sha256::new();
+    field(&mut hash, b"podbay.operator-process-rebind-intent/1");
+    for value in [
+        key.as_str(), identity.store_lineage.as_str(), identity.scope_id.as_str(),
+        identity.pod_id.as_str(), identity.attempt_id.as_str(),
+        reviewed.descriptor.digest(), reviewed.effective.digest(),
+        &prior.checkpoint_digest, &prior.boot_id, &prior.unit_name, &prior.cgroup_path,
+        peer.os_identity(), peer.native_process_id(), peer.boot_identity(),
+        peer.birth_identity(), peer.containment_identity(),
+    ] {
+        field(&mut hash, value.as_bytes());
+    }
+    for value in [
+        identity.incarnation.get(), prior.owner_epoch.get(), context.owner_epoch(),
+        prior.credential_epoch.get(), context.credential_epoch(),
+        u64::from(prior.supervisor_pid), prior.supervisor_start_ticks,
+        u64::from(observed.child_pid), observed.child_start_ticks,
+    ] {
+        field(&mut hash, &value.to_be_bytes());
+    }
+    for (resource, current) in context.resource_input_epochs() {
+        let old = prior.input_epochs.get(resource).ok_or(HostError::StaleGuard)?;
+        field(&mut hash, resource.as_str().as_bytes());
+        field(&mut hash, &old.get().to_be_bytes());
+        field(&mut hash, &current.get().to_be_bytes());
+    }
+    let digest = hash.finalize().iter().map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     RequestDigest::parse(&digest).map_err(|_| HostError::InvalidInput)
 }
@@ -1305,6 +1414,28 @@ pub trait HostDispatchPort {
     fn activate_existing_codex_v2_rebind(
         &self,
         _prepared: &PreparedCodexV2Rebind,
+        _pending_checkpoint_digest: &str,
+    ) -> Result<String, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    fn inspect_existing_operator_process_rebind(
+        &self,
+        _launch: &ResolvedOperatorProcessLaunch,
+    ) -> Result<PortRebindObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    fn prepare_existing_operator_process_rebind(
+        &self,
+        _prepared: &PreparedOperatorProcessRebind,
+    ) -> Result<String, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    fn activate_existing_operator_process_rebind(
+        &self,
+        _prepared: &PreparedOperatorProcessRebind,
         _pending_checkpoint_digest: &str,
     ) -> Result<String, HostError> {
         Err(HostError::Unsupported)
@@ -2715,6 +2846,7 @@ pub struct DurableAuthority<P: HostDispatchPort> {
     launch_profiles: HashMap<String, RegisteredLaunchProfile>,
     native_host: Option<TrustedNativeHostConfig>,
     pending_codex_rebinds: HashMap<(ScopeId, PodId, String), PreparedCodexV2Rebind>,
+    pending_operator_rebinds: HashMap<(ScopeId, PodId, String), PreparedOperatorProcessRebind>,
     active_codex_rebinds: HashSet<(ScopeId, PodId, String)>,
 }
 
@@ -2846,6 +2978,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             launch_profiles: HashMap::new(),
             native_host: None,
             pending_codex_rebinds: HashMap::new(),
+            pending_operator_rebinds: HashMap::new(),
             active_codex_rebinds: HashSet::new(),
         })
     }
@@ -3022,11 +3155,192 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         })
     }
 
+    /// Read-only review of the exact current generic process root. This does
+    /// not manufacture a V2 provider capability or authorize model input.
+    pub fn inspect_committed_operator_process(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<ResolvedOperatorProcessLaunch, RebindContextError> {
+        let initial = self.rebind_context(scope, pod)?;
+        let record = initial.launch().clone();
+        drop(initial);
+        if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+            return Err(HostError::Unsupported.into());
+        }
+        let effective = EffectiveLaunchContract::decode(&record.effective_spec)
+            .map_err(|_| HostError::StaleGuard)?;
+        let descriptor = ImmutableLaunchDescriptor::decode_json(&record.descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        effective.compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::StaleGuard)?;
+        let resource = descriptor.resource(0).ok_or(HostError::StaleGuard)?;
+        if descriptor.profile_ref() != OPERATOR_PROCESS_PROFILE_REF
+            || descriptor.role() != NativeRole::Coordinator
+            || descriptor.work_kind() != NativeWorkKind::Service
+            || descriptor.parent_run_id().is_some()
+            || resource.kind != NativeResourceKind::Auxiliary
+            || !matches!(resource.driver, ResourceDriver::Auxiliary { driver_ref }
+                if driver_ref == "process.exec")
+            || descriptor.scope_id() != record.scope_id
+            || descriptor.session_id() != record.session_id
+            || descriptor.run_id() != record.run_id
+            || descriptor.attempt_id() != record.attempt_id
+            || descriptor.pod_id() != record.pod_id
+            || descriptor.pod_incarnation() != record.pod_incarnation
+            || resource.resource_id != record.resources[0].id
+            || resource.epoch != record.resources[0].epoch
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let profile = self.launch_profiles.get(effective.profile_ref()).cloned()
+            .ok_or(HostError::StaleGuard)?;
+        let host = self.native_host.clone().ok_or(HostError::StaleGuard)?;
+        #[cfg(target_os = "linux")]
+        let store_file_identity = self.database_identity;
+        let mut current = self.rebind_context(scope, pod)?;
+        if current.launch() != &record {
+            return Err(HostError::StaleGuard.into());
+        }
+        let paths = profile.revalidate_committed_native(&host, &effective, &descriptor)
+            .map_err(RebindContextError::Host)?;
+        let resource_input_epochs = current.resource_input_epochs().iter().map(|(id, epoch)| (
+            id.as_str().to_owned(), epoch.get(),
+        )).collect();
+        current.recheck_current()?;
+        Ok(ResolvedOperatorProcessLaunch {
+            record, effective, descriptor, paths,
+            store_path: current.store_path().to_path_buf(),
+            #[cfg(target_os = "linux")]
+            store_file_identity,
+            store_lineage: current.store_lineage().to_owned(),
+            owner_epoch: current.owner_epoch(),
+            credential_epoch: current.credential_epoch(),
+            authority_revision: current.authority_revision(),
+            manager_peer: current.manager_peer().clone(),
+            resource_input_epochs,
+        })
+    }
+
+    /// The operator process uses the common proof-bearing rebind ledger, but
+    /// only its own V1 committed profile and Auxiliary resource can enter.
+    pub fn prepare_current_operator_process_rebind(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<DurableRebindReceipt, RebindContextError> {
+        let command_key = CommandKey::try_from(command_key).map_err(|_| HostError::InvalidInput)?;
+        let reviewed = self.inspect_committed_operator_process(scope, pod)?;
+        let observed = self
+            .host
+            .port()
+            .inspect_existing_operator_process_rebind(&reviewed)?;
+        let fresh = self.inspect_committed_operator_process(scope, pod)?;
+        if fresh.record != reviewed.record
+            || fresh.effective.canonical_bytes() != reviewed.effective.canonical_bytes()
+            || fresh.descriptor_bytes() != reviewed.descriptor_bytes()
+            || fresh.store_path != reviewed.store_path
+            || fresh.store_file_identity != reviewed.store_file_identity
+            || fresh.store_lineage != reviewed.store_lineage
+            || fresh.owner_epoch != reviewed.owner_epoch
+            || fresh.credential_epoch != reviewed.credential_epoch
+            || fresh.authority_revision != reviewed.authority_revision
+            || fresh.manager_peer != reviewed.manager_peer
+            || fresh.resource_input_epochs != reviewed.resource_input_epochs
+            || fresh.cwd() != reviewed.cwd()
+            || fresh.executable() != reviewed.executable()
+            || fresh.executable_sha256() != reviewed.executable_sha256()
+            || observed.descriptor_digest != reviewed.descriptor.digest()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let mut context = self.rebind_context(scope, pod)?;
+        context.recheck_current()?;
+        if context.launch() != &reviewed.record
+            || context.store_path() != reviewed.store_path()
+            || context.store_lineage() != reviewed.store_lineage()
+            || context.owner_epoch() != reviewed.owner_epoch()
+            || context.credential_epoch() != reviewed.credential_epoch()
+            || context.authority_revision() != reviewed.authority_revision()
+            || context.manager_peer() != reviewed.manager_peer()
+            || observed.prior.identity != *context.identity()
+            || observed.prior.phase != podbay_core::RebindPhase::Active
+            || observed.prior.owner_epoch.get() >= context.owner_epoch()
+            || observed.prior.credential_epoch.get() >= context.credential_epoch()
+            || observed.prior.input_epochs.len() != context.resource_input_epochs().len()
+            || format!("linux.boot.{}", observed.prior.boot_id)
+                != context.manager_peer().boot_identity()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let expected_inputs = observed.prior.input_epochs.clone();
+        for (resource_id, current) in context.resource_input_epochs() {
+            if expected_inputs
+                .get(resource_id)
+                .is_none_or(|prior| prior.get() >= current.get())
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        let digest = digest_operator_process_rebind_intent(&command_key, &context, &reviewed, &observed)?;
+        let proposal = RebindProposal {
+            identity: context.identity().clone(),
+            expected_owner_epoch: observed.prior.owner_epoch,
+            next_owner_epoch: OwnerEpoch::new(context.owner_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            expected_credential_epoch: observed.prior.credential_epoch,
+            next_credential_epoch: CredentialEpoch::new(context.credential_epoch())
+                .map_err(|_| HostError::StaleGuard)?,
+            expected_input_epochs: expected_inputs,
+            next_input_epochs: context.resource_input_epochs().clone(),
+            next_manager: context.manager_peer().clone(),
+            command_key,
+            digest,
+        };
+        // SQLite verifies the current destination claim and exact target
+        // epochs in the same IMMEDIATE transaction as the Pending insert.
+        let receipt = context
+            .store
+            .prepare_manager_rebind_from_host_observation(&proposal, &observed.prior)?;
+        if receipt.phase != DurableRebindPhase::Pending {
+            return Err(StoreError::Conflict("rebind is no longer Pending").into());
+        }
+        let cache_key = (
+            scope.clone(),
+            pod.clone(),
+            proposal.command_key.as_str().to_owned(),
+        );
+        let prepared = PreparedOperatorProcessRebind {
+            proposal,
+            pending_receipt: receipt.clone(),
+            prior_checkpoint_digest: observed.prior.checkpoint_digest.clone(),
+            record: reviewed.record.clone(),
+            store_path: reviewed.store_path.clone(),
+            #[cfg(target_os = "linux")]
+            store_file_identity: reviewed.store_file_identity,
+            manager_peer: reviewed.manager_peer.clone(),
+            authority_revision: reviewed.authority_revision,
+        };
+        drop(context);
+        if self
+            .pending_operator_rebinds
+            .get(&cache_key)
+            .is_some_and(|old| {
+                old.proposal != prepared.proposal
+                    || old.prior_checkpoint_digest != prepared.prior_checkpoint_digest
+                    || old.record != prepared.record
+            })
+        {
+            return Err(StoreError::Conflict("cached rebind intent differs").into());
+        }
+        self.pending_operator_rebinds.insert(cache_key, prepared);
+        Ok(receipt)
+    }
+
     /// Prepare one existing Codex V2 pod for manager rebind. This calls only
     /// the installed trusted read-only port; callers supply a key and current
     /// Pod selector, never a checkpoint, manager peer, epoch or proof DTO.
-    /// The first atom commits Pending only. A later pod-side protocol must
-    /// fsync and acknowledge before activation is possible.
     pub fn prepare_current_codex_v2_rebind(
         &mut self,
         scope: &ScopeId,
@@ -3141,6 +3455,33 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         Ok(receipt)
     }
 
+    fn recheck_prepared_operator_process_rebind(
+        &mut self,
+        prepared: &PreparedOperatorProcessRebind,
+    ) -> Result<(), RebindContextError> {
+        let proposal = &prepared.proposal;
+        let mut context =
+            self.rebind_context(&proposal.identity.scope_id, &proposal.identity.pod_id)?;
+        context.recheck_current()?;
+        if context.identity() != &proposal.identity
+            || context.launch() != &prepared.record
+            || context.store_path() != prepared.store_path()
+            || context.owner_epoch() != proposal.next_owner_epoch.get()
+            || context.credential_epoch() != proposal.next_credential_epoch.get()
+            || context.manager_peer() != &proposal.next_manager
+            || context.manager_peer() != prepared.manager_peer()
+            || context.authority_revision() != prepared.authority_revision
+            || context.resource_input_epochs() != &proposal.next_input_epochs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        #[cfg(target_os = "linux")]
+        if context.database_identity != prepared.store_file_identity() {
+            return Err(HostError::StaleGuard.into());
+        }
+        Ok(())
+    }
+
     fn recheck_prepared_codex_v2_rebind(
         &mut self,
         prepared: &PreparedCodexV2Rebind,
@@ -3168,10 +3509,166 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         Ok(())
     }
 
+    /// Finish only this manager's exact operator-process Pending row. A lost
+    /// pod reply remains explicit uncertainty; no child is relaunched.
+    pub fn complete_current_operator_process_rebind(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+        command_key: &str,
+    ) -> Result<RebindCompletionReceipt, RebindContextError> {
+        let cache_key = (scope.clone(), pod.clone(), command_key.to_owned());
+        if !self.pending_operator_rebinds.contains_key(&cache_key) {
+            self.prepare_current_operator_process_rebind(scope, pod, command_key)?;
+        }
+        let prepared = self
+            .pending_operator_rebinds
+            .get(&cache_key)
+            .ok_or(StoreError::Conflict("prepared rebind proof disappeared"))?
+            .clone();
+        let outcome = |durable: DurableRebindReceipt,
+                       stage: RebindCompletionStage,
+                       pending: Option<String>,
+                       active: Option<String>| RebindCompletionReceipt {
+            durable,
+            stage,
+            pending_checkpoint_digest: pending,
+            active_checkpoint_digest: active,
+        };
+        let fallback = || {
+            outcome(
+                prepared.pending_receipt.clone(),
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            )
+        };
+        if self.recheck_prepared_operator_process_rebind(&prepared).is_err() {
+            return Ok(fallback());
+        }
+        let mut durable = match self.store.lookup_prior_observed_rebind(&prepared.proposal) {
+            Ok(Some(found)) => found.receipt,
+            _ => return Ok(fallback()),
+        };
+        let mut pending_digest = durable.pod_checkpoint_ref.clone();
+        if durable.phase == DurableRebindPhase::Pending {
+            let digest = match self.host.port().prepare_existing_operator_process_rebind(&prepared) {
+                Ok(value) if valid_rebind_checkpoint_digest(&value) => value,
+                _ => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::PendingPodUnknown,
+                        None,
+                        None,
+                    ));
+                }
+            };
+            if self.recheck_prepared_operator_process_rebind(&prepared).is_err() {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::PendingPodUnknown,
+                    Some(digest),
+                    None,
+                ));
+            }
+            durable = match self
+                .store
+                .acknowledge_prior_observed_pod_rebind(&prepared.proposal, &digest)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::PendingPodUnknown,
+                        Some(digest),
+                        None,
+                    ));
+                }
+            };
+            pending_digest = Some(digest);
+        }
+        let Some(digest) = pending_digest else {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            ));
+        };
+        if !valid_rebind_checkpoint_digest(&digest) {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PendingPodUnknown,
+                None,
+                None,
+            ));
+        }
+        if durable.phase == DurableRebindPhase::PodAcknowledged {
+            if self.recheck_prepared_operator_process_rebind(&prepared).is_err() {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::PodAcknowledged,
+                    Some(digest),
+                    None,
+                ));
+            }
+            durable = match self
+                .store
+                .activate_prior_observed_manager_rebind(&prepared.proposal, &digest)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(outcome(
+                        durable,
+                        RebindCompletionStage::StoreActivationUnknown,
+                        Some(digest),
+                        None,
+                    ));
+                }
+            };
+        }
+        if durable.phase != DurableRebindPhase::Activated {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::PodAcknowledged,
+                Some(digest),
+                None,
+            ));
+        }
+        let active = match self
+            .host
+            .port()
+            .activate_existing_operator_process_rebind(&prepared, &digest)
+        {
+            Ok(value) if valid_rebind_checkpoint_digest(&value) => value,
+            _ => {
+                return Ok(outcome(
+                    durable,
+                    RebindCompletionStage::StoreActivatedPodUnconfirmed,
+                    Some(digest),
+                    None,
+                ));
+            }
+        };
+        if self.recheck_prepared_operator_process_rebind(&prepared).is_err() {
+            return Ok(outcome(
+                durable,
+                RebindCompletionStage::StoreActivatedPodUnconfirmed,
+                Some(digest),
+                None,
+            ));
+        }
+        Ok(outcome(
+            durable,
+            RebindCompletionStage::PodActive,
+            Some(digest),
+            Some(active),
+        ))
+    }
+
     /// Complete only an already durable, proof-bearing Pending V2 rebind.
-    /// After admission this always returns a known receipt and a truthful
-    /// stage, including after lost pod replies. A same-manager retry uses the
-    /// cached private proposal; it never reinspects Pending as prior Active.
+    /// After admission this returns a known receipt and a truthful stage,
+    /// including after lost pod replies. No child is relaunched.
     pub fn complete_current_codex_v2_rebind(
         &mut self,
         scope: &ScopeId,
@@ -3333,6 +3830,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     /// is sent. The old writer epoch is read as fenced CAS evidence; the
     /// current store target, owner actor, grant and manager claim are checked
     /// again before returning a usable lease.
+    /// Take over only the initial structured writer after PodActive. This is
+    /// separate from generic process control and sends no native input.
     pub fn takeover_initial_writer_after_active_rebind(
         &mut self,
         scope: &ScopeId,

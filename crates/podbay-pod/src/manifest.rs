@@ -130,7 +130,7 @@ pub const SYNTHETIC_CAPABILITY: &str = "synthetic_fixture_only";
 #[cfg(target_os = "linux")]
 pub const OPERATOR_PROCESS_CAPABILITY: &str = "operator_process_v1";
 #[cfg(target_os = "linux")]
-pub const OPERATOR_PROCESS_PROFILE_REF: &str = "podbay.operator.process.exec.v1";
+pub use podbay_wire::OPERATOR_PROCESS_PROFILE_REF;
 #[cfg(target_os = "linux")]
 pub const CODEX_V2_CAPABILITY: &str = "codex_app_server_v2";
 

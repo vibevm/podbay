@@ -14,8 +14,9 @@ use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
     PortDispatchOutcome, PortRebindObservation, PortReceiptRef, PreparedCodexV2Rebind,
-    ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch,
-    ResolvedNativeLaunch,
+    PreparedOperatorProcessRebind, ResolvedClaimedBootstrap,
+    ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
+    ResolvedOperatorProcessLaunch,
 };
 use podbay_pod::{
     BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
@@ -24,7 +25,7 @@ use podbay_pod::{
     RebindInspection,
 };
 use podbay_store::{
-    BootstrapSendSelector, BoundLaunchRecord, DurableRebindPhase, EffectState,
+    BootstrapSendSelector, BoundLaunchFormat, BoundLaunchRecord, DurableRebindPhase, EffectState,
     HostObservedPriorCheckpoint, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
 };
 use podbay_wire::{
@@ -970,6 +971,69 @@ impl HostDispatchPort for LinuxLaunchPort {
         Ok(digest)
     }
 
+    fn inspect_existing_operator_process_rebind(
+        &self,
+        launch: &ResolvedOperatorProcessLaunch,
+    ) -> Result<PortRebindObservation, podbay_host::HostError> {
+        self.inspect_operator_process_rebind(launch)
+            .map_err(|_| podbay_host::HostError::StaleGuard)
+    }
+
+    fn prepare_existing_operator_process_rebind(
+        &self,
+        prepared: &PreparedOperatorProcessRebind,
+    ) -> Result<String, podbay_host::HostError> {
+        let path = self.recheck_prepared_operator_rebind(
+            prepared, DurableRebindPhase::Pending, None,
+        ).map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let digest = PodClient::prepare_rebind(
+            &path, prepared.proposal(), prepared.prior_checkpoint_digest(),
+        ).map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+        })?;
+        self.recheck_prepared_operator_rebind(prepared, DurableRebindPhase::Pending, None)
+            .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+                command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+            })?;
+        Ok(digest)
+    }
+
+    fn activate_existing_operator_process_rebind(
+        &self,
+        prepared: &PreparedOperatorProcessRebind,
+        pending_checkpoint_digest: &str,
+    ) -> Result<String, podbay_host::HostError> {
+        let path = self.recheck_prepared_operator_rebind(
+            prepared, DurableRebindPhase::Activated, Some(pending_checkpoint_digest),
+        ).map_err(|_| podbay_host::HostError::StaleGuard)?;
+        let digest = PodClient::activate_rebind(
+            &path, prepared.proposal(), prepared.prior_checkpoint_digest(),
+            pending_checkpoint_digest,
+        ).map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+        })?;
+        self.recheck_prepared_operator_rebind(
+            prepared, DurableRebindPhase::Activated, Some(pending_checkpoint_digest),
+        ).map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+        })?;
+        let binding = podbay_pod::current_bound_peer_binding(&path)
+            .map_err(|_| podbay_host::HostError::UncertainAfterPossibleEffect {
+                command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+            })?;
+        if binding.capability != OPERATOR_PROCESS_CAPABILITY
+            || binding.owner_epoch != prepared.proposal().next_owner_epoch.get()
+            || binding.credential_epoch != prepared.proposal().next_credential_epoch.get()
+            || binding.resource_input_epochs != prepared.proposal().next_input_epochs.iter()
+                .map(|(id, epoch)| (id.as_str().to_owned(), epoch.get())).collect()
+        {
+            return Err(podbay_host::HostError::UncertainAfterPossibleEffect {
+                command_key: prepared.proposal().command_key.as_str().into(), receipt_ref: None,
+            });
+        }
+        Ok(digest)
+    }
+
     fn accepts_claimed_codex_bootstrap(&self) -> bool {
         self.config.recheck().is_ok()
     }
@@ -1479,6 +1543,296 @@ impl VerifiedRebindInspection {
 }
 
 impl LinuxLaunchPort {
+    fn recheck_operator_launch(
+        &self,
+        launch: &ResolvedOperatorProcessLaunch,
+    ) -> Result<LinuxPeerEvidence, PodError> {
+        self.config.recheck()?;
+        let profile = self.operator_process.as_ref().ok_or(PodError::Refused(
+            "operator process profile is not installed"))?;
+        profile.recheck()?;
+        let wire = launch.descriptor();
+        let record = launch.committed_record();
+        let resource = wire.resource(0).ok_or(PodError::Refused(
+            "operator process Resource is absent"))?;
+        if record.format != BoundLaunchFormat::V1
+            || record.resources.len() != 1
+            || wire.profile_ref() != OPERATOR_PROCESS_PROFILE_REF
+            || wire.profile_generation() != profile.profile_generation
+            || wire.role() != NativeRole::Coordinator
+            || wire.work_kind() != NativeWorkKind::Service
+            || wire.parent_run_id().is_some()
+            || wire.resources_len() != 1
+            || resource.kind != NativeResourceKind::Auxiliary
+            || !matches!(resource.driver, ResourceDriver::Auxiliary { driver_ref }
+                if driver_ref == "process.exec")
+            || resource.resource_id != record.resources[0].id
+            || resource.epoch != record.resources[0].epoch
+            || wire.scope_id() != record.scope_id
+            || wire.pod_id() != record.pod_id
+            || wire.attempt_id() != record.attempt_id
+            || wire.pod_incarnation() != record.pod_incarnation
+            || launch.cwd() != profile.cwd
+            || launch.executable() != profile.executable
+            || launch.executable_sha256() != profile.executable_sha256
+            || wire.arguments() != profile.arguments
+            || wire.wall_seconds() != profile.wall_seconds
+            || launch.effective().compare_with_descriptor(wire).is_err()
+        {
+            return Err(PodError::Refused("operator process committed policy differs"));
+        }
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("operator rebind manager OS peer unavailable"))?;
+        if manager.attested_peer() != launch.manager_peer()
+            || checked_store_file(launch.store_path(), manager.uid())?
+                != launch.store_file_identity()
+        {
+            return Err(PodError::Refused("operator rebind manager/store changed"));
+        }
+        let mut store = PodBayStore::open_existing_read_only(launch.store_path())
+            .map_err(|_| PodError::Refused("operator rebind store unavailable"))?;
+        let current = store.current_bound_pod_snapshot(wire.scope_id(), wire.pod_id())
+            .map_err(|_| PodError::Refused("operator rebind Pod unavailable"))?;
+        let claim = store.current_manager_credential_claim(launch.owner_epoch())
+            .map_err(|_| PodError::Refused("operator rebind claim unavailable"))?;
+        let inputs = current.resources().iter().map(|resource| (
+            resource.id().as_str().to_owned(), resource.input_epoch().get(),
+        )).collect::<BTreeMap<_, _>>();
+        if current.launch() != record
+            || current.store_lineage().as_str() != launch.store_lineage()
+            || current.owner_epoch().get() != launch.owner_epoch()
+            || current.authority_revision() != launch.authority_revision()
+            || claim.store_lineage() != launch.store_lineage()
+            || claim.credential_epoch() != launch.credential_epoch()
+            || !store.current_manager_peer_matches(&claim, manager.attested_peer())
+                .map_err(|_| PodError::Refused("operator rebind peer unavailable"))?
+            || inputs != *launch.resource_input_epochs()
+        {
+            return Err(PodError::Refused("operator rebind current target changed"));
+        }
+        Ok(manager)
+    }
+
+    fn inspect_operator_process_rebind(
+        &self,
+        launch: &ResolvedOperatorProcessLaunch,
+    ) -> Result<PortRebindObservation, PodError> {
+        let manager = self.recheck_operator_launch(launch)?;
+        let record = launch.committed_record();
+        let wire = launch.descriptor();
+        let identity = PodFenceIdentity {
+            scope_id: ScopeId::try_from(record.scope_id.as_str())
+                .map_err(|_| PodError::Invalid("operator rebind scope"))?,
+            pod_id: PodId::try_from(record.pod_id.as_str())
+                .map_err(|_| PodError::Invalid("operator rebind Pod"))?,
+            attempt_id: AttemptId::try_from(record.attempt_id.as_str())
+                .map_err(|_| PodError::Invalid("operator rebind Attempt"))?,
+            incarnation: Epoch::new(record.pod_incarnation)
+                .map_err(|_| PodError::Invalid("operator rebind incarnation"))?,
+            store_lineage: StoreLineageId::try_from(launch.store_lineage())
+                .map_err(|_| PodError::Invalid("operator rebind lineage"))?,
+        };
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory, &identity.pod_id, &identity.attempt_id, identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.nlink() != 1
+            || metadata.uid() != manager.uid() || metadata.mode() & 0o077 != 0
+            || !(1..=65_536).contains(&metadata.len())
+            || fs::canonicalize(&path)? != path
+        {
+            return Err(PodError::Refused("operator rebind manifest path changed"));
+        }
+        let bytes = read_rebind_manifest_bytes(&path)?;
+        let manifest: PodManifest = serde_json::from_slice(&bytes)?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+            "operator rebind manifest is unbound"))?;
+        let expected_unit = format!("podbay-pod-{}.service",
+            path.file_stem().and_then(|value| value.to_str())
+                .ok_or(PodError::Invalid("operator manifest slot"))?);
+        if binding.protocol != "podbay.peer-binding/1"
+            || binding.capability != OPERATOR_PROCESS_CAPABILITY
+            || binding.wire_descriptor != launch.descriptor_bytes()
+            || binding.effective_spec != launch.effective_spec_bytes()
+            || binding.descriptor_digest != wire.digest()
+            || binding.effective_digest != launch.effective().digest()
+            || binding.resource_epoch != wire.resource(0).unwrap().epoch
+            || binding.store_path != launch.store_path()
+            || binding.store_lineage != launch.store_lineage()
+            || binding.canonical_executable != launch.executable()
+            || binding.executable_sha256 != launch.executable_sha256()
+            || manifest.unit_name != expected_unit
+            || manifest.descriptor.pod_id != record.pod_id
+            || manifest.descriptor.attempt_id != record.attempt_id
+            || manifest.descriptor.incarnation != record.pod_incarnation
+            || manifest.descriptor.resource_id != record.resources[0].id
+            || manifest.descriptor.pty.is_some()
+        {
+            return Err(PodError::Refused("operator rebind immutable launch differs"));
+        }
+        let first = PodClient::inspect_rebind(
+            &path, &identity, launch.owner_epoch(), launch.credential_epoch(),
+        )?;
+        if first.unit_name != expected_unit
+            || first.boot_id != manager.boot_id()
+            || first.prior_owner_epoch == 0
+            || first.prior_owner_epoch >= launch.owner_epoch()
+            || first.prior_credential_epoch == 0
+            || first.prior_credential_epoch >= launch.credential_epoch()
+            || first.prior_input_epochs.len() != launch.resource_input_epochs().len()
+        {
+            return Err(PodError::Refused("operator rebind checkpoint differs"));
+        }
+        let mut old_inputs = BTreeMap::new();
+        for (id, next) in launch.resource_input_epochs() {
+            let old = first.prior_input_epochs.get(id)
+                .ok_or(PodError::Refused("operator rebind Resource set differs"))?;
+            if *old == 0 || old >= next {
+                return Err(PodError::Refused("operator rebind input did not advance"));
+            }
+            old_inputs.insert(ResourceId::try_from(id.as_str())
+                .map_err(|_| PodError::Invalid("operator Resource ID"))?,
+                InputEpoch::new(*old).map_err(|_| PodError::Invalid("operator old input"))?);
+        }
+        attest_rebind_process_pair(&first, manager.uid(), manager.gid())?;
+        attest_rebind_systemd_unit(&first.unit_name, first.supervisor_pid, &first.cgroup_path)?;
+        if self.recheck_operator_launch(launch)? != manager
+            || fs::symlink_metadata(&path).map(|value| (value.dev(), value.ino()))?
+                != (metadata.dev(), metadata.ino())
+            || read_rebind_manifest_bytes(&path)? != bytes
+        {
+            return Err(PodError::Refused("operator rebind manager or manifest changed"));
+        }
+        let second = PodClient::inspect_rebind(
+            &path, &identity, launch.owner_epoch(), launch.credential_epoch(),
+        )?;
+        let mut comparable_second = second.clone();
+        comparable_second.nonce = first.nonce.clone();
+        if comparable_second != first {
+            return Err(PodError::Refused("operator rebind inspection changed"));
+        }
+        attest_rebind_process_pair(&second, manager.uid(), manager.gid())?;
+        attest_rebind_systemd_unit(&second.unit_name, second.supervisor_pid, &second.cgroup_path)?;
+        let prior = HostObservedPriorCheckpoint {
+            identity, phase: RebindPhase::Active,
+            owner_epoch: OwnerEpoch::new(second.prior_owner_epoch)
+                .map_err(|_| PodError::Invalid("operator old owner"))?,
+            credential_epoch: CredentialEpoch::new(second.prior_credential_epoch)
+                .map_err(|_| PodError::Invalid("operator old credential"))?,
+            input_epochs: old_inputs, checkpoint_digest: second.checkpoint_digest,
+            supervisor_pid: second.supervisor_pid,
+            supervisor_start_ticks: second.supervisor_start_ticks,
+            boot_id: second.boot_id, unit_name: second.unit_name,
+            cgroup_path: second.cgroup_path,
+        };
+        PortRebindObservation::from_trusted_port(
+            prior, wire.digest().to_owned(), second.child_pid, second.child_start_ticks,
+        ).map_err(|_| PodError::Refused("operator port observation is malformed"))
+    }
+
+    fn recheck_prepared_operator_rebind(
+        &self,
+        prepared: &PreparedOperatorProcessRebind,
+        phase: DurableRebindPhase,
+        checkpoint_ref: Option<&str>,
+    ) -> Result<PathBuf, PodError> {
+        self.config.recheck()?;
+        let profile = self.operator_process.as_ref().ok_or(PodError::Refused(
+            "operator process profile is absent"))?;
+        profile.recheck()?;
+        let wire = podbay_wire::ImmutableLaunchDescriptor::decode_json(
+            &prepared.record().descriptor,
+        ).map_err(|_| PodError::Refused("operator rebind descriptor is malformed"))?;
+        if prepared.record().format != BoundLaunchFormat::V1
+            || wire.profile_ref() != OPERATOR_PROCESS_PROFILE_REF
+            || wire.profile_generation() != profile.profile_generation
+            || wire.role() != NativeRole::Coordinator
+            || wire.work_kind() != NativeWorkKind::Service
+            || wire.executable() != profile.executable.to_string_lossy()
+            || wire.cwd() != profile.cwd.to_string_lossy()
+            || wire.arguments() != profile.arguments
+            || wire.wall_seconds() != profile.wall_seconds
+        {
+            return Err(PodError::Refused("operator rebind trusted profile differs"));
+        }
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("rebind manager OS identity unavailable"))?;
+        if manager.attested_peer() != prepared.manager_peer()
+            || checked_store_file(prepared.store_path(), manager.uid())?
+                != prepared.store_file_identity()
+        {
+            return Err(PodError::Refused("rebind manager store path changed"));
+        }
+        let proposal = prepared.proposal();
+        let mut store = PodBayStore::open_existing_read_only(prepared.store_path())
+            .map_err(|_| PodError::Refused("rebind store unavailable"))?;
+        let claim = store
+            .current_manager_credential_claim(proposal.next_owner_epoch.get())
+            .map_err(|_| PodError::Refused("rebind manager claim unavailable"))?;
+        let current = store
+            .current_bound_pod_snapshot(
+                proposal.identity.scope_id.as_str(),
+                proposal.identity.pod_id.as_str(),
+            )
+            .map_err(|_| PodError::Refused("rebind Pod binding unavailable"))?;
+        let readback = store
+            .lookup_prior_observed_rebind(proposal)
+            .map_err(|_| PodError::Refused("rebind Pending proof unavailable"))?
+            .ok_or(PodError::Refused("rebind Pending row absent"))?;
+        let current_inputs = current
+            .resources()
+            .iter()
+            .map(|resource| (resource.id().clone(), resource.input_epoch()))
+            .collect::<BTreeMap<_, _>>();
+        if claim.store_lineage() != proposal.identity.store_lineage.as_str()
+            || claim.credential_epoch() != proposal.next_credential_epoch.get()
+            || !store
+                .current_manager_peer_matches(&claim, manager.attested_peer())
+                .map_err(|_| PodError::Refused("rebind manager peer unavailable"))?
+            || current.owner_epoch().get() != proposal.next_owner_epoch.get()
+            || current.authority_revision() != prepared.authority_revision()
+            || current.launch() != prepared.record()
+            || current_inputs != proposal.next_input_epochs
+            || readback.receipt.phase != phase
+            || readback.receipt.pod_checkpoint_ref.as_deref() != checkpoint_ref
+        {
+            return Err(PodError::Refused("rebind destination or Pod changed"));
+        }
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &proposal.identity.pod_id,
+            &proposal.identity.attempt_id,
+            proposal.identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != manager.uid()
+            || metadata.mode() & 0o077 != 0
+            || fs::canonicalize(&path)? != path
+        {
+            return Err(PodError::Refused("rebind manifest path changed"));
+        }
+        let manifest: PodManifest = serde_json::from_slice(&read_rebind_manifest_bytes(&path)?)?;
+        let binding = manifest
+            .peer_binding
+            .as_ref()
+            .ok_or(PodError::Refused("rebind manifest lacks operator process binding"))?;
+        if binding.protocol != "podbay.peer-binding/1"
+            || binding.capability != OPERATOR_PROCESS_CAPABILITY
+            || binding.wire_descriptor != prepared.record().descriptor
+            || binding.effective_spec != prepared.record().effective_spec
+            || binding.store_path != prepared.store_path()
+            || binding.store_lineage != proposal.identity.store_lineage.as_str()
+            || manifest.descriptor.pod_id != proposal.identity.pod_id.as_str()
+            || manifest.descriptor.attempt_id != proposal.identity.attempt_id.as_str()
+            || manifest.descriptor.incarnation != proposal.identity.incarnation.get()
+        {
+            return Err(PodError::Refused("rebind manifest immutable bytes differ"));
+        }
+        Ok(path)
+    }
+
     fn recheck_prepared_rebind(
         &self,
         prepared: &PreparedCodexV2Rebind,

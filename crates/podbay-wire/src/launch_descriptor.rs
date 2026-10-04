@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use crate::{CodexAppServerPolicyV2, MAX_FRAME_BYTES, ProtocolVersion};
 
 pub const LAUNCH_DESCRIPTOR_SCHEMA: &str = "podbay.launch-descriptor/1";
+/// Operator-installed V1 Auxiliary process profile; a request cannot define
+/// its executable, argv, cwd or private data directory.
+pub const OPERATOR_PROCESS_PROFILE_REF: &str = "podbay.operator.process.exec.v1";
 const DIGEST_DOMAIN: &[u8] = b"podbay.launch-descriptor/1\0";
 pub const LAUNCH_DESCRIPTOR_V2_SCHEMA: &str = "podbay.launch-descriptor/2";
 const DIGEST_DOMAIN_V2: &[u8] = b"podbay.launch-descriptor/2\0";

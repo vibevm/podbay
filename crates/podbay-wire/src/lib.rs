@@ -41,7 +41,8 @@ pub use error::WireError;
 pub use frame::{MAX_FRAME_BYTES, decode_frame_bytes, encode_frame};
 pub use launch_descriptor::{
     ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LAUNCH_DESCRIPTOR_SCHEMA,
-    LAUNCH_DESCRIPTOR_V2_SCHEMA, LaunchDescriptorError, NativeResourceKind, NativeResourceView,
+    LAUNCH_DESCRIPTOR_V2_SCHEMA, OPERATOR_PROCESS_PROFILE_REF, LaunchDescriptorError,
+    NativeResourceKind, NativeResourceView,
     NativeRole, NativeWorkKind, ResourceDriver, ReviewedNativePolicy, ReviewedResource, TargetOs,
 };
 pub use observation::{

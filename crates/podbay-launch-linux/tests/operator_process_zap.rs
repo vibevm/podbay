@@ -6,7 +6,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
@@ -17,9 +17,9 @@ use podbay_core::{
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, DurableAuthority,
-    ExecutionMode, GrantMode, GrantSpec, GuardSet, HostAction, HostError, HostRequest,
-    LaunchSelection, ManagerEpoch, Operation, PodIncarnation, RegisteredLaunchProfile, Right,
-    Target, TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
+    ExecutionMode, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError,
+    HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation, RegisteredLaunchProfile,
+    Right, Target, TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
     WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
@@ -39,6 +39,23 @@ struct Fixture {
     database: PathBuf,
     state: PathBuf,
     unit: Option<String>,
+}
+
+struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
 }
 
 impl Fixture {
@@ -65,13 +82,41 @@ impl Fixture {
             unit: None,
         }
     }
+
+    fn from_shared(root: PathBuf) -> Self {
+        let root = fs::canonicalize(root).unwrap();
+        Self {
+            database: root.join("store.sqlite"),
+            pod_directory: root.join("pods"),
+            state: root.join("zap-state"),
+            root,
+            unit: None,
+        }
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Some(unit) = &self.unit {
+        let mut units = self.unit.clone().into_iter().collect::<Vec<_>>();
+        if let Ok(entries) = fs::read_dir(&self.pod_directory) {
+            for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                    && stem.len() == 32
+                    && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    let unit = format!("podbay-pod-{stem}.service");
+                    if !units.contains(&unit) {
+                        units.push(unit);
+                    }
+                }
+            }
+        }
+        for unit in units {
             let _ = Command::new("systemctl")
-                .args(["--user", "stop", unit])
+                .args(["--user", "stop", &unit])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -185,6 +230,59 @@ if (!setup.ok || setup.value.operation !== 'product.setup.get.v1'
     );
 }
 
+/// One pairing and one cookie persist across both manager processes. A
+/// second pairing would test Zap's one-use token rather than PodBay recovery.
+fn spawn_authenticated_rebind_probe(
+    node: &Path,
+    zap_root: &Path,
+    output_path: &Path,
+    ready: &Path,
+    resume: &Path,
+) -> Child {
+    const SCRIPT: &str = r#"
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { createWorkspaceHttpConnection } from './src/cells/workspace-client/index.ts';
+const receipt = JSON.parse(readFileSync(process.argv[1], 'utf8').split('\n')[0]);
+const attach = new URL(receipt.url);
+const gateway = attach.searchParams.get('workspace-gateway');
+const pairing = new URLSearchParams(attach.hash.slice(1)).get('workspace-pair');
+if (!gateway || !pairing) process.exit(2);
+const connection = createWorkspaceHttpConnection({
+  baseUrl: gateway, origin: attach.origin, pairingToken: pairing,
+});
+if (!connection) process.exit(3);
+async function check() {
+  const setup = await connection.product.request({operation:'product.setup.get.v1'});
+  return setup.ok && setup.value.operation === 'product.setup.get.v1'
+      && setup.value.snapshot.projects.length === 0;
+}
+if (!(await check())) process.exit(4);
+writeFileSync(process.argv[2], 'paired', {mode:0o600});
+let released = false;
+for (let i=0; i<1200; i++) {
+  if (existsSync(process.argv[3])) { released=true; break; }
+  await sleep(25);
+}
+if (!released || !(await check())) process.exit(5);
+"#;
+    Command::new(node)
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            SCRIPT,
+        ])
+        .arg(output_path)
+        .arg(ready)
+        .arg(resume)
+        .current_dir(zap_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap()
+}
+
 #[test]
 fn operator_profile_refuses_private_data_directory_drift_before_effect() {
     let fixture = Fixture::new();
@@ -226,7 +324,11 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
     let pod_binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let zap_root = fs::canonicalize(std::env::var_os("PODBAY_TEST_ZAP_ROOT").unwrap()).unwrap();
     let node = node_binary();
-    let mut fixture = Fixture::new();
+    let shared = std::env::var_os("PODBAY_REBIND_FIXTURE_ROOT");
+    let mut fixture = shared
+        .as_ref()
+        .map(|root| Fixture::from_shared(root.into()))
+        .unwrap_or_else(Fixture::new);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let ui_port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -489,8 +591,37 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
     assert_eq!(receipt["viewerOpened"], false);
     assert_eq!(receipt["reusedOwner"], false);
     let url = receipt["url"].as_str().unwrap();
-    assert_authenticated_empty_setup(&node, &zap_root, url);
+    if shared.is_none() {
+        assert_authenticated_empty_setup(&node, &zap_root, url);
+    }
     assert!(client.attested_status().unwrap().child_running);
+    if shared.is_some() {
+        fs::write(
+            fixture.root.join("manager-a.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "scope_id": scope.as_str(), "pod_id": pod_id.as_str(),
+                "attempt_id": attempt_id.as_str(), "resource_id": resource_id.as_str(),
+                "manifest_path": manifest_path, "unit": fixture.unit.as_deref(),
+                "supervisor_pid": before.supervisor_pid,
+                "supervisor_start_ticks": before.supervisor_start_ticks,
+                "child_pid": before.child_pid,
+                "child_start_ticks": before.child_start_ticks,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let release = fixture.root.join("manager-a-exit");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "manager A exit barrier timed out"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        std::mem::forget(fixture);
+        return;
+    }
     assert!(!client.stop().unwrap().child_running);
     let deadline = Instant::now() + Duration::from_secs(5);
     while manifest.socket_path.exists() && Instant::now() < deadline {
@@ -518,6 +649,283 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
         assert!(
             Instant::now() < deadline,
             "disposable PodBay unit remained loaded"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+#[ignore = "helper for disposable two-manager operator process fixture"]
+fn operator_sibling_status_helper() {
+    let manifest = PathBuf::from(std::env::var_os("PODBAY_REBIND_MANIFEST").unwrap());
+    assert!(
+        PodClient::connect(&manifest).is_err(),
+        "same-UID sibling may not inherit the current manager's control"
+    );
+}
+
+fn proc_start_ticks(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
+fn real_zap_child_survives_manager_a_and_rebinds_to_b() {
+    let pod_binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let zap_root = fs::canonicalize(std::env::var_os("PODBAY_TEST_ZAP_ROOT").unwrap()).unwrap();
+    let node = node_binary();
+    let mut fixture = Fixture::new();
+    let mut manager_a = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "real_zap_server_runs_once_as_attested_pod_child",
+                "--nocapture",
+            ])
+            .env("PODBAY_TEST_POD_BINARY", &pod_binary)
+            .env("PODBAY_TEST_ZAP_ROOT", &zap_root)
+            .env("PODBAY_REBIND_FIXTURE_ROOT", &fixture.root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let marker_path = fixture.root.join("manager-a.json");
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
+    while !marker_path.exists() {
+        assert!(
+            manager_a.try_wait().unwrap().is_none(),
+            "manager A exited before launch proof"
+        );
+        assert!(
+            Instant::now() < wait_deadline,
+            "manager A launch proof timed out"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    let field = |name: &str| marker[name].as_str().unwrap().to_owned();
+    let scope = ScopeId::try_from(field("scope_id").as_str()).unwrap();
+    let pod = PodId::try_from(field("pod_id").as_str()).unwrap();
+    let manifest_path = PathBuf::from(field("manifest_path"));
+    fixture.unit = Some(field("unit"));
+    let a_supervisor = marker["supervisor_pid"].as_u64().unwrap() as u32;
+    let a_supervisor_birth = marker["supervisor_start_ticks"].as_u64().unwrap();
+    let a_child = marker["child_pid"].as_u64().unwrap() as u32;
+    let a_child_birth = marker["child_start_ticks"].as_u64().unwrap();
+    assert_eq!(proc_start_ticks(a_supervisor), a_supervisor_birth);
+    assert_eq!(proc_start_ticks(a_child), a_child_birth);
+    let output_path = manifest_path.with_extension("process-output");
+    let output = fs::read_to_string(&output_path).unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+    assert_eq!(receipt["protocol"], "zap-server/1");
+    let ready = fixture.root.join("http-before-rebind");
+    let resume = fixture.root.join("http-after-rebind");
+    let mut probe = KillOnDrop(spawn_authenticated_rebind_probe(
+        &node,
+        &zap_root,
+        &output_path,
+        &ready,
+        &resume,
+    ));
+    while !ready.exists() {
+        assert!(
+            probe.try_wait().unwrap().is_none(),
+            "HTTP pairing/setup failed before A exit"
+        );
+        assert!(
+            Instant::now() < wait_deadline,
+            "HTTP setup before A exit timed out"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    fs::write(fixture.root.join("manager-a-exit"), b"release").unwrap();
+    let exit_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = manager_a.try_wait().unwrap() {
+            assert!(status.success(), "manager A failed while exiting");
+            break;
+        }
+        assert!(Instant::now() < exit_deadline, "manager A did not exit");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(proc_start_ticks(a_child), a_child_birth);
+
+    let node_sha = sha256_file(&node);
+    let config = TrustedLinuxLaunchConfig::from_trusted_policy(
+        pod_binary.clone(),
+        sha256_file(&pod_binary),
+        fixture.pod_directory.clone(),
+    )
+    .unwrap();
+    let mut port = LinuxLaunchPort::new(config);
+    port.register_operator_process_from_trusted_policy(
+        TrustedOperatorProcessProfile::from_trusted_policy(
+            1,
+            node.clone(),
+            node_sha.clone(),
+            zap_root.clone(),
+            vec![
+                "--experimental-strip-types".into(),
+                "src/zap-server.ts".into(),
+                "--state-dir".into(),
+                fixture.state.to_string_lossy().into_owned(),
+            ],
+            fixture.state.clone(),
+            120,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(TrustedLaunchProfileInput {
+            profile_ref: OPERATOR_PROCESS_PROFILE_REF.into(),
+            profile_generation: 1,
+            executable: node.to_string_lossy().into_owned(),
+            binary_generation: format!("sha256:{node_sha}"),
+            executable_sha256: node_sha,
+            workspace_root: zap_root.clone(),
+            resource_layout: vec![TrustedDriverTemplate {
+                kind: ResourceKind::Auxiliary,
+                driver: ResourceDriver::Auxiliary {
+                    driver_ref: "process.exec".into(),
+                },
+            }],
+            execution_mode: ExecutionMode::LinuxCooperative,
+            fixed_arguments: vec![
+                "--experimental-strip-types".into(),
+                "src/zap-server.ts".into(),
+                "--state-dir".into(),
+                fixture.state.to_string_lossy().into_owned(),
+            ],
+            permitted_extra_arguments: BTreeSet::new(),
+            default_model: "none".into(),
+            allowed_models: BTreeSet::from(["none".into()]),
+            default_effort: "none".into(),
+            allowed_efforts: BTreeSet::from(["none".into()]),
+            workspace_scope: scope.clone(),
+            workspace_basis_ref: "basis.zap.disposable".into(),
+            allowed_cwd_prefix: ".".into(),
+            allow_write: true,
+            allowed_tool_bundle_refs: BTreeSet::new(),
+            environment_refs: vec![],
+            credential_refs: vec![],
+            max_wall_seconds: 120,
+            max_children: 0,
+            allow_fallback: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    host.register_native_host_from_trusted_policy(
+        TrustedNativeHostConfig::for_compiled_backend("host.zap.disposable".into())
+            .unwrap()
+            .with_auxiliary_driver("process.exec".into())
+            .unwrap(),
+    )
+    .unwrap();
+    let key = "rebind.zap.operator.a-to-b";
+    let reviewed = host
+        .inspect_committed_operator_process(&scope, &pod)
+        .unwrap();
+    let observed = <LinuxLaunchPort as HostDispatchPort>::inspect_existing_operator_process_rebind(
+        host.port(),
+        &reviewed,
+    );
+    assert!(
+        observed.is_ok(),
+        "operator read-only port inspect failed: {:?}",
+        observed.err()
+    );
+    let prepared = host
+        .prepare_current_operator_process_rebind(&scope, &pod, key)
+        .unwrap();
+    assert_eq!(prepared.phase, podbay_store::DurableRebindPhase::Pending);
+    let active = host
+        .complete_current_operator_process_rebind(&scope, &pod, key)
+        .unwrap();
+    assert_eq!(active.stage, podbay_host::RebindCompletionStage::PodActive);
+    assert_eq!(
+        active.durable.phase,
+        podbay_store::DurableRebindPhase::Activated
+    );
+    let repeat = host
+        .complete_current_operator_process_rebind(&scope, &pod, key)
+        .unwrap();
+    assert_eq!(repeat.durable, active.durable);
+    assert_eq!(repeat.stage, podbay_host::RebindCompletionStage::PodActive);
+    let client = PodClient::connect(&manifest_path).unwrap();
+    let status = client.attested_status().unwrap();
+    assert!(status.child_running);
+    assert_eq!(status.pod_id, pod.as_str());
+    assert_eq!(status.supervisor_pid, a_supervisor);
+    assert_eq!(status.supervisor_start_ticks, a_supervisor_birth);
+    assert_eq!(status.child_pid, a_child);
+    assert_eq!(status.child_start_ticks, a_child_birth);
+    assert_eq!(
+        status.bound.as_ref().unwrap().capability,
+        OPERATOR_PROCESS_CAPABILITY
+    );
+    assert_eq!(status.bound.as_ref().unwrap().owner_epoch, 2);
+    fs::write(&resume, b"continue").unwrap();
+    let probe_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = probe.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "authenticated HTTP setup failed after rebind"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < probe_deadline,
+            "HTTP setup after rebind timed out"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let sibling = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "operator_sibling_status_helper"])
+        .env("PODBAY_REBIND_MANIFEST", &manifest_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .unwrap();
+    assert!(sibling.success(), "sibling transport was not refused");
+    assert_eq!(proc_start_ticks(a_child), a_child_birth);
+    assert!(!client.stop().unwrap().child_running);
+    let manifest: PodManifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let loaded = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                fixture.unit.as_deref().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(loaded.status.success());
+        if !manifest.socket_path.exists()
+            && String::from_utf8_lossy(&loaded.stdout).trim() == "not-found"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rebound Zap unit or socket remained"
         );
         std::thread::sleep(Duration::from_millis(25));
     }

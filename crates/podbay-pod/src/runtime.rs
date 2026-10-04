@@ -1778,11 +1778,147 @@ fn active_codex_v2_binding(manifest: &PodManifest) -> Result<BoundPeerManifest, 
     Ok(live)
 }
 
+/// The operator process keeps its original immutable V1 launch. Only a
+/// fsynced Active checkpoint backed by the exact Activated rebind row may
+/// replace the current manager peer and epochs used for status/control.
+fn active_operator_process_binding(manifest: &PodManifest) -> Result<BoundPeerManifest, PodError> {
+    let original = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+        "operator process manifest binding is absent"))?;
+    if original.protocol != PEER_BINDING_PROTOCOL
+        || original.capability != OPERATOR_PROCESS_CAPABILITY
+    {
+        return Err(PodError::Unsupported("operator process binding unavailable"));
+    }
+    let identity = bound_identity(&manifest.descriptor, original)?;
+    let directory = manifest.socket_path.parent().ok_or(PodError::Invalid(
+        "operator process socket parent is absent"))?;
+    let observed = read_peer_checkpoint_observation(directory, &identity)
+        .map_err(|_| PodError::Refused("operator process checkpoint unavailable"))?;
+    let checkpoint = observed.checkpoint();
+    if checkpoint.phase() != RebindPhase::Active {
+        return Err(PodError::Refused("operator process checkpoint is not Active"));
+    }
+    let mut store = PodBayStore::open_existing_read_only(&original.store_path)
+        .map_err(|_| PodError::Refused("operator process store unavailable"))?;
+    let current = store.current_bound_pod_snapshot(
+        &manifest.descriptor.scope_id, &manifest.descriptor.pod_id,
+    ).map_err(|_| PodError::Refused("operator process target changed"))?;
+    let claim = store.current_manager_credential_claim(checkpoint.owner_epoch().get())
+        .map_err(|_| PodError::Refused("operator process manager claim changed"))?;
+    let inputs = current.resources().iter().map(|resource| (
+        resource.id().as_str().to_owned(), resource.input_epoch().get(),
+    )).collect::<BTreeMap<_, _>>();
+    if current.store_lineage() != &identity.store_lineage
+        || current.scope_id() != &identity.scope_id
+        || current.pod_id() != &identity.pod_id
+        || current.attempt_id() != &identity.attempt_id
+        || current.pod_incarnation() != identity.incarnation
+        || current.launch().format != BoundLaunchFormat::V1
+        || current.launch().descriptor != original.wire_descriptor
+        || current.launch().effective_spec != original.effective_spec
+        || current.launch().resources.len() != 1
+        || current.launch().resources[0].id != manifest.descriptor.resource_id
+        || current.launch().resources[0].epoch != original.resource_epoch
+        || inputs != checkpoint.input_epochs().iter().map(|(id, epoch)| (
+            id.as_str().to_owned(), epoch.get(),
+        )).collect::<BTreeMap<_, _>>()
+        || current.owner_epoch() != checkpoint.owner_epoch()
+        || claim.store_lineage() != identity.store_lineage.as_str()
+        || claim.credential_epoch() != checkpoint.credential_epoch().get()
+        || !store.current_manager_peer_matches(&claim, checkpoint.manager_peer())
+            .map_err(|_| PodError::Refused("operator process manager peer unavailable"))?
+    {
+        return Err(PodError::Refused("operator process current binding differs"));
+    }
+    if let Some(proposal) = checkpoint.last_rebind() {
+        let row = store.lookup_prior_observed_rebind(proposal)
+            .map_err(|_| PodError::Refused("operator process Activated proof unavailable"))?
+            .ok_or(PodError::Refused("operator process Activated row absent"))?;
+        if proposal.identity != identity
+            || checkpoint.manager_peer() != &proposal.next_manager
+            || checkpoint.owner_epoch() != proposal.next_owner_epoch
+            || checkpoint.credential_epoch() != proposal.next_credential_epoch
+            || checkpoint.input_epochs() != &proposal.next_input_epochs
+            || row.receipt.phase != podbay_store::DurableRebindPhase::Activated
+            || row.receipt.pod_checkpoint_ref.is_none()
+        {
+            return Err(PodError::Refused("operator process Activated checkpoint differs"));
+        }
+    } else if checkpoint.owner_epoch().get() != original.owner_epoch
+        || checkpoint.credential_epoch().get() != original.credential_epoch
+        || checkpoint.manager_peer() != &original.manager_peer()?
+        || inputs != original.resource_input_epochs
+    {
+        return Err(PodError::Refused("initial operator process checkpoint differs"));
+    }
+    let mut live = original.clone();
+    live.owner_epoch = checkpoint.owner_epoch().get();
+    live.credential_epoch = checkpoint.credential_epoch().get();
+    live.authority_revision = Some(current.authority_revision());
+    live.resource_input_epochs = inputs;
+    live.manager_os_identity = checkpoint.manager_peer().os_identity().into();
+    live.manager_process_id = checkpoint.manager_peer().native_process_id().into();
+    live.manager_boot_identity = checkpoint.manager_peer().boot_identity().into();
+    live.manager_birth_identity = checkpoint.manager_peer().birth_identity().into();
+    live.manager_containment = checkpoint.manager_peer().containment_identity().into();
+    live.binding_digest = live.digest()?;
+    Ok(live)
+}
+
+fn current_operator_rebind_target(
+    manifest: &PodManifest,
+    proposal: &RebindProposal,
+) -> Result<(), PodError> {
+    let binding = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+        "operator process binding is absent"))?;
+    if binding.protocol != PEER_BINDING_PROTOCOL
+        || binding.capability != OPERATOR_PROCESS_CAPABILITY
+        || bound_identity(&manifest.descriptor, binding)? != proposal.identity
+    {
+        return Err(PodError::Refused("operator process rebind capability differs"));
+    }
+    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+        .map_err(|_| PodError::Refused("operator process rebind store unavailable"))?;
+    let current = store.current_bound_pod_snapshot(
+        &manifest.descriptor.scope_id, &manifest.descriptor.pod_id,
+    ).map_err(|_| PodError::Refused("operator process rebind Pod unavailable"))?;
+    let claim = store.current_manager_credential_claim(proposal.next_owner_epoch.get())
+        .map_err(|_| PodError::Refused("operator process rebind claim unavailable"))?;
+    let inputs = current.resources().iter().map(|resource| (
+        resource.id().clone(), resource.input_epoch(),
+    )).collect::<BTreeMap<_, _>>();
+    if current.store_lineage() != &proposal.identity.store_lineage
+        || current.scope_id() != &proposal.identity.scope_id
+        || current.pod_id() != &proposal.identity.pod_id
+        || current.attempt_id() != &proposal.identity.attempt_id
+        || current.pod_incarnation() != proposal.identity.incarnation
+        || current.launch().format != BoundLaunchFormat::V1
+        || current.launch().descriptor != binding.wire_descriptor
+        || current.launch().effective_spec != binding.effective_spec
+        || current.launch().resources.len() != 1
+        || current.launch().resources[0].id != manifest.descriptor.resource_id
+        || current.launch().resources[0].epoch != binding.resource_epoch
+        || current.owner_epoch() != proposal.next_owner_epoch
+        || inputs != proposal.next_input_epochs
+        || claim.store_lineage() != proposal.identity.store_lineage.as_str()
+        || claim.credential_epoch() != proposal.next_credential_epoch.get()
+        || !store.current_manager_peer_matches(&claim, &proposal.next_manager)
+            .map_err(|_| PodError::Refused("operator process rebind peer unavailable"))?
+    {
+        return Err(PodError::Refused("operator process rebind target changed"));
+    }
+    Ok(())
+}
+
 /// Read-only dynamic manager projection for a trusted port. It grants no
 /// control by itself; socket peer and current manager must still be checked.
 pub fn current_bound_peer_binding(manifest_path: impl AsRef<Path>) -> Result<BoundPeerManifest, PodError> {
     let manifest = read_manifest(manifest_path.as_ref())?;
-    active_codex_v2_binding(&manifest)
+    match manifest.peer_binding.as_ref().map(|binding| binding.capability.as_str()) {
+        Some(CODEX_V2_CAPABILITY) => active_codex_v2_binding(&manifest),
+        Some(OPERATOR_PROCESS_CAPABILITY) => active_operator_process_binding(&manifest),
+        _ => Err(PodError::Unsupported("current bound peer projection unavailable")),
+    }
 }
 
 fn renew_and_authorize_manager_pod_control(
@@ -2281,11 +2417,14 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && let Ok(prepare) = decode_request(&bytes)
             {
                 let result = (|| -> Result<String, PodError> {
-                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
-                        || binding.capability != CODEX_V2_CAPABILITY
+                    let operator_rebind = binding.protocol == PEER_BINDING_PROTOCOL
+                        && binding.capability == OPERATOR_PROCESS_CAPABILITY;
+                    let codex_rebind = binding.protocol == PEER_BINDING_V2_PROTOCOL
+                        && binding.capability == CODEX_V2_CAPABILITY;
+                    if !(operator_rebind || codex_rebind)
                         || prepare.proposal.identity != identity
                     {
-                        return Err(PodError::Refused("V2 rebind prepare identity differs"));
+                        return Err(PodError::Refused("bound rebind prepare identity differs"));
                     }
                     let peer = peer_evidence.as_ref().map_err(|_| PodError::Refused(
                         "V2 rebind manager OS peer unavailable"))?;
@@ -2300,6 +2439,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         || crate::runtime::cgroup_path().ok().as_deref() != Some(cgroup_path.as_str())
                     {
                         return Err(PodError::Refused("V2 rebind manager or child changed"));
+                    }
+                    if operator_rebind {
+                        current_operator_rebind_target(&manifest, &prepare.proposal)?;
                     }
                     let directory = manifest_path.as_ref().parent().ok_or(PodError::Invalid(
                         "V2 rebind checkpoint directory"))?;
@@ -2394,11 +2536,14 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && let Ok(activate) = decode_activate_request(&bytes)
             {
                 let result = (|| -> Result<String, PodError> {
-                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
-                        || binding.capability != CODEX_V2_CAPABILITY
+                    let operator_rebind = binding.protocol == PEER_BINDING_PROTOCOL
+                        && binding.capability == OPERATOR_PROCESS_CAPABILITY;
+                    let codex_rebind = binding.protocol == PEER_BINDING_V2_PROTOCOL
+                        && binding.capability == CODEX_V2_CAPABILITY;
+                    if !(operator_rebind || codex_rebind)
                         || activate.proposal.identity != identity
                     {
-                        return Err(PodError::Refused("V2 rebind activation identity differs"));
+                        return Err(PodError::Refused("bound rebind activation identity differs"));
                     }
                     let peer = peer_evidence.as_ref().map_err(|_| PodError::Refused(
                         "V2 activation manager OS peer unavailable"))?;
@@ -2412,6 +2557,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
                     {
                         return Err(PodError::Refused("V2 activation manager or child changed"));
+                    }
+                    if operator_rebind {
+                        current_operator_rebind_target(&manifest, &activate.proposal)?;
                     }
                     let prior = prior_rebind_observation.as_ref().ok_or(PodError::Refused(
                         "V2 prior checkpoint proof was lost"))?;
@@ -2460,6 +2608,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
                     {
                         return Err(PodError::Uncertain("V2 Active proof changed"));
+                    }
+                    if operator_rebind {
+                        active_operator_process_binding(&manifest).map_err(|_| PodError::Uncertain(
+                            "operator process Active store/checkpoint proof changed",
+                        ))?;
                     }
                     let now = u64::try_from(fence_clock.elapsed().as_millis())
                         .unwrap_or(u64::MAX)
@@ -2876,6 +3029,10 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     Some(active_codex_v2_binding(&manifest)?.status(
                         &descriptor.resource_id, &descriptor.scope_id,
                     ))
+                } else if operator_process {
+                    Some(active_operator_process_binding(&manifest)?.status(
+                        &descriptor.resource_id, &descriptor.scope_id,
+                    ))
                 } else {
                     manifest.peer_binding.as_ref().map(|binding| {
                         binding.status(&descriptor.resource_id, &descriptor.scope_id)
@@ -2913,6 +3070,12 @@ fn attest(manifest: &PodManifest, status: &PodStatus) -> Result<(), PodError> {
             Some(active_codex_v2_binding(manifest)?.status(
                 &manifest.descriptor.resource_id,
                 &manifest.descriptor.scope_id,
+            ))
+        }
+        Some(binding) if binding.protocol == PEER_BINDING_PROTOCOL
+            && binding.capability == OPERATOR_PROCESS_CAPABILITY => {
+            Some(active_operator_process_binding(manifest)?.status(
+                &manifest.descriptor.resource_id, &manifest.descriptor.scope_id,
             ))
         }
         Some(binding) => Some(binding.status(
