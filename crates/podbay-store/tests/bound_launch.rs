@@ -4,20 +4,22 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
+    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding,
+    PlannedRootBinding, Pod, PodId,
     Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
     SessionId, WorkKind,
 };
 use podbay_store::{
     Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityRightRecord, BoundLaunchAdmission, BoundLaunchProposal, BoundLaunchRequest,
+    BoundOperatorRootLaunchProposal, BoundOperatorRootLaunchRequest,
     CommandRequest, EffectClaim, EffectObservation, HostAcceptanceProof, LaunchDispatchStage,
     LaunchIntentBinding, LaunchLookupRequest, LaunchPortResult, PodBayStore, StoreError,
     VerifiedPrincipal,
 };
 use podbay_wire::{
     EffectiveLaunchContract, ImmutableLaunchDescriptor, ResourceDriver, ReviewedNativePolicy,
-    ReviewedResource, TargetOs,
+    ReviewedResource, TargetOs, OPERATOR_PROCESS_PROFILE_REF,
 };
 use sha2::{Digest, Sha256};
 
@@ -296,6 +298,229 @@ fn count(path: &PathBuf, table: &str) -> i64 {
             row.get(0)
         })
         .unwrap()
+}
+
+struct OperatorRootFixture {
+    session: Session,
+    run: Run,
+    planned: PlannedRootBinding,
+    descriptor: ImmutableLaunchDescriptor,
+    effective: Vec<u8>,
+}
+
+impl OperatorRootFixture {
+    fn new(profile_ref: &str) -> Self {
+        let mut session = Session::new(
+            SessionId::try_from("session.operator.root").unwrap(),
+            ActorId::try_from("actor.operator.root").unwrap(),
+            ScopeId::try_from("scope.root.fixture").unwrap(),
+        );
+        let run = Run::new(
+            RunId::try_from("run.operator.root").unwrap(),
+            &session,
+            Role::Coordinator,
+            WorkKind::Service,
+            None,
+        );
+        session.bind_run(session.revision(), &run).unwrap();
+        let mut attempt = Attempt::new(
+            AttemptId::try_from("attempt.operator.root").unwrap(),
+            run.id().clone(),
+            1,
+            Epoch::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut pod = Pod::new(
+            PodId::try_from("pod.operator.root").unwrap(),
+            attempt.id().clone(),
+            Epoch::new(1).unwrap(),
+        );
+        attempt.attach_pod(attempt.revision(), &pod).unwrap();
+        let resource = Resource::new(
+            ResourceId::try_from("resource.operator.root").unwrap(),
+            pod.id().clone(),
+            ResourceKind::Auxiliary,
+            Epoch::new(1).unwrap(),
+        );
+        pod.attach_resource(pod.revision(), &resource).unwrap();
+        let planned = LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource.clone()])
+            .unwrap();
+        let mut effective = b"podbay.effective-launch/1\0".to_vec();
+        append_string(&mut effective, "pod.operator.root");
+        append_string(&mut effective, "coordinator");
+        effective.push(0);
+        append_string(&mut effective, profile_ref);
+        effective.extend_from_slice(&1u64.to_be_bytes());
+        append_string(&mut effective, "/bin/true");
+        append_string(&mut effective, "generation.operator.root");
+        append_list(&mut effective, &["zap-server"]);
+        append_string(&mut effective, "none");
+        append_string(&mut effective, "none");
+        effective.push(0);
+        append_string(&mut effective, "scope.root.fixture");
+        append_string(&mut effective, "basis.operator.root");
+        append_string(&mut effective, ".");
+        effective.push(1);
+        append_list(&mut effective, &[]);
+        effective.extend_from_slice(&1u64.to_be_bytes());
+        effective.extend_from_slice(&60u64.to_be_bytes());
+        effective.extend_from_slice(&0u32.to_be_bytes());
+        append_list(&mut effective, &[]);
+        effective.extend_from_slice(&0u32.to_be_bytes());
+        let decoded = EffectiveLaunchContract::decode(&effective).unwrap();
+        let descriptor = ImmutableLaunchDescriptor::from_planned_root(
+            &planned,
+            ReviewedNativePolicy {
+                target_os: TargetOs::Linux,
+                host_id: "host.operator.root".into(),
+                profile_ref: profile_ref.into(),
+                profile_generation: 1,
+                model_id: "none".into(),
+                reasoning_effort: "none".into(),
+                executable_generation: "generation.operator.root".into(),
+                effective_spec_digest: decoded.digest().into(),
+                workspace_basis_ref: "basis.operator.root".into(),
+                executable: "/bin/true".into(),
+                cwd: "/tmp".into(),
+                arguments: vec!["zap-server".into()],
+                environment_refs: vec![],
+                credential_refs: vec![],
+                wall_seconds: 60,
+                max_children: 0,
+                resources: vec![ReviewedResource {
+                    resource_id: resource.id().clone(),
+                    kind: ResourceKind::Auxiliary,
+                    epoch: resource.epoch(),
+                    driver: ResourceDriver::Auxiliary {
+                        driver_ref: "process.exec".into(),
+                    },
+                }],
+            },
+        )
+        .unwrap();
+        decoded.compare_with_descriptor(&descriptor).unwrap();
+        Self { session, run, planned, descriptor, effective }
+    }
+
+    fn request<'a>(&'a self, key: &'a str) -> BoundOperatorRootLaunchRequest<'a> {
+        BoundOperatorRootLaunchRequest {
+            principal: principal(),
+            command_key: key,
+            canonical_intent: b"operator root caller intent",
+            scope_id: self.planned.identity().scope_id().as_str(),
+            pod_id: self.planned.identity().pod_id().as_str(),
+            proposal: Some(BoundOperatorRootLaunchProposal {
+                session: &self.session,
+                run: &self.run,
+                binding: &self.planned,
+                effective_spec: &self.effective,
+                descriptor: &self.descriptor,
+                expected_owner_epoch: 1,
+                expected_authority_revision: 0,
+            }),
+        }
+    }
+}
+
+#[test]
+fn queued_operator_root_uses_inserted_command_witness_and_replays_without_another_outbox() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    let proposal = OperatorRootFixture::new(OPERATOR_PROCESS_PROFILE_REF);
+    assert_eq!(proposal.run.admission(), podbay_core::AdmissionState::Queued);
+    let first = match store.admit_bound_operator_root_launch(proposal.request("key.operator.root"))
+        .unwrap() {
+        BoundLaunchAdmission::Committed(record) => record,
+        BoundLaunchAdmission::Duplicate(_) => panic!("first operator root was duplicate"),
+    };
+    assert_eq!(first.format, podbay_store::BoundLaunchFormat::V1);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let (admission, revision): (String, i64) = connection
+        .query_row(
+            "SELECT admission_state,revision FROM runtime_runs WHERE run_id='run.operator.root'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(admission, "admitted");
+    assert_eq!(revision, 3);
+    assert_eq!(count(&fixture.database, "commands"), 1);
+    assert_eq!(count(&fixture.database, "outbox"), 1);
+    drop(connection);
+    drop(store);
+    let mut reopened = fixture.open();
+    let repeated = reopened
+        .admit_bound_operator_root_launch(BoundOperatorRootLaunchRequest {
+            principal: principal(),
+            command_key: "key.operator.root",
+            canonical_intent: b"operator root caller intent",
+            scope_id: "scope.root.fixture",
+            pod_id: "pod.operator.root",
+            proposal: None,
+        })
+        .unwrap();
+    match repeated {
+        BoundLaunchAdmission::Duplicate(record) => assert_eq!(record.receipt, first.receipt),
+        BoundLaunchAdmission::Committed(_) => panic!("operator duplicate committed twice"),
+    }
+    assert!(matches!(
+        reopened.admit_bound_launch(BoundLaunchRequest {
+            principal: principal(),
+            command_key: "key.operator.root",
+            canonical_intent: b"operator root caller intent",
+            scope_id: "scope.root.fixture",
+            pod_id: "pod.operator.root",
+            proposal: None,
+        }),
+        Err(StoreError::Conflict("command key changed operator process admission path"))
+    ));
+    assert_eq!(count(&fixture.database, "commands"), 1);
+    assert_eq!(count(&fixture.database, "outbox"), 1);
+}
+
+#[test]
+fn queued_operator_root_rejects_other_profile_before_any_commit() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    let proposal = OperatorRootFixture::new("profile.other.root");
+    assert!(matches!(
+        store.admit_bound_operator_root_launch(proposal.request("key.operator.wrong-profile")),
+        Err(StoreError::Conflict("operator process root shape differs"))
+    ));
+    for table in ["commands", "runtime_runs", "launch_bindings", "outbox"] {
+        assert_eq!(count(&fixture.database, table), 0, "{table}");
+    }
+}
+
+#[test]
+fn queued_operator_root_rolls_back_inserted_command_if_outbox_fails() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    setup(&mut store);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_operator_outbox BEFORE INSERT ON outbox
+             WHEN NEW.kind='pod.offer' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let proposal = OperatorRootFixture::new(OPERATOR_PROCESS_PROFILE_REF);
+    let mut store = fixture.open();
+    assert!(store
+        .admit_bound_operator_root_launch(proposal.request("key.operator.rollback"))
+        .is_err());
+    for table in [
+        "runtime_sessions", "runtime_runs", "launch_bindings", "launch_resources",
+        "authority_pods", "authority_resources", "target_epochs", "launch_slots",
+        "commands", "events", "outbox",
+    ] {
+        assert_eq!(count(&fixture.database, table), 0, "{table}");
+    }
+    assert_eq!(store.authority_snapshot().unwrap().revision, 0);
 }
 
 #[test]

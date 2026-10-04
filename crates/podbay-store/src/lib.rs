@@ -21,7 +21,8 @@ pub use bootstrap_send::{
 };
 pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
-    BoundLaunchRequest, BoundLaunchResource, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
+    BoundLaunchRequest, BoundLaunchResource, BoundOperatorRootLaunchProposal,
+    BoundOperatorRootLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
     CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot,
     CurrentLaunchPolicyFence, CurrentV2RebindCursor, CurrentV2RebindPage, RunChildBudget,
 };

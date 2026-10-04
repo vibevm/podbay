@@ -22,7 +22,8 @@ use podbay_store::{
     Admission, AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BootstrapSendSelector,
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
-    BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
+    BoundLaunchRequest, BoundOperatorRootLaunchProposal, BoundOperatorRootLaunchRequest,
+    BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
     CommandLookupSelector, CurrentScopeSnapshot, CurrentV2RebindCursor, CurrentV2RebindPage,
     DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
@@ -1902,6 +1903,29 @@ pub struct BoundLaunchPodRequest {
     pub host_request: HostRequest,
     pub canonical_request: Vec<u8>,
     pub proposal: Option<BoundHostLaunchProposal>,
+}
+
+fn operator_root_record(record: &BoundLaunchRecord) -> bool {
+    if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+        return false;
+    }
+    let Ok(descriptor) = ImmutableLaunchDescriptor::decode_json(&record.descriptor) else {
+        return false;
+    };
+    let Some(resource) = descriptor.resource(0) else { return false };
+    descriptor.profile_ref() == OPERATOR_PROCESS_PROFILE_REF
+        && descriptor.role() == NativeRole::Coordinator
+        && descriptor.work_kind() == NativeWorkKind::Service
+        && descriptor.parent_run_id().is_none()
+        && descriptor.resources_len() == 1
+        && resource.kind == NativeResourceKind::Auxiliary
+        && matches!(resource.driver, ResourceDriver::Auxiliary { driver_ref }
+            if driver_ref == "process.exec")
+        && descriptor.model_id() == "none"
+        && descriptor.reasoning_effort() == "none"
+        && descriptor.max_children() == 0
+        && descriptor.environment_refs().is_empty()
+        && descriptor.credential_refs().is_empty()
 }
 
 /// Host-owned context for the first high-level wire root. The GrantId comes
@@ -7115,6 +7139,35 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         self.dispatch_committed_bound(authorised.ok_or(HostError::InvalidInput)?, record, false)
     }
 
+    /// Admit a queued operator_process_v1 Coordinator/Service root with the
+    /// store's inserted-command witness, then dispatch only its committed
+    /// generic process descriptor. Duplicate keys are readback-only.
+    pub fn launch_bound_operator_process<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        let (authorised, record, duplicate) =
+            self.lookup_or_admit_operator_root(transport, &request)?;
+        if duplicate {
+            return self.bound_receipt(record, true);
+        }
+        self.dispatch_committed_bound(authorised.ok_or(HostError::InvalidInput)?, record, false)
+    }
+
+    /// Commit the same typed operator root without entering the OS port.
+    pub fn admit_bound_operator_process<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError> {
+        let (_, record, duplicate) = self.lookup_or_admit_operator_root(transport, &request)?;
+        self.bound_receipt(record, duplicate)
+    }
+
     /// Commits the complete bound launch transaction without an OS port call.
     pub fn admit_bound_pod<T: AuthenticatedTransport>(
         &mut self,
@@ -8022,7 +8075,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .store
             .lookup_bound_launch(&lookup)?
             .ok_or(StoreError::NotFound)?;
-        if record.format != BoundLaunchFormat::V1 {
+        if record.format != BoundLaunchFormat::V1 || operator_root_record(&record) {
             return Err(HostError::Unauthorised.into());
         }
         let status = self.store.launch_dispatch_status(
@@ -8044,6 +8097,52 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 .encode_json()
                 .map_err(|_| HostError::InvalidInput)?
                 != record.descriptor
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        self.dispatch_committed_bound(authorised, record, true)
+    }
+
+    /// Resume only the original Prepared operator root from committed bytes.
+    /// A different key or changed reviewed policy never starts another Pod.
+    pub fn resume_prepared_bound_operator_process<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: BoundLaunchPodRequest,
+    ) -> Result<LaunchPodReceipt, LaunchPodError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.ensure_current_owner_epoch()?;
+        if !matches!(request.host_request.action, HostAction::LaunchPod { .. }) {
+            return Err(LaunchPodError::WrongOperation);
+        }
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(&request, principal);
+        let record = self.store.lookup_bound_launch(&lookup)?.ok_or(StoreError::NotFound)?;
+        if !operator_root_record(&record) {
+            return Err(HostError::Unauthorised.into());
+        }
+        let status = self.store.launch_dispatch_status(
+            record.receipt.outbox_id, &record.scope_id, &record.pod_id,
+        )?;
+        if status.stage != LaunchDispatchStage::Prepared {
+            return self.bound_receipt(record, true);
+        }
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let authorised = self.host.authorise_proposed_launch(transport, &request.host_request)?;
+        let planned = PlannedRootBinding::from_queued_snapshot(
+            &proposal.session, &proposal.run, &proposal.binding,
+        ).map_err(|_| HostError::Unauthorised)?;
+        let (effective_bytes, descriptor) = self.review_bound_operator_root(
+            &authorised, request.host_request.grant_id, proposal, &planned,
+        )?;
+        if effective_bytes != record.effective_spec
+            || descriptor.encode_json().map_err(|_| HostError::InvalidInput)? != record.descriptor
         {
             return Err(HostError::StaleGuard.into());
         }
@@ -8085,7 +8184,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
         let lookup = self.bound_lookup(request, principal.clone());
         if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
-            if record.format != BoundLaunchFormat::V1 {
+            if record.format != BoundLaunchFormat::V1 || operator_root_record(&record) {
                 return Err(HostError::Unauthorised.into());
             }
             return Ok((None, record, true));
@@ -8122,6 +8221,78 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     != descriptor
                         .encode_json()
                         .map_err(|_| HostError::InvalidInput)?
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            self.hydrate_new_bound(&record)?;
+        }
+        Ok((Some(authorised), record, duplicate))
+    }
+
+    fn lookup_or_admit_operator_root<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &BoundLaunchPodRequest,
+    ) -> Result<(Option<AuthorisedDispatch>, BoundLaunchRecord, bool), LaunchPodError> {
+        self.ensure_current_owner_epoch()?;
+        let HostAction::LaunchPod { pod_id, .. } = &request.host_request.action else {
+            return Err(LaunchPodError::WrongOperation);
+        };
+        let actor = self.host.authenticate(transport)?;
+        if actor.scope_id != request.host_request.scope_id {
+            return Err(HostError::Unauthorised.into());
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
+        let lookup = self.bound_lookup(request, principal.clone());
+        if let Some(record) = self.store.lookup_bound_launch(&lookup)? {
+            if !operator_root_record(&record) {
+                return Err(HostError::Unauthorised.into());
+            }
+            return Ok((None, record, true));
+        }
+        let authorised = self
+            .host
+            .authorise_proposed_launch(transport, &request.host_request)?;
+        let proposal = request.proposal.as_ref().ok_or(HostError::InvalidInput)?;
+        let planned = PlannedRootBinding::from_queued_snapshot(
+            &proposal.session,
+            &proposal.run,
+            &proposal.binding,
+        )
+        .map_err(|_| HostError::Unauthorised)?;
+        let (effective_bytes, descriptor) = self.review_bound_operator_root(
+            &authorised,
+            request.host_request.grant_id,
+            proposal,
+            &planned,
+        )?;
+        let store_request = BoundOperatorRootLaunchRequest {
+            principal,
+            command_key: &request.host_request.command_key,
+            canonical_intent: &request.canonical_request,
+            scope_id: authorised.scope_id.as_str(),
+            pod_id: pod_id.as_str(),
+            proposal: Some(BoundOperatorRootLaunchProposal {
+                session: &proposal.session,
+                run: &proposal.run,
+                binding: &planned,
+                effective_spec: &effective_bytes,
+                descriptor: &descriptor,
+                expected_owner_epoch: self.host.manager_epoch.get(),
+                expected_authority_revision: self.recorded.revision,
+            }),
+        };
+        let (record, duplicate) = match self.store.admit_bound_operator_root_launch(store_request)? {
+            BoundLaunchAdmission::Committed(record) => (record, false),
+            BoundLaunchAdmission::Duplicate(record) => (record, true),
+        };
+        if !operator_root_record(&record) {
+            return Err(HostError::StaleGuard.into());
+        }
+        if !duplicate {
+            if record.effective_spec != effective_bytes
+                || record.descriptor
+                    != descriptor.encode_json().map_err(|_| HostError::InvalidInput)?
             {
                 return Err(HostError::StaleGuard.into());
             }
@@ -8436,6 +8607,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         grant_id: GrantId,
         proposal: &BoundHostLaunchProposal,
     ) -> Result<(Vec<u8>, ImmutableLaunchDescriptor), HostError> {
+        if proposal.selection.profile_ref == OPERATOR_PROCESS_PROFILE_REF {
+            return Err(HostError::Unsupported);
+        }
         let HostAction::LaunchPod { pod_id, role, .. } = &authorised.action else {
             return Err(HostError::InvalidInput);
         };
@@ -8462,6 +8636,61 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         decoded
             .compare_with_descriptor(&descriptor)
             .map_err(|_| HostError::Unauthorised)?;
+        Ok((bytes, descriptor))
+    }
+
+    fn review_bound_operator_root(
+        &self,
+        authorised: &AuthorisedDispatch,
+        grant_id: GrantId,
+        proposal: &BoundHostLaunchProposal,
+        planned: &PlannedRootBinding,
+    ) -> Result<(Vec<u8>, ImmutableLaunchDescriptor), HostError> {
+        let HostAction::LaunchPod { pod_id, role, credential } = &authorised.action else {
+            return Err(HostError::InvalidInput);
+        };
+        if *role != Role::Coordinator
+            || credential.is_some()
+            || proposal.binding.scope_id() != &authorised.scope_id
+            || proposal.binding.actor_id() != &authorised.actor_id
+            || proposal.binding.pod_id() != pod_id
+            || proposal.binding.role() != Role::Coordinator
+            || proposal.binding.work_kind() != WorkKind::Service
+            || proposal.binding.parent_run_id().is_some()
+            || proposal.binding.resources().len() != 1
+            || proposal.binding.resources()[0].kind() != ResourceKind::Auxiliary
+            || proposal.selection.profile_ref != OPERATOR_PROCESS_PROFILE_REF
+            || proposal.selection.max_children != 0
+        {
+            return Err(HostError::Unauthorised);
+        }
+        let spec = self.resolve_effective_launch(authorised, grant_id, &proposal.selection)?;
+        let bytes = spec.canonical_bytes()?;
+        let decoded = EffectiveLaunchContract::decode(&bytes)
+            .map_err(|_| HostError::Unauthorised)?;
+        let profile = self.launch_profiles.get(&proposal.selection.profile_ref)
+            .ok_or(HostError::Unsupported)?;
+        let host = self.native_host.as_ref().ok_or(HostError::Unsupported)?;
+        let (native, _) = profile.resolve_native_policy(
+            host, &spec, &proposal.binding, decoded.digest(),
+        )?;
+        let descriptor = ImmutableLaunchDescriptor::from_planned_root(planned, native)
+            .map_err(|_| HostError::Unauthorised)?;
+        decoded.compare_with_descriptor(&descriptor)
+            .map_err(|_| HostError::Unauthorised)?;
+        let Some(resource) = descriptor.resource(0) else {
+            return Err(HostError::Unauthorised);
+        };
+        if descriptor.model_id() != "none"
+            || descriptor.reasoning_effort() != "none"
+            || descriptor.max_children() != 0
+            || !descriptor.environment_refs().is_empty()
+            || !descriptor.credential_refs().is_empty()
+            || !matches!(resource.driver, ResourceDriver::Auxiliary { driver_ref }
+                if driver_ref == "process.exec")
+        {
+            return Err(HostError::Unauthorised);
+        }
         Ok((bytes, descriptor))
     }
 

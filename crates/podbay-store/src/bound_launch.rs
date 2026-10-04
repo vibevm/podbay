@@ -10,7 +10,7 @@ use podbay_wire::{
     EFFECTIVE_LAUNCH_V2_VERSION, EFFECTIVE_LAUNCH_VERSION, EffectiveLaunchContract,
     EffectiveLaunchContractV2, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2,
     LAUNCH_DESCRIPTOR_SCHEMA, LAUNCH_DESCRIPTOR_V2_SCHEMA, NativeResourceKind, NativeRole,
-    NativeWorkKind,
+    NativeWorkKind, OPERATOR_PROCESS_PROFILE_REF, ResourceDriver,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeMap;
@@ -84,6 +84,28 @@ pub struct BoundLaunchProposal<'a> {
     pub expected_authority_revision: u64,
 }
 
+/// A generic operator Service root starts queued. Its V1 descriptor remains
+/// wire-compatible, while admission is proved by the command row inserted in
+/// the same store transaction rather than a caller-supplied Run witness.
+pub struct BoundOperatorRootLaunchProposal<'a> {
+    pub session: &'a Session,
+    pub run: &'a Run,
+    pub binding: &'a PlannedRootBinding,
+    pub effective_spec: &'a [u8],
+    pub descriptor: &'a ImmutableLaunchDescriptor,
+    pub expected_owner_epoch: u64,
+    pub expected_authority_revision: u64,
+}
+
+pub struct BoundOperatorRootLaunchRequest<'a> {
+    pub principal: VerifiedPrincipal,
+    pub command_key: &'a str,
+    pub canonical_intent: &'a [u8],
+    pub scope_id: &'a str,
+    pub pod_id: &'a str,
+    pub proposal: Option<BoundOperatorRootLaunchProposal<'a>>,
+}
+
 /// Reviewed internal Codex V2 proof for a new first root launch. Both values are
 /// typed and canonical before the store checks them again under one writer
 /// transaction. This cannot admit a child Worker of an existing parent Run
@@ -146,6 +168,7 @@ impl BoundLaunchFormat {
 
 enum ProposalKind<'a> {
     V1(BoundLaunchProposal<'a>),
+    OperatorRoot(BoundOperatorRootLaunchProposal<'a>),
     CodexV2(BoundRootLaunchProposalV2<'a>),
 }
 
@@ -157,6 +180,7 @@ struct AdmissionRequest<'a> {
     pod_id: &'a str,
     proposal: Option<ProposalKind<'a>>,
     format: BoundLaunchFormat,
+    operator_root: bool,
     policy_fence_epoch: Option<u64>,
 }
 
@@ -1364,6 +1388,26 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::V1),
             format: BoundLaunchFormat::V1,
+            operator_root: false,
+            policy_fence_epoch: None,
+        })
+    }
+
+    /// Atomically admits a queued operator_process_v1 first root. The command
+    /// row is the only Run admission witness, and no OS effect occurs here.
+    pub fn admit_bound_operator_root_launch(
+        &mut self,
+        request: BoundOperatorRootLaunchRequest<'_>,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::OperatorRoot),
+            format: BoundLaunchFormat::V1,
+            operator_root: true,
             policy_fence_epoch: None,
         })
     }
@@ -1382,6 +1426,7 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::CodexV2),
             format: BoundLaunchFormat::CodexV2,
+            operator_root: false,
             policy_fence_epoch: None,
         })
     }
@@ -1405,6 +1450,7 @@ impl PodBayStore {
             pod_id: request.pod_id,
             proposal: request.proposal.map(ProposalKind::CodexV2),
             format: BoundLaunchFormat::CodexV3,
+            operator_root: false,
             policy_fence_epoch: Some(expected_policy_fence_epoch),
         })
     }
@@ -1446,6 +1492,11 @@ impl PodBayStore {
             if record.format != request.format {
                 return Err(StoreError::Conflict(
                     "command key changed bound launch format",
+                ));
+            }
+            if request.operator_root != is_operator_root_record(&record)? {
+                return Err(StoreError::Conflict(
+                    "command key changed operator process admission path",
                 ));
             }
             let policy_row: Option<(String, i64, i64)> = transaction
@@ -1547,9 +1598,9 @@ impl PodBayStore {
         }
         let digest = digest_request(&command);
         let command_id = stable_command_id(&command);
-        // Typed V2/V3 roots need a real row before Run::admit. V1 keeps its
-        // original SQL ordering; every format commits in one transaction.
-        let early_command_rowid = (checked.format != BoundLaunchFormat::V1)
+        // Every queued root needs the real command row before Run::admit.
+        // Legacy preadmitted V1 retains its original SQL ordering.
+        let early_command_rowid = checked.planned_binding.is_some()
             .then(|| {
                 insert_launch_command(
                     &transaction,
@@ -1561,12 +1612,12 @@ impl PodBayStore {
                 )
             })
             .transpose()?;
-        let admitted_run = if checked.format != BoundLaunchFormat::V1 {
+        let admitted_run = if checked.planned_binding.is_some() {
             let command_identity = CommandId::try_from(command_id.as_str())
-                .map_err(|_| StoreError::Conflict("V2 command identity is invalid"))?;
+                .map_err(|_| StoreError::Conflict("root command identity is invalid"))?;
             let witness = InsertedRootCommand {
                 transaction: &transaction,
-                rowid: early_command_rowid.expect("V2 inserted command before admission"),
+                rowid: early_command_rowid.expect("queued root inserted command before admission"),
                 command_id: command_identity.clone(),
                 run_id: binding.run_id().clone(),
                 principal: command.principal.as_str().to_owned(),
@@ -1580,21 +1631,21 @@ impl PodBayStore {
             };
             let mut run = checked.run.clone();
             run.admit(run.revision(), &command_identity, &witness)
-                .map_err(|_| StoreError::Conflict("V2 Run lacks inserted launch command"))?;
+                .map_err(|_| StoreError::Conflict("root Run lacks inserted launch command"))?;
             let attempt = Attempt::new(
                 binding.attempt_id().clone(),
                 binding.run_id().clone(),
                 binding.attempt_ordinal(),
                 binding.attempt_epoch(),
             )
-            .map_err(|_| StoreError::Conflict("V2 planned Attempt is invalid"))?;
+            .map_err(|_| StoreError::Conflict("planned root Attempt is invalid"))?;
             run.start_attempt(run.revision(), &attempt)
-                .map_err(|_| StoreError::Conflict("V2 planned Attempt cannot start"))?;
+                .map_err(|_| StoreError::Conflict("planned root Attempt cannot start"))?;
             let strict = checked
                 .planned_binding
-                .ok_or(StoreError::Conflict("V2 planned binding is missing"))?
+                .ok_or(StoreError::Conflict("planned root binding is missing"))?
                 .confirm_after_admission(checked.session, &run)
-                .map_err(|_| StoreError::Conflict("V2 post-command binding differs"))?;
+                .map_err(|_| StoreError::Conflict("post-command root binding differs"))?;
             validate_initial(
                 request.scope_id,
                 request.pod_id,
@@ -1828,6 +1879,11 @@ fn check_proposal<'a>(
 ) -> Result<CheckedProposal<'a>, StoreError> {
     match proposal {
         ProposalKind::V1(proposal) => {
+            if proposal.descriptor.profile_ref() == OPERATOR_PROCESS_PROFILE_REF {
+                return Err(StoreError::Conflict(
+                    "operator process requires queued root admission",
+                ));
+            }
             validate_initial(
                 request.scope_id,
                 request.pod_id,
@@ -1865,6 +1921,40 @@ fn check_proposal<'a>(
                 run: proposal.run,
                 binding: proposal.binding,
                 planned_binding: None,
+                effective_spec: proposal.effective_spec,
+                descriptor,
+                spec_digest: effective.digest().to_owned(),
+                descriptor_digest: proposal.descriptor.digest().to_owned(),
+                format: BoundLaunchFormat::V1,
+                max_children: 0,
+                expected_owner_epoch: proposal.expected_owner_epoch,
+                expected_authority_revision: proposal.expected_authority_revision,
+            })
+        }
+        ProposalKind::OperatorRoot(proposal) => {
+            let binding = proposal.binding.identity();
+            validate_planned_initial(request, proposal.session, proposal.run, binding)?;
+            proposal
+                .descriptor
+                .validate_against_planned_root(proposal.binding)
+                .map_err(|_| StoreError::Conflict("operator descriptor differs from queued root"))?;
+            if !operator_root_shape(proposal.descriptor) {
+                return Err(StoreError::Conflict("operator process root shape differs"));
+            }
+            let descriptor = proposal
+                .descriptor
+                .encode_json()
+                .map_err(|_| StoreError::InvalidInput("operator descriptor cannot encode"))?;
+            let effective = EffectiveLaunchContract::decode(proposal.effective_spec)
+                .map_err(|_| StoreError::InvalidInput("operator effective launch is malformed"))?;
+            effective
+                .compare_with_descriptor(proposal.descriptor)
+                .map_err(|_| StoreError::Conflict("operator effective launch differs from descriptor"))?;
+            Ok(CheckedProposal {
+                session: proposal.session,
+                run: proposal.run,
+                binding,
+                planned_binding: Some(proposal.binding),
                 effective_spec: proposal.effective_spec,
                 descriptor,
                 spec_digest: effective.digest().to_owned(),
@@ -1928,6 +2018,32 @@ fn check_proposal<'a>(
             })
         }
     }
+}
+
+fn operator_root_shape(descriptor: &ImmutableLaunchDescriptor) -> bool {
+    let Some(resource) = descriptor.resource(0) else { return false };
+    descriptor.profile_ref() == OPERATOR_PROCESS_PROFILE_REF
+        && descriptor.role() == NativeRole::Coordinator
+        && descriptor.work_kind() == NativeWorkKind::Service
+        && descriptor.parent_run_id().is_none()
+        && descriptor.resources_len() == 1
+        && resource.kind == NativeResourceKind::Auxiliary
+        && matches!(resource.driver, ResourceDriver::Auxiliary { driver_ref }
+            if driver_ref == "process.exec")
+        && descriptor.model_id() == "none"
+        && descriptor.reasoning_effort() == "none"
+        && descriptor.max_children() == 0
+        && descriptor.environment_refs().is_empty()
+        && descriptor.credential_refs().is_empty()
+}
+
+fn is_operator_root_record(record: &BoundLaunchRecord) -> Result<bool, StoreError> {
+    if record.format != BoundLaunchFormat::V1 || record.resources.len() != 1 {
+        return Ok(false);
+    }
+    let descriptor = ImmutableLaunchDescriptor::decode_json(&record.descriptor)
+        .map_err(|_| StoreError::Conflict("stored operator descriptor is malformed"))?;
+    Ok(operator_root_shape(&descriptor))
 }
 
 fn validate_planned_initial(

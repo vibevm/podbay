@@ -37,6 +37,7 @@ use podbay_wire::{
     FallbackPolicy, Guard as WireGuard, ImmutableLaunchDescriptor, LaunchBody, LaunchLimits,
     LaunchRole, LaunchSelection as WireLaunchSelection, LaunchWork, NativeRole, RequestedAuthority,
     ResourceDriver, SendPolicy, SessionChoice, SessionSendBody, Target as WireTarget, TargetOs,
+    OPERATOR_PROCESS_PROFILE_REF,
     WorkKind as WireWorkKind, WorkspaceAccess as WireWorkspaceAccess, WorkspaceBinding,
 };
 use sha2::{Digest, Sha256};
@@ -3175,6 +3176,148 @@ fn codex_v2_root_rejects_v1_duplicate_and_stale_owner() {
     ));
     assert_command_not_admitted(&other, &who, &request);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn queued_operator_root_dispatches_once_from_store_backed_admission() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, grant) = initial_authority(&fixture.database, port.resolved_only(), &who);
+    let mut input = profile_input(&who);
+    input.profile_ref = OPERATOR_PROCESS_PROFILE_REF.into();
+    input.resource_layout = vec![TrustedDriverTemplate {
+        kind: ResourceKind::Auxiliary,
+        driver: ResourceDriver::Auxiliary {
+            driver_ref: "process.exec".into(),
+        },
+    }];
+    input.fixed_arguments = vec!["zap-server".into()];
+    input.permitted_extra_arguments.clear();
+    input.default_model = "none".into();
+    input.allowed_models = BTreeSet::from(["none".into()]);
+    input.default_effort = "none".into();
+    input.allowed_efforts = BTreeSet::from(["none".into()]);
+    input.allowed_tool_bundle_refs.clear();
+    input.environment_refs.clear();
+    input.credential_refs.clear();
+    input.max_children = 0;
+    host.register_launch_profile_from_trusted_policy(
+        RegisteredLaunchProfile::from_trusted_policy(input).unwrap(),
+    )
+    .unwrap();
+    host.register_native_host_from_trusted_policy(
+        TrustedNativeHostConfig::for_compiled_backend("host.fixture".into())
+            .unwrap()
+            .with_auxiliary_driver("process.exec".into())
+            .unwrap(),
+    )
+    .unwrap();
+    let selection = LaunchSelection {
+        profile_ref: OPERATOR_PROCESS_PROFILE_REF.into(),
+        profile_generation: 1,
+        model_id: None,
+        reasoning_effort: None,
+        fallback_approved: false,
+        workspace: WorkspaceSelection {
+            scope_id: who.scope.clone(),
+            basis_ref: "basis.commit.one".into(),
+            relative_cwd: ".".into(),
+            access: WorkspaceAccess::ReadWrite,
+        },
+        arguments: vec![],
+        tool_bundle_refs: vec![],
+        authority_ref: format!("grant.{}", grant.get()),
+        wall_seconds: 60,
+        max_children: 0,
+        parent_run_id: None,
+    };
+    let request = BoundLaunchPodRequest {
+        host_request: HostRequest {
+            scope_id: who.scope.clone(),
+            grant_id: grant,
+            guards: GuardSet {
+                manager_epoch: ManagerEpoch::new(1).unwrap(),
+                pod_incarnation: PodIncarnation::new(1).unwrap(),
+                resource_epoch: None,
+                credential_generation: CredentialGeneration::new(1).unwrap(),
+            },
+            command_key: "launch.operator.queued".into(),
+            correlation_id: "correlation.operator.queued".into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+            action: HostAction::LaunchPod {
+                pod_id: who.pod.clone(),
+                role: Role::Coordinator,
+                credential: None,
+            },
+        },
+        canonical_request: b"operator queued root".to_vec(),
+        proposal: Some(bound_proposal_with_resources(
+            &who,
+            &who.pod,
+            Role::Coordinator,
+            selection,
+            &[ResourceKind::Auxiliary],
+            true,
+        )),
+    };
+    let mut legacy = request.clone();
+    legacy.host_request.command_key = "launch.operator.preadmitted".into();
+    let selection = legacy.proposal.as_ref().unwrap().selection.clone();
+    legacy.proposal = Some(bound_proposal_with_resources(
+        &who,
+        &who.pod,
+        Role::Coordinator,
+        selection,
+        &[ResourceKind::Auxiliary],
+        false,
+    ));
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, legacy.clone()),
+        Err(LaunchPodError::Host(HostError::Unsupported))
+    ));
+    assert_command_not_admitted(&fixture, &who, &legacy);
+    assert!(host.launch_bound_pod(&who.transport, request.clone()).is_err());
+    assert_command_not_admitted(&fixture, &who, &request);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let prepared = host
+        .admit_bound_operator_process(&who.transport, request.clone())
+        .unwrap();
+    assert_eq!(prepared.status.stage, LaunchDispatchStage::Prepared);
+    assert!(!prepared.port_called && !prepared.duplicate);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let inspected = host
+        .launch_bound_operator_process(&who.transport, request.clone())
+        .unwrap();
+    assert!(inspected.duplicate && !inspected.port_called);
+    assert_eq!(inspected.receipt, prepared.receipt);
+    let first = host
+        .resume_prepared_bound_operator_process(&who.transport, request.clone())
+        .unwrap();
+    assert_eq!(first.status.stage, LaunchDispatchStage::HostAccepted);
+    assert!(first.port_called && first.duplicate);
+    assert_eq!(first.receipt, prepared.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let seen = host.port().manager_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let descriptor = ImmutableLaunchDescriptor::decode_json(&seen[0].descriptor).unwrap();
+    assert_eq!(descriptor.profile_ref(), OPERATOR_PROCESS_PROFILE_REF);
+    assert_eq!(descriptor.resources_len(), 1);
+    drop(seen);
+    assert!(matches!(
+        host.launch_bound_pod(&who.transport, request.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert!(matches!(
+        host.resume_prepared_bound_pod(&who.transport, request.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    let mut retry = request;
+    retry.proposal = None;
+    let duplicate = host.launch_bound_operator_process(&who.transport, retry).unwrap();
+    assert!(duplicate.duplicate && !duplicate.port_called);
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

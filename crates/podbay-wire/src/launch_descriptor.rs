@@ -255,6 +255,15 @@ pub struct NativeResourceView<'a> {
 }
 
 impl ImmutableLaunchDescriptor {
+    /// Review a queued first-root identity without pretending its Run has
+    /// already been admitted. The store must admit it with a real command row.
+    pub fn from_planned_root(
+        planned: &PlannedRootBinding,
+        policy: ReviewedNativePolicy,
+    ) -> Result<Self, LaunchDescriptorError> {
+        Self::from_identity(planned.identity(), policy)
+    }
+
     pub fn from_binding(
         binding: &LaunchBinding,
         policy: ReviewedNativePolicy,
@@ -377,6 +386,13 @@ impl ImmutableLaunchDescriptor {
             return Err(LaunchDescriptorError::BindingMismatch);
         }
         self.validate_against_identity(binding)
+    }
+
+    pub fn validate_against_planned_root(
+        &self,
+        planned: &PlannedRootBinding,
+    ) -> Result<(), LaunchDescriptorError> {
+        self.validate_against_identity(planned.identity())
     }
 
     fn validate_against_identity(

@@ -10,8 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod, PodId,
-    Resource, ResourceId, ResourceKind, Role, Run, RunCommandKind, RunId, ScopeId, Session,
+    ActorId, Attempt, AttemptId, Epoch, LaunchBinding, Pod, PodId,
+    Resource, ResourceId, ResourceKind, Role, Run, RunId, ScopeId, Session,
     SessionId, WorkKind,
 };
 use podbay_host::{
@@ -131,16 +131,6 @@ struct Transport(AuthenticatedPeer);
 impl AuthenticatedTransport for Transport {
     fn verified_peer(&self) -> Result<AuthenticatedPeer, HostError> {
         Ok(self.0.clone())
-    }
-}
-
-// The V1 aggregate fixture predates transaction-local Run admission. The
-// actual pod.offer/outbox is still committed by DurableAuthority before the
-// Linux port can receive its private ResolvedNativeLaunch capability.
-struct FixtureAdmission(CommandId, RunId);
-impl CommandAdmission for FixtureAdmission {
-    fn admits_run(&self, command: &CommandId, run: &RunId, kind: RunCommandKind) -> bool {
-        command == &self.0 && run == &self.1 && kind == RunCommandKind::Launch
     }
 }
 
@@ -449,20 +439,13 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
     let attempt_id = AttemptId::try_from("attempt.zap.disposable").unwrap();
     let resource_id = ResourceId::try_from("resource.zap.disposable").unwrap();
     let mut session = Session::new(session_id, actor, scope.clone());
-    let mut run = Run::new(
+    let run = Run::new(
         run_id.clone(),
         &session,
         Role::Coordinator,
         WorkKind::Service,
         None,
     );
-    let command_id = CommandId::try_from("command.zap.disposable").unwrap();
-    run.admit(
-        run.revision(),
-        &command_id,
-        &FixtureAdmission(command_id.clone(), run_id),
-    )
-    .unwrap();
     session.bind_run(session.revision(), &run).unwrap();
     let mut attempt = Attempt::new(
         attempt_id.clone(),
@@ -471,7 +454,6 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
         Epoch::new(1).unwrap(),
     )
     .unwrap();
-    run.start_attempt(run.revision(), &attempt).unwrap();
     let mut pod = Pod::new(pod_id.clone(), attempt.id().clone(), Epoch::new(1).unwrap());
     attempt.attach_pod(attempt.revision(), &pod).unwrap();
     let resource = Resource::new(
@@ -481,8 +463,10 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
         Epoch::new(1).unwrap(),
     );
     pod.attach_resource(pod.revision(), &resource).unwrap();
-    let binding =
-        LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource]).unwrap();
+    let binding = LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource])
+        .unwrap()
+        .identity()
+        .clone();
     let request = BoundLaunchPodRequest {
         host_request: HostRequest {
             scope_id: scope.clone(),
@@ -536,7 +520,7 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
     );
     let stem = manifest_path.file_stem().unwrap().to_string_lossy();
     fixture.unit = Some(format!("podbay-pod-{stem}.service"));
-    let first = host.launch_bound_pod(&transport, request.clone()).unwrap();
+    let first = host.launch_bound_operator_process(&transport, request.clone()).unwrap();
     assert_eq!(first.status.stage, LaunchDispatchStage::HostAccepted);
     assert!(first.port_called && !first.duplicate);
     let inspected = host
@@ -567,7 +551,7 @@ fn real_zap_server_runs_once_as_attested_pod_child() {
         resource_id.as_str()
     );
     assert!(before.child_pid > 1 && before.child_start_ticks > 0);
-    let duplicate = host.launch_bound_pod(&transport, request).unwrap();
+    let duplicate = host.launch_bound_operator_process(&transport, request).unwrap();
     assert!(duplicate.duplicate && !duplicate.port_called);
     assert_eq!(duplicate.receipt, first.receipt);
     let after = client.attested_status().unwrap();
