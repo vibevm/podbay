@@ -58,3 +58,28 @@ through PodBay reads before deciding on a new operation.
 Run its disposable local-socket fixtures with Node.js 24:
 
     node --test bindings/typescript/tests/authenticated-unix-socket.test.ts
+
+## Initial Linux owner setup
+
+`src/owner-setup.ts` enrolls the exact launcher-parent process over the
+one-use `owner-setup.sock` before `manager.sock` opens. It generates an
+Ed25519 KeyObject in memory, sends only its 32-byte public key, validates the
+full domain-separated setup challenge against caller-supplied trusted actor,
+scope, credential, store lineage, owner/revision, Linux process birth and
+rights digest, and signs only that transcript. The returned
+`authenticatedChannel()` retains the same private KeyObject in this process
+and signs only an exact `podbay.auth/1` challenge. It never exports, logs or
+persists the private key.
+
+The launcher must independently pin the manager endpoint and supply
+`validateHostEndpoint`; challenge fields and request JSON are not authority.
+The client permits one same-key retry only when a signed attempt loses its
+receipt or ACK. A remaining possible-enrollment error retains the KeyObject
+in the client instance for read-only reconciliation; it must not trigger a
+new key or owner enrollment automatically.
+
+The mock socket tests use Node.js 24. A disposable Node-parent/Rust-manager
+fixture runs when `PODBAY_TEST_MANAGER_BINARY` names the absolute current
+`podbay` executable:
+
+    PODBAY_TEST_MANAGER_BINARY=/absolute/path/to/podbay node --test bindings/typescript/tests/owner-setup.test.ts

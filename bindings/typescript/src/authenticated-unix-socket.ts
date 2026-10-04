@@ -85,6 +85,16 @@ export interface AuthenticatedUnixSocketOptions {
   readonly exchangeTimeoutMs?: number;
 }
 
+/** Reparse bytes before a process-owned signer signs an auth/1 transcript. */
+export function matchesCanonicalActorChallenge(
+  challenge: CanonicalActorChallenge,
+  expected: ExpectedActorChallenge,
+): boolean {
+  if (!(challenge.bytes instanceof Uint8Array)) return false;
+  const parsed = parseChallenge(Buffer.from(challenge.bytes));
+  return parsed !== undefined && matchesExpected(parsed, copyAndValidateExpected(expected));
+}
+
 type Phase = "connecting" | "challenge" | "signing" | "ack" | "response" | "reply_complete";
 
 /** Authenticates before writing one request; never retries uncertain input. */
