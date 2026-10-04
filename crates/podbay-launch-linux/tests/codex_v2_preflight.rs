@@ -12,7 +12,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    ActorId, Attempt, AttemptId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
+    ActorId, Attempt, AttemptId, CommandId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
     ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
 use podbay_host::{
@@ -30,8 +30,9 @@ use podbay_launch_linux::{
     preflight_committed_codex_v2,
 };
 use podbay_pod::{
-    CODEX_V2_CAPABILITY, CodexCommandJournal, CodexJournalIdentity, CodexJournalStage,
-    LinuxBackend, PodClient, PodError, launch_bound_codex_v2,
+    BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CodexCommandJournal,
+    CodexJournalIdentity, CodexJournalStage, LinuxBackend, PodClient, PodError,
+    launch_bound_codex_v2,
 };
 use podbay_store::{
     CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
@@ -1309,5 +1310,43 @@ fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
     ));
     assert_eq!(after_retry.command_key, durable.command_key);
     assert_eq!(after_retry.native_turn_id, durable.native_turn_id);
+    let command_id = CommandId::try_from(submitted.receipt.command_id.as_str()).unwrap();
+    let completion_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let observed = client
+            .inspect_claimed_codex_bootstrap(&command_id, &target, lease.writer_epoch())
+            .unwrap();
+        assert!(matches!(
+            observed.stage,
+            BootstrapControlStage::Submitted {
+                ref native_turn_id,
+                ..
+            } if native_turn_id == durable.native_turn_id.as_ref().unwrap()
+        ));
+        match observed.settlement {
+            Some(BootstrapSettlementStage::Completed) => break,
+            Some(BootstrapSettlementStage::Failed | BootstrapSettlementStage::Interrupted) => {
+                panic!(
+                    "real Codex bootstrap reported terminal failure: {:?}",
+                    observed.settlement
+                );
+            }
+            None | Some(BootstrapSettlementStage::CompletionObservedPendingIdleProof) => {}
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "real Codex bootstrap did not prove idle completion: {:?}",
+            observed.settlement
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        reopened_bootstrap_journal(&fixture).stage,
+        CodexJournalStage::BootstrapCompleted,
+    );
+    eprintln!(
+        "real smoke completed_ms={}",
+        smoke_start.elapsed().as_millis()
+    );
     assert!(!client.stop().unwrap().child_running);
 }
