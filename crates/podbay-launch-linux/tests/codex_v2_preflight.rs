@@ -1073,7 +1073,7 @@ fn rebind_second_manager_process_helper() {
     .unwrap();
     let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
     register_restarted_codex_profile(&mut host, &fixture);
-    let frames = fixture.directory.join("home/codex/frames.log");
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 2);
     let actor = ActorId::try_from("actor.codex.preflight").unwrap();
     let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
@@ -1209,6 +1209,8 @@ fn rebind_second_manager_process_helper() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(client.attested_status().unwrap().child_pid, before_pid);
+    let events = client.read_codex_native_events(None, 16).unwrap();
+    assert_eq!(events.snapshot.identity.pod_id, fixture.pod.as_str());
     assert!(!client.stop().unwrap().child_running);
     fs::write(
         fixture.directory.join("rebind.second.done"),
