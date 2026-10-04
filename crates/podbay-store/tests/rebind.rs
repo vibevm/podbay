@@ -154,7 +154,9 @@ fn remove_post_v13_schema(connection: &rusqlite::Connection) {
     // Synthetic old-version fixtures must remove newer tables before the
     // historical manager_rebinds rename can rewrite their foreign keys.
     connection.execute_batch(
-        "DROP INDEX rebind_supersession_latest_v21;
+        "DROP INDEX codex_later_turns_session_v22;
+         DROP TABLE codex_later_turns;
+         DROP INDEX rebind_supersession_latest_v21;
          DROP TABLE rebind_supersession_resources;
          DROP TABLE rebind_supersession_attempts;
          DROP TABLE launch_policy_fences;
@@ -700,7 +702,7 @@ fn v9_v11_v12_to_v13_preserve_legacy_rows_without_prior_observation() {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 21);
+            assert_eq!(version, 22);
             let prior_count: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM manager_rebind_prior_observations",

@@ -522,6 +522,15 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP INDEX rebind_supersession_latest_v21;
+             DROP TABLE rebind_supersession_resources;
+             DROP TABLE rebind_supersession_attempts;
+             DROP TABLE launch_policy_fences;
+             DELETE FROM metadata WHERE key='policy_fence_epoch';
+             DROP INDEX runtime_sessions_open_scope_v19;
+             DROP INDEX authority_resources_pod_v19;
              DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
@@ -601,7 +610,8 @@ fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations; DROP TABLE actor_verifiers;
              PRAGMA user_version=13;",
@@ -633,7 +643,8 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE owner_actor_rotations; PRAGMA user_version=14;",
         )
@@ -660,7 +671,7 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, count), (20, 0));
+    assert_eq!((version, count), (22, 0));
 }
 
 #[test]

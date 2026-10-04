@@ -91,7 +91,9 @@ fn remove_v8_schema(connection: &rusqlite::Connection) {
     // user_version attached to the new tables.
     connection
         .execute_batch(
-            "DROP INDEX rebind_supersession_latest_v21;
+            "DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP INDEX rebind_supersession_latest_v21;
              DROP TABLE rebind_supersession_resources;
              DROP TABLE rebind_supersession_attempts;
              DROP TABLE codex_bootstrap_sends;
@@ -419,7 +421,7 @@ fn schema_six_duplicate_preproduction_launches_refuse_migration() {
 }
 
 #[test]
-fn fresh_schema_twenty_one_has_empty_runtime_rebind_manager_and_verifier_tables() {
+fn fresh_schema_twenty_two_has_empty_runtime_rebind_manager_and_verifier_tables() {
     let fixture = Fixture::new();
     let store = fixture.open();
     drop(store);
@@ -427,7 +429,7 @@ fn fresh_schema_twenty_one_has_empty_runtime_rebind_manager_and_verifier_tables(
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 21);
+    assert_eq!(version, 22);
     for table in [
         "runtime_sessions",
         "runtime_runs",
@@ -473,7 +475,9 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP INDEX rebind_supersession_latest_v21;
+            "DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP INDEX rebind_supersession_latest_v21;
              DROP TABLE rebind_supersession_resources;
              DROP TABLE rebind_supersession_attempts;
              DROP TABLE codex_bootstrap_sends;
@@ -510,7 +514,7 @@ fn schema_seven_migration_preserves_launch_and_invents_no_binding() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 21);
+    assert_eq!(version, 22);
     for table in [
         "runtime_sessions",
         "runtime_runs",
@@ -547,7 +551,9 @@ fn schema_eight_refuses_preexisting_or_malformed_runtime_tables() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends;
+            "DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets;
              DROP TABLE launch_resources;

@@ -64,7 +64,7 @@ where
             })?;
             let outcome = self
                 .authority
-                .send_first_codex_bootstrap_from_wire(transport, request, policy)
+                .send_codex_session_from_wire(transport, request, policy)
                 .map_err(bootstrap_error)?;
             return project_bootstrap_send_receipt(self.authority, outcome);
         }

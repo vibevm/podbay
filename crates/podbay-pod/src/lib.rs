@@ -6,13 +6,14 @@ mod codex_bootstrap;
 #[cfg(target_os = "linux")]
 mod codex_credential;
 mod codex_journal;
-#[allow(dead_code)] // Only a sealed fixture proof exists until v22 admission.
 mod codex_later_turn;
 #[cfg(target_os = "linux")]
 mod codex_launch;
 #[cfg(target_os = "linux")]
 mod codex_resource;
 mod codex_turn_journal;
+#[cfg(target_os = "linux")]
+mod codex_turn_control;
 #[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
@@ -59,6 +60,8 @@ pub use codex_turn_journal::{
     CodexLaterTurnJournal, LaterTurnIntentResult, LaterTurnStage, LaterTurnTerminal, LaterTurnView,
 };
 #[cfg(target_os = "linux")]
+pub use codex_turn_control::{CodexAnchorInspectReceipt, LaterTurnControlReceipt, LaterTurnControlStage};
+#[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
 pub use manifest::{
@@ -84,7 +87,6 @@ pub use peer_checkpoint::{
     PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint,
     peer_checkpoint_observation_digest,
 };
-#[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
     DurableAppendLog, DurableFileIdentity, DurableFiles, LocalConnection, LocalControlTransport,

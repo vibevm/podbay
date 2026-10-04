@@ -1,11 +1,12 @@
-//! Internal later-turn controller. Its claimed-command trait is sealed; only
-//! disposable tests implement it until the v22 store can prove admission.
+//! Later-turn controller. Its claimed-command trait is sealed; production
+//! construction requires an exact claimed v22 store record.
 
 use podbay_adapter_codex::{
     BlockReason, BootstrapReadPoll, CodexError, CodexResource, JsonlTransport,
     LaterTurnCompletionObservation, LaterTurnTerminalStatus, TurnSubmissionStage, WriterPermit,
 };
 use podbay_core::Epoch;
+use podbay_store::{EffectState, LaterCodexSendRecord};
 
 use crate::codex_journal::{CodexCommandJournal, CodexJournalIdentity, CodexJournalStage};
 use crate::codex_turn_journal::{
@@ -25,6 +26,60 @@ trait ClaimedLaterTurn: sealed::Sealed {
     fn request_digest(&self) -> &str;
     fn client_message_id(&self) -> &str;
     fn text(&self) -> &str;
+}
+
+struct StoreClaimedLaterTurn<'a> {
+    record: &'a LaterCodexSendRecord,
+    journal_identity: CodexJournalIdentity,
+    resource_identity: podbay_adapter_codex::ResourceIdentity,
+}
+
+impl sealed::Sealed for StoreClaimedLaterTurn<'_> {}
+
+impl ClaimedLaterTurn for StoreClaimedLaterTurn<'_> {
+    fn journal_identity(&self) -> &CodexJournalIdentity { &self.journal_identity }
+    fn resource_identity(&self) -> &podbay_adapter_codex::ResourceIdentity { &self.resource_identity }
+    fn writer_epoch(&self) -> u64 { self.record.writer_epoch() }
+    fn command_key(&self) -> &str { &self.record.receipt().command_id }
+    fn request_digest(&self) -> &str { &self.record.receipt().request_digest }
+    fn client_message_id(&self) -> &str { &self.record.receipt().command_id }
+    fn text(&self) -> &str { self.record.prompt_text() }
+}
+
+/// Only a freshly inspected, claimed store record can cross this production
+/// seam. The caller rechecks OS manager, store, lease and child inside `recheck`.
+pub(crate) fn submit_store_claimed<T: JsonlTransport>(
+    resource: &mut CodexResource<T>,
+    bootstrap: &mut CodexCommandJournal,
+    later: &mut CodexLaterTurnJournal,
+    record: &LaterCodexSendRecord,
+    recheck: &mut impl FnMut(&mut CodexResource<T>) -> Result<(), PodError>,
+) -> Result<LaterTurnView, PodError> {
+    if record.effect_state() != EffectState::ClaimedUncertain {
+        return Err(PodError::Refused("later turn has no claimed store effect"));
+    }
+    let target = record.native_target();
+    let bootstrap_view = bootstrap.view();
+    if bootstrap_view.native_thread_id.as_deref() != Some(record.native_thread_id()) {
+        return Err(PodError::Refused("later turn store thread differs from bootstrap journal"));
+    }
+    let pod_epoch = Epoch::new(target.pod_incarnation)
+        .map_err(|_| PodError::Invalid("later turn Pod incarnation"))?;
+    let resource_epoch = Epoch::new(target.resource_epoch)
+        .map_err(|_| PodError::Invalid("later turn Resource epoch"))?;
+    let proof = StoreClaimedLaterTurn {
+        record,
+        journal_identity: CodexJournalIdentity::from_resource(
+            &target.store_lineage, &target.scope_id, &target.session_id, &target.run_id,
+            &target.attempt_id, &target.pod_id, pod_epoch, &target.resource_id, resource_epoch,
+        ),
+        resource_identity: podbay_adapter_codex::ResourceIdentity {
+            session_id: target.session_id.clone(), run_id: target.run_id.clone(),
+            attempt_id: target.attempt_id.clone(), pod_id: target.pod_id.clone(),
+            resource_id: target.resource_id.clone(), resource_epoch,
+        },
+    };
+    submit_claimed(resource, bootstrap, later, &proof, recheck)
 }
 
 fn current_anchor<T: JsonlTransport>(
@@ -64,8 +119,8 @@ fn uncertain_view(
 }
 
 /// Fsync one intent and attempt at most one native `turn/start`. `recheck`
-/// is the future OS child and writer-lease boundary. No release build has a
-/// ClaimedLaterTurn implementation, so no normal pod route can invoke this.
+/// is the current OS child and writer-lease boundary. A store record alone
+/// never authenticates the connected manager or authorizes native input.
 fn submit_claimed<T: JsonlTransport, P: ClaimedLaterTurn>(
     resource: &mut CodexResource<T>,
     bootstrap: &mut CodexCommandJournal,
@@ -139,7 +194,7 @@ fn matches_active(view: &LaterTurnView, observed: &LaterTurnCompletionObservatio
 
 /// One nonblocking native step, then durable private observation and journal
 /// advancement. The outer socket loop can answer status between these calls.
-fn poll_once<T: JsonlTransport>(
+pub(crate) fn poll_once<T: JsonlTransport>(
     resource: &mut CodexResource<T>,
     bootstrap: &mut CodexCommandJournal,
     later: &mut CodexLaterTurnJournal,
@@ -233,9 +288,8 @@ mod tests {
 
     use super::*;
     use crate::linux_peer::LinuxPeerEvidence;
-    use crate::native_events::{NativeEventIdentity, NativeEventKind, NativeEventStatus};
+    use crate::native_events::{NativeEventIdentity, NativeEventKind, NativeEventSpool, NativeEventStatus};
     use crate::runtime::LinuxBackend;
-    use crate::segmented_native_events::SegmentedNativeEventSpool;
 
     #[derive(Default)]
     struct FakeState {
@@ -377,7 +431,7 @@ mod tests {
         resource: CodexResource<FakeTransport>,
         bootstrap: CodexCommandJournal,
         later: CodexLaterTurnJournal,
-        events: SegmentedNativeEventSpool,
+        events: NativeEventSpool,
         owner: LinuxPeerEvidence,
         guard_child: Child,
         guard_birth: (u32, u64, String, String),
@@ -520,7 +574,9 @@ mod tests {
                 &mut bootstrap,
             )
             .unwrap();
-            let events = SegmentedNativeEventSpool::open(root.clone(), event_identity()).unwrap();
+            let events = NativeEventSpool::open(
+                &LinuxBackend, &root.join("codex.native-events.log"), event_identity(),
+            ).unwrap();
             let owner = LinuxPeerEvidence::for_current_process().unwrap();
             let guard_child = Command::new("/usr/bin/sleep")
                 .arg("40")
@@ -622,7 +678,7 @@ mod tests {
                 },
                 &mut |resource| {
                     while resource.has_unspooled_native_notifications() {
-                        let sequence = events.reserve_native_take()?;
+                        let sequence = events.next_source_sequence()?;
                         let observed = resource.take_applied_native_notification().ok_or(
                             PodError::Uncertain(
                                 "fixture native frame disappeared after reservation",
@@ -727,8 +783,9 @@ mod tests {
                 .watermark
                 >= 4
         );
-        let reopened_events =
-            SegmentedNativeEventSpool::open(fixture.root.clone(), event_identity()).unwrap();
+        let reopened_events = NativeEventSpool::open(
+            &LinuxBackend, &fixture.root.join("codex.native-events.log"), event_identity(),
+        ).unwrap();
         assert_eq!(
             reopened_events
                 .read_after(None, 16)

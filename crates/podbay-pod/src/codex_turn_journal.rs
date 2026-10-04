@@ -1,5 +1,5 @@
 //! Portable pod-local later-turn facts. This journal never calls a provider or
-//! authenticates a writer; the future claimed-command bridge must prove exact
+//! authenticates a writer; the claimed-command bridge must prove exact
 //! manager, writer lease, child and native state before each native effect.
 
 use std::collections::BTreeMap;
@@ -354,7 +354,6 @@ impl CodexLaterTurnJournal {
 
     /// Caller must have observed a matching state-applied turn/completed.
     /// This is a provider report, not proof of idle or PodBay Run settlement.
-    #[allow(dead_code)] // The future authenticated pod bridge supplies this native observation.
     pub(crate) fn record_completion_observed(
         &mut self,
         key: &str,
@@ -383,7 +382,6 @@ impl CodexLaterTurnJournal {
 
     /// Caller must have a fresh idle/no-waiting/no-pending-request native
     /// read for this exact observed turn. The journal does no native RPC.
-    #[allow(dead_code)] // The future nonblocking idle-proof bridge supplies this transition.
     pub(crate) fn record_terminal_after_fresh_idle(
         &mut self,
         key: &str,

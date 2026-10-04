@@ -17,7 +17,7 @@ use podbay_core::{
 };
 use podbay_store::{
     BootstrapSendSelector, BoundLaunchFormat, BoundLaunchRecord, HostObservedPriorCheckpoint,
-    NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
+    LaterCodexSendSelector, NativeWriterTarget, PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness,
     SqlitePriorObservedPendingLedger, SqliteSupersessionLedger,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole, NativeWorkKind};
@@ -27,7 +27,9 @@ use crate::codex_credential::prepare_codex_home_from_systemd_credential;
 use crate::codex_bootstrap::{
     BootstrapControlReceipt, BootstrapControlRequest, BootstrapControlStage,
     CODEX_BOOTSTRAP_INSPECT_PROTOCOL, CODEX_BOOTSTRAP_PROTOCOL,
+    CODEX_ANCHOR_INSPECT_PROTOCOL, CODEX_LATER_TURN_INSPECT_PROTOCOL, CODEX_LATER_TURN_PROTOCOL,
 };
+use crate::codex_turn_control::{CodexAnchorInspectReceipt, LaterTurnControlReceipt, LaterTurnControlStage};
 use crate::codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
@@ -1245,6 +1247,196 @@ impl PodClient {
         Ok(response)
     }
 
+    pub fn submit_claimed_codex_turn(
+        &self,
+        selector: &LaterCodexSendSelector,
+        writer_epoch: u64,
+        expected_digest: &str,
+        expected_thread_id: &str,
+    ) -> Result<LaterTurnControlReceipt, PodError> {
+        self.exchange_claimed_codex_turn(selector, writer_epoch, expected_digest,
+            expected_thread_id, false)
+    }
+
+    pub fn inspect_claimed_codex_turn(
+        &self,
+        selector: &LaterCodexSendSelector,
+        writer_epoch: u64,
+        expected_digest: &str,
+        expected_thread_id: &str,
+    ) -> Result<LaterTurnControlReceipt, PodError> {
+        self.exchange_claimed_codex_turn(selector, writer_epoch, expected_digest,
+            expected_thread_id, true)
+    }
+
+    fn exchange_claimed_codex_turn(
+        &self,
+        selector: &LaterCodexSendSelector,
+        writer_epoch: u64,
+        expected_digest: &str,
+        expected_thread_id: &str,
+        inspection: bool,
+    ) -> Result<LaterTurnControlReceipt, PodError> {
+        let binding = active_codex_binding(&self.manifest)?;
+        if !is_codex_binding(&binding) {
+            return Err(PodError::Unsupported("Codex later-turn binding unavailable"));
+        }
+        let request = if inspection {
+            BootstrapControlRequest::for_later_inspection(selector, writer_epoch, &self.manifest.token)
+        } else {
+            BootstrapControlRequest::from_later_selector(selector, writer_epoch, &self.manifest.token)
+        };
+        if inspection { request.checked_later_inspection_selector(&binding, &self.manifest.descriptor)?; }
+        else { request.checked_later_selector(&binding, &self.manifest.descriptor)?; }
+        let bytes = serde_json::to_vec(&request)?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("later-turn request exceeds frame bound"));
+        }
+        let mut socket = UnixStream::connect(&self.manifest.socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_secs(if inspection { 10 } else { 75 })))?;
+        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let observed = LinuxPeerEvidence::from_connected(&socket)
+            .map_err(|_| PodError::Refused("later-turn server OS identity unavailable"))?;
+        socket.write_all(&bytes)
+            .map_err(|_| PodError::Uncertain("later-turn socket write may have reached pod"))?;
+        socket.shutdown(std::net::Shutdown::Write)
+            .map_err(|_| PodError::Uncertain("later-turn request completion unknown"))?;
+        let mut reply = Vec::new();
+        (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)
+            .map_err(|_| PodError::Uncertain("later-turn reply lost after possible effect"))?;
+        if reply.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Uncertain("later-turn reply exceeds frame bound"));
+        }
+        observed.recheck_connected(&socket)
+            .map_err(|_| PodError::Uncertain("later-turn server changed after possible effect"))?;
+        let fresh_manifest = read_manifest(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("later-turn manifest changed after possible effect"))?;
+        let metadata = fs::symlink_metadata(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("later-turn manifest unavailable after possible effect"))?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Uncertain("later-turn client OS identity unavailable"))?;
+        if serde_json::to_vec(&fresh_manifest)
+            .map_err(|_| PodError::Uncertain("later-turn manifest encoding unknown"))?
+            != serde_json::to_vec(&self.manifest)
+                .map_err(|_| PodError::Uncertain("later-turn manifest encoding unknown"))?
+            || observed.uid() != metadata.uid() || observed.uid() != current.uid()
+            || !unit_cgroup_exact(observed.cgroup(), &self.manifest.unit_name)
+        { return Err(PodError::Uncertain("later-turn server identity differs after possible effect")); }
+        let response: LaterTurnControlReceipt = serde_json::from_slice(&reply)
+            .map_err(|_| PodError::Uncertain("later-turn reply malformed after possible effect"))?;
+        let target = &selector.native_target;
+        let expected_protocol = if inspection { CODEX_LATER_TURN_INSPECT_PROTOCOL }
+            else { CODEX_LATER_TURN_PROTOCOL };
+        let valid_digest = |value: &str| value.len() == 64
+            && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let valid_native = |value: &str| !value.is_empty() && value.len() <= 512
+            && value.trim() == value && !value.chars().any(char::is_control);
+        if !valid_digest(expected_digest) || !valid_native(expected_thread_id)
+            || response.protocol != expected_protocol
+            || response.command_id != selector.command_id.as_str()
+            || response.store_lineage != target.store_lineage.as_str()
+            || response.scope_id != selector.scope_id.as_str()
+            || response.session_id != target.session_id.as_str()
+            || response.run_id != target.run_id.as_str()
+            || response.attempt_id != target.attempt_id.as_str()
+            || response.pod_id != target.pod_id.as_str()
+            || response.pod_incarnation != target.pod_incarnation
+            || response.resource_id != target.resource_id.as_str()
+            || response.resource_epoch != target.resource_epoch
+            || response.resource_input_epoch != target.resource_input_epoch
+            || response.writer_epoch != writer_epoch
+            || (!matches!(response.stage, LaterTurnControlStage::RefusedBeforeEffect)
+                && response.request_digest.as_deref() != Some(expected_digest))
+            || response.native_thread_id.as_deref().is_some_and(|id| id != expected_thread_id)
+            || response.native_session_id.as_deref().is_some_and(|id| !valid_native(id))
+        { return Err(PodError::Uncertain("later-turn reply identity differs")); }
+        if let LaterTurnControlStage::Submitted { native_turn_id } = &response.stage {
+            if !valid_native(native_turn_id)
+                || response.native_thread_id.as_deref() != Some(expected_thread_id)
+                || response.native_session_id.is_none()
+            { return Err(PodError::Uncertain("later-turn native receipt is malformed")); }
+        }
+        if response.stage == LaterTurnControlStage::RefusedBeforeEffect {
+            return Err(PodError::Refused("claimed later-turn request refused"));
+        }
+        Ok(response)
+    }
+
+    /// Read a fresh completed bootstrap anchor under today's manager and
+    /// writer lease. The old bootstrap lease is historical lineage only.
+    pub fn inspect_current_codex_anchor(
+        &self,
+        bootstrap_command_id: &CommandId,
+        target: &NativeWriterTarget,
+        writer_epoch: u64,
+        expected_bootstrap_digest: &str,
+    ) -> Result<CodexAnchorInspectReceipt, PodError> {
+        let binding = active_codex_binding(&self.manifest)?;
+        if !is_codex_binding(&binding) {
+            return Err(PodError::Unsupported("Codex anchor binding unavailable"));
+        }
+        let selector = BootstrapSendSelector {
+            scope_id: target.scope_id.clone(), command_id: bootstrap_command_id.clone(),
+            native_target: target.clone(),
+        };
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let request = BootstrapControlRequest::for_anchor_inspection(
+            &selector, writer_epoch, &self.manifest.token, nonce.clone(),
+        );
+        request.checked_anchor_inspection_selector(&binding, &self.manifest.descriptor)?;
+        let bytes = serde_json::to_vec(&request)?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("Codex anchor request exceeds frame bound"));
+        }
+        let mut socket = UnixStream::connect(&self.manifest.socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let observed = LinuxPeerEvidence::from_connected(&socket)
+            .map_err(|_| PodError::Refused("Codex anchor server OS identity unavailable"))?;
+        socket.write_all(&bytes)?;
+        socket.shutdown(std::net::Shutdown::Write)?;
+        let mut reply = Vec::new();
+        (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)?;
+        if reply.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Refused("Codex anchor reply exceeds frame bound"));
+        }
+        observed.recheck_connected(&socket)
+            .map_err(|_| PodError::Refused("Codex anchor server changed"))?;
+        let fresh = read_manifest(&self.manifest_path)?;
+        let metadata = fs::symlink_metadata(&self.manifest_path)?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("Codex anchor client OS identity unavailable"))?;
+        if serde_json::to_vec(&fresh)? != serde_json::to_vec(&self.manifest)?
+            || observed.uid() != metadata.uid() || observed.uid() != current.uid()
+            || !unit_cgroup_exact(observed.cgroup(), &self.manifest.unit_name)
+        { return Err(PodError::Refused("Codex anchor server identity differs")); }
+        let response: CodexAnchorInspectReceipt = serde_json::from_slice(&reply)
+            .map_err(|_| PodError::Refused("Codex anchor reply is unavailable"))?;
+        let native_id = |value: &str| !value.is_empty() && value.len() <= 256
+            && value.bytes().all(|byte| byte.is_ascii_graphic());
+        if response.protocol != CODEX_ANCHOR_INSPECT_PROTOCOL
+            || response.nonce != nonce
+            || response.bootstrap_command_id != bootstrap_command_id.as_str()
+            || response.store_lineage != target.store_lineage.as_str()
+            || response.scope_id != target.scope_id.as_str()
+            || response.session_id != target.session_id.as_str()
+            || response.run_id != target.run_id.as_str()
+            || response.attempt_id != target.attempt_id.as_str()
+            || response.pod_id != target.pod_id.as_str()
+            || response.pod_incarnation != target.pod_incarnation
+            || response.resource_id != target.resource_id.as_str()
+            || response.resource_epoch != target.resource_epoch
+            || response.resource_input_epoch != target.resource_input_epoch
+            || response.writer_epoch != writer_epoch
+            || response.bootstrap_request_digest != expected_bootstrap_digest
+            || !native_id(&response.native_thread_id)
+            || !native_id(&response.native_session_id)
+        { return Err(PodError::Refused("Codex anchor reply differs")); }
+        Ok(response)
+    }
+
     /// One manager-only redacted snapshot and bounded events-after read. The
     /// cursor binds exact lineage/scope/Resource; no native input or replay
     /// of private JSONL occurs on this control path.
@@ -2384,7 +2576,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         let processed = if native_pump_available {
             match &mut child {
                 ChildResource::Codex(resource) => {
-                    let tick = resource.poll_bootstrap_notification_once(|| {
+                    let tick = resource.poll_native_notification_once(|| {
                         let live = active_codex_binding(&manifest)?;
                         current_codex_binding(&live, descriptor)?;
                         if !manager_witness.matches_current(
@@ -3072,6 +3264,188 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         error_code: Some("uncertain".into()), terminal: None,
                     })?,
                 }
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(anchor) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
+                && anchor.protocol == CODEX_ANCHOR_INSPECT_PROTOCOL
+            {
+                let verified = (|| -> Result<CodexAnchorInspectReceipt, PodError> {
+                    let live_binding = active_codex_binding(&manifest)?;
+                    let binding = &live_binding;
+                    if !is_codex_binding(binding)
+                        || !constant_time_equal(anchor.token.as_bytes(), manifest.token.as_bytes())
+                    { return Err(PodError::Refused("Codex anchor capability unavailable")); }
+                    let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "Codex anchor manager OS peer unavailable"))?;
+                    if observed.attested_peer() != &manager_peer
+                        || observed.recheck_before_effect(&stream, &manager_peer).is_err()
+                        || !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer)
+                    { return Err(PodError::Refused("Codex anchor manager peer is stale")); }
+                    let (selector, writer_epoch) = anchor.checked_anchor_inspection_selector(binding, descriptor)?;
+                    current_codex_binding(binding, descriptor)?;
+                    if child.try_wait()?.is_some() {
+                        return Err(PodError::Refused("Codex anchor child is not running"));
+                    }
+                    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                        .map_err(|_| PodError::Refused("Codex anchor store unavailable"))?;
+                    let (current, _) = store.current_native_writer_target_for_session(
+                        &selector.scope_id, &selector.native_target.session_id,
+                    ).map_err(|_| PodError::Refused("Codex anchor current Resource unavailable"))?;
+                    if current != selector.native_target {
+                        return Err(PodError::Refused("Codex anchor current Resource differs"));
+                    }
+                    let lease = store.inspect_native_writer_lease(&current)
+                        .map_err(|_| PodError::Refused("Codex anchor writer lease is stale"))?;
+                    let bootstrap = store.claimed_bootstrap_lineage_for_session(
+                        &selector.scope_id, &current.session_id,
+                    ).map_err(|_| PodError::Refused("Codex bootstrap lineage unavailable"))?;
+                    if bootstrap.receipt().command_id != selector.command_id.as_str()
+                        || lease.writer_epoch() != writer_epoch
+                        || lease.owner_epoch() != binding.owner_epoch
+                        || lease.manager_credential_epoch() != binding.credential_epoch
+                        || lease.holder_actor_id() != bootstrap.holder_actor_id()
+                    { return Err(PodError::Refused("Codex anchor lease or lineage differs")); }
+                    let view = if let ChildResource::Codex(resource) = &mut child {
+                        resource.inspect_current_codex_anchor(&bootstrap, &current)?
+                    } else { return Err(PodError::Refused("Codex anchor resource is unavailable")); };
+                    observed.recheck_before_effect(&stream, &manager_peer)
+                        .map_err(|_| PodError::Refused("Codex anchor manager peer changed"))?;
+                    if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
+                        return Err(PodError::Refused("Codex anchor manager claim changed"));
+                    }
+                    current_codex_binding(binding, descriptor)?;
+                    let mut fresh_store = PodBayStore::open_existing_read_only(&binding.store_path)
+                        .map_err(|_| PodError::Refused("Codex anchor store changed"))?;
+                    if fresh_store.current_native_writer_target_for_session(
+                        &selector.scope_id, &current.session_id,
+                    ).map(|value| value.0).ok().as_ref() != Some(&current)
+                        || fresh_store.inspect_native_writer_lease(&current).ok().as_ref() != Some(&lease)
+                        || fresh_store.claimed_bootstrap_lineage_for_session(
+                            &selector.scope_id, &current.session_id,
+                        ).ok().as_ref() != Some(&bootstrap)
+                    { return Err(PodError::Refused("Codex anchor proof changed")); }
+                    CodexAnchorInspectReceipt::from_completed(
+                        &anchor, &bootstrap.receipt().request_digest, &view,
+                    ).ok_or(PodError::Refused("Codex anchor journal is not completed"))
+                })();
+                match verified {
+                    Ok(receipt) => {
+                        let encoded = serde_json::to_vec(&receipt)?;
+                        if encoded.len() as u64 > FRAME_LIMIT {
+                            return Err(PodError::Invalid("Codex anchor reply exceeds frame bound"));
+                        }
+                        stream.write_all(&encoded)?;
+                    }
+                    Err(_) => respond(&mut stream, Response {
+                        ok: false, status: None, error: Some("Codex anchor inspection refused".into()),
+                        error_code: Some("forbidden".into()), terminal: None,
+                    })?,
+                }
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(turn) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
+                && matches!(turn.protocol.as_str(), CODEX_LATER_TURN_PROTOCOL | CODEX_LATER_TURN_INSPECT_PROTOCOL)
+            {
+                let inspection = turn.protocol == CODEX_LATER_TURN_INSPECT_PROTOCOL;
+                let verified = (|| -> Result<_, PodError> {
+                    let live_binding = active_codex_binding(&manifest)?;
+                    let binding = &live_binding;
+                    if !is_codex_binding(binding)
+                        || !constant_time_equal(turn.token.as_bytes(), manifest.token.as_bytes())
+                    { return Err(PodError::Refused("Codex later-turn capability unavailable")); }
+                    let observed = peer_evidence.as_ref()
+                        .map_err(|_| PodError::Refused("later-turn manager OS peer unavailable"))?;
+                    if observed.attested_peer() != &manager_peer
+                        || observed.recheck_before_effect(&stream, &manager_peer).is_err()
+                        || !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer)
+                    { return Err(PodError::Refused("later-turn manager peer is stale")); }
+                    let (selector, expected_writer_epoch) = if inspection {
+                        turn.checked_later_inspection_selector(binding, descriptor)?
+                    } else { turn.checked_later_selector(binding, descriptor)? };
+                    current_codex_binding(binding, descriptor)?;
+                    if !inspection && child.try_wait()?.is_some() {
+                        return Err(PodError::Refused("Codex child is not running"));
+                    }
+                    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                        .map_err(|_| PodError::Refused("later-turn store unavailable"))?;
+                    let proof = store.inspect_claimed_later_codex_send(&selector)
+                        .map_err(|_| PodError::Refused("later-turn claimed proof is stale"))?;
+                    let lease = store.inspect_native_writer_lease(&selector.native_target)
+                        .map_err(|_| PodError::Refused("later-turn writer lease is stale"))?;
+                    if proof.writer_epoch() != expected_writer_epoch
+                        || proof.owner_epoch() != binding.owner_epoch
+                        || proof.manager_credential_epoch() != binding.credential_epoch
+                        || !bootstrap_revision_matches(binding, proof.authority_revision())
+                        || lease.writer_epoch() != proof.writer_epoch()
+                        || lease.holder_actor_id() != proof.holder_actor_id()
+                        || lease.holder_credential_generation() != proof.holder_credential_generation()
+                        || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+                    { return Err(PodError::Refused("later-turn writer proof differs")); }
+                    Ok((selector, proof, live_binding))
+                })();
+                let reply = match verified {
+                    Ok((selector, proof, live_binding)) => {
+                        let binding = &live_binding;
+                        let fresh = || -> Result<(), PodError> {
+                            let observed = peer_evidence.as_ref()
+                                .map_err(|_| PodError::Refused("later-turn manager peer unavailable"))?;
+                            observed.recheck_before_effect(&stream, &manager_peer)
+                                .map_err(|_| PodError::Refused("later-turn manager peer changed"))?;
+                            if !manager_witness.matches_current(
+                                owner_epoch.get(), credential_epoch.get(), &manager_peer,
+                            ) { return Err(PodError::Refused("later-turn manager claim changed")); }
+                            current_codex_binding(binding, descriptor)?;
+                            let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                                .map_err(|_| PodError::Refused("later-turn store unavailable"))?;
+                            let current = store.inspect_claimed_later_codex_send(&selector)
+                                .map_err(|_| PodError::Refused("later-turn claim changed"))?;
+                            let lease = store.inspect_native_writer_lease(&selector.native_target)
+                                .map_err(|_| PodError::Refused("later-turn lease changed"))?;
+                            if current != proof
+                                || lease.writer_epoch() != proof.writer_epoch()
+                                || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+                            { return Err(PodError::Refused("later-turn proof changed")); }
+                            Ok(())
+                        };
+                        if let ChildResource::Codex(resource) = &mut child {
+                            let result = if inspection {
+                                resource.inspect_claimed_later_turn(&proof)
+                            } else {
+                                resource.submit_claimed_later_turn(&proof, fresh).map(Some)
+                            };
+                            let failed = result.is_err();
+                            let view = match result {
+                                Ok(view) => view,
+                                Err(_) => resource.prior_later_view(&turn.command_id),
+                            };
+                            if failed && view.is_none() {
+                                LaterTurnControlReceipt::uncertain(&turn, &proof.receipt().request_digest)
+                            } else if (|| -> Result<(), PodError> {
+                                let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                                    "later-turn manager peer unavailable"))?;
+                                observed.recheck_before_effect(&stream, &manager_peer)
+                                    .map_err(|_| PodError::Refused("later-turn manager peer changed"))?;
+                                if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
+                                    return Err(PodError::Refused("later-turn manager claim changed"));
+                                }
+                                current_codex_binding(binding, descriptor)?;
+                                Ok(())
+                            })().is_err() {
+                                LaterTurnControlReceipt::uncertain(&turn, &proof.receipt().request_digest)
+                            } else {
+                                LaterTurnControlReceipt::new(&turn, Some(&proof.receipt().request_digest), view.as_ref())
+                            }
+                        } else { LaterTurnControlReceipt::refused(&turn) }
+                    }
+                    Err(_) => LaterTurnControlReceipt::refused(&turn),
+                };
+                let encoded = serde_json::to_vec(&reply)?;
+                if encoded.len() as u64 > FRAME_LIMIT {
+                    return Err(PodError::Uncertain("later-turn reply exceeds frame bound"));
+                }
+                stream.write_all(&encoded)?;
                 return Ok(false);
             }
             if bytes.len() as u64 <= FRAME_LIMIT

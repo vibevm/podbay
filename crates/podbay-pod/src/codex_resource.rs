@@ -14,7 +14,7 @@ use podbay_adapter_codex::{
     PinnedCodexConfig, ProcessJsonlTransport, ResourceIdentity, Sandbox, WriterPermit,
 };
 use podbay_core::{AttemptId, Epoch, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId};
-use podbay_store::BootstrapSendRecord;
+use podbay_store::{BootstrapSendRecord, LaterCodexSendRecord};
 use podbay_wire::{
     EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, ResourceDriver,
     TargetOs,
@@ -26,6 +26,8 @@ use crate::codex_credential::{
 };
 use crate::codex_bootstrap::{BootstrapControlStage, BootstrapSettlementStage};
 use crate::codex_journal::{CodexCommandJournal, CodexJournalIdentity, CodexJournalIntentResult, CodexJournalStage, CodexJournalView};
+use crate::codex_later_turn;
+use crate::codex_turn_journal::{CodexLaterTurnJournal, LaterTurnStage, LaterTurnView};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::native_events::{
     NativeEventAppend, NativeEventCursor, NativeEventIdentity, NativeEventKind, NativeEventRead,
@@ -93,12 +95,15 @@ impl ValidatedCodexResourceLaunch {
     }
 }
 
-/// Owns the structured adapter and its direct child. Exposes lifecycle
-/// observation and bounded disposal, but cannot submit a model turn.
+/// Owns the structured adapter and its direct child. Later-turn input is
+/// available only through a claimed store proof and current pod control.
 pub struct PodCodexResource {
     resource: CodexResource<ProcessJsonlTransport>,
     journal: Option<CodexCommandJournal>,
     journal_path: PathBuf,
+    later_journal: Option<CodexLaterTurnJournal>,
+    later_journal_path: PathBuf,
+    later_identity: Option<CodexJournalIdentity>,
     native_events: CodexNativeEventSource,
     child_birth: KernelChildBirthObservation,
     pod_boot_id: String,
@@ -311,6 +316,9 @@ impl PodCodexResource {
             resource,
             journal: None,
             journal_path: private_slot.join("codex.commands.log"),
+            later_journal: None,
+            later_journal_path: private_slot.join("codex.turns.log"),
+            later_identity: None,
             native_events,
             child_birth,
             pod_boot_id,
@@ -334,43 +342,125 @@ impl PodCodexResource {
     /// facts have crossed a held fsynced append. A failed append stops native
     /// publication and leaves the pod's control channel available.
     fn flush_native_events(&mut self) -> Result<(), PodError> {
-        while self.resource.has_unspooled_native_notifications() {
-            let sequence = self.native_events.reserve_before_take()?;
-            let observed = match self.resource.take_applied_native_notification() {
-                Some(observed) => observed,
-                None => {
-                    self.mark_native_events_unknown();
-                    return Err(PodError::Uncertain("native notification disappeared after take reservation"));
-                }
-            };
-            let kind = match observed.kind() {
-                NativeObservationKind::Status => NativeEventKind::Status,
-                NativeObservationKind::Output => NativeEventKind::Output,
-                NativeObservationKind::Question => NativeEventKind::Question,
-                NativeObservationKind::Permission => NativeEventKind::Permission,
-                NativeObservationKind::Opaque => NativeEventKind::Opaque,
-            };
-            let status = observed.status().map(|status| match status {
-                NativeObservationStatus::Idle => NativeEventStatus::Idle,
-                NativeObservationStatus::Active => NativeEventStatus::Active,
-                NativeObservationStatus::Waiting => NativeEventStatus::Waiting,
-                NativeObservationStatus::Completed => NativeEventStatus::Completed,
-                NativeObservationStatus::Failed => NativeEventStatus::Failed,
-                NativeObservationStatus::Interrupted => NativeEventStatus::Interrupted,
-                NativeObservationStatus::SystemError => NativeEventStatus::SystemError,
-            });
-            let appended = self.native_events.append_applied(
-                sequence, observed.private_jsonl(), kind, status,
-                observed.external_conflict(),
-            );
-            if appended.is_err() {
-                self.mark_native_events_unknown();
-            }
-            if !matches!(appended?, NativeEventAppend::Committed(_)) {
-                return Err(PodError::Conflict("native event source sequence repeated"));
-            }
+        flush_native_events_from(&mut self.resource, &mut self.native_events)
+    }
+
+    pub(crate) fn submit_claimed_later_turn(
+        &mut self,
+        proof: &LaterCodexSendRecord,
+        mut recheck: impl FnMut() -> Result<(), PodError>,
+    ) -> Result<LaterTurnView, PodError> {
+        self.recheck_child()?;
+        recheck()?;
+        let target = proof.native_target();
+        if target.session_id != self.resource.identity().session_id
+            || target.run_id != self.resource.identity().run_id
+            || target.attempt_id != self.resource.identity().attempt_id
+            || target.pod_id != self.resource.identity().pod_id
+            || target.resource_id != self.resource.identity().resource_id
+            || target.resource_epoch != self.resource.identity().resource_epoch.get()
+        { return Err(PodError::Refused("later turn Resource differs from child")); }
+        self.flush_native_events()?;
+        let identity = CodexJournalIdentity::from_resource(
+            &target.store_lineage, &target.scope_id, &target.session_id,
+            &target.run_id, &target.attempt_id, &target.pod_id,
+            Epoch::new(target.pod_incarnation)
+                .map_err(|_| PodError::Invalid("later turn Pod incarnation"))?,
+            &target.resource_id, self.resource.identity().resource_epoch,
+        );
+        let bootstrap = self.journal.as_mut()
+            .ok_or(PodError::Refused("bootstrap journal is absent"))?;
+        if !bootstrap.matches_identity(&identity) {
+            return Err(PodError::Refused("bootstrap journal Resource differs"));
         }
-        Ok(())
+        if self.later_journal.is_none() {
+            self.later_journal = Some(CodexLaterTurnJournal::open_after_completed_bootstrap(
+                &LinuxBackend, &self.later_journal_path, identity.clone(), bootstrap,
+            )?);
+            self.later_identity = Some(identity.clone());
+        }
+        if self.later_identity.as_ref() != Some(&identity)
+            || !self.later_journal.as_ref().is_some_and(|journal| journal.matches_identity(&identity))
+        { return Err(PodError::Refused("later-turn journal Resource differs")); }
+        let expected_child = self.child_birth.clone();
+        let expected_boot = self.pod_boot_id.clone();
+        let expected_cgroup = self.pod_cgroup.clone();
+        let result = codex_later_turn::submit_store_claimed(
+            &mut self.resource, bootstrap,
+            self.later_journal.as_mut().expect("checked held later journal"), proof,
+            &mut |native| {
+                recheck_native_child(native, &expected_child, &expected_boot, &expected_cgroup)?;
+                recheck()
+            },
+        );
+        self.flush_native_events()?;
+        result
+    }
+
+    pub(crate) fn inspect_claimed_later_turn(
+        &mut self,
+        proof: &LaterCodexSendRecord,
+    ) -> Result<Option<LaterTurnView>, PodError> {
+        let target = proof.native_target();
+        if target.session_id != self.resource.identity().session_id
+            || target.run_id != self.resource.identity().run_id
+            || target.attempt_id != self.resource.identity().attempt_id
+            || target.pod_id != self.resource.identity().pod_id
+            || target.resource_id != self.resource.identity().resource_id
+            || target.resource_epoch != self.resource.identity().resource_epoch.get()
+        { return Err(PodError::Refused("later-turn inspection Resource differs")); }
+        let bootstrap = self.journal.as_mut()
+            .ok_or(PodError::Refused("bootstrap journal is absent"))?;
+        bootstrap.recheck_held_file()?;
+        let anchor = bootstrap.view();
+        if anchor.stage != CodexJournalStage::BootstrapCompleted
+            || anchor.native_thread_id.as_deref() != Some(proof.native_thread_id())
+        { return Err(PodError::Refused("later-turn bootstrap anchor is not complete")); }
+        let Some(later) = self.later_journal.as_mut() else {
+            return match fs::symlink_metadata(&self.later_journal_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(PodError::Uncertain("later-turn journal exists without held identity")),
+            };
+        };
+        later.recheck_held_file()?;
+        let view = later.view(&proof.receipt().command_id);
+        if view.as_ref().is_some_and(|view| {
+            view.payload_digest != proof.receipt().request_digest
+                || view.writer_epoch != proof.writer_epoch()
+                || view.native_thread_id != proof.native_thread_id()
+        }) { return Err(PodError::Conflict("later-turn journal command differs")); }
+        Ok(view)
+    }
+
+    pub(crate) fn prior_later_view(&mut self, command_id: &str) -> Option<LaterTurnView> {
+        let journal = self.later_journal.as_mut()?;
+        let mut view = journal.view(command_id)?;
+        if journal.recheck_held_file().is_err() {
+            view.stage = LaterTurnStage::StorageUncertain;
+        }
+        Some(view)
+    }
+
+    pub(crate) fn poll_native_notification_once(
+        &mut self,
+        mut recheck_before_journal: impl FnMut() -> Result<(), PodError>,
+    ) -> Result<bool, PodError> {
+        let (Some(later), Some(identity), Some(bootstrap)) = (
+            self.later_journal.as_mut(), self.later_identity.as_ref(), self.journal.as_mut(),
+        ) else {
+            return self.poll_bootstrap_notification_once(recheck_before_journal);
+        };
+        let expected_child = self.child_birth.clone();
+        let expected_boot = self.pod_boot_id.clone();
+        let expected_cgroup = self.pod_cgroup.clone();
+        codex_later_turn::poll_once(
+            &mut self.resource, bootstrap, later, identity,
+            &mut |native| {
+                recheck_native_child(native, &expected_child, &expected_boot, &expected_cgroup)?;
+                recheck_before_journal()
+            },
+            &mut |native| flush_native_events_from(native, &mut self.native_events),
+        )
     }
 
     pub(crate) fn mark_native_events_unknown(&mut self) {
@@ -558,6 +648,46 @@ impl PodCodexResource {
             _ => None,
         };
         Ok((inspect_stage_from_journal_view(&view)?, settlement))
+    }
+
+    pub(crate) fn inspect_current_codex_anchor(
+        &mut self,
+        bootstrap: &BootstrapSendRecord,
+        current: &podbay_store::NativeWriterTarget,
+    ) -> Result<CodexJournalView, PodError> {
+        self.recheck_child()?;
+        let original = bootstrap.native_target();
+        if original.store_lineage != current.store_lineage
+            || original.scope_id != current.scope_id
+            || original.session_id != current.session_id
+            || original.run_id != current.run_id
+            || original.attempt_id != current.attempt_id
+            || original.pod_id != current.pod_id
+            || original.pod_incarnation != current.pod_incarnation
+            || original.resource_id != current.resource_id
+            || original.resource_epoch != current.resource_epoch
+            || original.resource_input_epoch > current.resource_input_epoch
+        { return Err(PodError::Refused("Codex bootstrap lineage differs from current Resource")); }
+        let journal = self.journal.as_mut()
+            .ok_or(PodError::Refused("Codex bootstrap journal is absent"))?;
+        let identity = CodexJournalIdentity::from_resource(
+            &current.store_lineage, &current.scope_id, &current.session_id,
+            &current.run_id, &current.attempt_id, &current.pod_id,
+            Epoch::new(current.pod_incarnation).map_err(|_| PodError::Invalid("Pod incarnation"))?,
+            &current.resource_id,
+            Epoch::new(current.resource_epoch).map_err(|_| PodError::Invalid("Resource epoch"))?,
+        );
+        if !journal.matches_identity(&identity) {
+            return Err(PodError::Refused("held bootstrap journal Resource differs"));
+        }
+        journal.recheck_held_file()?;
+        let view = journal.view();
+        if view.stage != CodexJournalStage::BootstrapCompleted
+            || view.command_key.as_deref() != Some(bootstrap.receipt().command_id.as_str())
+            || view.payload_digest.as_deref() != Some(bootstrap.receipt().request_digest.as_str())
+            || view.native_thread_id.is_none() || view.native_session_id.is_none()
+        { return Err(PodError::Refused("Codex bootstrap completion is not fsynced")); }
+        Ok(view)
     }
 
     /// A current authority failure cannot erase an earlier fsynced native
@@ -890,6 +1020,67 @@ impl PodCodexResource {
         require_child_in_pod(&current, &self.pod_boot_id, &self.pod_cgroup)?;
         Ok(current)
     }
+}
+
+fn flush_native_events_from(
+    resource: &mut CodexResource<ProcessJsonlTransport>,
+    events: &mut CodexNativeEventSource,
+) -> Result<(), PodError> {
+    while resource.has_unspooled_native_notifications() {
+        // Segmented output reserves its next durable source position before
+        // the adapter notification can be taken from memory.
+        let sequence = events.reserve_before_take()?;
+        let observed = match resource.take_applied_native_notification() {
+            Some(observed) => observed,
+            None => {
+                let _ = events.mark_continuity_unknown();
+                return Err(PodError::Uncertain("native notification disappeared after take reservation"));
+            }
+        };
+        let kind = match observed.kind() {
+            NativeObservationKind::Status => NativeEventKind::Status,
+            NativeObservationKind::Output => NativeEventKind::Output,
+            NativeObservationKind::Question => NativeEventKind::Question,
+            NativeObservationKind::Permission => NativeEventKind::Permission,
+            NativeObservationKind::Opaque => NativeEventKind::Opaque,
+        };
+        let status = observed.status().map(|status| match status {
+            NativeObservationStatus::Idle => NativeEventStatus::Idle,
+            NativeObservationStatus::Active => NativeEventStatus::Active,
+            NativeObservationStatus::Waiting => NativeEventStatus::Waiting,
+            NativeObservationStatus::Completed => NativeEventStatus::Completed,
+            NativeObservationStatus::Failed => NativeEventStatus::Failed,
+            NativeObservationStatus::Interrupted => NativeEventStatus::Interrupted,
+            NativeObservationStatus::SystemError => NativeEventStatus::SystemError,
+        });
+        let appended = events.append_applied(
+            sequence, observed.private_jsonl(), kind, status, observed.external_conflict(),
+        );
+        if appended.is_err() {
+            let _ = events.mark_continuity_unknown();
+        }
+        if !matches!(appended?, NativeEventAppend::Committed(_)) {
+            return Err(PodError::Conflict("native event source sequence repeated"));
+        }
+    }
+    Ok(())
+}
+
+fn recheck_native_child(
+    resource: &mut CodexResource<ProcessJsonlTransport>,
+    expected: &KernelChildBirthObservation,
+    boot_id: &str,
+    cgroup: &str,
+) -> Result<(), PodError> {
+    let owner = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| PodError::Refused("pod process identity unavailable"))?;
+    if owner.boot_id() != boot_id || owner.cgroup() != cgroup {
+        return Err(PodError::Refused("pod boot or cgroup changed"));
+    }
+    let current = resource.attest_owned_child_birth()
+        .map_err(|_| PodError::Refused("Codex child process is unavailable"))?;
+    if &current != expected { return Err(PodError::Refused("Codex child birth changed")); }
+    require_child_in_pod(&current, boot_id, cgroup)
 }
 
 fn require_child_in_pod(

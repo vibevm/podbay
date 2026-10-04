@@ -107,9 +107,9 @@ fn v19_upgrade_mints_positive_epoch_and_no_historical_launch_policy_row() {
             row.get(0)
         })
         .unwrap();
-    // The rehearsal applies v20's policy epoch/table and then advances the
-    // empty store through v21 without inventing a historical launch row.
-    assert_eq!((version, count), (21, 0));
+    // The rehearsal applies v20's policy epoch/table before advancing the
+    // empty store through v21 and v22 without inventing historical rows.
+    assert_eq!((version, count), (22, 0));
     drop(connection);
     assert_eq!(
         PodBayStore::open_existing_read_only(&fixture.database)
