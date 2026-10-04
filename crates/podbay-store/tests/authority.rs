@@ -735,6 +735,17 @@ fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
         .register_actor_verifier_from_trusted_host(1, revision, &record, [3; 32])
         .unwrap();
     let lineage = store.initial_cursor("scope.main").unwrap().store_lineage;
+    assert!(matches!(
+        SqliteActorVerifierWitness::for_actor(
+            "relative.sqlite",
+            &lineage,
+            1,
+            revision,
+            record.clone(),
+            [3; 32],
+        ),
+        Err(StoreError::InvalidInput(_))
+    ));
     let witness =
         |database: &std::path::Path, lineage: &str, actor: AuthorityActorRecord, key: [u8; 32]| {
             SqliteActorVerifierWitness::for_actor(database, lineage, 1, revision, actor, key)

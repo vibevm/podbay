@@ -17,6 +17,8 @@ const ACTOR_VERIFIER_VERSION: &str = "podbay.ed25519/1";
 /// public verifier. This is not a peer identity or a signature proof. The
 /// caller must derive the actor/process birth from trusted policy and kernel
 /// attestation, never from request JSON, and separately verify the challenge.
+/// The manager must also bind the database path to its own store/lock; this
+/// check does not defend against a same-account copy of the entire database.
 pub struct SqliteActorVerifierWitness {
     database: PathBuf,
     store_lineage: String,
@@ -38,7 +40,7 @@ impl SqliteActorVerifierWitness {
         public_key: [u8; 32],
     ) -> Result<Self, StoreError> {
         let database = database.as_ref();
-        if database.as_os_str().is_empty()
+        if !database.is_absolute()
             || store_lineage.is_empty()
             || owner_epoch == 0
             || actor.credential_generation == 0
