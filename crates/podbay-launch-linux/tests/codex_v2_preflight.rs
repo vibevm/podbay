@@ -186,6 +186,14 @@ struct NoPort(Arc<AtomicUsize>);
 /// trusted host sees uncertainty and cannot ACK or activate B by inference.
 struct PendingThenLostPort(LinuxLaunchPort);
 
+/// B's store reaches Activated, but the test port withholds the pod Activate
+/// call. The pod remains fsynced PendingPod and B must never be called Active.
+struct ActivatedThenLostPort(LinuxLaunchPort);
+
+/// D's first two Active inspections succeed, but the test withholds the
+/// post-Plan inspection. D dies with a successor Planned, never ACKed.
+struct AdoptionThenLostPort(LinuxLaunchPort, AtomicUsize);
+
 /// C's pod fsync/readback succeeds, but its store ACK is interrupted by a
 /// test-only lost port reply. Manager D must prove the existing Active file.
 struct RecoveryThenLostPort(LinuxLaunchPort);
@@ -225,6 +233,80 @@ impl HostDispatchPort for PendingThenLostPort {
             command_key: prepared.proposal().command_key.as_str().into(),
             receipt_ref: None,
         })
+    }
+}
+
+impl HostDispatchPort for ActivatedThenLostPort {
+    type Receipt = PortReceiptRef;
+
+    fn dispatch(
+        &mut self,
+        _: AuthorisedDispatch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn launch_bound(
+        &mut self,
+        _: AuthorisedBoundLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn inspect_existing_codex_v2_rebind(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortRebindObservation, HostError> {
+        <LinuxLaunchPort as HostDispatchPort>::inspect_existing_codex_v2_rebind(&self.0, launch)
+    }
+
+    fn prepare_existing_codex_v2_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+    ) -> Result<String, HostError> {
+        <LinuxLaunchPort as HostDispatchPort>::prepare_existing_codex_v2_rebind(&self.0, prepared)
+    }
+
+    fn activate_existing_codex_v2_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+        _: &str,
+    ) -> Result<String, HostError> {
+        Err(HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(),
+            receipt_ref: None,
+        })
+    }
+}
+
+impl HostDispatchPort for AdoptionThenLostPort {
+    type Receipt = PortReceiptRef;
+
+    fn dispatch(
+        &mut self,
+        _: AuthorisedDispatch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn launch_bound(
+        &mut self,
+        _: AuthorisedBoundLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn inspect_recovered_active_codex_v2(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+        prior: &podbay_store::PriorPlannedRecovery,
+    ) -> Result<podbay_host::PortRecoveredActiveObservation, HostError> {
+        if self.1.fetch_add(1, Ordering::SeqCst) >= 2 {
+            return Err(HostError::StaleGuard);
+        }
+        <LinuxLaunchPort as HostDispatchPort>::inspect_recovered_active_codex_v2(
+            &self.0, launch, prior,
+        )
     }
 }
 
@@ -1686,6 +1768,61 @@ fn rebind_second_pending_manager_process_helper() {
 }
 
 #[test]
+#[ignore = "helper for disposable B store-Activated/pod-PendingPod fixture"]
+fn rebind_second_store_activated_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, ActivatedThenLostPort(port)).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let pending = host
+        .prepare_current_codex_v2_rebind(
+            &fixture.scope,
+            &fixture.pod,
+            "rebind.native.v21.store-activated",
+        )
+        .unwrap();
+    assert_eq!(pending.phase, podbay_store::DurableRebindPhase::Pending);
+    let completed = host
+        .complete_current_codex_v2_rebind(
+            &fixture.scope,
+            &fixture.pod,
+            "rebind.native.v21.store-activated",
+        )
+        .unwrap();
+    assert_eq!(
+        completed.durable.phase,
+        podbay_store::DurableRebindPhase::Activated
+    );
+    assert_eq!(
+        completed.stage,
+        RebindCompletionStage::StoreActivatedPodUnconfirmed
+    );
+    let context = host.rebind_context(&fixture.scope, &fixture.pod).unwrap();
+    let checkpoint = podbay_pod::read_peer_checkpoint(&fixture.directory, context.identity())
+        .unwrap()
+        .checkpoint();
+    assert_eq!(checkpoint.phase(), RebindPhase::PendingPod);
+    assert_eq!(checkpoint.owner_epoch().get(), 1);
+    assert!(checkpoint.pending_rebind().is_some());
+    drop(context);
+    fs::write(
+        fixture.directory.join("rebind.second.activated"),
+        b"store_activated_pod_pending",
+    )
+    .unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
 #[ignore = "helper for disposable three-manager pending recovery inspect fixture"]
 fn rebind_third_recover_manager_process_helper() {
     let fixture = Fixture::from_shared();
@@ -1779,80 +1916,172 @@ fn rebind_third_lost_recovery_ack_helper() {
 }
 
 #[test]
+#[ignore = "helper for disposable D successor Planned-before-ACK crash"]
+fn rebind_fourth_lost_adoption_ack_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(
+        &fixture.database,
+        AdoptionThenLostPort(port, AtomicUsize::new(0)),
+    )
+    .unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let outcome = host
+        .adopt_recovered_active_codex_v2(
+            &fixture.scope,
+            &fixture.pod,
+            "recover.native.v21.d.lost-ack",
+        )
+        .unwrap();
+    assert_eq!(outcome.stage, RecoveryCompletionStage::PodRecoveryUnknown);
+    assert_eq!(
+        outcome.durable.stage,
+        podbay_store::SupersessionStage::Planned
+    );
+    assert_eq!(host.port().1.load(Ordering::SeqCst), 3);
+    let identity = host
+        .rebind_context(&fixture.scope, &fixture.pod)
+        .unwrap()
+        .identity()
+        .clone();
+    let checkpoint = podbay_pod::read_peer_checkpoint(&fixture.directory, &identity)
+        .unwrap()
+        .checkpoint();
+    assert_eq!(checkpoint.phase(), RebindPhase::Active);
+    assert_eq!(checkpoint.owner_epoch().get(), 1);
+    assert_eq!(checkpoint.input_epochs().values().next().unwrap().get(), 2);
+    fs::write(
+        fixture.directory.join("rebind.fourth.lost"),
+        b"d_planned_no_ack",
+    )
+    .unwrap();
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
 #[ignore = "helper for disposable four-manager D adoption fixture"]
 fn rebind_fourth_adopt_manager_process_helper() {
     let fixture = Fixture::from_shared();
+    let expected_owner = std::env::var("PODBAY_RECOVERY_OWNER")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(4);
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
-    let mut port = port_for(&fixture,&binary);
-    let reference = CredentialRef::from_trusted_vault(
-        fixture.scope.clone(),"vault.codex.preflight",
-    ).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
     port.register_codex_credential_source_from_trusted_policy(
-        TrustedCodexCredentialSource::from_trusted_policy(
-            reference,fixture.source.clone(),
-        ).unwrap(),
-    ).unwrap();
-    let mut host = DurableAuthority::open(&fixture.database,port).unwrap();
-    register_restarted_codex_profile(&mut host,&fixture);
-    let adopted = host.adopt_recovered_active_codex_v2(
-        &fixture.scope,&fixture.pod,"recover.native.v21.d.adopt",
-    ).unwrap();
-    assert_eq!(adopted.stage,RecoveryCompletionStage::PodCheckpointed);
-    assert_eq!(adopted.durable.stage,podbay_store::SupersessionStage::PodCheckpointed);
-    let next = host.prepare_current_codex_v2_rebind(
-        &fixture.scope,&fixture.pod,"rebind.after.recovery.d",
-    ).unwrap();
-    assert_eq!(next.phase,podbay_store::DurableRebindPhase::Pending);
-    let completed = host.complete_current_codex_v2_rebind(
-        &fixture.scope,&fixture.pod,"rebind.after.recovery.d",
-    ).unwrap();
-    assert_eq!(completed.stage,RebindCompletionStage::PodActive);
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let adopt_key = format!("recover.native.v21.owner{expected_owner}.adopt");
+    let rebind_key = format!("rebind.after.recovery.owner{expected_owner}");
+    let adopted = host
+        .adopt_recovered_active_codex_v2(&fixture.scope, &fixture.pod, &adopt_key)
+        .unwrap();
+    assert_eq!(adopted.stage, RecoveryCompletionStage::PodCheckpointed);
+    assert_eq!(
+        adopted.durable.stage,
+        podbay_store::SupersessionStage::PodCheckpointed
+    );
+    let next = host
+        .prepare_current_codex_v2_rebind(&fixture.scope, &fixture.pod, &rebind_key)
+        .unwrap();
+    assert_eq!(next.phase, podbay_store::DurableRebindPhase::Pending);
+    let completed = host
+        .complete_current_codex_v2_rebind(&fixture.scope, &fixture.pod, &rebind_key)
+        .unwrap();
+    assert_eq!(completed.stage, RebindCompletionStage::PodActive);
     let manifest = slot_manifest(&fixture).unwrap();
     let client = PodClient::connect(&manifest).unwrap();
     let active = client.attested_status().unwrap();
     assert!(active.child_running);
-    run_rebind_manager_helper("rebind_sibling_status_process_helper",&fixture,&binary);
+    run_rebind_manager_helper("rebind_sibling_status_process_helper", &fixture, &binary);
     let original_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
-        .unwrap().parse().unwrap();
-    assert_eq!(active.child_pid,original_pid);
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(active.child_pid, original_pid);
     let births = fs::read_to_string(fixture.directory.join("rebind.first.births")).unwrap();
-    assert_eq!(births,format!("{}:{}:{}",active.supervisor_pid,
-        active.supervisor_start_ticks,active.child_start_ticks));
-    let identity = host.rebind_context(&fixture.scope,&fixture.pod).unwrap().identity().clone();
-    let checkpoint = podbay_pod::read_peer_checkpoint(&fixture.directory,&identity)
-        .unwrap().checkpoint();
-    assert_eq!(checkpoint.owner_epoch().get(),4);
-    assert_eq!(checkpoint.input_epochs().values().next().unwrap().get(),4);
+    assert_eq!(
+        births,
+        format!(
+            "{}:{}:{}",
+            active.supervisor_pid, active.supervisor_start_ticks, active.child_start_ticks
+        )
+    );
+    let identity = host
+        .rebind_context(&fixture.scope, &fixture.pod)
+        .unwrap()
+        .identity()
+        .clone();
+    let checkpoint = podbay_pod::read_peer_checkpoint(&fixture.directory, &identity)
+        .unwrap()
+        .checkpoint();
+    assert_eq!(checkpoint.owner_epoch().get(), expected_owner);
+    assert_eq!(
+        checkpoint.input_epochs().values().next().unwrap().get(),
+        expected_owner
+    );
     let actor = ActorId::try_from("actor.codex.preflight").unwrap();
     let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
-        1000,4242,777,"/user.slice/preflight.scope",
-    ).unwrap();
+        1000,
+        4242,
+        777,
+        "/user.slice/preflight.scope",
+    )
+    .unwrap();
     let transport = Transport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
-        process.clone(),CredentialGeneration::new(1).unwrap(),
+        process.clone(),
+        CredentialGeneration::new(1).unwrap(),
     ));
     host.reattest_actor_from_trusted_replay(
         &transport,
         ActorRegistration::owner_cli_from_trusted_policy(
-            actor.clone(),fixture.scope.clone(),process,
+            actor.clone(),
+            fixture.scope.clone(),
+            process,
             CredentialGeneration::new(1).unwrap(),
         ),
-    ).unwrap();
+    )
+    .unwrap();
     let recorded_id = host.recorded_snapshot().grants[0].grant_id;
-    let grant = host.activate_recorded_grant_for_actor_from_trusted_replay(
-        &actor,&fixture.scope,recorded_id,
-    ).unwrap();
+    let grant = host
+        .activate_recorded_grant_for_actor_from_trusted_replay(&actor, &fixture.scope, recorded_id)
+        .unwrap();
     let send_policy = TrustedBootstrapSendPolicy::from_trusted_policy(
-        grant,Instant::now()+Duration::from_secs(45),
-    ).unwrap();
+        grant,
+        Instant::now() + Duration::from_secs(45),
+    )
+    .unwrap();
     let session_id = SessionId::try_from("session.codex.preflight").unwrap();
-    let lease = host.acquire_initial_bootstrap_writer_lease(
-        &transport,&session_id,&send_policy,60,
-    ).unwrap();
-    let (target,revision) = PodBayStore::open_existing_read_only(&fixture.database)
-        .unwrap().current_native_writer_target_for_session(&fixture.scope,&session_id).unwrap();
+    let lease = host
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &send_policy, 60)
+        .unwrap();
+    let (target, revision) = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session_id)
+        .unwrap();
+    let turn_request = format!("request.rebind.owner{expected_owner}.turn");
+    let turn_key = format!("key.rebind.owner{expected_owner}.turn");
     let send = CommandEnvelope::new(
-        "request.rebind.d.turn","key.rebind.d.turn",
-        WireTarget::Session { session_id: session_id.as_str().into() },
+        &turn_request,
+        &turn_key,
+        WireTarget::Session {
+            session_id: session_id.as_str().into(),
+        },
         Some(Guard {
             manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
             pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
@@ -1863,29 +2092,50 @@ fn rebind_fourth_adopt_manager_process_helper() {
         }),
         None,
         CommandBody::SessionSend(SessionSendBody {
-            content: vec![ContentBlock::Text { text: "one turn after four managers".into() }],
+            content: vec![ContentBlock::Text {
+                text: format!("one turn after manager {expected_owner}"),
+            }],
             policy: SendPolicy::WhenIdle,
         }),
-    ).unwrap();
-    let submitted = host.send_first_codex_bootstrap_from_wire(
-        &transport,send.clone(),&send_policy,
-    ).unwrap();
-    assert!(matches!(submitted.port_observation,
-        Some(BootstrapPortObservation::PodAccepted(_))));
-    let duplicate = host.send_first_codex_bootstrap_from_wire(
-        &transport,send,&send_policy,
-    ).unwrap();
-    assert_eq!(duplicate.receipt,submitted.receipt);
+    )
+    .unwrap();
+    let submitted = host
+        .send_first_codex_bootstrap_from_wire(&transport, send.clone(), &send_policy)
+        .unwrap();
+    assert!(matches!(
+        submitted.port_observation,
+        Some(BootstrapPortObservation::PodAccepted(_))
+    ));
+    let duplicate = host
+        .send_first_codex_bootstrap_from_wire(&transport, send, &send_policy)
+        .unwrap();
+    assert_eq!(duplicate.receipt, submitted.receipt);
     assert!(!duplicate.port_called);
     let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
-    let deadline = Instant::now()+Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if fs::read_to_string(&frames).unwrap_or_default().lines().count()==5 { break; }
-        assert!(Instant::now()<deadline,"D did not submit exactly one fake turn");
+        if fs::read_to_string(&frames)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            == 5
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "last manager did not submit one fake turn"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(client.attested_status().unwrap().child_pid,original_pid);
-    fs::write(fixture.directory.join("rebind.fourth.done"),original_pid.to_string()).unwrap();
+    assert_eq!(client.attested_status().unwrap().child_pid, original_pid);
+    fs::write(
+        fixture
+            .directory
+            .join(format!("rebind.owner{expected_owner}.done")),
+        original_pid.to_string(),
+    )
+    .unwrap();
     drop(host);
     std::mem::forget(fixture);
 }
@@ -1904,15 +2154,29 @@ fn rebind_sibling_status_process_helper() {
 }
 
 fn run_rebind_manager_helper(name: &str, fixture: &Fixture, binary: &Path) {
-    let mut process = Command::new(std::env::current_exe().unwrap())
+    run_rebind_manager_helper_with_owner(name, fixture, binary, None);
+}
+
+fn run_rebind_manager_helper_with_owner(
+    name: &str,
+    fixture: &Fixture,
+    binary: &Path,
+    owner: Option<u64>,
+) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--ignored", "--exact", name, "--nocapture"])
         .env("PODBAY_REBIND_FIXTURE_DIR", &fixture.directory)
         .env("PODBAY_REBIND_FIXTURE_POD", fixture.pod.as_str())
         .env("PODBAY_TEST_POD_BINARY", binary)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::inherit());
+    if let Some(owner) = owner {
+        command.env("PODBAY_RECOVERY_OWNER", owner.to_string());
+    } else {
+        command.env_remove("PODBAY_RECOVERY_OWNER");
+    }
+    let mut process = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(status) = process.try_wait().unwrap() {
@@ -2011,7 +2275,7 @@ fn disposable_v21_four_managers_reconcile_c_lost_recovery_ack() {
         "active_a_store_planned");
     assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
     run_rebind_manager_helper("rebind_fourth_adopt_manager_process_helper",&fixture,&binary);
-    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.fourth.done")).unwrap(),
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.owner4.done")).unwrap(),
         child_pid.to_string());
     let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     assert_eq!(fs::read_to_string(frames).unwrap().lines().count(),5,
@@ -2029,6 +2293,151 @@ fn disposable_v21_four_managers_reconcile_c_lost_recovery_ack() {
         assert!(state.status.success());
         if String::from_utf8_lossy(&state.stdout).trim()=="not-found" { break; }
         assert!(Instant::now()<deadline,"four-manager disposable unit remained loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_v21_store_activated_b_never_claims_pod_active() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).expect("A left one immutable pod manifest");
+    let guard = DisposableUnitGuard::for_manifest(&manifest);
+    let child_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    run_rebind_manager_helper(
+        "rebind_second_store_activated_manager_process_helper",
+        &fixture,
+        &binary,
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.second.activated")).unwrap(),
+        "store_activated_pod_pending"
+    );
+    assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
+    run_rebind_manager_helper("rebind_third_lost_recovery_ack_helper", &fixture, &binary);
+    run_rebind_manager_helper(
+        "rebind_fourth_adopt_manager_process_helper",
+        &fixture,
+        &binary,
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.owner4.done")).unwrap(),
+        child_pid.to_string()
+    );
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 5);
+    assert!(
+        Command::new("systemctl")
+            .args(["--user", "stop", &guard.0])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                &guard.0,
+            ])
+            .output()
+            .unwrap();
+        assert!(state.status.success());
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "activated-B disposable unit remained loaded"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_v21_five_managers_reconcile_successor_planned_lost_ack() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).expect("A left one immutable pod manifest");
+    let guard = DisposableUnitGuard::for_manifest(&manifest);
+    let child_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let original_births =
+        fs::read_to_string(fixture.directory.join("rebind.first.births")).unwrap();
+    run_rebind_manager_helper(
+        "rebind_second_pending_manager_process_helper",
+        &fixture,
+        &binary,
+    );
+    run_rebind_manager_helper("rebind_third_lost_recovery_ack_helper", &fixture, &binary);
+    run_rebind_manager_helper("rebind_fourth_lost_adoption_ack_helper", &fixture, &binary);
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.fourth.lost")).unwrap(),
+        "d_planned_no_ack"
+    );
+    assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
+    run_rebind_manager_helper_with_owner(
+        "rebind_fourth_adopt_manager_process_helper",
+        &fixture,
+        &binary,
+        Some(5),
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.owner5.done")).unwrap(),
+        child_pid.to_string()
+    );
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    assert_eq!(
+        fs::read_to_string(frames).unwrap().lines().count(),
+        5,
+        "E must send one native turn without replaying the original two frames"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.directory.join("rebind.first.births")).unwrap(),
+        original_births
+    );
+    let store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(store.owner_epoch().unwrap(), 5);
+    drop(store);
+    assert!(
+        Command::new("systemctl")
+            .args(["--user", "stop", &guard.0])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                &guard.0,
+            ])
+            .output()
+            .unwrap();
+        assert!(state.status.success());
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "five-manager disposable unit remained loaded"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
