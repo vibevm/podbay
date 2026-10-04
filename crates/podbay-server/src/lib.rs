@@ -26,6 +26,41 @@ pub use auth_prelude::{
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
 
+/// Authenticate the accepted Linux socket before reading any PodBay/1 request,
+/// then perform exactly one exchange. Authentication grants no command rights;
+/// `serve_one` and its handler retain their own authority checks. In particular,
+/// a lost response keeps the original `ServerFault::ResponseLost` key/CommandId.
+#[cfg(target_os = "linux")]
+pub fn serve_authenticated_linux_one<P: podbay_host::HostDispatchPort, H: Handler>(
+    socket: std::os::unix::net::UnixStream,
+    authority: &mut podbay_host::DurableAuthority<P>,
+    handler: &mut H,
+) -> Result<(), LinuxServeOneFault> {
+    let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
+        .map_err(LinuxServeOneFault::Authentication)?;
+    serve_one(&mut authenticated, handler).map_err(LinuxServeOneFault::Exchange)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum LinuxServeOneFault {
+    Authentication(LinuxAuthPreludeError),
+    Exchange(ServerFault),
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for LinuxServeOneFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authentication(error) => write!(formatter, "Linux actor proof failed: {error}"),
+            Self::Exchange(error) => write!(formatter, "authenticated exchange failed: {error}"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for LinuxServeOneFault {}
+
 #[derive(Debug)]
 pub enum ServerFault {
     Unauthenticated,
