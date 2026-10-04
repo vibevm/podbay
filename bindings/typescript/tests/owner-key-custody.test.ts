@@ -486,6 +486,13 @@ test("a second process cannot reuse custody while the first owner birth is live"
     assert.equal(status, 0, Buffer.concat(stderr).toString("utf8"));
     const recovered = recoverOwnerKeyForInitialEnrollment(path, expected, randomBytes(32));
     assert.deepEqual(recovered.publicKey, loadOwnerKeyCustody(path, expected).publicKey);
+    const advanced = recoverOwnerKeyForInitialEnrollment(path, {
+      ...expected, ownerEpoch: 3n, authorityRevision: 3n,
+    }, randomBytes(32));
+    assert.deepEqual(advanced.publicKey, recovered.publicKey);
+    assert.throws(() => recoverOwnerKeyForInitialEnrollment(path, {
+      ...expected, ownerEpoch: 3n, authorityRevision: 4n,
+    }, randomBytes(32)), /expectation differs/u);
   } finally {
     if (child.exitCode === null) child.kill("SIGTERM");
     await rm(root, { recursive: true, force: true });

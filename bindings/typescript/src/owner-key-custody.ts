@@ -201,6 +201,8 @@ export function loadOwnerKeyForRecovery(
 /**
  * Reuse the exact pre-enrollment key after a cut before first setup proof.
  * A different process is admitted only after the prior PID and birth are gone.
+ * Unenrolled manager restarts may advance owner epoch and authority revision
+ * together; the fresh setup challenge still has to prove the current store.
  * This does not authorize rotation of an already enrolled owner actor.
  * Later rotation must verify the current actor binding from the durable store;
  * the saved process birth is only the origin of these key bytes.
@@ -217,9 +219,10 @@ export function recoverOwnerKeyForInitialEnrollment(
   finally { closeSync(cleanupDirectory); }
   const material = loadOwnerKeyMaterial(path, expected);
   const prior = material.binding;
+  const epochAdvance = expected.ownerEpoch - prior.ownerEpoch;
   if (prior.credentialRef !== expected.credentialRef ||
-      prior.ownerEpoch !== expected.ownerEpoch ||
-      prior.authorityRevision !== expected.authorityRevision ||
+      epochAdvance < 0n ||
+      expected.authorityRevision - prior.authorityRevision !== epochAdvance ||
       prior.osIdentity !== expected.osIdentity)
     throw new TypeError("owner custody enrollment expectation differs");
   const sameBirth = prior.processIdentity === expected.processIdentity &&
