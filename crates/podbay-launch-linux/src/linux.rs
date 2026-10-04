@@ -544,7 +544,8 @@ fn bootstrap_port_stage(
     match stage {
         BootstrapControlStage::Submitted { .. } => Ok(PortDispatchOutcome::Accepted(receipt)),
         BootstrapControlStage::RefusedBeforeEffect => Err(PortDispatchError::RefusedBeforeEffect),
-        BootstrapControlStage::ThreadCreateUncertain
+        BootstrapControlStage::ClaimedUnobserved
+        | BootstrapControlStage::ThreadCreateUncertain
         | BootstrapControlStage::ThreadCreated { .. }
         | BootstrapControlStage::BootstrapUncertain { .. } => {
             Err(PortDispatchError::UncertainAfterPossibleEffect {
@@ -1532,6 +1533,7 @@ mod tests {
             Err(PortDispatchError::RefusedBeforeEffect)
         ));
         for stage in [
+            BootstrapControlStage::ClaimedUnobserved,
             BootstrapControlStage::ThreadCreateUncertain,
             BootstrapControlStage::ThreadCreated {
                 native_thread_id: "thread.fixture".into(),
