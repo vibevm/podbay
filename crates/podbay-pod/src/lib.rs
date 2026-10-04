@@ -6,6 +6,8 @@ mod codex_bootstrap;
 #[cfg(target_os = "linux")]
 mod codex_credential;
 mod codex_journal;
+#[allow(dead_code)] // Only a sealed fixture proof exists until v22 admission.
+mod codex_later_turn;
 #[cfg(target_os = "linux")]
 mod codex_launch;
 #[cfg(target_os = "linux")]

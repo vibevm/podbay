@@ -98,6 +98,14 @@ distinct facts. Neither primitive grants manager admission. A later store
 version and authenticated pod control bridge are required before exposing
 subsequent `session.send` to clients.
 
+After a matching state-applied later `turn/completed`, the adapter retains the
+exact native thread, Session, turn and terminal status. Its existing bounded
+nonblocking `thread/read` bridge can then require fresh idle, no waiting and
+no pending host request before a pod journal records settlement. An unrelated
+turn or a lost/malformed read remains uncertain. This bridge is exercised by
+a sealed fixture-only controller; the normal Pod binary still has no later
+`session.send` mutation route.
+
 The pod-local `CodexCommandJournal` storage slice now records a fsynced
 thread-create intent, exact native thread/session checkpoint, and separate
 bootstrap intent, uncertain, submitted and completed facts. It uses bounded,

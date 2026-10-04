@@ -322,6 +322,21 @@ pub enum BootstrapReadPoll {
     Verified,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaterTurnTerminalStatus {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaterTurnCompletionObservation {
+    pub native_thread_id: String,
+    pub native_session_id: String,
+    pub native_turn_id: String,
+    pub status: LaterTurnTerminalStatus,
+}
+
 enum CompletionReadState {
     NotStarted,
     PendingWrite {
@@ -481,6 +496,7 @@ pub struct CodexResource<T: JsonlTransport> {
     applied_notifications: VecDeque<AppliedNativeNotification>,
     applied_notification_bytes: usize,
     completion_read: CompletionReadState,
+    last_later_turn_completion: Option<LaterTurnCompletionObservation>,
 }
 
 impl<T: JsonlTransport> CodexResource<T> {
@@ -509,6 +525,7 @@ impl<T: JsonlTransport> CodexResource<T> {
             applied_notifications: VecDeque::new(),
             applied_notification_bytes: 0,
             completion_read: CompletionReadState::NotStarted,
+            last_later_turn_completion: None,
         }
     }
 
@@ -526,6 +543,10 @@ impl<T: JsonlTransport> CodexResource<T> {
 
     pub fn bootstrap_state(&self) -> &BootstrapState {
         &self.bootstrap
+    }
+
+    pub fn last_later_turn_completion(&self) -> Option<&LaterTurnCompletionObservation> {
+        self.last_later_turn_completion.as_ref()
     }
 
     /// This settles only the bootstrap requirement. Full dispatch readiness
@@ -1111,6 +1132,8 @@ impl<T: JsonlTransport> CodexResource<T> {
             }
         };
         if mode == TurnMode::Start {
+            self.last_later_turn_completion = None;
+            self.completion_read = CompletionReadState::NotStarted;
             self.owned_active_turn_id = Some(turn_id.clone());
             self.observed_active_turn_id = Some(turn_id.clone());
             self.native_status = ThreadStatus::Active;
@@ -1139,7 +1162,7 @@ impl<T: JsonlTransport> CodexResource<T> {
         expected_session_id: &str,
         text: &str,
         client_message_id: &str,
-        mut before_turn_start: impl FnMut(&Self) -> Result<(), CodexError>,
+        mut before_turn_start: impl FnMut(&mut Self) -> Result<(), CodexError>,
     ) -> Result<TurnSubmission, CodexError> {
         self.check_permit(permit)?;
         if text.is_empty()
@@ -1224,6 +1247,8 @@ impl<T: JsonlTransport> CodexResource<T> {
             }
         };
         self.owned_active_turn_id = Some(turn_id.clone());
+        self.last_later_turn_completion = None;
+        self.completion_read = CompletionReadState::NotStarted;
         self.observed_active_turn_id = Some(turn_id.clone());
         self.native_status = ThreadStatus::Active;
         self.idle_after_completion = false;
@@ -1410,6 +1435,42 @@ impl<T: JsonlTransport> CodexResource<T> {
         {
             return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
         }
+        self.poll_exact_completion_read_proof_once(
+            expected_thread_id,
+            expected_session_id,
+            expected_turn_id,
+        )
+    }
+
+    /// The same nonblocking read bridge serves later turns only after a
+    /// matching state-applied native terminal notification. This proof is
+    /// native idle/no-waiting/no-pending status, not PodBay command authority.
+    pub fn poll_later_turn_read_proof_once(
+        &mut self,
+        expected: &LaterTurnCompletionObservation,
+    ) -> Result<BootstrapReadPoll, CodexError> {
+        if self.last_later_turn_completion.as_ref() != Some(expected)
+            || self.external_conflict
+            || !matches!(self.bootstrap, BootstrapState::Completed { .. })
+        {
+            return Err(CodexError::Blocked(BlockReason::ObservationUnknown));
+        }
+        self.poll_exact_completion_read_proof_once(
+            &expected.native_thread_id,
+            &expected.native_session_id,
+            &expected.native_turn_id,
+        )
+    }
+
+    fn poll_exact_completion_read_proof_once(
+        &mut self,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<BootstrapReadPoll, CodexError> {
+        if self.poisoned || !self.initialized {
+            return Err(CodexError::InvalidState("native connection is unavailable"));
+        }
         if !completion_target_matches(
             &self.completion_read,
             expected_thread_id,
@@ -1444,7 +1505,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                     turn_id: expected_turn_id.into(),
                     deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
                 };
-                self.poll_bootstrap_read_proof_once(
+                self.poll_exact_completion_read_proof_once(
                     expected_thread_id,
                     expected_session_id,
                     expected_turn_id,
@@ -2106,9 +2167,12 @@ impl<T: JsonlTransport> CodexResource<T> {
                     .get("turn")
                     .and_then(|turn| turn.get("status"))
                     .and_then(Value::as_str);
-                if !matches!(status, Some("completed" | "failed" | "interrupted")) {
-                    return Err(CodexError::Protocol("turn completion status is invalid"));
-                }
+                let terminal = match status {
+                    Some("completed") => LaterTurnTerminalStatus::Completed,
+                    Some("failed") => LaterTurnTerminalStatus::Failed,
+                    Some("interrupted") => LaterTurnTerminalStatus::Interrupted,
+                    _ => return Err(CodexError::Protocol("turn completion status is invalid")),
+                };
                 if matches!(
                     self.interrupt,
                     InterruptState::Requested { .. } | InterruptState::Uncertain { .. }
@@ -2123,6 +2187,18 @@ impl<T: JsonlTransport> CodexResource<T> {
                         }
                     };
                 }
+                let session_id = self
+                    .thread
+                    .as_ref()
+                    .ok_or(CodexError::InvalidState("native thread disappeared"))?
+                    .session_id
+                    .clone();
+                self.last_later_turn_completion = Some(LaterTurnCompletionObservation {
+                    native_thread_id: bound.to_owned(),
+                    native_session_id: session_id,
+                    native_turn_id: turn_id.to_owned(),
+                    status: terminal,
+                });
                 self.owned_active_turn_id = None;
                 self.observed_active_turn_id = None;
             }
