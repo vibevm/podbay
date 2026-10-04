@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::bound_launch::{ensure_current_dispatch_eligible, read_bound_record};
@@ -199,6 +199,42 @@ pub struct PodBayStore {
 }
 
 impl PodBayStore {
+    /// Open an already migrated store for a pod-side witness without becoming
+    /// a writer, creating a database, or running schema migrations. Mutating
+    /// methods on this handle still fail at SQLite's read-only boundary.
+    pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(StoreError::InvalidInput(
+                "read-only database path must be absolute",
+            ));
+        }
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema(version));
+        }
+        verify_authority_schema(&transaction)?;
+        verify_runtime_schema(&transaction)?;
+        verify_rebind_schema(&transaction)?;
+        verify_manager_credential_schema(&transaction)?;
+        verify_manager_peer_schema(&transaction)?;
+        verify_prior_observation_schema(&transaction)?;
+        verify_actor_verifier_schema(&transaction)?;
+        let store_lineage: String = transaction.query_row(
+            "SELECT lineage FROM store_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(Self {
+            connection,
+            store_lineage,
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
