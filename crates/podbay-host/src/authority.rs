@@ -162,6 +162,22 @@ impl AuthenticatedProcessSubject {
     pub fn platform(&self) -> HostPlatform {
         self.platform
     }
+
+    pub fn os_identity(&self) -> &str {
+        &self.os_identity
+    }
+
+    pub fn process_identity(&self) -> &str {
+        &self.process_identity
+    }
+
+    pub fn start_identity(&self) -> u64 {
+        self.start_identity
+    }
+
+    pub fn containment_identity(&self) -> &str {
+        &self.containment_identity
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

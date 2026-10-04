@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ed25519-compact = { version = "2", default-features = false }
 podbay-core = { path = "../podbay-core" }
 podbay-store = { path = "../podbay-store" }
 podbay-wire = { path = "../podbay-wire" }
