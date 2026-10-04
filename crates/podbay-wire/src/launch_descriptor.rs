@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use podbay_core::{LaunchBinding, PlannedRootBinding, ResourceId, ResourceKind, Role, WorkKind};
+use podbay_core::{
+    LaunchBinding, PlannedChildBinding, PlannedRootBinding, ResourceId, ResourceKind, Revision,
+    Role, Session, SessionState, WorkKind,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
@@ -774,6 +777,22 @@ impl ImmutableLaunchDescriptorV2 {
         Self::from_base(base, codex_policy)
     }
 
+    /// Review one queued child Worker/Task before its command admission. The
+    /// exact non-null parentRunId and complete first Pod resource inventory
+    /// come from the private core plan. This grants no delegation or liveness.
+    pub fn from_planned_child(
+        planned: &PlannedChildBinding,
+        session: &Session,
+        policy: ReviewedNativePolicy,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, LaunchDescriptorError> {
+        require_planned_child_identity(planned, session)?;
+        let base = ImmutableLaunchDescriptor::from_identity(planned.identity(), policy)?;
+        let result = Self::from_base(base, codex_policy)?;
+        result.validate_against_planned_child(planned, session)?;
+        Ok(result)
+    }
+
     pub fn from_binding(
         binding: &LaunchBinding,
         policy: ReviewedNativePolicy,
@@ -853,6 +872,22 @@ impl ImmutableLaunchDescriptorV2 {
         &self,
         planned: &PlannedRootBinding,
     ) -> Result<(), LaunchDescriptorError> {
+        let base = ImmutableLaunchDescriptor {
+            digest: digest_body(&self.body.base)?,
+            body: self.body.base.clone(),
+        };
+        base.validate_against_identity(planned.identity())
+    }
+
+    /// A decoded child's canonical identity must match the exact queued
+    /// Worker/Task plan, including parentRunId and every ordered resource.
+    pub fn validate_against_planned_child(
+        &self,
+        planned: &PlannedChildBinding,
+        session: &Session,
+    ) -> Result<(), LaunchDescriptorError> {
+        require_planned_child_identity(planned, session)?;
+        validate_body_v2(&self.body)?;
         let base = ImmutableLaunchDescriptor {
             digest: digest_body(&self.body.base)?,
             body: self.body.base.clone(),
@@ -982,6 +1017,40 @@ impl ImmutableLaunchDescriptorV2 {
                 driver: &value.driver,
             })
     }
+}
+
+fn require_planned_child_identity(
+    planned: &PlannedChildBinding,
+    session: &Session,
+) -> Result<(), LaunchDescriptorError> {
+    let identity = planned.identity();
+    let first_bound_revision = Revision::INITIAL
+        .checked_next()
+        .map_err(|_| LaunchDescriptorError::BindingMismatch)?;
+    if session.state() != SessionState::Open
+        || session.revision() != first_bound_revision
+        || session.current_run_id() != Some(identity.run_id())
+        || session.id() != identity.session_id()
+        || session.actor_id() != identity.actor_id()
+        || session.scope_id() != identity.scope_id()
+        || !identity.is_planned()
+        || identity.role() != Role::Worker
+        || identity.work_kind() != WorkKind::Task
+        || identity
+            .parent_run_id()
+            .is_none_or(|parent| parent == identity.run_id())
+        || identity.attempt_ordinal() != 1
+        || identity.attempt_epoch().get() != 1
+        || identity.pod_incarnation().get() != 1
+        || identity.resources().is_empty()
+        || identity
+            .resources()
+            .iter()
+            .any(|resource| resource.epoch().get() != 1)
+    {
+        return Err(LaunchDescriptorError::BindingMismatch);
+    }
+    Ok(())
 }
 
 fn validate_body_v2(body: &DescriptorBodyV2) -> Result<(), LaunchDescriptorError> {
