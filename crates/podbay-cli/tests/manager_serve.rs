@@ -641,6 +641,26 @@ fn private_trusted_policy_enables_reviewed_route_after_parent_enrollment() {
         0
     );
     assert!(manager.stop_with("TERM").success());
+
+    // A new manager owner epoch cannot silently turn an old process-bound
+    // enrollment into a new first enrollment. Recovery is a separate path.
+    let before = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .authority_snapshot()
+        .unwrap();
+    let mut restarted = spawn_policy(&fixture, &policy);
+    restarted.wait_setup_ready(&fixture);
+    let mut socket = UnixStream::connect(fixture.setup_socket()).unwrap();
+    write_frame(&mut socket, signer.pk.as_ref());
+    drop(socket);
+    assert!(!restarted.wait_exit().success());
+    assert!(!fixture.socket().exists());
+    let after = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .authority_snapshot()
+        .unwrap();
+    assert_eq!(after.actors, before.actors);
+    assert_eq!(after.grants, before.grants);
 }
 
 #[test]

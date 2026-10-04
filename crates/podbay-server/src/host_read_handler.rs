@@ -140,6 +140,10 @@ fn inspection_json(
     if let Some(stage) = launch_stage {
         response["launchStage"] = json!(stage);
         response["outboxState"] = json!(outbox_state);
+        // An indexed CommandId→current writer lease lookup is not available
+        // in this store API. Never reconstruct a guard by scanning pods or
+        // replaying a prior launch receipt on a generic read.
+        response["bootstrapGuard"] = json!({"available": false});
         if let Some(reference) = launch.and_then(|status| status.receipt_ref.as_deref()) {
             response["portReceiptRef"] = json!(reference);
         }

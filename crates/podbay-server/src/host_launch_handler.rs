@@ -3,8 +3,8 @@
 
 use podbay_host::{
     AuthenticatedTransport, BootstrapPortObservation, BootstrapSendError, BootstrapSendReceipt,
-    DurableAuthority, HostDispatchPort, HostError, LaunchPodError, LaunchPodReceipt,
-    StablePortReceipt, TrustedBootstrapSendPolicy, TrustedWireRootLaunchPolicy,
+    DurableAuthority, HostDispatchPort, HostError, InitialBootstrapGuard, LaunchPodError,
+    LaunchPodReceipt, StablePortReceipt, TrustedBootstrapSendPolicy, TrustedWireRootLaunchPolicy,
 };
 use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, StoreError};
 use podbay_wire::{
@@ -99,7 +99,37 @@ where
         if binding.receipt != outcome.receipt {
             return Err(committed_projection_error(&command_id));
         }
-        project_launch_receipt(self.authority, &scope_id, outcome, &binding)
+        let bootstrap_guard = if matches!(
+            outcome.status.stage,
+            LaunchDispatchStage::HostAccepted | LaunchDispatchStage::PortSettled
+        ) {
+            self.bootstrap_send_policy.and_then(|policy| {
+                let session = podbay_core::SessionId::try_from(binding.session_id.as_str()).ok()?;
+                let guard = self
+                    .authority
+                    .acquire_initial_bootstrap_guard(transport, &session, policy)
+                    .ok()?;
+                (guard.target().scope_id.as_str() == binding.scope_id
+                    && guard.target().session_id.as_str() == binding.session_id
+                    && guard.target().run_id.as_str() == binding.run_id
+                    && guard.target().attempt_id.as_str() == binding.attempt_id
+                    && guard.target().pod_id.as_str() == binding.pod_id
+                    && guard.target().pod_incarnation == binding.pod_incarnation
+                    && binding.resources.len() == 1
+                    && guard.target().resource_id.as_str() == binding.resources[0].id
+                    && guard.target().resource_epoch == binding.resources[0].epoch)
+                    .then_some(guard)
+            })
+        } else {
+            None
+        };
+        project_launch_receipt(
+            self.authority,
+            &scope_id,
+            outcome,
+            &binding,
+            bootstrap_guard.as_ref(),
+        )
     }
 
     fn read<T: AuthenticatedTransport>(
@@ -252,6 +282,7 @@ fn project_launch_receipt<P: HostDispatchPort>(
     scope_id: &str,
     outcome: LaunchPodReceipt,
     binding: &BoundLaunchRecord,
+    bootstrap_guard: Option<&InitialBootstrapGuard>,
 ) -> Result<Receipt<Value>, RuntimeError> {
     let original = outcome.receipt;
     let command_id = original.command_id;
@@ -304,6 +335,8 @@ fn project_launch_receipt<P: HostDispatchPort>(
                 "kind": resource.kind,
                 "epoch": resource.epoch.to_string(),
             })).collect::<Vec<_>>(),
+            "bootstrapGuard": bootstrap_guard.map(bootstrap_guard_json)
+                .unwrap_or_else(|| json!({"available": false})),
         }),
         revision: position,
         cursor: EventCursor {
@@ -316,6 +349,28 @@ fn project_launch_receipt<P: HostDispatchPort>(
         .validate()
         .map_err(|_| committed_projection_error(&command_id))?;
     Ok(receipt)
+}
+
+fn bootstrap_guard_json(guard: &InitialBootstrapGuard) -> Value {
+    let target = guard.target();
+    json!({
+        "available": true,
+        "scopeId": target.scope_id.as_str(),
+        "sessionId": target.session_id.as_str(),
+        "runId": target.run_id.as_str(),
+        "attemptId": target.attempt_id.as_str(),
+        "podId": target.pod_id.as_str(),
+        "resourceId": target.resource_id.as_str(),
+        "resourceInputEpoch": target.resource_input_epoch.to_string(),
+        "leaseExpiresAtUnixSeconds": guard.expires_at_unix_seconds().to_string(),
+        "guard": {
+            "managerEpoch": guard.owner_epoch().to_string(),
+            "podEpoch": target.pod_incarnation.to_string(),
+            "resourceEpoch": target.resource_epoch.to_string(),
+            "writerEpoch": guard.writer_epoch().to_string(),
+            "targetRevision": guard.session_revision().to_string(),
+        },
+    })
 }
 
 fn committed_projection_error(command_id: &str) -> RuntimeError {

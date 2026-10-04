@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_compact::{KeyPair, Seed};
-use podbay_client::authenticate_existing_linux_stream;
+use podbay_client::{LinuxClientAuthLimits, authenticate_existing_linux_stream_with_limits};
 use podbay_core::{ActorId, ResourceKind, ScopeId, SessionId};
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
@@ -37,8 +37,8 @@ use podbay_store::{
     TrustedNativeWriterLeaseRequest,
 };
 use podbay_wire::{
-    CommandEnvelope, DecimalString, Guard, MutationOperation, ReadEnvelope, ReadOperation,
-    ResourceDriver, Target as WireTarget,
+    CommandEnvelope, Guard, MutationOperation, ReadEnvelope, ReadOperation, ResourceDriver,
+    Target as WireTarget,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -86,6 +86,9 @@ impl Drop for Fixture {
 #[derive(Clone, Copy)]
 enum PortMode {
     Accepted,
+    SlowAccepted,
+    SlowSend,
+    SendLostReply,
     LostReply,
 }
 
@@ -125,7 +128,13 @@ impl HostDispatchPort for FakePort {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let receipt = PortReceiptRef::from_port("receipt.fake.codex").unwrap();
         match self.mode {
-            PortMode::Accepted => Ok(PortDispatchOutcome::Accepted(receipt)),
+            PortMode::Accepted | PortMode::SlowSend | PortMode::SendLostReply => {
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
+            PortMode::SlowAccepted => {
+                thread::sleep(Duration::from_millis(2_300));
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
             PortMode::LostReply => Err(PortDispatchError::UncertainAfterPossibleEffect {
                 receipt_ref: Some(receipt),
             }),
@@ -143,7 +152,16 @@ impl HostDispatchPort for FakePort {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let receipt = PortReceiptRef::from_port("receipt.fake.bootstrap").unwrap();
         match self.mode {
-            PortMode::Accepted => Ok(PortDispatchOutcome::Accepted(receipt)),
+            PortMode::Accepted | PortMode::SlowAccepted => {
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
+            PortMode::SlowSend => {
+                thread::sleep(Duration::from_secs(31));
+                Ok(PortDispatchOutcome::Accepted(receipt))
+            }
+            PortMode::SendLostReply => Err(PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt),
+            }),
             PortMode::LostReply => Err(PortDispatchError::UncertainAfterPossibleEffect {
                 receipt_ref: Some(receipt),
             }),
@@ -406,12 +424,17 @@ fn read_by_key(request_id: &str, key: &str) -> ReadEnvelope {
 
 fn authenticate(socket: UnixStream, actor: &str) -> impl Read + Write {
     let signer = KeyPair::from_seed(Seed::new([7; 32]));
-    authenticate_existing_linux_stream(socket, actor, |challenge| {
-        let signature = signer.sk.sign(challenge.bytes, None);
-        let mut bytes = [0_u8; 64];
-        bytes.copy_from_slice(signature.as_ref());
-        Some(bytes)
-    })
+    authenticate_existing_linux_stream_with_limits(
+        socket,
+        actor,
+        LinuxClientAuthLimits::new(Duration::from_secs(5), Duration::from_secs(90)).unwrap(),
+        |challenge| {
+            let signature = signer.sk.sign(challenge.bytes, None);
+            let mut bytes = [0_u8; 64];
+            bytes.copy_from_slice(signature.as_ref());
+            Some(bytes)
+        },
+    )
     .unwrap()
 }
 
@@ -597,7 +620,10 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
     )
     .unwrap();
     let send_template =
-        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30)).unwrap();
+        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30))
+            .unwrap()
+            .with_initial_writer_lease_seconds(120)
+            .unwrap();
     let launched = serve_batch(
         &mut listener,
         &mut authority,
@@ -611,11 +637,41 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
             )
             .encode_json()
             .unwrap(),
+            launch_request(
+                "request.bootstrap.launch.retry",
+                "key.bootstrap.launch",
+                grant,
+                "gpt-6-sol",
+            )
+            .encode_json()
+            .unwrap(),
+            read_by_key("request.bootstrap.launch.read", "key.bootstrap.launch")
+                .encode_json()
+                .unwrap(),
         ],
         Some(&launch_template),
         Some(&send_template),
     );
     assert_eq!(launched[0]["ok"]["state"], "host_accepted");
+    let first_guard = &launched[0]["ok"]["value"]["bootstrapGuard"];
+    assert_eq!(first_guard["available"], true);
+    assert_eq!(
+        first_guard["guard"]["managerEpoch"],
+        authority.owner_epoch().get().to_string()
+    );
+    assert_eq!(first_guard["guard"]["podEpoch"], "1");
+    assert_eq!(first_guard["guard"]["resourceEpoch"], "1");
+    assert_eq!(first_guard["guard"]["writerEpoch"], "1");
+    assert_eq!(
+        launched[1]["ok"]["commandId"],
+        launched[0]["ok"]["commandId"]
+    );
+    assert_eq!(launched[1]["ok"]["value"]["duplicate"], true);
+    assert_eq!(launched[1]["ok"]["value"]["portCalled"], false);
+    assert_eq!(launched[1]["ok"]["value"]["bootstrapGuard"], *first_guard);
+    assert_eq!(launched[2]["ok"]["state"], "host_accepted");
+    assert_eq!(launched[2]["ok"]["bootstrapGuard"]["available"], false);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     let session_id =
         SessionId::try_from(launched[0]["ok"]["value"]["sessionId"].as_str().unwrap()).unwrap();
     let scope = ScopeId::try_from("scope.server.launch").unwrap();
@@ -632,14 +688,10 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
     let lease = authority
         .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 120)
         .unwrap();
-    let guard = Guard {
-        manager_epoch: Some(DecimalString::new(authority.owner_epoch().get())),
-        pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
-        resource_epoch: Some(DecimalString::new(target.resource_epoch)),
-        writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
-        target_revision: Some(DecimalString::new(revision)),
-        ..Guard::default()
-    };
+    assert_eq!(lease.writer_epoch(), 1);
+    assert_eq!(first_guard["guard"]["targetRevision"], revision.to_string());
+    assert_eq!(first_guard["resourceId"], target.resource_id.as_str());
+    let guard: Guard = serde_json::from_value(first_guard["guard"].clone()).unwrap();
     let send = |request_id: &str, text: &str| {
         CommandEnvelope::new_json(
             request_id,
@@ -860,6 +912,252 @@ fn authenticated_first_send_is_claimed_once_and_keeps_native_result_separate() {
             .scope_snapshot(scope.as_str())
             .unwrap(),
         before
+    );
+    listener.shutdown().unwrap();
+}
+
+struct ReadySend {
+    authority: DurableAuthority<FakePort>,
+    listener: LinuxManagerCommandsGetListener,
+    actor: ActorId,
+    calls: Arc<AtomicUsize>,
+    launch_template: TrustedWireRootLaunchTemplate,
+    send_template: TrustedBootstrapSendTemplate,
+    session_id: String,
+    guard: Guard,
+}
+
+impl ReadySend {
+    fn new(fixture: &Fixture, mode: PortMode) -> Self {
+        let (mut authority, actor, grant, calls, _) = prepared_authority(fixture, mode);
+        let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+        let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+            grant,
+            Duration::from_secs(30),
+            "result.none",
+        )
+        .unwrap();
+        let send_template =
+            TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(30))
+                .unwrap()
+                .with_initial_writer_lease_seconds(120)
+                .unwrap();
+        let launch = serve_batch(
+            &mut listener,
+            &mut authority,
+            &actor,
+            vec![
+                launch_request(
+                    "request.ready.launch",
+                    "key.ready.launch",
+                    grant,
+                    "gpt-6-sol",
+                )
+                .encode_json()
+                .unwrap(),
+            ],
+            Some(&launch_template),
+            Some(&send_template),
+        );
+        assert_eq!(launch[0]["ok"]["state"], "host_accepted");
+        assert_eq!(
+            launch[0]["ok"]["value"]["bootstrapGuard"]["available"],
+            true
+        );
+        let session_id = launch[0]["ok"]["value"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let guard =
+            serde_json::from_value(launch[0]["ok"]["value"]["bootstrapGuard"]["guard"].clone())
+                .unwrap();
+        Self {
+            authority,
+            listener,
+            actor,
+            calls,
+            launch_template,
+            send_template,
+            session_id,
+            guard,
+        }
+    }
+
+    fn send(&self, request_id: &str) -> Vec<u8> {
+        CommandEnvelope::new_json(
+            request_id,
+            "key.ready.send",
+            WireTarget::Session {
+                session_id: self.session_id.clone(),
+            },
+            Some(self.guard.clone()),
+            None,
+            MutationOperation::SessionSend,
+            json!({"content":[{"kind":"text","text":"hello native"}],
+                "policy":{"kind":"when_idle"}}),
+        )
+        .unwrap()
+        .encode_json()
+        .unwrap()
+    }
+}
+
+#[test]
+fn delayed_fake_send_outlives_old_exchange_deadline_without_duplicate_effect() {
+    let fixture = Fixture::new();
+    let mut ready = ReadySend::new(&fixture, PortMode::SlowSend);
+    let first_request = ready.send("request.ready.send");
+    let first = serve_batch(
+        &mut ready.listener,
+        &mut ready.authority,
+        &ready.actor,
+        vec![first_request],
+        Some(&ready.launch_template),
+        Some(&ready.send_template),
+    );
+    assert_eq!(first[0]["ok"]["state"], "uncertain");
+    assert_eq!(
+        first[0]["ok"]["value"]["portObservation"]["kind"],
+        "pod_accepted"
+    );
+    assert_eq!(ready.calls.load(Ordering::SeqCst), 2); // one launch and one send
+    let original = first[0]["ok"]["commandId"].clone();
+    let retry = ready.send("request.ready.send.retry");
+    let duplicate = serve_batch(
+        &mut ready.listener,
+        &mut ready.authority,
+        &ready.actor,
+        vec![retry],
+        Some(&ready.launch_template),
+        Some(&ready.send_template),
+    );
+    assert_eq!(duplicate[0]["ok"]["commandId"], original);
+    assert_eq!(duplicate[0]["ok"]["value"]["duplicate"], true);
+    assert_eq!(duplicate[0]["ok"]["value"]["portCalled"], false);
+    assert_eq!(ready.calls.load(Ordering::SeqCst), 2);
+    ready.listener.shutdown().unwrap();
+}
+
+#[test]
+fn lost_fake_send_reply_stays_uncertain_and_is_not_resent() {
+    let fixture = Fixture::new();
+    let mut ready = ReadySend::new(&fixture, PortMode::SendLostReply);
+    let first_request = ready.send("request.ready.lost");
+    let first = serve_batch(
+        &mut ready.listener,
+        &mut ready.authority,
+        &ready.actor,
+        vec![first_request],
+        Some(&ready.launch_template),
+        Some(&ready.send_template),
+    );
+    assert_eq!(first[0]["ok"]["state"], "uncertain");
+    assert_eq!(
+        first[0]["ok"]["value"]["portObservation"]["kind"],
+        "uncertain_after_possible_effect"
+    );
+    let original = first[0]["ok"]["commandId"].clone();
+    let retry = ready.send("request.ready.lost.retry");
+    let duplicate = serve_batch(
+        &mut ready.listener,
+        &mut ready.authority,
+        &ready.actor,
+        vec![retry],
+        Some(&ready.launch_template),
+        Some(&ready.send_template),
+    );
+    assert_eq!(duplicate[0]["ok"]["commandId"], original);
+    assert_eq!(duplicate[0]["ok"]["value"]["portCalled"], false);
+    assert_eq!(ready.calls.load(Ordering::SeqCst), 2);
+    ready.listener.shutdown().unwrap();
+}
+
+#[test]
+fn accepted_launch_keeps_receipt_when_guard_expires_then_duplicate_gets_one_lease() {
+    let fixture = Fixture::new();
+    let (mut authority, actor, grant, calls, _) =
+        prepared_authority(&fixture, PortMode::SlowAccepted);
+    let mut listener = LinuxManagerCommandsGetListener::bind(&fixture.root).unwrap();
+    let launch_template = TrustedWireRootLaunchTemplate::from_trusted_policy(
+        grant,
+        Duration::from_secs(30),
+        "result.none",
+    )
+    .unwrap();
+    let send_template =
+        TrustedBootstrapSendTemplate::from_trusted_policy(grant, Duration::from_secs(2))
+            .unwrap()
+            .with_initial_writer_lease_seconds(120)
+            .unwrap();
+    let first = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            launch_request(
+                "request.guard.first",
+                "key.guard.launch",
+                grant,
+                "gpt-6-sol",
+            )
+            .encode_json()
+            .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let first = &first[0]["ok"];
+    assert_eq!(first["state"], "host_accepted");
+    assert_eq!(first["value"]["launchStage"], "host_accepted");
+    assert_eq!(first["value"]["bootstrapGuard"]["available"], false);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let original_command = first["commandId"].clone();
+    let session_id = first["value"]["sessionId"].as_str().unwrap().to_owned();
+
+    let duplicate = serve_batch(
+        &mut listener,
+        &mut authority,
+        &actor,
+        vec![
+            launch_request(
+                "request.guard.retry",
+                "key.guard.launch",
+                grant,
+                "gpt-6-sol",
+            )
+            .encode_json()
+            .unwrap(),
+        ],
+        Some(&launch_template),
+        Some(&send_template),
+    );
+    let duplicate = &duplicate[0]["ok"];
+    assert_eq!(duplicate["commandId"], original_command);
+    assert_eq!(duplicate["state"], "host_accepted");
+    assert_eq!(duplicate["value"]["duplicate"], true);
+    assert_eq!(duplicate["value"]["portCalled"], false);
+    assert_eq!(duplicate["value"]["bootstrapGuard"]["available"], true);
+    assert_eq!(
+        duplicate["value"]["bootstrapGuard"]["guard"]["writerEpoch"],
+        "1"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let scope = ScopeId::try_from("scope.server.launch").unwrap();
+    let session = SessionId::try_from(session_id.as_str()).unwrap();
+    let (target, _) = store
+        .current_native_writer_target_for_session(&scope, &session)
+        .unwrap();
+    assert_eq!(
+        store
+            .inspect_native_writer_lease(&target)
+            .unwrap()
+            .writer_epoch(),
+        1
+    );
+    assert_eq!(
+        store.scope_snapshot(scope.as_str()).unwrap().receipts.len(),
+        1
     );
     listener.shutdown().unwrap();
 }

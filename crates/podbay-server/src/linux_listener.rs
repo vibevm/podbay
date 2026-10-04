@@ -19,8 +19,9 @@ use podbay_host::{
 use podbay_pod::LinuxPeerEvidence;
 
 use crate::{
-    LinuxServeOneFault, serve_authenticated_linux_commands_get_one,
-    serve_authenticated_linux_launch_and_first_send_one, serve_authenticated_linux_launch_one,
+    LinuxAuthPreludeLimits, LinuxServeOneFault, serve_authenticated_linux_commands_get_one,
+    serve_authenticated_linux_launch_and_first_send_one_with_limits,
+    serve_authenticated_linux_launch_one,
 };
 
 pub const MANAGER_SOCKET_NAME: &str = "manager.sock";
@@ -103,6 +104,7 @@ impl TrustedWireRootLaunchTemplate {
 pub struct TrustedBootstrapSendTemplate {
     grant_id: GrantId,
     exchange_budget: Duration,
+    initial_writer_lease_seconds: Option<u64>,
 }
 
 impl TrustedBootstrapSendTemplate {
@@ -119,14 +121,27 @@ impl TrustedBootstrapSendTemplate {
         Ok(Self {
             grant_id,
             exchange_budget,
+            initial_writer_lease_seconds: None,
         })
+    }
+
+    pub fn with_initial_writer_lease_seconds(mut self, seconds: u64) -> Result<Self, HostError> {
+        if !(1..=3_600).contains(&seconds) {
+            return Err(HostError::InvalidInput);
+        }
+        self.initial_writer_lease_seconds = Some(seconds);
+        Ok(self)
     }
 
     fn fresh(&self) -> Result<TrustedBootstrapSendPolicy, HostError> {
         let deadline = Instant::now()
             .checked_add(self.exchange_budget)
             .ok_or(HostError::InvalidInput)?;
-        TrustedBootstrapSendPolicy::from_trusted_policy(self.grant_id, deadline)
+        let policy = TrustedBootstrapSendPolicy::from_trusted_policy(self.grant_id, deadline)?;
+        match self.initial_writer_lease_seconds {
+            Some(seconds) => policy.with_initial_writer_lease_seconds(seconds),
+            None => Ok(policy),
+        }
     }
 }
 
@@ -245,6 +260,16 @@ impl LinuxManagerCommandsGetListener {
     where
         P::Receipt: StablePortReceipt,
     {
+        // Pod bootstrap can wait up to 75s on its attested socket. The
+        // authenticated manager exchange stays bounded but must outlive that
+        // call. This limit is created from trusted templates, never wire JSON.
+        let exchange = launch_template
+            .exchange_budget
+            .max(send_template.exchange_budget)
+            .max(Duration::from_secs(90))
+            .min(Duration::from_secs(300));
+        let limits = LinuxAuthPreludeLimits::new(Duration::from_secs(5), exchange)
+            .map_err(|_| LinuxListenerError::Configuration(HostError::InvalidInput))?;
         self.serve_serial(authority, stop, |stream, authority| {
             let launch_policy = launch_template
                 .fresh()
@@ -252,12 +277,15 @@ impl LinuxManagerCommandsGetListener {
             let send_policy = send_template
                 .fresh()
                 .map_err(LinuxListenerError::Configuration)?;
-            Ok(serve_authenticated_linux_launch_and_first_send_one(
-                stream,
-                authority,
-                &launch_policy,
-                &send_policy,
-            ))
+            Ok(
+                serve_authenticated_linux_launch_and_first_send_one_with_limits(
+                    stream,
+                    authority,
+                    &launch_policy,
+                    &send_policy,
+                    limits,
+                ),
+            )
         })
     }
 

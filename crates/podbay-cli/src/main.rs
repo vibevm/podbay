@@ -203,8 +203,10 @@ mod linux {
             .map_err(|error| format!("trusted launch template refused: {error:?}"))?;
             let send =
                 TrustedBootstrapSendTemplate::from_trusted_policy(grant, policy.send_deadline)
+                    .and_then(|template| {
+                        template.with_initial_writer_lease_seconds(policy.writer_lease_seconds)
+                    })
                     .map_err(|error| format!("trusted send template refused: {error:?}"))?;
-            let _writer_lease_seconds = policy.writer_lease_seconds;
             Some((launch, send))
         } else {
             None

@@ -1180,6 +1180,7 @@ pub struct TrustedWireRootLaunchPolicy {
 pub struct TrustedBootstrapSendPolicy {
     grant_id: GrantId,
     deadline: Instant,
+    initial_writer_lease_seconds: Option<u64>,
 }
 
 impl TrustedBootstrapSendPolicy {
@@ -1187,7 +1188,52 @@ impl TrustedBootstrapSendPolicy {
         if deadline <= Instant::now() {
             return Err(HostError::InvalidInput);
         }
-        Ok(Self { grant_id, deadline })
+        Ok(Self {
+            grant_id,
+            deadline,
+            initial_writer_lease_seconds: None,
+        })
+    }
+
+    pub fn with_initial_writer_lease_seconds(mut self, seconds: u64) -> Result<Self, HostError> {
+        if !(1..=3_600).contains(&seconds) {
+            return Err(HostError::InvalidInput);
+        }
+        self.initial_writer_lease_seconds = Some(seconds);
+        Ok(self)
+    }
+
+    pub fn initial_writer_lease_seconds(&self) -> Option<u64> {
+        self.initial_writer_lease_seconds
+    }
+}
+
+/// Current first-send guard derived from one exact V2 Session target and the
+/// active native writer lease. It is not pod liveness or provider completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialBootstrapGuard {
+    target: podbay_store::NativeWriterTarget,
+    owner_epoch: u64,
+    session_revision: u64,
+    writer_epoch: u64,
+    expires_at_unix_seconds: u64,
+}
+
+impl InitialBootstrapGuard {
+    pub fn target(&self) -> &podbay_store::NativeWriterTarget {
+        &self.target
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn session_revision(&self) -> u64 {
+        self.session_revision
+    }
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+    pub fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
     }
 }
 
@@ -3496,6 +3542,52 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return Err(HostError::StaleGuard.into());
         }
         Ok(current)
+    }
+
+    /// After an accepted V2 root, mint or read back the one initial writer
+    /// lease and return the exact send guard. This never invokes a pod or
+    /// provider. A caller must keep the accepted launch receipt even if this
+    /// separate guard preparation fails.
+    pub fn acquire_initial_bootstrap_guard<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        session_id: &SessionId,
+        policy: &TrustedBootstrapSendPolicy,
+    ) -> Result<InitialBootstrapGuard, BootstrapSendError> {
+        let ttl = policy
+            .initial_writer_lease_seconds()
+            .ok_or(HostError::Unsupported)?;
+        let lease =
+            self.acquire_initial_bootstrap_writer_lease(transport, session_id, policy, ttl)?;
+        let actor = self.current_bootstrap_actor(transport)?;
+        self.host.check_grant(
+            &actor,
+            policy.grant_id,
+            &actor.scope_id,
+            &Right::new(
+                Operation::SendSession,
+                Target::Scope(actor.scope_id.clone()),
+            ),
+        )?;
+        let (target, session_revision) = self
+            .store
+            .current_native_writer_target_for_session(&actor.scope_id, session_id)?;
+        let current = self.store.inspect_native_writer_lease(&target)?;
+        if current != lease
+            || lease.target() != &target
+            || lease.holder_actor_id() != &actor.actor_id
+            || lease.holder_credential_generation() != actor.credential_generation.get()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        self.recheck_actor_resolution_manager()?;
+        Ok(InitialBootstrapGuard {
+            target,
+            owner_epoch: lease.owner_epoch(),
+            session_revision,
+            writer_epoch: lease.writer_epoch(),
+            expires_at_unix_seconds: lease.expires_at_unix_seconds(),
+        })
     }
 
     /// The first text-only `session.send` uses a separately installed scope

@@ -106,8 +106,33 @@ where
     P: podbay_host::HostDispatchPort,
     P::Receipt: podbay_host::StablePortReceipt,
 {
-    let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
-        .map_err(LinuxServeOneFault::Authentication)?;
+    serve_authenticated_linux_launch_and_first_send_one_with_limits(
+        socket,
+        authority,
+        launch_policy,
+        send_policy,
+        LinuxAuthPreludeLimits::default(),
+    )
+}
+
+/// The listener supplies a bounded post-auth exchange budget from trusted
+/// manager policy. The challenge and acknowledgement retain their separate
+/// short handshake deadline; neither wire JSON nor a port reply extends it.
+#[cfg(target_os = "linux")]
+pub fn serve_authenticated_linux_launch_and_first_send_one_with_limits<P>(
+    socket: std::os::unix::net::UnixStream,
+    authority: &mut podbay_host::DurableAuthority<P>,
+    launch_policy: &podbay_host::TrustedWireRootLaunchPolicy,
+    send_policy: &podbay_host::TrustedBootstrapSendPolicy,
+    limits: LinuxAuthPreludeLimits,
+) -> Result<(), LinuxServeOneFault>
+where
+    P: podbay_host::HostDispatchPort,
+    P::Receipt: podbay_host::StablePortReceipt,
+{
+    let mut authenticated =
+        authenticate_accepted_linux_stream_with_limits(socket, authority, limits)
+            .map_err(LinuxServeOneFault::Authentication)?;
     let mut handler = host_launch_handler::HostLaunchHandler::with_first_send(
         authority,
         launch_policy,
