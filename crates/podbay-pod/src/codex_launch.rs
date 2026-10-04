@@ -20,15 +20,31 @@ use sha2::{Digest, Sha256};
 
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
-    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, LaunchDescriptor,
-    PEER_BINDING_V2_PROTOCOL, PROTOCOL, PodError, PodManifest, PodPeerBootstrap, PodRole, hex,
-    manifest_path, private_directory, read_manifest, unit_name, write_manifest,
+    BoundPeerManifest, BoundPodStatus, BoundPolicyFenceV3, CODEX_V2_CAPABILITY,
+    CODEX_V3_CAPABILITY, LaunchDescriptor, PEER_BINDING_V2_PROTOCOL, PEER_BINDING_V3_PROTOCOL,
+    PROTOCOL, PodError, PodManifest, PodPeerBootstrap, PodRole, hex, manifest_path,
+    private_directory, read_manifest, unit_name, write_manifest,
 };
 use crate::runtime::PodClient;
 
 const MAX_CREDENTIAL_BYTES: u64 = 1_048_576;
 const MAX_STATUS_WAIT_SECONDS: u64 = 300;
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+enum CodexLaunchFence {
+    V2 { authority_revision: u64 },
+    V3 { policy_fence_epoch: u64, admission_authority_revision: u64 },
+}
+
+impl CodexLaunchFence {
+    fn format(self) -> BoundLaunchFormat {
+        match self {
+            Self::V2 { .. } => BoundLaunchFormat::CodexV2,
+            Self::V3 { .. } => BoundLaunchFormat::CodexV3,
+        }
+    }
+}
 
 /// Starts only one already-claimed Codex V2 pod, using the private source
 /// reviewed by Linux preflight. It never reads credential bytes. Existing
@@ -37,6 +53,62 @@ pub fn launch_bound_codex_v2(
     record: BoundLaunchRecord,
     bootstrap: PodPeerBootstrap,
     expected_authority_revision: u64,
+    expected_store_file_identity: (u64, u64),
+    directory: impl AsRef<Path>,
+    pod_binary: impl AsRef<Path>,
+    credential_source: impl AsRef<Path>,
+    credential_source_identity: (u64, u64),
+) -> Result<PodClient, PodError> {
+    launch_bound_codex(
+        record,
+        bootstrap,
+        CodexLaunchFence::V2 { authority_revision: expected_authority_revision },
+        expected_store_file_identity,
+        directory,
+        pod_binary,
+        credential_source,
+        credential_source_identity,
+    )
+}
+
+/// Starts one explicitly V3 policy-bound Codex root. The historical admission
+/// revision is retained in the manifest; only the policy epoch is a lifetime
+/// fence. Global authority revision remains an admission/claim CAS.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_bound_codex_v3(
+    record: BoundLaunchRecord,
+    bootstrap: PodPeerBootstrap,
+    expected_policy_fence_epoch: u64,
+    expected_admission_authority_revision: u64,
+    expected_store_file_identity: (u64, u64),
+    directory: impl AsRef<Path>,
+    pod_binary: impl AsRef<Path>,
+    credential_source: impl AsRef<Path>,
+    credential_source_identity: (u64, u64),
+) -> Result<PodClient, PodError> {
+    if expected_policy_fence_epoch == 0 || expected_admission_authority_revision == 0 {
+        return Err(PodError::Invalid("Codex V3 policy fence is zero"));
+    }
+    launch_bound_codex(
+        record,
+        bootstrap,
+        CodexLaunchFence::V3 {
+            policy_fence_epoch: expected_policy_fence_epoch,
+            admission_authority_revision: expected_admission_authority_revision,
+        },
+        expected_store_file_identity,
+        directory,
+        pod_binary,
+        credential_source,
+        credential_source_identity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_bound_codex(
+    record: BoundLaunchRecord,
+    bootstrap: PodPeerBootstrap,
+    fence: CodexLaunchFence,
     expected_store_file_identity: (u64, u64),
     directory: impl AsRef<Path>,
     pod_binary: impl AsRef<Path>,
@@ -64,7 +136,7 @@ pub fn launch_bound_codex_v2(
         (NativeRole::Worker, NativeWorkKind::Task) => PodRole::Worker,
         _ => return Err(PodError::Unsupported("Codex V2 root role is unavailable")),
     };
-    if record.format != BoundLaunchFormat::CodexV2
+    if record.format != fence.format()
         || record.scope_id != wire.scope_id()
         || record.session_id != wire.session_id()
         || record.run_id != wire.run_id()
@@ -117,8 +189,14 @@ pub fn launch_bound_codex_v2(
         ));
     }
     let mut bound = BoundPeerManifest {
-        protocol: PEER_BINDING_V2_PROTOCOL.into(),
-        capability: CODEX_V2_CAPABILITY.into(),
+        protocol: match fence {
+            CodexLaunchFence::V2 { .. } => PEER_BINDING_V2_PROTOCOL,
+            CodexLaunchFence::V3 { .. } => PEER_BINDING_V3_PROTOCOL,
+        }.into(),
+        capability: match fence {
+            CodexLaunchFence::V2 { .. } => CODEX_V2_CAPABILITY,
+            CodexLaunchFence::V3 { .. } => CODEX_V3_CAPABILITY,
+        }.into(),
         wire_descriptor: record.descriptor.clone(),
         effective_spec: record.effective_spec.clone(),
         descriptor_digest: wire.digest().into(),
@@ -128,8 +206,16 @@ pub fn launch_bound_codex_v2(
         store_lineage: bootstrap.store_lineage.clone(),
         owner_epoch: bootstrap.owner_epoch,
         credential_epoch: bootstrap.credential_epoch,
-        authority_revision: Some(expected_authority_revision),
-        policy_fence: None,
+        authority_revision: match fence {
+            CodexLaunchFence::V2 { authority_revision } => Some(authority_revision),
+            CodexLaunchFence::V3 { .. } => None,
+        },
+        policy_fence: match fence {
+            CodexLaunchFence::V2 { .. } => None,
+            CodexLaunchFence::V3 { policy_fence_epoch, admission_authority_revision } => {
+                Some(BoundPolicyFenceV3 { policy_fence_epoch, admission_authority_revision })
+            }
+        },
         resource_input_epochs: bootstrap.resource_input_epochs.clone(),
         manager_os_identity: peer.os_identity().into(),
         manager_process_id: peer.native_process_id().into(),
@@ -153,14 +239,17 @@ pub fn launch_bound_codex_v2(
         .ok_or(PodError::Invalid("systemd credential source path"))?;
 
     recheck_store_file(&bootstrap.store_path, expected_store_file_identity)?;
-    let mut store = PodBayStore::open(&bootstrap.store_path)
-        .map_err(|_| PodError::Refused("committed store unavailable"))?;
+    let mut store = match fence {
+        CodexLaunchFence::V2 { .. } => PodBayStore::open(&bootstrap.store_path),
+        CodexLaunchFence::V3 { .. } => PodBayStore::open_existing_read_only(&bootstrap.store_path),
+    }
+    .map_err(|_| PodError::Refused("committed store unavailable"))?;
     recheck_current_binding(
         &mut store,
         &record,
         &bound,
         peer,
-        expected_authority_revision,
+        fence,
     )?;
     match fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -184,7 +273,7 @@ pub fn launch_bound_codex_v2(
                 &record,
                 &bound,
                 peer,
-                expected_authority_revision,
+                fence,
                 expected_store_file_identity,
                 credential_source,
                 credential_source_identity,
@@ -262,7 +351,7 @@ pub fn launch_bound_codex_v2(
         &record,
         &bound,
         peer,
-        expected_authority_revision,
+        fence,
     )
     .map_err(|_| PodError::Uncertain("Codex V2 authority changed after manifest write"))?;
     recheck_store_file(&bootstrap.store_path, expected_store_file_identity)
@@ -302,7 +391,7 @@ pub fn launch_bound_codex_v2(
         &record,
         &bound,
         peer,
-        expected_authority_revision,
+        fence,
         expected_store_file_identity,
         credential_source,
         credential_source_identity,
@@ -364,7 +453,7 @@ fn final_acceptance_guards(
     record: &BoundLaunchRecord,
     binding: &BoundPeerManifest,
     manager_peer: &podbay_core::AttestedPeer,
-    expected_authority_revision: u64,
+    fence: CodexLaunchFence,
     expected_store_file_identity: (u64, u64),
     credential_source: &Path,
     credential_source_identity: (u64, u64),
@@ -380,7 +469,7 @@ fn final_acceptance_guards(
         record,
         binding,
         manager_peer,
-        expected_authority_revision,
+        fence,
     )?;
     recheck_credential_source(credential_source, credential_source_identity)?;
     let manager = LinuxPeerEvidence::for_current_process()
@@ -396,7 +485,7 @@ fn recheck_current_binding(
     record: &BoundLaunchRecord,
     binding: &BoundPeerManifest,
     peer: &podbay_core::AttestedPeer,
-    expected_authority_revision: u64,
+    fence: CodexLaunchFence,
 ) -> Result<(), PodError> {
     let claim = store
         .current_manager_credential_claim(binding.owner_epoch)
@@ -416,17 +505,43 @@ fn recheck_current_binding(
         .collect::<BTreeMap<_, _>>();
     if claim.store_lineage() != binding.store_lineage
         || claim.credential_epoch() != binding.credential_epoch
-        || binding.authority_revision != Some(expected_authority_revision)
         || !store
             .current_manager_peer_matches(&claim, peer)
             .map_err(|_| PodError::Refused("current Codex V2 manager peer unavailable"))?
         || current.store_lineage().as_str() != binding.store_lineage
         || current.owner_epoch().get() != binding.owner_epoch
-        || current.authority_revision() != expected_authority_revision
         || current.launch() != record
         || inputs != binding.resource_input_epochs
     {
         return Err(PodError::Refused("current Codex V2 authority changed"));
+    }
+    match fence {
+        CodexLaunchFence::V2 { authority_revision } => {
+            if binding.authority_revision != Some(authority_revision)
+                || binding.policy_fence.is_some()
+                || current.authority_revision() != authority_revision
+                || current.launch().format != BoundLaunchFormat::CodexV2
+            {
+                return Err(PodError::Refused("current Codex V2 authority changed"));
+            }
+        }
+        CodexLaunchFence::V3 { policy_fence_epoch, admission_authority_revision } => {
+            let Some(policy) = current.current_policy_fence() else {
+                return Err(PodError::Refused("current Codex V3 policy row unavailable"));
+            };
+            if binding.authority_revision.is_some()
+                || binding.policy_fence.as_ref() != Some(&BoundPolicyFenceV3 {
+                    policy_fence_epoch,
+                    admission_authority_revision,
+                })
+                || current.launch().format != BoundLaunchFormat::CodexV3
+                || policy.store_lineage != binding.store_lineage
+                || policy.policy_fence_epoch != policy_fence_epoch
+                || policy.admission_authority_revision != admission_authority_revision
+            {
+                return Err(PodError::Refused("current Codex V3 policy changed"));
+            }
+        }
     }
     Ok(())
 }

@@ -46,7 +46,7 @@ pub use codex_journal::{
     CodexJournalView,
 };
 #[cfg(target_os = "linux")]
-pub use codex_launch::launch_bound_codex_v2;
+pub use codex_launch::{launch_bound_codex_v2, launch_bound_codex_v3};
 #[cfg(target_os = "linux")]
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 #[cfg(target_os = "linux")]

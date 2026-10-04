@@ -713,6 +713,43 @@ impl PodBayStore {
         scope: &ScopeId,
         command_id: &CommandId,
     ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(
+            principal, scope, command_id, Some(BoundLaunchFormat::CodexV2),
+        )
+    }
+
+    /// Indexed V3 root selector. A historical V2 command cannot become V3
+    /// through this read, and a V3 command cannot enter a V2-only guard path.
+    pub fn lookup_bound_root_v3_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(
+            principal, scope, command_id, Some(BoundLaunchFormat::CodexV3),
+        )
+    }
+
+    /// Indexed version-aware Codex root readback for an authenticated caller.
+    /// The returned explicit format must be checked before constructing any
+    /// version-specific capability or current guard.
+    pub fn lookup_bound_root_codex_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
+        self.lookup_bound_root_by_command_id(principal, scope, command_id, None)
+    }
+
+    fn lookup_bound_root_by_command_id(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        scope: &ScopeId,
+        command_id: &CommandId,
+        format: Option<BoundLaunchFormat>,
+    ) -> Result<Option<BoundLaunchRecord>, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -734,13 +771,23 @@ impl PodBayStore {
             return Ok(None);
         };
         let record = read_bound_record(&transaction, rowid)?;
-        if record.format != BoundLaunchFormat::CodexV2
+        if (if let Some(format) = format {
+            record.format != format
+        } else {
+            !matches!(record.format, BoundLaunchFormat::CodexV2 | BoundLaunchFormat::CodexV3)
+        })
             || record.scope_id != scope.as_str()
             || record.receipt.command_id != command_id.as_str()
             || record.resources.len() != 1
             || record.resources[0].kind != "structured_provider"
         {
-            return Err(StoreError::Conflict("indexed V2 root binding differs"));
+            return Err(StoreError::Conflict(if format == Some(BoundLaunchFormat::CodexV2) {
+                "indexed V2 root binding differs"
+            } else if format == Some(BoundLaunchFormat::CodexV3) {
+                "indexed V3 root binding differs"
+            } else {
+                "indexed Codex root binding differs"
+            }));
         }
         transaction.commit()?;
         Ok(Some(record))

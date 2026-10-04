@@ -7,12 +7,13 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use podbay_host::{CredentialRef, ResolvedNativeCodexLaunch};
+use podbay_host::{CredentialRef, ResolvedNativeCodexLaunch, ResolvedNativeCodexV3Launch};
 use podbay_pod::{LinuxPeerEvidence, PodError, PodPeerBootstrap};
-use podbay_store::{BoundLaunchFormat, PodBayStore};
+use podbay_store::{BoundLaunchFormat, BoundLaunchRecord, CurrentBoundPodSnapshot, PodBayStore};
 use podbay_wire::{
-    CodexApprovalPolicyV2, CodexSandboxV2, NativeResourceKind, NativeRole, NativeWorkKind,
-    ResourceDriver, TargetOs,
+    CodexApprovalPolicyV2, CodexSandboxV2, EffectiveLaunchContractV2,
+    ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
+    TargetOs,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,6 +64,105 @@ pub struct CodexV2Preflight {
     credential_source_identity: (u64, u64),
 }
 
+/// V3 shares the reviewed typed V2 launch bytes and private credential source;
+/// its lifetime check is selected by a distinct host proof and store format.
+pub type CodexV3Preflight = CodexV2Preflight;
+
+#[derive(Clone, Copy)]
+enum CodexPreflightFence {
+    V2 { authority_revision: u64 },
+    V3 { policy_fence_epoch: u64, admission_authority_revision: u64 },
+}
+
+struct CodexPreflightInput<'a> {
+    record: &'a BoundLaunchRecord,
+    wire: &'a ImmutableLaunchDescriptorV2,
+    effective: &'a EffectiveLaunchContractV2,
+    store_path: &'a Path,
+    store_file_identity: (u64, u64),
+    store_lineage: &'a str,
+    owner_epoch: u64,
+    credential_epoch: u64,
+    manager_peer: &'a podbay_core::AttestedPeer,
+    resource_input_epochs: &'a BTreeMap<String, u64>,
+    cwd: &'a Path,
+    executable: &'a Path,
+    executable_sha256: &'a str,
+    fence: CodexPreflightFence,
+}
+
+impl<'a> CodexPreflightInput<'a> {
+    fn v2(launch: &'a ResolvedNativeCodexLaunch) -> Self {
+        Self {
+            record: launch.committed_record(), wire: launch.descriptor(),
+            effective: launch.effective(), store_path: launch.store_path(),
+            store_file_identity: launch.store_file_identity(),
+            store_lineage: launch.store_lineage(), owner_epoch: launch.owner_epoch(),
+            credential_epoch: launch.credential_epoch(), manager_peer: launch.manager_peer(),
+            resource_input_epochs: launch.resource_input_epochs(), cwd: launch.cwd(),
+            executable: launch.executable(), executable_sha256: launch.executable_sha256(),
+            fence: CodexPreflightFence::V2 { authority_revision: launch.authority_revision() },
+        }
+    }
+
+    fn v3(launch: &'a ResolvedNativeCodexV3Launch) -> Self {
+        Self {
+            record: launch.committed_record(), wire: launch.descriptor(),
+            effective: launch.effective(), store_path: launch.store_path(),
+            store_file_identity: launch.store_file_identity(),
+            store_lineage: launch.store_lineage(), owner_epoch: launch.owner_epoch(),
+            credential_epoch: launch.credential_epoch(), manager_peer: launch.manager_peer(),
+            resource_input_epochs: launch.resource_input_epochs(), cwd: launch.cwd(),
+            executable: launch.executable(), executable_sha256: launch.executable_sha256(),
+            fence: CodexPreflightFence::V3 {
+                policy_fence_epoch: launch.policy_fence_epoch(),
+                admission_authority_revision: launch.admission_authority_revision(),
+            },
+        }
+    }
+
+    fn current_fence(&self, current: &CurrentBoundPodSnapshot) -> bool {
+        match self.fence {
+            CodexPreflightFence::V2 { authority_revision } => {
+                current.launch().format == BoundLaunchFormat::CodexV2
+                    && current.authority_revision() == authority_revision
+                    && current.current_policy_fence().is_none()
+            }
+            CodexPreflightFence::V3 { policy_fence_epoch, admission_authority_revision } => {
+                current.launch().format == BoundLaunchFormat::CodexV3
+                    && current.current_policy_fence().is_some_and(|policy| {
+                        policy.store_lineage == self.store_lineage
+                            && policy.policy_fence_epoch == policy_fence_epoch
+                            && policy.admission_authority_revision == admission_authority_revision
+                    })
+            }
+        }
+    }
+
+    fn format(&self) -> BoundLaunchFormat {
+        match self.fence {
+            CodexPreflightFence::V2 { .. } => BoundLaunchFormat::CodexV2,
+            CodexPreflightFence::V3 { .. } => BoundLaunchFormat::CodexV3,
+        }
+    }
+
+    fn committed_record(&self) -> &BoundLaunchRecord { self.record }
+    fn descriptor(&self) -> &ImmutableLaunchDescriptorV2 { self.wire }
+    fn effective(&self) -> &EffectiveLaunchContractV2 { self.effective }
+    fn resource_input_epochs(&self) -> &BTreeMap<String, u64> { self.resource_input_epochs }
+    fn executable(&self) -> &Path { self.executable }
+    fn cwd(&self) -> &Path { self.cwd }
+    fn executable_sha256(&self) -> &str { self.executable_sha256 }
+    fn effective_spec_bytes(&self) -> &[u8] { &self.record.effective_spec }
+    fn descriptor_bytes(&self) -> &[u8] { &self.record.descriptor }
+    fn manager_peer(&self) -> &podbay_core::AttestedPeer { self.manager_peer }
+    fn store_path(&self) -> &Path { self.store_path }
+    fn store_file_identity(&self) -> (u64, u64) { self.store_file_identity }
+    fn store_lineage(&self) -> &str { self.store_lineage }
+    fn owner_epoch(&self) -> u64 { self.owner_epoch }
+    fn credential_epoch(&self) -> u64 { self.credential_epoch }
+}
+
 impl CodexV2Preflight {
     pub fn bootstrap(&self) -> &PodPeerBootstrap {
         &self.bootstrap
@@ -82,7 +182,7 @@ pub fn preflight_committed_codex_v2(
     launch: &ResolvedNativeCodexLaunch,
     credential: &TrustedCodexCredentialSource,
 ) -> Result<CodexV2Preflight, PodError> {
-    preflight_committed_codex_v2_with_store(launch, credential, false)
+    preflight_committed_codex_with_store(CodexPreflightInput::v2(launch), credential, false)
 }
 
 /// Same exact policy/path/authority checks for a read-only rebind inspection.
@@ -92,11 +192,20 @@ pub fn preflight_committed_codex_v2_read_only(
     launch: &ResolvedNativeCodexLaunch,
     credential: &TrustedCodexCredentialSource,
 ) -> Result<CodexV2Preflight, PodError> {
-    preflight_committed_codex_v2_with_store(launch, credential, true)
+    preflight_committed_codex_with_store(CodexPreflightInput::v2(launch), credential, true)
 }
 
-fn preflight_committed_codex_v2_with_store(
-    launch: &ResolvedNativeCodexLaunch,
+/// V3 never opens the store for writing, so preflight cannot migrate a live
+/// historical V2 store as a side effect of checking a proposed launch.
+pub fn preflight_committed_codex_v3(
+    launch: &ResolvedNativeCodexV3Launch,
+    credential: &TrustedCodexCredentialSource,
+) -> Result<CodexV3Preflight, PodError> {
+    preflight_committed_codex_with_store(CodexPreflightInput::v3(launch), credential, true)
+}
+
+fn preflight_committed_codex_with_store(
+    launch: CodexPreflightInput<'_>,
     credential: &TrustedCodexCredentialSource,
     read_only: bool,
 ) -> Result<CodexV2Preflight, PodError> {
@@ -112,7 +221,7 @@ fn preflight_committed_codex_v2_with_store(
         (NativeRole::Coordinator, NativeWorkKind::Service)
             | (NativeRole::Worker, NativeWorkKind::Task)
     );
-    if record.format != BoundLaunchFormat::CodexV2
+    if record.format != launch.format()
         || !role_pair
         || wire.parent_run_id().is_some()
         || wire.target_os() != TargetOs::Linux
@@ -195,7 +304,7 @@ fn preflight_committed_codex_v2_with_store(
         .collect::<BTreeMap<_, _>>();
     if current.store_lineage().as_str() != launch.store_lineage()
         || current.owner_epoch().get() != launch.owner_epoch()
-        || current.authority_revision() != launch.authority_revision()
+        || !launch.current_fence(&current)
         || current.launch() != record
         || inputs != *launch.resource_input_epochs()
         || current.resources().len() != 1
@@ -253,7 +362,7 @@ fn preflight_committed_codex_v2_with_store(
             .map_err(|_| PodError::Refused("manager peer unavailable"))?
         || final_current.store_lineage().as_str() != launch.store_lineage()
         || final_current.owner_epoch().get() != launch.owner_epoch()
-        || final_current.authority_revision() != launch.authority_revision()
+        || !launch.current_fence(&final_current)
         || final_current.launch() != record
         || final_inputs != inputs
     {

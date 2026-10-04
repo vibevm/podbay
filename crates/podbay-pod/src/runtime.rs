@@ -30,10 +30,11 @@ use crate::codex_bootstrap::{
 use crate::codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
-    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, LaunchDescriptor,
-    PEER_BINDING_PROTOCOL, PEER_BINDING_V2_PROTOCOL, PROTOCOL, PodError, PodManifest,
-    PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
-    private_directory, read_manifest, unit_name, write_manifest,
+    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY,
+    LaunchDescriptor, PEER_BINDING_PROTOCOL, PEER_BINDING_V2_PROTOCOL,
+    PEER_BINDING_V3_PROTOCOL, PROTOCOL, PodError, PodManifest, PodPeerBootstrap, PodRole,
+    PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path, private_directory, read_manifest,
+    unit_name, write_manifest,
 };
 use crate::native_events::{
     CODEX_NATIVE_EVENTS_READ_PROTOCOL, NativeEventCursor, NativeEventRead,
@@ -933,9 +934,9 @@ impl PodClient {
         target: &NativeWriterTarget,
         writer_epoch: u64,
     ) -> Result<BootstrapControlReceipt, PodError> {
-        let binding = active_codex_v2_binding(&self.manifest)?;
-        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY {
-            return Err(PodError::Unsupported("Codex bootstrap requires V2"));
+        let binding = active_codex_binding(&self.manifest)?;
+        if !is_codex_binding(&binding) {
+            return Err(PodError::Unsupported("Codex bootstrap binding unavailable"));
         }
         let selector = BootstrapSendSelector {
             scope_id: target.scope_id.clone(),
@@ -1033,9 +1034,9 @@ impl PodClient {
         target: &NativeWriterTarget,
         writer_epoch: u64,
     ) -> Result<BootstrapControlReceipt, PodError> {
-        let binding = active_codex_v2_binding(&self.manifest)?;
-        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY {
-            return Err(PodError::Unsupported("Codex bootstrap inspection requires V2"));
+        let binding = active_codex_binding(&self.manifest)?;
+        if !is_codex_binding(&binding) {
+            return Err(PodError::Unsupported("Codex bootstrap inspection binding unavailable"));
         }
         let selector = BootstrapSendSelector {
             scope_id: target.scope_id.clone(),
@@ -1138,10 +1139,10 @@ impl PodClient {
     ) -> Result<NativeEventRead, PodError> {
         let binding = self.manifest.peer_binding.as_ref()
             .ok_or(PodError::Unsupported("Codex event binding is unavailable"))?;
-        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY
+        if !is_codex_binding(binding)
             || !(1..=64).contains(&limit)
         {
-            return Err(PodError::Unsupported("Codex event read requires bounded V2"));
+            return Err(PodError::Unsupported("Codex event read requires bounded binding"));
         }
         let identity = identity_from_manifest(&self.manifest)?;
         if cursor.is_some_and(|cursor| cursor.identity != identity) {
@@ -1690,6 +1691,42 @@ fn current_codex_v2_binding(
     Ok(())
 }
 
+fn is_codex_binding(binding: &BoundPeerManifest) -> bool {
+    matches!(
+        (binding.protocol.as_str(), binding.capability.as_str()),
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY)
+            | (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY)
+    )
+}
+
+fn bootstrap_revision_matches(binding: &BoundPeerManifest, revision: u64) -> bool {
+    match (binding.protocol.as_str(), binding.capability.as_str()) {
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => {
+            binding.authority_revision == Some(revision)
+        }
+        (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY) => binding
+            .policy_fence
+            .as_ref()
+            .is_some_and(|fence| revision >= fence.admission_authority_revision),
+        _ => false,
+    }
+}
+
+fn current_codex_binding(
+    binding: &BoundPeerManifest,
+    descriptor: &LaunchDescriptor,
+) -> Result<(), PodError> {
+    match (binding.protocol.as_str(), binding.capability.as_str()) {
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => {
+            current_codex_v2_binding(binding, descriptor)
+        }
+        (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY) => {
+            binding.check_current_codex_v3_policy(descriptor)
+        }
+        _ => Err(PodError::Unsupported("current Codex binding unavailable")),
+    }
+}
+
 /// Immutable manifest bytes still identify the original launch. Only the
 /// current manager peer/epochs are projected from this pod's fsynced Active
 /// checkpoint plus the exact Activated store row. This is a read-only view,
@@ -1770,11 +1807,44 @@ fn active_codex_v2_binding(manifest: &PodManifest) -> Result<BoundPeerManifest, 
     Ok(live)
 }
 
+fn active_codex_binding(manifest: &PodManifest) -> Result<BoundPeerManifest, PodError> {
+    let original = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+        "Codex manifest binding is absent",
+    ))?;
+    match (original.protocol.as_str(), original.capability.as_str()) {
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => active_codex_v2_binding(manifest),
+        (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY) => {
+            let identity = bound_identity(&manifest.descriptor, original)?;
+            let directory = manifest.socket_path.parent().ok_or(PodError::Invalid(
+                "Codex V3 socket parent is absent",
+            ))?;
+            let observed = read_peer_checkpoint_observation(directory, &identity)
+                .map_err(|_| PodError::Refused("Codex V3 checkpoint unavailable"))?;
+            let checkpoint = observed.checkpoint();
+            let inputs = checkpoint.input_epochs().iter().map(|(id, epoch)| {
+                (id.as_str().to_owned(), epoch.get())
+            }).collect::<BTreeMap<_, _>>();
+            if checkpoint.phase() != RebindPhase::Active
+                || checkpoint.last_rebind().is_some()
+                || checkpoint.owner_epoch().get() != original.owner_epoch
+                || checkpoint.credential_epoch().get() != original.credential_epoch
+                || checkpoint.manager_peer() != &original.manager_peer()?
+                || inputs != original.resource_input_epochs
+            {
+                return Err(PodError::Refused("Codex V3 checkpoint changed"));
+            }
+            current_codex_binding(original, &manifest.descriptor)?;
+            Ok(original.clone())
+        }
+        _ => Err(PodError::Unsupported("current Codex binding unavailable")),
+    }
+}
+
 /// Read-only dynamic manager projection for a trusted port. It grants no
 /// control by itself; socket peer and current manager must still be checked.
 pub fn current_bound_peer_binding(manifest_path: impl AsRef<Path>) -> Result<BoundPeerManifest, PodError> {
     let manifest = read_manifest(manifest_path.as_ref())?;
-    active_codex_v2_binding(&manifest)
+    active_codex_binding(&manifest)
 }
 
 fn renew_and_authorize_manager_pod_control(
@@ -1816,7 +1886,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     ))?;
     let codex_launch = match (binding.protocol.as_str(), binding.capability.as_str()) {
         (PEER_BINDING_PROTOCOL, SYNTHETIC_CAPABILITY) => None,
-        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => {
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY)
+        | (PEER_BINDING_V3_PROTOCOL, CODEX_V3_CAPABILITY) => {
             Some(ValidatedCodexResourceLaunch::from_peer_binding(
                 binding,
                 &manifest.descriptor,
@@ -1856,7 +1927,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
         return Err(PodError::Refused("bound manager credential changed"));
     }
     if codex_launch.is_some() {
-        current_codex_v2_binding(binding, &manifest.descriptor)?;
+        current_codex_binding(binding, &manifest.descriptor)?;
     }
     match read_peer_checkpoint(manifest_path.as_ref().parent().unwrap(), &identity) {
         Ok(_) => {
@@ -1922,7 +1993,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     fs::set_permissions(&manifest.socket_path, fs::Permissions::from_mode(0o600))?;
     let descriptor = &manifest.descriptor;
     let mut child = if let Some(reviewed) = codex_launch {
-        current_codex_v2_binding(binding, descriptor)?;
+        current_codex_binding(binding, descriptor)?;
         if !manager_witness.matches_current(
             owner_epoch.get(),
             credential_epoch.get(),
@@ -1961,8 +2032,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             ),
         }
     };
-    if binding.protocol == PEER_BINDING_V2_PROTOCOL {
-        current_codex_v2_binding(binding, descriptor)
+    if is_codex_binding(binding) {
+        current_codex_binding(binding, descriptor)
             .map_err(|_| PodError::Uncertain("Codex V2 authority changed after child start"))?;
         if !manager_witness.matches_current(
             owner_epoch.get(),
@@ -1979,7 +2050,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let mut exit_code = None;
     let mut settled = false;
     let mut accept_failures = 0u8;
-    let codex_pump = binding.protocol == PEER_BINDING_V2_PROTOCOL;
+    let codex_pump = is_codex_binding(binding);
     if codex_pump {
         listener.set_nonblocking(true)?;
     }
@@ -1992,8 +2063,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             match &mut child {
                 ChildResource::Codex(resource) => {
                     let tick = resource.poll_bootstrap_notification_once(|| {
-                        let live = active_codex_v2_binding(&manifest)?;
-                        current_codex_v2_binding(&live, descriptor)?;
+                        let live = active_codex_binding(&manifest)?;
+                        current_codex_binding(&live, descriptor)?;
                         if !manager_witness.matches_current(
                             owner_epoch.get(), credential_epoch.get(), &manager_peer,
                         ) {
@@ -2158,11 +2229,10 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && read.protocol == CODEX_NATIVE_EVENTS_READ_PROTOCOL
             {
                 let result = (|| -> Result<NativeEventRead, PodError> {
-                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let live_binding = active_codex_binding(&manifest)?;
                     let binding = &live_binding;
                     if read.operation != "codex.events.read"
-                        || binding.protocol != PEER_BINDING_V2_PROTOCOL
-                        || binding.capability != CODEX_V2_CAPABILITY
+                        || !is_codex_binding(binding)
                         || !constant_time_equal(read.token.as_bytes(), manifest.token.as_bytes())
                         || !(1..=64).contains(&read.limit)
                         || read.identity != identity_from_manifest(&manifest)?
@@ -2177,7 +2247,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     {
                         return Err(PodError::Refused("Codex event manager peer is stale"));
                     }
-                    current_codex_v2_binding(binding, descriptor)?;
+                    current_codex_binding(binding, descriptor)?;
                     let result = if let ChildResource::Codex(resource) = &mut child {
                         resource.read_native_events(read.cursor.as_ref(), read.limit)?
                     } else {
@@ -2188,7 +2258,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
                         return Err(PodError::Refused("Codex event manager claim changed"));
                     }
-                    current_codex_v2_binding(binding, descriptor)?;
+                    current_codex_binding(binding, descriptor)?;
                     Ok(result)
                 })();
                 let reply = match result {
@@ -2437,10 +2507,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && inspect.protocol == CODEX_BOOTSTRAP_INSPECT_PROTOCOL
             {
                 let verified = (|| -> Result<_, PodError> {
-                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let live_binding = active_codex_binding(&manifest)?;
                     let binding = &live_binding;
-                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
-                        || binding.capability != CODEX_V2_CAPABILITY
+                    if !is_codex_binding(binding)
                         || !constant_time_equal(inspect.token.as_bytes(), manifest.token.as_bytes())
                     {
                         return Err(PodError::Refused("Codex bootstrap inspection capability unavailable"));
@@ -2454,7 +2523,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         return Err(PodError::Refused("bootstrap inspection manager peer is stale"));
                     }
                     let (selector, expected_writer_epoch) = inspect.checked_inspection_selector(binding, descriptor)?;
-                    current_codex_v2_binding(binding, descriptor)?;
+                    current_codex_binding(binding, descriptor)?;
                     let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
                         .map_err(|_| PodError::Refused("bootstrap inspection store unavailable"))?;
                     let proof = store.inspect_claimed_bootstrap_send(&selector)
@@ -2464,7 +2533,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     if proof.writer_epoch() != expected_writer_epoch
                         || proof.owner_epoch() != binding.owner_epoch
                         || proof.manager_credential_epoch() != binding.credential_epoch
-                        || Some(proof.authority_revision()) != binding.authority_revision
+                        || !bootstrap_revision_matches(binding, proof.authority_revision())
                         || lease.writer_epoch() != proof.writer_epoch()
                         || lease.holder_actor_id() != proof.holder_actor_id()
                         || lease.holder_credential_generation() != proof.holder_credential_generation()
@@ -2495,7 +2564,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                             if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
                                 return Err(PodError::Refused("bootstrap inspection manager claim changed"));
                             }
-                            current_codex_v2_binding(binding, descriptor)?;
+                            current_codex_binding(binding, descriptor)?;
                             let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
                                 .map_err(|_| PodError::Refused("bootstrap inspection store unavailable"))?;
                             let current = store.inspect_claimed_bootstrap_send(&selector)
@@ -2535,10 +2604,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 && let Ok(bootstrap) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
             {
                 let verified = (|| -> Result<_, PodError> {
-                    let live_binding = active_codex_v2_binding(&manifest)?;
+                    let live_binding = active_codex_binding(&manifest)?;
                     let binding = &live_binding;
-                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
-                        || binding.capability != CODEX_V2_CAPABILITY
+                    if !is_codex_binding(binding)
                         || !constant_time_equal(bootstrap.token.as_bytes(), manifest.token.as_bytes())
                     {
                         return Err(PodError::Refused("Codex bootstrap capability is unavailable"));
@@ -2552,7 +2620,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         return Err(PodError::Refused("bootstrap manager peer is stale"));
                     }
                     let (selector, expected_writer_epoch) = bootstrap.checked_selector(binding, descriptor)?;
-                    current_codex_v2_binding(binding, descriptor)?;
+                    current_codex_binding(binding, descriptor)?;
                     if child.try_wait()?.is_some() {
                         return Err(PodError::Refused("Codex child is not running"));
                     }
@@ -2565,7 +2633,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     if proof.writer_epoch() != expected_writer_epoch
                         || proof.owner_epoch() != binding.owner_epoch
                         || proof.manager_credential_epoch() != binding.credential_epoch
-                        || Some(proof.authority_revision()) != binding.authority_revision
+                        || !bootstrap_revision_matches(binding, proof.authority_revision())
                         || lease.writer_epoch() != proof.writer_epoch()
                         || lease.holder_actor_id() != proof.holder_actor_id()
                         || lease.holder_credential_generation() != proof.holder_credential_generation()
@@ -2590,7 +2658,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                                 ) {
                                     return Err(PodError::Refused("bootstrap manager claim changed"));
                                 }
-                                current_codex_v2_binding(binding, descriptor)?;
+                                current_codex_binding(binding, descriptor)?;
                                 let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
                                     .map_err(|_| PodError::Refused("bootstrap store witness unavailable"))?;
                                 let fresh = store.inspect_claimed_bootstrap_send(&selector)
@@ -2622,7 +2690,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         // Historical journal facts may be returned only to
                         // the exact originally attested manager transport.
                         // A bad bearer or sibling peer learns no native IDs.
-                        let same_transport = binding.protocol == PEER_BINDING_V2_PROTOCOL
+                        let same_transport = is_codex_binding(binding)
+                            && current_codex_binding(binding, descriptor).is_ok()
                             && constant_time_equal(
                                 bootstrap.token.as_bytes(), manifest.token.as_bytes(),
                             )
@@ -2735,7 +2804,8 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     owner_epoch.get(),
                     credential_epoch.get(),
                     &manager_peer,
-                );
+                ) && (binding.protocol != PEER_BINDING_V3_PROTOCOL
+                    || active_codex_binding(&manifest).is_ok());
             if renew_and_authorize_manager_pod_control(
                 &mut fence,
                 observed.attested_peer(),
@@ -2804,7 +2874,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 child_running: !settled,
                 exit_code,
                 bound: if codex_pump {
-                    Some(active_codex_v2_binding(&manifest)?.status(
+                    Some(active_codex_binding(&manifest)?.status(
                         &descriptor.resource_id, &descriptor.scope_id,
                     ))
                 } else {
@@ -2840,8 +2910,8 @@ fn attest(manifest: &PodManifest, status: &PodStatus) -> Result<(), PodError> {
         ));
     }
     let expected_bound = match manifest.peer_binding.as_ref() {
-        Some(binding) if binding.protocol == PEER_BINDING_V2_PROTOCOL => {
-            Some(active_codex_v2_binding(manifest)?.status(
+        Some(binding) if is_codex_binding(binding) => {
+            Some(active_codex_binding(manifest)?.status(
                 &manifest.descriptor.resource_id,
                 &manifest.descriptor.scope_id,
             ))

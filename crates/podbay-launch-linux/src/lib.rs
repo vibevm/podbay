@@ -9,8 +9,9 @@ mod linux;
 mod native_ingest;
 #[cfg(target_os = "linux")]
 pub use codex_v2::{
-    CodexV2Preflight, TrustedCodexCredentialSource, preflight_committed_codex_v2,
-    preflight_committed_codex_v2_read_only,
+    CodexV2Preflight, CodexV3Preflight, TrustedCodexCredentialSource,
+    preflight_committed_codex_v2, preflight_committed_codex_v2_read_only,
+    preflight_committed_codex_v3,
 };
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxLaunchPort, TrustedLinuxLaunchConfig, VerifiedRebindInspection};

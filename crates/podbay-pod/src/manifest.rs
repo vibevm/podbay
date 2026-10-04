@@ -457,12 +457,10 @@ impl BoundPeerManifest {
     pub fn check_current_codex_v3_policy(
         &self,
         launch: &LaunchDescriptor,
-        directory: &Path,
     ) -> Result<(), PodError> {
         if self.protocol != PEER_BINDING_V3_PROTOCOL || self.capability != CODEX_V3_CAPABILITY {
             return Err(PodError::Unsupported("current Codex V3 policy unavailable"));
         }
-        self.validate(launch, directory)?;
         let expected = self
             .policy_fence
             .as_ref()
@@ -545,6 +543,8 @@ pub struct BoundPodStatus {
     pub store_lineage: String,
     pub owner_epoch: u64,
     pub credential_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fence: Option<BoundPolicyFenceV3>,
     pub manager_os_identity: String,
     pub manager_process_id: String,
     pub manager_boot_identity: String,
@@ -565,6 +565,7 @@ impl BoundPeerManifest {
             store_lineage: self.store_lineage.clone(),
             owner_epoch: self.owner_epoch,
             credential_epoch: self.credential_epoch,
+            policy_fence: self.policy_fence.clone(),
             manager_os_identity: self.manager_os_identity.clone(),
             manager_process_id: self.manager_process_id.clone(),
             manager_boot_identity: self.manager_boot_identity.clone(),

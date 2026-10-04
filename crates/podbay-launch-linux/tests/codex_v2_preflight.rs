@@ -19,12 +19,12 @@ use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeStage, BootstrapPortObservation,
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
-    DurableAuthority, ExecutionMode, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
+    DurableAuthority, ExecutionMode, GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
     HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
     PortDispatchError, PortDispatchOutcome, PortReceiptRef, RebindCompletionStage,
     RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy,
-    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess,
-    WorkspaceSelection,
+    TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
+    TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
@@ -32,17 +32,22 @@ use podbay_launch_linux::{
     TrustedNativeEventDirectory, read_committed_codex_native_evidence,
 };
 use podbay_pod::{
-    BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CodexCommandJournal,
+    BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY,
+    CodexCommandJournal,
     CodexJournalIdentity, CodexJournalStage, LinuxBackend, NativeEventCursor, NativeEventKind,
     PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
+    manifest_path_for_identity,
 };
 use podbay_store::{
     CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
     TrustedNativeWriterLeaseRequest,
 };
 use podbay_wire::{
-    CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard,
-    ResourceDriver, SendPolicy, SessionSendBody, Target as WireTarget,
+    CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString,
+    FallbackPolicy, Guard, LaunchBody, LaunchLimits, LaunchRole,
+    LaunchSelection as WireLaunchSelection, LaunchWork, RequestedAuthority, ResourceDriver,
+    SendPolicy, SessionChoice, SessionSendBody, Target as WireTarget, WorkKind as WireWorkKind,
+    WorkspaceAccess as WireWorkspaceAccess, WorkspaceBinding,
 };
 use sha2::{Digest, Sha256};
 
@@ -468,6 +473,106 @@ fn port_for(fixture: &Fixture, binary: &Path) -> LinuxLaunchPort {
         )
         .unwrap(),
     )
+}
+
+fn v3_wire_root_body(fixture: &Fixture, grant: GrantId) -> LaunchBody {
+    LaunchBody {
+        session: SessionChoice::New,
+        role: LaunchRole::Coordinator,
+        work: LaunchWork {
+            kind: WireWorkKind::Service,
+            input: None,
+            task_ref: None,
+            result_contract_ref: "result.none".into(),
+        },
+        parent_run_id: None,
+        profile_ref: "profile.codex.preflight".into(),
+        selection: WireLaunchSelection {
+            model_id: Some("gpt-6-sol".into()),
+            reasoning_effort: Some("medium".into()),
+            fallback: FallbackPolicy::None,
+        },
+        workspace: WorkspaceBinding {
+            scope_id: fixture.scope.as_str().into(),
+            relative_cwd: ".".into(),
+            basis_ref: Some("basis.codex".into()),
+            access: WireWorkspaceAccess::ReadWrite,
+        },
+        tool_bundle_refs: Vec::new(),
+        authority: RequestedAuthority { grant_ref: format!("grant.{}", grant.get()) },
+        limits: LaunchLimits {
+            wall_seconds: DecimalString::new(90),
+            max_children: DecimalString::new(1),
+        },
+    }
+}
+
+fn v3_wire_root(fixture: &Fixture, grant: GrantId, request_id: &str, key: &str) -> CommandEnvelope {
+    CommandEnvelope::new(
+        request_id,
+        key,
+        WireTarget::Scope { scope_id: fixture.scope.as_str().into() },
+        None,
+        None,
+        CommandBody::Launch(v3_wire_root_body(fixture, grant)),
+    ).unwrap()
+}
+
+fn setup_v3_wire_port(
+    binary: &Path,
+) -> (
+    Fixture,
+    DurableAuthority<LinuxLaunchPort>,
+    Transport,
+    GrantId,
+    TrustedWireRootLaunchPolicy,
+) {
+    let fixture = Fixture::new();
+    assert!(!fixture.database.exists());
+    assert!(slot_manifest(&fixture).is_none());
+    let mut port = port_for(&fixture, binary);
+    let credential = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(
+            credential.clone(), fixture.source.clone(),
+        ).unwrap(),
+    ).unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    PodBayStore::open_existing_read_only(&fixture.database)
+        .expect("native V3 fixture must start on a fresh v20 store");
+    let actor = ActorId::try_from("actor.codex.preflight").unwrap();
+    let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
+        1000, 4242, 777, "/user.slice/preflight.scope",
+    ).unwrap();
+    let transport = Transport(AuthenticatedPeer::owner_cli_from_authenticated_transport(
+        process.clone(), CredentialGeneration::new(1).unwrap(),
+    ));
+    host.register_actor_from_trusted_policy(
+        ActorRegistration::owner_cli_from_trusted_policy(
+            actor.clone(), fixture.scope.clone(), process,
+            CredentialGeneration::new(1).unwrap(),
+        ),
+    ).unwrap();
+    let grant = host.install_grant_from_trusted_policy(
+        &actor,
+        GrantSpec {
+            scope_id: fixture.scope.clone(),
+            mode: GrantMode::Controller,
+            rights: BTreeSet::from([
+                Right::new(Operation::LaunchPod, Target::Scope(fixture.scope.clone())),
+                Right::new(Operation::UseCredential, Target::Credential(credential)),
+                Right::new(Operation::SendSession, Target::Scope(fixture.scope.clone())),
+            ]),
+            remaining_delegation_depth: 0,
+        },
+    ).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let policy = TrustedWireRootLaunchPolicy::from_trusted_policy(
+        grant, Instant::now() + Duration::from_secs(120), "result.none",
+    ).unwrap();
+    (fixture, host, transport, grant, policy)
 }
 
 fn register_restarted_codex_profile(
@@ -1017,6 +1122,145 @@ fn disposable_codex_v2_port_admits_and_reattaches_without_duplicate_child() {
     assert!(client.attested_status().unwrap().child_running);
     assert!(!client.stop().unwrap().child_running);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_v3_two_roots_hold_policy_until_revocation() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let (fixture, mut host, transport, grant, policy) = setup_v3_wire_port(&binary);
+    let epoch = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().policy_fence_epoch().unwrap();
+    let first = host.launch_new_root_codex_v3_from_wire(
+        &transport,
+        v3_wire_root(&fixture, grant, "request.v3.root.a", "key.v3.root.a"),
+        &policy,
+    ).unwrap();
+    assert_eq!(first.status.stage, LaunchDispatchStage::HostAccepted);
+    let snapshot_a = host.recorded_snapshot();
+    assert_eq!(snapshot_a.pods.len(), 1);
+    let pod_a = PodId::try_from(snapshot_a.pods[0].pod_id.as_str()).unwrap();
+    let revision_a = snapshot_a.revision;
+    let proof_a = host.inspect_committed_root_codex_v3(&fixture.scope, &pod_a).unwrap();
+    let path_a = manifest_path_for_identity(
+        &fixture.directory, &pod_a,
+        &AttemptId::try_from(proof_a.committed_record().attempt_id.as_str()).unwrap(),
+        Epoch::new(proof_a.committed_record().pod_incarnation).unwrap(),
+    );
+    let guard_a = DisposableUnitGuard::for_manifest(&path_a);
+    let client_a = PodClient::connect(&path_a).unwrap();
+    let status_a = client_a.attested_status().unwrap();
+    assert!(status_a.child_running);
+    assert_eq!(status_a.bound.as_ref().unwrap().capability, CODEX_V3_CAPABILITY);
+    assert_eq!(status_a.bound.as_ref().unwrap().policy_fence.as_ref().unwrap().policy_fence_epoch, epoch);
+
+    let second = host.launch_new_root_codex_v3_from_wire(
+        &transport,
+        v3_wire_root(&fixture, grant, "request.v3.root.b", "key.v3.root.b"),
+        &policy,
+    ).unwrap();
+    assert_eq!(second.status.stage, LaunchDispatchStage::HostAccepted);
+    let snapshot_b = host.recorded_snapshot();
+    assert!(snapshot_b.revision > revision_a);
+    assert_eq!(snapshot_b.pods.len(), 2);
+    assert_eq!(PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().policy_fence_epoch().unwrap(), epoch);
+    let pod_b = PodId::try_from(snapshot_b.pods.iter()
+        .find(|pod| pod.pod_id != pod_a.as_str()).unwrap().pod_id.as_str()).unwrap();
+    let proof_b = host.inspect_committed_root_codex_v3(&fixture.scope, &pod_b).unwrap();
+    let path_b = manifest_path_for_identity(
+        &fixture.directory, &pod_b,
+        &AttemptId::try_from(proof_b.committed_record().attempt_id.as_str()).unwrap(),
+        Epoch::new(proof_b.committed_record().pod_incarnation).unwrap(),
+    );
+    let guard_b = DisposableUnitGuard::for_manifest(&path_b);
+    let client_b = PodClient::connect(&path_b).unwrap();
+    let status_b = client_b.attested_status().unwrap();
+    assert!(status_b.child_running);
+    let still_a = client_a.attested_status().unwrap();
+    assert!(still_a.child_running);
+    assert_eq!((still_a.supervisor_pid, still_a.child_pid, still_a.child_start_ticks),
+        (status_a.supervisor_pid, status_a.child_pid, status_a.child_start_ticks));
+
+    let send_policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        grant, Instant::now() + Duration::from_secs(75),
+    ).unwrap();
+    let session_b = SessionId::try_from(proof_b.committed_record().session_id.as_str()).unwrap();
+    let lease_b = host.acquire_initial_bootstrap_writer_lease(
+        &transport, &session_b, &send_policy, 90,
+    ).unwrap();
+    let (target_b, revision_b) = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().current_native_writer_target_for_session(&fixture.scope, &session_b).unwrap();
+    let send_b = CommandEnvelope::new(
+        "request.v3.send.b", "key.v3.send.b",
+        WireTarget::Session { session_id: session_b.as_str().into() },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease_b.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target_b.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target_b.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease_b.writer_epoch())),
+            lease_epoch: None,
+            target_revision: Some(DecimalString::new(revision_b)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "fixture B first turn".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let submitted = host.send_first_codex_bootstrap_from_wire(
+        &transport, send_b, &send_policy,
+    ).unwrap();
+    assert!(submitted.port_called);
+    assert!(matches!(submitted.port_observation, Some(BootstrapPortObservation::PodAccepted(_))));
+    assert!(client_a.attested_status().unwrap().child_running);
+
+    let session_a = SessionId::try_from(proof_a.committed_record().session_id.as_str()).unwrap();
+    let lease_a = host.acquire_initial_bootstrap_writer_lease(
+        &transport, &session_a, &send_policy, 90,
+    ).unwrap();
+    let (target_a, revision_a) = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().current_native_writer_target_for_session(&fixture.scope, &session_a).unwrap();
+    host.revoke_grant_from_trusted_policy(grant).unwrap();
+    assert_eq!(PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap().policy_fence_epoch().unwrap(), epoch + 1);
+    assert!(client_a.attested_status().is_err());
+    let send_a = CommandEnvelope::new(
+        "request.v3.send.a", "key.v3.send.a",
+        WireTarget::Session { session_id: session_a.as_str().into() },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease_a.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target_a.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target_a.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease_a.writer_epoch())),
+            lease_epoch: None,
+            target_revision: Some(DecimalString::new(revision_a)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "must not reach native A".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    assert!(host.send_first_codex_bootstrap_from_wire(&transport, send_a, &send_policy).is_err());
+    let home_a = codex_private_slot_directory(&fixture.directory, &guard_a.0, false)
+        .unwrap().join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(home_a).unwrap().lines().count(), 2);
+
+    for unit in [&guard_a.0, &guard_b.0] {
+        assert!(Command::new("systemctl").args(["--user", "stop", unit])
+            .status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = Command::new("systemctl")
+                .args(["--user", "show", "--property=LoadState", "--value", unit])
+                .output().unwrap();
+            assert!(state.status.success());
+            if String::from_utf8_lossy(&state.stdout).trim() == "not-found" { break; }
+            assert!(Instant::now() < deadline, "V3 disposable unit remained loaded: {unit}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]

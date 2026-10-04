@@ -330,7 +330,7 @@ fn codex_v3_manifest_binds_policy_epoch_without_reinterpreting_v2_revision() {
     assert!(!fixture.root.join("store.sqlite").exists());
     assert!(
         v3.peer
-            .check_current_codex_v3_policy(&v3.launch, &fixture.root)
+            .check_current_codex_v3_policy(&v3.launch)
             .is_err()
     );
     assert!(!fixture.root.join("store.sqlite").exists());
