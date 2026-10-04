@@ -337,6 +337,7 @@ dependencies = [
  "podbay-pod",
  "podbay-store",
  "podbay-wire",
+ "serde_json",
  "sha2",
 ]
 

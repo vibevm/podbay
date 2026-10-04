@@ -4,15 +4,19 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use podbay_core::ScopeId;
+use podbay_core::{Epoch, ScopeId};
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, CredentialRef, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
+    PortDispatchOutcome, PortReceiptRef, ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch,
+    ResolvedNativeLaunch,
 };
 use podbay_pod::{
-    BoundPodStatus, CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodError, PodPeerBootstrap,
+    BootstrapControlStage, BoundPodStatus, CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodClient,
+    PodError, PodManifest, PodPeerBootstrap, PodStatus,
 };
-use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, PodBayStore};
+use podbay_store::{
+    BoundLaunchRecord, EffectState, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
+};
 use podbay_wire::{NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver, TargetOs};
 use sha2::{Digest, Sha256};
 
@@ -364,6 +368,187 @@ impl LinuxLaunchPort {
         }
         Ok(PortDispatchOutcome::Accepted(receipt))
     }
+
+    /// One already-claimed send. Everything before PodClient's selector-only
+    /// call is read-only; once that call begins, any ambiguous result keeps
+    /// the original command uncertain and the port never retries it.
+    fn send_claimed_bootstrap(
+        &mut self,
+        claimed: ResolvedClaimedBootstrap,
+    ) -> Result<PortDispatchOutcome<PortReceiptRef>, PortDispatchError> {
+        let selector = claimed.selector();
+        let target = &selector.native_target;
+        fn refused<E>(_: E) -> PortDispatchError {
+            PortDispatchError::RefusedBeforeEffect
+        }
+        self.config.recheck().map_err(refused)?;
+        if selector.scope_id != target.scope_id || claimed.writer_epoch() == 0 {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let receipt = PortReceiptRef::from_port(&format!(
+            "podbay.bootstrap.{}",
+            selector.command_id.as_str()
+        ))
+        .map_err(refused)?;
+        let uncertain = || PortDispatchError::UncertainAfterPossibleEffect {
+            receipt_ref: Some(receipt.clone()),
+        };
+        let manager = LinuxPeerEvidence::for_current_process().map_err(refused)?;
+        let database_identity =
+            checked_store_file(claimed.store_path(), manager.uid()).map_err(refused)?;
+        let incarnation = Epoch::new(target.pod_incarnation).map_err(refused)?;
+        let manifest_path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &target.pod_id,
+            &target.attempt_id,
+            incarnation,
+        );
+        let manifest_meta = fs::symlink_metadata(&manifest_path).map_err(refused)?;
+        if !manifest_meta.is_file()
+            || manifest_meta.nlink() != 1
+            || manifest_meta.uid() != manager.uid()
+            || manifest_meta.mode() & 0o077 != 0
+            || manifest_meta.len() == 0
+            || manifest_meta.len() > 1_048_576
+            || fs::canonicalize(&manifest_path).map_err(refused)? != manifest_path
+        {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let manifest: PodManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).map_err(refused)?).map_err(refused)?;
+        let binding = manifest
+            .peer_binding
+            .as_ref()
+            .ok_or(PortDispatchError::RefusedBeforeEffect)?;
+        if binding.capability != CODEX_V2_CAPABILITY
+            || binding.protocol != "podbay.peer-binding/2"
+            || binding.store_path != claimed.store_path()
+            || binding.store_lineage != target.store_lineage.as_str()
+            || binding.owner_epoch != claimed.owner_epoch()
+            || binding.credential_epoch != claimed.manager_credential_epoch()
+            || binding.authority_revision != Some(claimed.authority_revision())
+            || binding.resource_epoch != target.resource_epoch
+            || binding.resource_input_epochs.len() != 1
+            || binding
+                .resource_input_epochs
+                .get(target.resource_id.as_str())
+                != Some(&target.resource_input_epoch)
+            || manifest.descriptor.scope_id != target.scope_id.as_str()
+            || manifest.descriptor.session_id != target.session_id.as_str()
+            || manifest.descriptor.run_id != target.run_id.as_str()
+            || manifest.descriptor.attempt_id != target.attempt_id.as_str()
+            || manifest.descriptor.pod_id != target.pod_id.as_str()
+            || manifest.descriptor.incarnation != target.pod_incarnation
+            || manifest.descriptor.resource_id != target.resource_id.as_str()
+            || manifest.descriptor.pty.is_some()
+        {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let mut store =
+            PodBayStore::open_existing_read_only(claimed.store_path()).map_err(refused)?;
+        let proof = store
+            .inspect_claimed_bootstrap_send(selector)
+            .map_err(refused)?;
+        let lease = store.inspect_native_writer_lease(target).map_err(refused)?;
+        let current = store
+            .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str())
+            .map_err(refused)?;
+        let manager_claim = store
+            .current_manager_credential_claim(claimed.owner_epoch())
+            .map_err(refused)?;
+        if proof.receipt().command_id != selector.command_id.as_str()
+            || proof.native_target() != target
+            || proof.writer_epoch() != claimed.writer_epoch()
+            || proof.owner_epoch() != claimed.owner_epoch()
+            || proof.manager_credential_epoch() != claimed.manager_credential_epoch()
+            || proof.authority_revision() != claimed.authority_revision()
+            || lease.writer_epoch() != proof.writer_epoch()
+            || lease.target() != target
+            || lease.holder_actor_id() != proof.holder_actor_id()
+            || lease.holder_credential_generation() != proof.holder_credential_generation()
+            || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+            || current.store_lineage() != &target.store_lineage
+            || current.owner_epoch().get() != claimed.owner_epoch()
+            || current.authority_revision() != claimed.authority_revision()
+            || current.launch().session_id != target.session_id.as_str()
+            || current.launch().run_id != target.run_id.as_str()
+            || current.launch().attempt_id != target.attempt_id.as_str()
+            || current.launch().descriptor != binding.wire_descriptor
+            || current.launch().effective_spec != binding.effective_spec
+            || manager_claim.store_lineage() != target.store_lineage.as_str()
+            || manager_claim.credential_epoch() != claimed.manager_credential_epoch()
+            || !store
+                .current_manager_peer_matches(&manager_claim, manager.attested_peer())
+                .map_err(refused)?
+            || binding.manager_os_identity != manager.attested_peer().os_identity()
+            || binding.manager_process_id != manager.attested_peer().native_process_id()
+            || binding.manager_boot_identity != manager.attested_peer().boot_identity()
+            || binding.manager_birth_identity != manager.attested_peer().birth_identity()
+            || binding.manager_containment != manager.attested_peer().containment_identity()
+        {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let client = PodClient::connect(&manifest_path).map_err(refused)?;
+        let before = client.attested_status().map_err(refused)?;
+        if !bootstrap_status_matches(&before, target, &claimed, &manifest) {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        self.config.recheck().map_err(refused)?;
+        if checked_store_file(claimed.store_path(), manager.uid()).map_err(refused)?
+            != database_identity
+            || fs::symlink_metadata(&manifest_path).map_err(refused)?.ino() != manifest_meta.ino()
+        {
+            return Err(PortDispatchError::RefusedBeforeEffect);
+        }
+        let response = client
+            .submit_claimed_codex_bootstrap(&selector.command_id, target, claimed.writer_epoch())
+            .map_err(|_| uncertain())?;
+        // The pod may have started a native effect even when its reply was
+        // Refused or incomplete. Reattest the same supervisor and child before
+        // trusting a typed stage, while never making a second send call.
+        let after = client.attested_status().map_err(|_| uncertain())?;
+        if !bootstrap_status_matches(&after, target, &claimed, &manifest)
+            || after.supervisor_pid != before.supervisor_pid
+            || after.supervisor_start_ticks != before.supervisor_start_ticks
+            || after.child_pid != before.child_pid
+            || after.child_start_ticks != before.child_start_ticks
+            || after.boot_id != before.boot_id
+            || after.cgroup_path != before.cgroup_path
+            || self.config.recheck().is_err()
+            || !LinuxPeerEvidence::for_current_process()
+                .is_ok_and(|peer| peer.attested_peer() == manager.attested_peer())
+            || fs::symlink_metadata(&manifest_path)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                != Some((manifest_meta.dev(), manifest_meta.ino()))
+            || checked_store_file(claimed.store_path(), manager.uid()).map_err(|_| uncertain())?
+                != database_identity
+            || response
+                .request_digest
+                .as_deref()
+                .is_some_and(|digest| digest != proof.receipt().request_digest)
+        {
+            return Err(uncertain());
+        }
+        bootstrap_port_stage(response.stage, receipt)
+    }
+}
+
+fn bootstrap_port_stage(
+    stage: BootstrapControlStage,
+    receipt: PortReceiptRef,
+) -> Result<PortDispatchOutcome<PortReceiptRef>, PortDispatchError> {
+    match stage {
+        BootstrapControlStage::Submitted { .. } => Ok(PortDispatchOutcome::Accepted(receipt)),
+        BootstrapControlStage::RefusedBeforeEffect => Err(PortDispatchError::RefusedBeforeEffect),
+        BootstrapControlStage::ThreadCreateUncertain
+        | BootstrapControlStage::ThreadCreated { .. }
+        | BootstrapControlStage::BootstrapUncertain { .. } => {
+            Err(PortDispatchError::UncertainAfterPossibleEffect {
+                receipt_ref: Some(receipt),
+            })
+        }
+    }
 }
 
 impl HostDispatchPort for LinuxLaunchPort {
@@ -403,6 +588,53 @@ impl HostDispatchPort for LinuxLaunchPort {
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
         self.launch_codex_v2(launch)
     }
+
+    fn accepts_claimed_codex_bootstrap(&self) -> bool {
+        self.config.recheck().is_ok()
+    }
+
+    fn send_claimed_codex_bootstrap(
+        &mut self,
+        claimed: ResolvedClaimedBootstrap,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        self.send_claimed_bootstrap(claimed)
+    }
+}
+
+fn checked_store_file(path: &Path, expected_uid: u32) -> Result<(u64, u64), PodError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !path.is_absolute()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != expected_uid
+        || fs::canonicalize(path)? != path
+    {
+        return Err(PodError::Refused("claimed bootstrap store file changed"));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn bootstrap_status_matches(
+    status: &PodStatus,
+    target: &NativeWriterTarget,
+    claimed: &ResolvedClaimedBootstrap,
+    manifest: &PodManifest,
+) -> bool {
+    let Some(bound) = status.bound.as_ref() else {
+        return false;
+    };
+    status.child_running
+        && status.pod_id == target.pod_id.as_str()
+        && status.attempt_id == target.attempt_id.as_str()
+        && status.incarnation == target.pod_incarnation
+        && status.manifest_digest == manifest.digest
+        && bound.capability == CODEX_V2_CAPABILITY
+        && bound.scope_id == target.scope_id.as_str()
+        && bound.resource_id == target.resource_id.as_str()
+        && bound.resource_epoch == target.resource_epoch
+        && bound.store_lineage == target.store_lineage.as_str()
+        && bound.owner_epoch == claimed.owner_epoch()
+        && bound.credential_epoch == claimed.manager_credential_epoch()
 }
 
 fn sha256_file(path: &Path) -> Result<String, PodError> {
@@ -1276,5 +1508,43 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bootstrap_port_accepts_only_fsynced_submitted_stage() {
+        let receipt = PortReceiptRef::from_port("receipt.bootstrap.fixture").unwrap();
+        assert!(matches!(
+            bootstrap_port_stage(
+                BootstrapControlStage::Submitted {
+                    native_thread_id: "thread.fixture".into(),
+                    native_session_id: "session.native.fixture".into(),
+                    native_turn_id: "turn.fixture".into(),
+                },
+                receipt.clone(),
+            ),
+            Ok(PortDispatchOutcome::Accepted(_))
+        ));
+        assert!(matches!(
+            bootstrap_port_stage(BootstrapControlStage::RefusedBeforeEffect, receipt.clone()),
+            Err(PortDispatchError::RefusedBeforeEffect)
+        ));
+        for stage in [
+            BootstrapControlStage::ThreadCreateUncertain,
+            BootstrapControlStage::ThreadCreated {
+                native_thread_id: "thread.fixture".into(),
+                native_session_id: "session.native.fixture".into(),
+            },
+            BootstrapControlStage::BootstrapUncertain {
+                native_thread_id: "thread.fixture".into(),
+                native_session_id: "session.native.fixture".into(),
+            },
+        ] {
+            assert!(matches!(
+                bootstrap_port_stage(stage, receipt.clone()),
+                Err(PortDispatchError::UncertainAfterPossibleEffect {
+                    receipt_ref: Some(_)
+                })
+            ));
+        }
     }
 }

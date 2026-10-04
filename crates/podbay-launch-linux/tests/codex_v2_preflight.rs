@@ -17,12 +17,13 @@ use podbay_core::{
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
-    AuthorisedBoundLaunch, AuthorisedDispatch, BoundHostLaunchProposal, BoundLaunchPodRequest,
-    CredentialGeneration, CredentialRef, DurableAuthority, ExecutionMode, GrantMode, GrantSpec,
-    GuardSet, HostAction, HostDispatchPort, HostError, HostRequest, LaunchSelection, ManagerEpoch,
-    Operation, PodIncarnation, PortDispatchError, PortDispatchOutcome, PortReceiptRef,
-    RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedDriverTemplate,
-    TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
+    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapPortObservation, BoundHostLaunchProposal,
+    BoundLaunchPodRequest, CredentialGeneration, CredentialRef, DurableAuthority, ExecutionMode,
+    GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
+    LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
+    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right,
+    Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate, TrustedLaunchProfileInput,
+    TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
@@ -30,7 +31,10 @@ use podbay_launch_linux::{
 };
 use podbay_pod::{CODEX_V2_CAPABILITY, PodClient, PodError, launch_bound_codex_v2};
 use podbay_store::{EffectClaim, LaunchDispatchStage, PodBayStore};
-use podbay_wire::{CodexAppServerPolicyV2, ResourceDriver};
+use podbay_wire::{
+    CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard,
+    ResourceDriver, SendPolicy, SessionSendBody, Target as WireTarget,
+};
 use sha2::{Digest, Sha256};
 
 struct Fixture {
@@ -59,7 +63,28 @@ impl Fixture {
         let executable = directory.join("agent.sh");
         fs::write(
             &executable,
-            b"#!/bin/sh\nset -eu\n[ \"$1\" = app-server ]\n[ \"$2\" = --listen ]\n[ \"$3\" = stdio:// ]\n[ -r \"$CODEX_HOME/auth.json\" ]\nread -r initialize\nprintf '%s\\n' \"$initialize\" > \"$CODEX_HOME/frames.log\"\nprintf '{\"id\":1,\"result\":{\"codexHome\":\"%s\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"fixture\"}}\\n' \"$CODEX_HOME\"\nread -r initialized\nprintf '%s\\n' \"$initialized\" >> \"$CODEX_HOME/frames.log\"\nsleep 30\n",
+            br##"#!/bin/sh
+set -eu
+[ "$1" = app-server ]
+[ "$2" = --listen ]
+[ "$3" = stdio:// ]
+[ -r "$CODEX_HOME/auth.json" ]
+read -r initialize
+printf '%s\n' "$initialize" > "$CODEX_HOME/frames.log"
+printf '{"id":1,"result":{"codexHome":"%s","platformFamily":"unix","platformOs":"linux","userAgent":"fixture"}}\n' "$CODEX_HOME"
+read -r initialized
+printf '%s\n' "$initialized" >> "$CODEX_HOME/frames.log"
+read -r start
+printf '%s\n' "$start" >> "$CODEX_HOME/frames.log"
+printf '{"id":2,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]},"model":"gpt-6-sol","reasoningEffort":"medium","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"cwd":"%s"}}\n' "$(pwd)" "$(pwd)"
+read -r inspect
+printf '%s\n' "$inspect" >> "$CODEX_HOME/frames.log"
+printf '{"id":3,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
+read -r turn
+printf '%s\n' "$turn" >> "$CODEX_HOME/frames.log"
+printf '{"id":4,"result":{"turn":{"id":"turn.fixture","status":"inProgress"}}}\n'
+sleep 30
+"##,
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -193,6 +218,7 @@ fn setup_with_port<P: HostDispatchPort>(
                         Operation::UseCredential,
                         Target::Credential(credential.clone()),
                     ),
+                    Right::new(Operation::SendSession, Target::Scope(fixture.scope.clone())),
                 ]),
                 remaining_delegation_depth: 0,
             },
@@ -870,4 +896,121 @@ fn disposable_codex_v2_durable_dispatch_records_one_real_pod_launch() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    let mut port = port_for(&fixture, &binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let (fixture, mut host, _, _, transport, launch_request) =
+        setup_with_port(Role::Coordinator, fixture, port);
+    let accepted = host
+        .dispatch_prepared_bound_root_codex_v2(&transport, launch_request.clone())
+        .unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    let manifest = slot_manifest(&fixture).expect("one committed V2 pod manifest");
+    let client = PodClient::connect(&manifest).unwrap();
+    assert!(client.attested_status().unwrap().child_running);
+
+    let session_id = SessionId::try_from("session.codex.preflight").unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        launch_request.host_request.grant_id,
+        Instant::now() + Duration::from_secs(45),
+    )
+    .unwrap();
+    let lease = host
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 60)
+        .unwrap();
+    let (target, session_revision) = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session_id)
+        .unwrap();
+    assert_eq!(lease.target(), &target);
+    let envelope = CommandEnvelope::new(
+        "request.codex.bootstrap.one",
+        "key.codex.bootstrap.one",
+        WireTarget::Session {
+            session_id: session_id.as_str().into(),
+        },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+            lease_epoch: None,
+            target_revision: Some(DecimalString::new(session_revision)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text {
+                text: "fixture first turn".into(),
+            }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap();
+    let submitted = host
+        .send_first_codex_bootstrap_from_wire(&transport, envelope.clone(), &policy)
+        .unwrap();
+    assert!(submitted.port_called);
+    assert_eq!(
+        submitted.effect_state,
+        podbay_store::EffectState::ClaimedUncertain
+    );
+    assert!(matches!(
+        submitted.port_observation,
+        Some(BootstrapPortObservation::PodAccepted(_))
+    ));
+    assert!(fixture.directory.join("codex.commands.log").is_file());
+    let frames = fixture.directory.join("home/codex/frames.log");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let methods = loop {
+        let content = fs::read_to_string(&frames).unwrap_or_default();
+        if content.lines().count() == 5 {
+            break content
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake app-server did not receive one turn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "thread/read",
+            "turn/start"
+        ]
+    );
+
+    let mut retry = envelope;
+    retry.request_id = "request.codex.bootstrap.retry".into();
+    let duplicate = host
+        .send_first_codex_bootstrap_from_wire(&transport, retry, &policy)
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert!(!duplicate.port_called);
+    assert_eq!(duplicate.receipt, submitted.receipt);
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 5);
+    assert!(!client.stop().unwrap().child_running);
 }

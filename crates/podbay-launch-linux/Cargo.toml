@@ -11,3 +11,4 @@ podbay-store = { path = "../podbay-store" }
 podbay-wire = { path = "../podbay-wire" }
 podbay-pod = { path = "../podbay-pod" }
 sha2 = "0.11"
+serde_json = "1"
