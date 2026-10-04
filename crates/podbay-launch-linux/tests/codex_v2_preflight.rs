@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
     ActorId, Attempt, AttemptId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
-    ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, WorkKind,
+    ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
@@ -29,7 +29,10 @@ use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
     preflight_committed_codex_v2,
 };
-use podbay_pod::{CODEX_V2_CAPABILITY, PodClient, PodError, launch_bound_codex_v2};
+use podbay_pod::{
+    CODEX_V2_CAPABILITY, CodexCommandJournal, CodexJournalIdentity, CodexJournalStage,
+    LinuxBackend, PodClient, PodError, launch_bound_codex_v2,
+};
 use podbay_store::{EffectClaim, LaunchDispatchStage, PodBayStore};
 use podbay_wire::{
     CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard,
@@ -450,6 +453,43 @@ fn slot_manifest(fixture: &Fixture) -> Option<PathBuf> {
                         stem.len() == 32 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
                     })
         })
+}
+
+fn required_real_test_path(name: &str) -> PathBuf {
+    let raw = PathBuf::from(std::env::var_os(name).expect("real Codex smoke path is required"));
+    assert!(raw.is_absolute(), "real Codex smoke path must be absolute");
+    let path = fs::canonicalize(raw).expect("real Codex smoke path is unavailable");
+    assert!(
+        fs::metadata(&path).unwrap().is_file(),
+        "real Codex smoke path must name a regular file"
+    );
+    path
+}
+
+fn reopened_bootstrap_journal(fixture: &Fixture) -> podbay_pod::CodexJournalView {
+    let store = PodBayStore::open(&fixture.database).unwrap();
+    let lineage = store
+        .initial_cursor(fixture.scope.as_str())
+        .unwrap()
+        .store_lineage;
+    let identity = CodexJournalIdentity::from_resource(
+        &StoreLineageId::try_from(lineage.as_str()).unwrap(),
+        &fixture.scope,
+        &SessionId::try_from("session.codex.preflight").unwrap(),
+        &RunId::try_from("run.codex.preflight").unwrap(),
+        &AttemptId::try_from("attempt.codex.preflight").unwrap(),
+        &fixture.pod,
+        Epoch::new(1).unwrap(),
+        &ResourceId::try_from("resource.codex.preflight").unwrap(),
+        Epoch::new(1).unwrap(),
+    );
+    CodexCommandJournal::open(
+        &LinuxBackend,
+        &fixture.directory.join("codex.commands.log"),
+        identity,
+    )
+    .unwrap()
+    .view()
 }
 
 #[test]
@@ -971,6 +1011,9 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
         Some(BootstrapPortObservation::PodAccepted(_))
     ));
     assert!(fixture.directory.join("codex.commands.log").is_file());
+    let journal = reopened_bootstrap_journal(&fixture);
+    assert_eq!(journal.stage, CodexJournalStage::BootstrapSubmitted);
+    assert_eq!(journal.native_turn_id.as_deref(), Some("turn.fixture"));
     let frames = fixture.directory.join("home/codex/frames.log");
     let deadline = Instant::now() + Duration::from_secs(3);
     let methods = loop {
@@ -1011,6 +1054,124 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
     assert!(duplicate.duplicate);
     assert!(!duplicate.port_called);
     assert_eq!(duplicate.receipt, submitted.receipt);
+    assert_eq!(reopened_bootstrap_journal(&fixture), journal);
     assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 5);
+    assert!(!client.stop().unwrap().child_running);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY, PODBAY_TEST_REAL_CODEX_BINARY, PODBAY_TEST_REAL_AUTH_SOURCE; submits one real model turn"]
+fn disposable_codex_v2_real_first_bootstrap_has_one_fsynced_submitted_turn() {
+    let pod_binary = required_real_test_path("PODBAY_TEST_POD_BINARY");
+    let codex_binary = required_real_test_path("PODBAY_TEST_REAL_CODEX_BINARY");
+    let auth_source = required_real_test_path("PODBAY_TEST_REAL_AUTH_SOURCE");
+    assert_eq!(
+        fs::metadata(&auth_source).unwrap().permissions().mode() & 0o077,
+        0,
+        "real Codex auth source must be private"
+    );
+    let mut fixture = Fixture::new();
+    fixture.executable = codex_binary;
+    fs::set_permissions(
+        fixture.directory.join("workspace"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::copy(auth_source, &fixture.source).expect("private Codex auth source copy failed");
+    fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut port = port_for(&fixture, &pod_binary);
+    let reference =
+        CredentialRef::from_trusted_vault(fixture.scope.clone(), "vault.codex.preflight").unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
+            .unwrap(),
+    )
+    .unwrap();
+    let (fixture, mut host, _, _, transport, launch_request) =
+        setup_with_port(Role::Coordinator, fixture, port);
+    let accepted = host
+        .dispatch_prepared_bound_root_codex_v2(&transport, launch_request.clone())
+        .unwrap();
+    assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
+    let manifest = slot_manifest(&fixture).expect("one committed V2 pod manifest");
+    let client = PodClient::connect(&manifest).unwrap();
+    assert!(client.attested_status().unwrap().child_running);
+
+    let session_id = SessionId::try_from("session.codex.preflight").unwrap();
+    let policy = TrustedBootstrapSendPolicy::from_trusted_policy(
+        launch_request.host_request.grant_id,
+        Instant::now() + Duration::from_secs(45),
+    )
+    .unwrap();
+    let lease = host
+        .acquire_initial_bootstrap_writer_lease(&transport, &session_id, &policy, 60)
+        .unwrap();
+    let (target, session_revision) = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .current_native_writer_target_for_session(&fixture.scope, &session_id)
+        .unwrap();
+    assert_eq!(lease.target(), &target);
+    let envelope = CommandEnvelope::new(
+        "request.codex.real-bootstrap.one",
+        "key.codex.real-bootstrap.one",
+        WireTarget::Session {
+            session_id: session_id.as_str().into(),
+        },
+        Some(Guard {
+            manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+            pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+            resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+            writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+            lease_epoch: None,
+            target_revision: Some(DecimalString::new(session_revision)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text {
+                text: "Reply with one short sentence.".into(),
+            }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    )
+    .unwrap();
+    let submitted = host
+        .send_first_codex_bootstrap_from_wire(&transport, envelope.clone(), &policy)
+        .unwrap();
+    assert!(submitted.port_called);
+    assert!(matches!(
+        submitted.port_observation,
+        Some(BootstrapPortObservation::PodAccepted(_))
+    ));
+    let durable = reopened_bootstrap_journal(&fixture);
+    assert!(matches!(
+        durable.stage,
+        CodexJournalStage::BootstrapSubmitted | CodexJournalStage::BootstrapCompleted
+    ));
+    assert_eq!(
+        durable.command_key.as_deref(),
+        Some(submitted.receipt.command_id.as_str())
+    );
+    let native_turn_id = durable
+        .native_turn_id
+        .as_deref()
+        .expect("native turn ID is durable");
+    assert!(!native_turn_id.is_empty());
+
+    let mut retry = envelope;
+    retry.request_id = "request.codex.real-bootstrap.retry".into();
+    let duplicate = host
+        .send_first_codex_bootstrap_from_wire(&transport, retry, &policy)
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert!(!duplicate.port_called);
+    assert_eq!(duplicate.receipt, submitted.receipt);
+    let after_retry = reopened_bootstrap_journal(&fixture);
+    assert!(matches!(
+        after_retry.stage,
+        CodexJournalStage::BootstrapSubmitted | CodexJournalStage::BootstrapCompleted
+    ));
+    assert_eq!(after_retry.command_key, durable.command_key);
+    assert_eq!(after_retry.native_turn_id, durable.native_turn_id);
     assert!(!client.stop().unwrap().child_running);
 }
