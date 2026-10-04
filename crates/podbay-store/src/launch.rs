@@ -157,7 +157,7 @@ impl PodBayStore {
     }
 }
 
-fn decode_stage(value: &str) -> Result<LaunchDispatchStage, StoreError> {
+pub(crate) fn decode_stage(value: &str) -> Result<LaunchDispatchStage, StoreError> {
     match value {
         "refused_before_effect" => Ok(LaunchDispatchStage::RefusedBeforeEffect),
         "uncertain_after_possible_effect" => Ok(LaunchDispatchStage::UncertainAfterPossibleEffect),

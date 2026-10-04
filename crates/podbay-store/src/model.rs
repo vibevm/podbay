@@ -79,6 +79,9 @@ pub struct CommandInspection {
     pub effect_state: EffectState,
     pub observed_stage: Option<ObservedStage>,
     pub observation_event_sequence: Option<i64>,
+    /// Bound launch outcome from the same committed read snapshot. Generic
+    /// outbox state alone can remain claimed_uncertain after host acceptance.
+    pub launch_dispatch_status: Option<LaunchDispatchStatus>,
 }
 
 /// A verified manager principal supplies these exact caller-intent bytes.

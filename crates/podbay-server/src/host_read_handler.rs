@@ -5,7 +5,8 @@ use podbay_host::{
     AuthenticatedTransport, DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError,
 };
 use podbay_store::{
-    CommandInspection, CommandLookupSelector, EffectState, ObservedStage, StoreError,
+    CommandInspection, CommandLookupSelector, EffectState, LaunchDispatchStage, ObservedStage,
+    StoreError,
 };
 use podbay_wire::{
     CommandEnvelope, CommandSelector, CommandStage, ReadBody, ReadEnvelope, Receipt, RuntimeError,
@@ -71,13 +72,45 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
 fn inspection_json(inspected: CommandInspection) -> Value {
     // These are the facts established by the store. A claimed effect remains
     // uncertain; host acceptance does not imply provider consumption.
-    let (state, effect_state) = match inspected.effect_state {
+    let (generic_state, outbox_state) = match inspected.effect_state {
         EffectState::Prepared => (CommandStage::Persisted, "prepared"),
         EffectState::ClaimedUncertain => (CommandStage::Uncertain, "claimed_uncertain"),
         EffectState::Observed => match inspected.observed_stage {
             Some(ObservedStage::HostAccepted) => (CommandStage::HostAccepted, "observed"),
             Some(ObservedStage::LegacyUnverified) | None => (CommandStage::Uncertain, "observed"),
         },
+    };
+    let launch = inspected.launch_dispatch_status.as_ref();
+    let (state, effect_state, launch_stage) = match launch.map(|status| status.stage) {
+        Some(LaunchDispatchStage::Prepared) => {
+            (CommandStage::Persisted, "prepared", Some("prepared"))
+        }
+        Some(LaunchDispatchStage::ClaimedUncertain) => (
+            CommandStage::Uncertain,
+            "claimed_uncertain",
+            Some("claimed_uncertain"),
+        ),
+        Some(LaunchDispatchStage::RefusedBeforeEffect) => (
+            CommandStage::Rejected,
+            "refused_before_effect",
+            Some("refused_before_effect"),
+        ),
+        Some(LaunchDispatchStage::UncertainAfterPossibleEffect) => (
+            CommandStage::Uncertain,
+            "uncertain_after_possible_effect",
+            Some("uncertain_after_possible_effect"),
+        ),
+        Some(LaunchDispatchStage::HostAccepted) => (
+            CommandStage::HostAccepted,
+            "host_accepted",
+            Some("host_accepted"),
+        ),
+        Some(LaunchDispatchStage::PortSettled) => (
+            CommandStage::HostAccepted,
+            "port_settled",
+            Some("port_settled"),
+        ),
+        None => (generic_state, outbox_state, None),
     };
     let receipt = inspected.receipt;
     let mut response = json!({
@@ -99,6 +132,13 @@ fn inspection_json(inspected: CommandInspection) -> Value {
     }
     if let Some(sequence) = inspected.observation_event_sequence {
         response["observationEventSequence"] = json!(sequence.to_string());
+    }
+    if let Some(stage) = launch_stage {
+        response["launchStage"] = json!(stage);
+        response["outboxState"] = json!(outbox_state);
+        if let Some(reference) = launch.and_then(|status| status.receipt_ref.as_deref()) {
+            response["portReceiptRef"] = json!(reference);
+        }
     }
     response
 }
@@ -165,6 +205,7 @@ mod tests {
             effect_state: state,
             observed_stage,
             observation_event_sequence: observed_stage.map(|_| 11),
+            launch_dispatch_status: None,
         }
     }
 
@@ -182,5 +223,25 @@ mod tests {
         assert_eq!(accepted["observedStage"], "host_accepted");
         assert_eq!(accepted["observationEventSequence"], "11");
         assert!(accepted.get("payload").is_none());
+    }
+
+    #[test]
+    fn bound_launch_outcome_overrides_raw_claimed_outbox_without_provider_settlement() {
+        for (stage, label) in [
+            (LaunchDispatchStage::HostAccepted, "host_accepted"),
+            (LaunchDispatchStage::PortSettled, "port_settled"),
+        ] {
+            let mut fact = inspection(EffectState::ClaimedUncertain, None);
+            fact.launch_dispatch_status = Some(podbay_store::LaunchDispatchStatus {
+                stage,
+                receipt_ref: Some("host.receipt.one".into()),
+            });
+            let response = inspection_json(fact);
+            assert_eq!(response["state"], "host_accepted");
+            assert_eq!(response["effectState"], label);
+            assert_eq!(response["launchStage"], label);
+            assert_eq!(response["outboxState"], "claimed_uncertain");
+            assert_eq!(response["portReceiptRef"], "host.receipt.one");
+        }
     }
 }

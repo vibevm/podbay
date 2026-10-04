@@ -11,7 +11,8 @@ use podbay_core::{
 use podbay_store::{
     AuthorityActorRecord, AuthorityMutation, BoundLaunchAdmission, BoundLaunchFormat,
     BoundLaunchProposal, BoundLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
-    LaunchKeyLookupRequest, LaunchLookupRequest, NativeWriterTarget, PodBayStore, StoreError,
+    CommandLookupSelector, EffectClaim, LaunchDispatchStage, LaunchKeyLookupRequest,
+    LaunchLookupRequest, LaunchPortResult, NativeWriterTarget, PodBayStore, StoreError,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
@@ -296,6 +297,74 @@ fn lookup_by_key(key: &str, intent: &[u8]) -> LaunchKeyLookupRequest {
         scope_id: "scope.launch".into(),
         canonical_intent: intent.to_vec(),
     }
+}
+
+#[test]
+fn command_lookup_reads_bound_launch_outcome_in_one_snapshot() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store.advance_owner_epoch(0, 1).unwrap();
+    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
+    let record = match store
+        .admit_bound_root_launch_v2(proposal.request("key.readback.v2", b"intent.readback.v2"))
+        .unwrap()
+    {
+        BoundLaunchAdmission::Committed(record) => record,
+        other => panic!("expected V2 admission: {other:?}"),
+    };
+    let selector = CommandLookupSelector::Key {
+        key: "key.readback.v2".into(),
+    };
+    let prepared = store
+        .lookup_command("scope.launch", &principal(), &selector)
+        .unwrap();
+    assert_eq!(prepared.receipt, record.receipt);
+    assert_eq!(
+        prepared.launch_dispatch_status.unwrap().stage,
+        LaunchDispatchStage::Prepared
+    );
+    let revision = store.authority_snapshot().unwrap().revision;
+    assert_eq!(
+        store
+            .claim_effect(
+                record.receipt.outbox_id,
+                "scope.launch",
+                "pod.launch",
+                1,
+                1,
+                revision,
+                "claim.readback.v2",
+            )
+            .unwrap(),
+        EffectClaim::NewClaim
+    );
+    let claimed = store
+        .lookup_command("scope.launch", &principal(), &selector)
+        .unwrap();
+    assert_eq!(
+        claimed.launch_dispatch_status.unwrap().stage,
+        LaunchDispatchStage::ClaimedUncertain
+    );
+    store
+        .record_launch_port_result(
+            record.receipt.outbox_id,
+            "scope.launch",
+            "pod.launch",
+            1,
+            "claim.readback.v2",
+            LaunchPortResult::HostAccepted {
+                receipt_ref: Some("host.receipt.readback".into()),
+            },
+        )
+        .unwrap();
+    let accepted = store
+        .lookup_command("scope.launch", &principal(), &selector)
+        .unwrap();
+    assert_eq!(accepted.receipt, record.receipt);
+    assert_eq!(
+        accepted.launch_dispatch_status.unwrap().stage,
+        LaunchDispatchStage::HostAccepted
+    );
 }
 
 #[test]
@@ -884,7 +953,11 @@ fn admitted_writer_target(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget
         .unwrap();
     let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
     let mut request = proposal.request("key.writer.launch", b"intent.writer.launch");
-    request.proposal.as_mut().unwrap().expected_authority_revision = revision;
+    request
+        .proposal
+        .as_mut()
+        .unwrap()
+        .expected_authority_revision = revision;
     assert!(matches!(
         store.admit_bound_root_launch_v2(request).unwrap(),
         BoundLaunchAdmission::Committed(_)
@@ -1008,7 +1081,10 @@ fn v17_writer_lease_rechecks_target_manager_actor_and_expiry() {
         .unwrap();
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute("UPDATE native_writer_leases SET expires_at_unix_seconds=1", [])
+        .execute(
+            "UPDATE native_writer_leases SET expires_at_unix_seconds=1",
+            [],
+        )
         .unwrap();
     drop(connection);
     assert!(matches!(
@@ -1054,7 +1130,10 @@ fn v17_writer_lease_concurrent_initial_acquire_has_one_holder() {
     assert_eq!(
         results
             .iter()
-            .filter(|result| matches!(result, Err(StoreError::Conflict("native writer already held"))))
+            .filter(|result| matches!(
+                result,
+                Err(StoreError::Conflict("native writer already held"))
+            ))
             .count(),
         1
     );
@@ -1104,7 +1183,9 @@ fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() 
         Err(StoreError::Storage(_))
     ));
     assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), first);
-    connection.execute_batch("DROP TRIGGER fail_writer_takeover").unwrap();
+    connection
+        .execute_batch("DROP TRIGGER fail_writer_takeover")
+        .unwrap();
     drop(connection);
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();

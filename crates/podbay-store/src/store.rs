@@ -692,7 +692,9 @@ impl PodBayStore {
                 |row| row.get(0),
             )?;
             if occupied != 0 {
-                return Err(StoreError::Conflict("v17 writer lease schema name already exists"));
+                return Err(StoreError::Conflict(
+                    "v17 writer lease schema name already exists",
+                ));
             }
             transaction.execute_batch(&format!("{NATIVE_WRITER_LEASES_V17};"))?;
         }
@@ -1195,6 +1197,48 @@ impl PodBayStore {
                 return Err(StoreError::Conflict("observation event lineage differs"));
             }
         }
+        let launch_dispatch_status = if namespace == "podbay.launch" && effect.kind == "pod.offer" {
+            let outcome: Option<(String, Option<String>, String)> = transaction
+                .query_row(
+                    "SELECT stage,receipt_ref,claim_key FROM launch_dispatch_outcomes
+                     WHERE outbox_id=?1",
+                    [outbox_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let status = match (effect.state, outcome) {
+                (EffectState::Prepared, None) if effect.claim_key.is_none() => {
+                    LaunchDispatchStatus {
+                        stage: LaunchDispatchStage::Prepared,
+                        receipt_ref: None,
+                    }
+                }
+                (EffectState::ClaimedUncertain | EffectState::Observed, None)
+                    if effect.claim_key.is_some() =>
+                {
+                    LaunchDispatchStatus {
+                        stage: LaunchDispatchStage::ClaimedUncertain,
+                        receipt_ref: None,
+                    }
+                }
+                (
+                    EffectState::ClaimedUncertain | EffectState::Observed,
+                    Some((stage, reference, claim)),
+                ) if effect.claim_key.as_deref() == Some(claim.as_str()) => {
+                    if let Some(reference) = &reference {
+                        valid_id(reference)?;
+                    }
+                    LaunchDispatchStatus {
+                        stage: crate::launch::decode_stage(&stage)?,
+                        receipt_ref: reference,
+                    }
+                }
+                _ => return Err(StoreError::Conflict("launch dispatch readback differs")),
+            };
+            Some(status)
+        } else {
+            None
+        };
         let result = CommandInspection {
             receipt: Receipt {
                 command_id: command_id.clone(),
@@ -1206,6 +1250,7 @@ impl PodBayStore {
             effect_state: effect.state,
             observed_stage: effect.observed_stage,
             observation_event_sequence: effect.observation_event_sequence,
+            launch_dispatch_status,
         };
         transaction.commit()?;
         Ok(result)
