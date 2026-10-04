@@ -13,7 +13,7 @@ mod linux_peer;
 mod manifest;
 mod peer_checkpoint;
 mod ports;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 mod rebind_protocol;
 #[cfg(target_os = "linux")]
 mod runtime;
