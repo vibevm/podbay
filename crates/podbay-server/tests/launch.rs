@@ -452,10 +452,12 @@ fn default_read_only_then_opt_in_launch_dedup_conflict_and_readback() {
         responses[3]["ok"]["receipt"]["commandId"],
         first["commandId"]
     );
-    // commands.get reports its current outbox projection. Launch-specific
-    // port acceptance is recorded separately and the outbox remains claimed.
-    assert_eq!(responses[3]["ok"]["state"], "uncertain");
-    assert_eq!(responses[3]["ok"]["effectState"], "claimed_uncertain");
+    // commands.get joins the durable launch outcome into the same read
+    // snapshot; the raw outbox remains claimed, but host acceptance is known.
+    assert_eq!(responses[3]["ok"]["state"], "host_accepted");
+    assert_eq!(responses[3]["ok"]["effectState"], "host_accepted");
+    assert_eq!(responses[3]["ok"]["launchStage"], "host_accepted");
+    assert_eq!(responses[3]["ok"]["outboxState"], "claimed_uncertain");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(authority.recorded_snapshot().pods.len(), 1);
     listener.shutdown().unwrap();
