@@ -44,6 +44,8 @@ export interface TrustedOwnerSetupExpectations {
   /** Independently verify the pinned manager endpoint before each signature. */
   readonly validateHostEndpoint: (phase: "setup" | "auth") => boolean | Promise<boolean>;
   readonly totalTimeoutMs?: number;
+  /** Opt-in owner-only key custody, written before any setup signature. */
+  readonly ownerKeyCustodyPath?: string;
 }
 
 export interface InitialOwnerSetupReceipt {
@@ -73,7 +75,7 @@ export class OwnerSetupError extends Error {
   }
 }
 
-type Expected = Required<Omit<TrustedOwnerSetupExpectations, "totalTimeoutMs">> & {
+type Expected = Omit<TrustedOwnerSetupExpectations, "totalTimeoutMs"> & {
   readonly totalTimeoutMs: number;
 };
 
@@ -86,6 +88,7 @@ export class InitialOwnerSetupClient {
   #receipt: InitialOwnerSetupReceipt | undefined;
   #observedReceipt: InitialOwnerSetupReceipt | undefined;
   #seenNonce: Buffer | undefined;
+  #custodyPrepared = false;
 
   constructor(input: TrustedOwnerSetupExpectations) {
     this.#expected = validateExpected(input);
@@ -99,11 +102,20 @@ export class InitialOwnerSetupClient {
       throw new TypeError("Node Ed25519 public key has the wrong length");
   }
 
+  /** Durably pins the generated key before any setup signature is possible. */
+  async prepareOwnerKeyCustody(): Promise<void> {
+    if (this.#custodyPrepared || this.#expected.ownerKeyCustodyPath === undefined) return;
+    const { persistOwnerKeyCustody } = await import("./owner-key-custody.ts");
+    persistOwnerKeyCustody(this.#expected.ownerKeyCustodyPath, this.#expected, this.#privateKey);
+    this.#custodyPrepared = true;
+  }
+
   /** One setup, with one same-key retry only after a lost receipt or ACK. */
   async enroll(): Promise<InitialOwnerSetupReceipt> {
     if (this.#receipt) return this.#receipt;
     if (this.#started) throw new OwnerSetupError("reconciliation_failed", "possible_enrollment");
     this.#started = true;
+    await this.prepareOwnerKeyCustody();
     const deadline = performance.now() + this.#expected.totalTimeoutMs;
     try {
       this.#receipt = await this.#attempt(deadline, false);
@@ -316,6 +328,10 @@ function validateExpected(input: TrustedOwnerSetupExpectations): Expected {
       !isAbsolute(input.managerSocketPath) || basename(input.managerSocketPath) !== "manager.sock" ||
       dirname(input.setupSocketPath) !== dirname(input.managerSocketPath) ||
       input.setupSocketPath.includes("\0") || input.managerSocketPath.includes("\0") ||
+      (input.ownerKeyCustodyPath !== undefined &&
+       (!isAbsolute(input.ownerKeyCustodyPath) ||
+        basename(input.ownerKeyCustodyPath) !== "owner-key-custody.json" ||
+        dirname(input.ownerKeyCustodyPath) !== dirname(input.setupSocketPath))) ||
       !graphic(input.actorId, 256) || !graphic(input.scopeId, 256) ||
       !graphic(input.credentialRef, 256) || !graphic(input.storeLineage, 256) ||
       !counter(input.ownerEpoch) || !counter(input.authorityRevision) ||

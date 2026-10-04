@@ -1,0 +1,199 @@
+/** Owner-only key custody for a future proof-bearing owner rotation. */
+import { createPrivateKey, createPublicKey, sign, type KeyObject } from "node:crypto";
+import { constants as fsConstants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute } from "node:path";
+
+const SCHEMA = "podbay.owner-key-custody/1";
+const FILE_NAME = "owner-key-custody.json";
+const PROOF_DOMAIN = Buffer.from("podbay.owner-key-custody.continuity/1\0", "ascii");
+const MAX_FILE_BYTES = 8_192;
+const MAX_U64 = (1n << 64n) - 1n;
+const RECORD_KEYS = [
+  "actorId", "authorityRevision", "containmentIdentity", "credentialRef",
+  "osIdentity", "ownerEpoch", "privateKeyPkcs8", "processIdentity",
+  "publicKey", "schema", "scopeId", "startIdentity", "storeLineage",
+] as const;
+
+export interface OwnerKeyCustodyBinding {
+  readonly actorId: string;
+  readonly scopeId: string;
+  readonly storeLineage: string;
+  readonly credentialRef: string;
+  readonly ownerEpoch: bigint;
+  readonly authorityRevision: bigint;
+  readonly osIdentity: string;
+  readonly processIdentity: string;
+  readonly startIdentity: bigint;
+  readonly containmentIdentity: string;
+}
+
+export interface LoadedOwnerKeyCustody {
+  readonly binding: OwnerKeyCustodyBinding;
+  readonly publicKey: Uint8Array;
+  /** Test-only continuity proof. It is not a manager auth or rotation signature. */
+  proveContinuity(nonce: Uint8Array): Uint8Array;
+}
+
+/** O_EXCL, mode 0600, file and directory fsync precede any owner setup signature. */
+export function persistOwnerKeyCustody(
+  path: string,
+  binding: OwnerKeyCustodyBinding,
+  privateKey: KeyObject,
+): void {
+  validateBinding(binding);
+  if (privateKey.type !== "private" || privateKey.asymmetricKeyType !== "ed25519")
+    throw new TypeError("owner custody requires one Ed25519 private key");
+  const directory = pinnedPrivateDirectory(path);
+  try {
+    const publicKey = rawPublicKey(privateKey);
+    const pkcs8 = privateKey.export({ format: "der", type: "pkcs8" });
+    if (!Buffer.isBuffer(pkcs8) || pkcs8.length < 32 || pkcs8.length > 256)
+      throw new TypeError("owner private key encoding is invalid");
+    const record = {
+      schema: SCHEMA,
+      actorId: binding.actorId,
+      scopeId: binding.scopeId,
+      storeLineage: binding.storeLineage,
+      credentialRef: binding.credentialRef,
+      ownerEpoch: binding.ownerEpoch.toString(),
+      authorityRevision: binding.authorityRevision.toString(),
+      osIdentity: binding.osIdentity,
+      processIdentity: binding.processIdentity,
+      startIdentity: binding.startIdentity.toString(),
+      containmentIdentity: binding.containmentIdentity,
+      publicKey: publicKey.toString("base64url"),
+      privateKeyPkcs8: pkcs8.toString("base64"),
+    };
+    const bytes = Buffer.from(JSON.stringify(record), "utf8");
+    if (bytes.length > MAX_FILE_BYTES) throw new TypeError("owner custody record exceeds bound");
+    const file = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    try {
+      const metadata = fstatSync(file);
+      if (!metadata.isFile() || metadata.uid !== process.getuid?.() ||
+          (metadata.mode & 0o7777) !== 0o600 || metadata.nlink !== 1)
+        throw new TypeError("owner custody file identity differs");
+      writeFileSync(file, bytes);
+      fsyncSync(file);
+    } finally { closeSync(file); }
+    fsyncSync(directory);
+  } finally { closeSync(directory); }
+}
+
+/** Fail closed on path, owner, binding, encoding, or key mismatch. */
+export function loadOwnerKeyCustody(
+  path: string,
+  expected: Pick<OwnerKeyCustodyBinding, "actorId" | "scopeId" | "storeLineage">,
+): LoadedOwnerKeyCustody {
+  const directory = pinnedPrivateDirectory(path);
+  try {
+    const file = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let bytes: Buffer;
+    try {
+      const before = fstatSync(file);
+      if (!before.isFile() || before.uid !== process.getuid?.() ||
+          (before.mode & 0o7777) !== 0o600 || before.nlink !== 1 ||
+          before.size < 1 || before.size > MAX_FILE_BYTES || realpathSync(path) !== path)
+        throw new TypeError("owner custody file is not private and canonical");
+      bytes = readFileSync(file);
+      const after = fstatSync(file);
+      if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+          before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+          bytes.length !== before.size)
+        throw new TypeError("owner custody file changed during read");
+    } finally { closeSync(file); }
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const value: unknown = JSON.parse(text);
+    if (!isRecord(value) || JSON.stringify(value) !== text ||
+        Object.keys(value).sort().join("\0") !== [...RECORD_KEYS].sort().join("\0") ||
+        value["schema"] !== SCHEMA ||
+        value["actorId"] !== expected.actorId || value["scopeId"] !== expected.scopeId ||
+        value["storeLineage"] !== expected.storeLineage ||
+        !isGraphic(value["credentialRef"], 256) || !isGraphic(value["osIdentity"], 256) ||
+        !isGraphic(value["processIdentity"], 256) ||
+        !isGraphic(value["containmentIdentity"], 4096) ||
+        !isCounter(value["ownerEpoch"]) || !isCounter(value["authorityRevision"]) ||
+        !isCounter(value["startIdentity"]) ||
+        typeof value["publicKey"] !== "string" || typeof value["privateKeyPkcs8"] !== "string")
+      throw new TypeError("owner custody binding is invalid");
+    const encoded = value["privateKeyPkcs8"];
+    if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(encoded) || Buffer.from(encoded, "base64").toString("base64") !== encoded)
+      throw new TypeError("owner custody private key encoding is invalid");
+    const privateKey = createPrivateKey({ key: Buffer.from(encoded, "base64"), format: "der", type: "pkcs8" });
+    if (privateKey.asymmetricKeyType !== "ed25519")
+      throw new TypeError("owner custody key algorithm differs");
+    const publicKey = rawPublicKey(privateKey);
+    if (publicKey.toString("base64url") !== value["publicKey"])
+      throw new TypeError("owner custody public verifier differs");
+    const binding: OwnerKeyCustodyBinding = {
+      actorId: expected.actorId, scopeId: expected.scopeId, storeLineage: expected.storeLineage,
+      credentialRef: value["credentialRef"], ownerEpoch: BigInt(value["ownerEpoch"]),
+      authorityRevision: BigInt(value["authorityRevision"]), osIdentity: value["osIdentity"],
+      processIdentity: value["processIdentity"], startIdentity: BigInt(value["startIdentity"]),
+      containmentIdentity: value["containmentIdentity"],
+    };
+    return {
+      binding,
+      publicKey: new Uint8Array(publicKey),
+      proveContinuity(nonce) {
+        if (!(nonce instanceof Uint8Array) || nonce.length !== 32 || nonce.every((byte) => byte === 0))
+          throw new TypeError("owner custody continuity nonce is invalid");
+        return new Uint8Array(sign(null, Buffer.concat([PROOF_DOMAIN, nonce]), privateKey));
+      },
+    };
+  } finally { closeSync(directory); }
+}
+
+export function ownerKeyContinuityChallenge(nonce: Uint8Array): Uint8Array {
+  if (!(nonce instanceof Uint8Array) || nonce.length !== 32 || nonce.every((byte) => byte === 0))
+    throw new TypeError("owner custody continuity nonce is invalid");
+  return new Uint8Array(Buffer.concat([PROOF_DOMAIN, nonce]));
+}
+
+function pinnedPrivateDirectory(path: string): number {
+  if (process.platform !== "linux" || typeof process.getuid !== "function" ||
+      !isAbsolute(path) || basename(path) !== FILE_NAME || path.includes("\0"))
+    throw new TypeError("owner custody path is invalid");
+  const parent = dirname(path);
+  const before = lstatSync(parent);
+  if (!before.isDirectory() || before.uid !== process.getuid() ||
+      (before.mode & 0o7777) !== 0o700 || realpathSync(parent) !== parent)
+    throw new TypeError("owner custody parent is not canonical and private");
+  const descriptor = openSync(parent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  const pinned = fstatSync(descriptor);
+  if (pinned.dev !== before.dev || pinned.ino !== before.ino) {
+    closeSync(descriptor);
+    throw new TypeError("owner custody parent changed");
+  }
+  return descriptor;
+}
+
+function rawPublicKey(privateKey: KeyObject): Buffer {
+  const jwk = createPublicKey(privateKey).export({ format: "jwk" });
+  if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || typeof jwk.x !== "string")
+    throw new TypeError("owner custody verifier is invalid");
+  const raw = Buffer.from(jwk.x, "base64url");
+  if (raw.length !== 32 || raw.every((byte) => byte === 0))
+    throw new TypeError("owner custody verifier is invalid");
+  return raw;
+}
+
+function validateBinding(binding: OwnerKeyCustodyBinding): void {
+  if (![binding.actorId, binding.scopeId, binding.storeLineage, binding.credentialRef,
+        binding.osIdentity, binding.processIdentity].every((value) => isGraphic(value, 256)) ||
+      !isGraphic(binding.containmentIdentity, 4096) ||
+      ![binding.ownerEpoch, binding.authorityRevision, binding.startIdentity].every((value) =>
+        typeof value === "bigint" && value > 0n && value <= MAX_U64))
+    throw new TypeError("owner custody binding is invalid");
+}
+
+function isGraphic(value: unknown, maximum: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum &&
+    [...value].every((char) => char.charCodeAt(0) >= 0x21 && char.charCodeAt(0) <= 0x7e);
+}
+function isCounter(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]*$/u.test(value) &&
+    BigInt(value) <= MAX_U64;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

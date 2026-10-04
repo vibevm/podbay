@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
@@ -17,6 +17,7 @@ import {
   OwnerSetupError,
   type TrustedOwnerSetupExpectations,
 } from "../src/owner-setup.ts";
+import { loadOwnerKeyCustody } from "../src/owner-key-custody.ts";
 
 const domain = Buffer.from("podbay.owner-initial-enrollment/1\0", "ascii");
 const rights = "launch_pod.scope+use_credential.exact+send_session.scope";
@@ -24,10 +25,17 @@ const rights = "launch_pod.scope+use_credential.exact+send_session.scope";
 test("setup signs only the exact trusted challenge and returns a process-owned auth channel", async (t) => {
   let key: Buffer = Buffer.alloc(0);
   let signatures = 0;
+  let custodyPath = "";
   const socketPath = await fakeSetupServer(t, async (socket) => {
     const frames = new Frames(socket);
     key = await frames.next();
     assert.equal(key.length, 32);
+    const custody = await stat(custodyPath);
+    assert.equal(custody.mode & 0o7777, 0o600);
+    assert.deepEqual(loadOwnerKeyCustody(custodyPath, {
+      actorId: "actor.owner.fixture", scopeId: "scope.owner.fixture",
+      storeLineage: "lineage.owner.fixture",
+    }).publicKey, new Uint8Array(key));
     const challenge = challengeBytes(key, expectations(socketPath));
     const framed = frame(challenge);
     socket.write(framed.subarray(0, 2));
@@ -40,7 +48,10 @@ test("setup signs only the exact trusted challenge and returns a process-owned a
     assert.equal((await frames.next()).toString("ascii"), "ack");
     socket.end();
   });
-  const client = new InitialOwnerSetupClient(expectations(socketPath));
+  custodyPath = join(dirname(socketPath), "owner-key-custody.json");
+  const client = new InitialOwnerSetupClient({
+    ...expectations(socketPath), ownerKeyCustodyPath: custodyPath,
+  });
   const receipt = await client.enroll();
   assert.equal(receipt.actorId, "actor.owner.fixture");
   assert.equal(receipt.grantRef, "grant.1");
