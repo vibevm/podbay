@@ -10,13 +10,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
     ActorId, AttestedPeer, LaunchBinding, PodId, ResourceId, Role, Run, ScopeId, Session,
+    StoreLineageId,
 };
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, BoundLaunchAdmission,
     BoundLaunchProposal, BoundLaunchRecord, BoundLaunchRequest, EffectClaim, LaunchDispatchStatus,
     LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim, PodBayStore, Receipt,
-    StoreError, VerifiedPrincipal,
+    SqliteActorVerifierWitness, StoreError, VerifiedPrincipal,
 };
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor};
 
@@ -27,6 +28,7 @@ use crate::launch_spec::{
     EffectiveLaunchSpec, LaunchSelection, RegisteredLaunchProfile, ResolvedNativePaths,
     TrustedNativeHostConfig,
 };
+use crate::{ActorChallenge, ActorChallengeOrigin, ActorCredentialError, verify_actor_challenge};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostError {
@@ -231,6 +233,139 @@ impl AuthenticatedPeer {
 
 pub trait AuthenticatedTransport {
     fn verified_peer(&self) -> Result<AuthenticatedPeer, HostError>;
+}
+
+/// A read-only, owned challenge candidate minted from the current manager's
+/// active actor map and durable public verifier. Merely holding it authenticates
+/// nobody. It cannot be cloned or reused for a second challenge.
+pub struct ActorAuthCandidate {
+    actor_id: ActorId,
+    scope_id: ScopeId,
+    generation: CredentialGeneration,
+    process: AuthenticatedProcessSubject,
+    origin: PeerOrigin,
+    store_lineage: StoreLineageId,
+    public_key: [u8; 32],
+    verifier_witness: SqliteActorVerifierWitness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActorAuthProofError {
+    StaleVerifier,
+    ProcessChanged,
+    Credential(ActorCredentialError),
+}
+
+/// One pending server nonce and one candidate. The caller must generate the
+/// nonce with a CSPRNG and send these exact transcript bytes to the actor.
+pub struct PendingActorChallenge {
+    candidate: ActorAuthCandidate,
+    nonce: [u8; 32],
+}
+
+/// A proof-backed peer plus a read-only verifier fence. The caller must supply
+/// a freshly kernel-attested process on every check; this is not a socket or a
+/// manager-liveness witness, and it grants no rights by itself.
+pub struct ProvenActorSession {
+    peer: AuthenticatedPeer,
+    process: AuthenticatedProcessSubject,
+    verifier_witness: SqliteActorVerifierWitness,
+}
+
+impl ActorAuthCandidate {
+    fn challenge(&self, nonce: [u8; 32]) -> Result<ActorChallenge<'_>, ActorAuthProofError> {
+        let origin = match &self.origin {
+            PeerOrigin::OwnerCli => ActorChallengeOrigin::OwnerCli,
+            PeerOrigin::Pod {
+                pod_id,
+                incarnation,
+                ..
+            } => ActorChallengeOrigin::Pod {
+                pod_id,
+                incarnation: *incarnation,
+            },
+        };
+        ActorChallenge::from_trusted_context(
+            nonce,
+            &self.store_lineage,
+            &self.actor_id,
+            &self.scope_id,
+            self.generation,
+            &self.process,
+            origin,
+        )
+        .map_err(ActorAuthProofError::Credential)
+    }
+
+    pub fn begin_challenge(
+        self,
+        nonce: [u8; 32],
+    ) -> Result<PendingActorChallenge, ActorAuthProofError> {
+        self.challenge(nonce)?;
+        if !self.verifier_witness.is_current() {
+            return Err(ActorAuthProofError::StaleVerifier);
+        }
+        Ok(PendingActorChallenge {
+            candidate: self,
+            nonce,
+        })
+    }
+}
+
+impl PendingActorChallenge {
+    pub fn transcript_bytes(&self) -> Result<Vec<u8>, ActorAuthProofError> {
+        if !self.candidate.verifier_witness.is_current() {
+            return Err(ActorAuthProofError::StaleVerifier);
+        }
+        self.candidate
+            .challenge(self.nonce)?
+            .transcript_bytes()
+            .map_err(ActorAuthProofError::Credential)
+    }
+
+    pub fn verify(
+        self,
+        freshly_observed_process: &AuthenticatedProcessSubject,
+        signature: &[u8],
+    ) -> Result<ProvenActorSession, ActorAuthProofError> {
+        let candidate = self.candidate;
+        if freshly_observed_process != &candidate.process {
+            return Err(ActorAuthProofError::ProcessChanged);
+        }
+        {
+            let challenge = candidate.challenge(self.nonce)?;
+            verify_actor_challenge(&challenge, &candidate.public_key, signature)
+                .map_err(ActorAuthProofError::Credential)?;
+        }
+        if !candidate.verifier_witness.is_current() {
+            return Err(ActorAuthProofError::StaleVerifier);
+        }
+        let peer = AuthenticatedPeer {
+            origin: candidate.origin,
+            process: candidate.process.clone(),
+            credential_generation: candidate.generation,
+        };
+        Ok(ProvenActorSession {
+            peer,
+            process: candidate.process,
+            verifier_witness: candidate.verifier_witness,
+        })
+    }
+}
+
+impl ProvenActorSession {
+    pub fn verified_peer(
+        &self,
+        freshly_observed_process: &AuthenticatedProcessSubject,
+    ) -> Result<AuthenticatedPeer, ActorAuthProofError> {
+        if freshly_observed_process != &self.process {
+            return Err(ActorAuthProofError::ProcessChanged);
+        }
+        if !self.verifier_witness.is_current() {
+            return Err(ActorAuthProofError::StaleVerifier);
+        }
+        Ok(self.peer.clone())
+    }
 }
 
 /// Trusted local policy registers exact process evidence before any grant can be used.
@@ -1896,6 +2031,118 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     pub fn recorded_snapshot(&self) -> &AuthoritySnapshot {
         &self.recorded
+    }
+
+    /// Treats `actor_selector` only as a lookup hint. The process must come
+    /// from a fresh kernel-attested transport, never from request JSON. This
+    /// returns owned, read-only proof inputs; it does not authenticate the
+    /// caller, activate replayed actors, grant rights, or invoke a host port.
+    pub fn challenge_candidate_for_observed_process(
+        &mut self,
+        actor_selector: &ActorId,
+        observed_process: &AuthenticatedProcessSubject,
+    ) -> Result<ActorAuthCandidate, DurableAuthorityError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (actor_selector, observed_process);
+            return Err(HostError::Unsupported.into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if observed_process.platform() != HostPlatform::Linux {
+                return Err(HostError::Unsupported.into());
+            }
+            self.recheck_actor_resolution_manager()?;
+            let current = self.store.authority_snapshot()?;
+            if current.owner_epoch != self.manager_claim.owner_epoch()
+                || current.owner_epoch != self.host.manager_epoch.get()
+                || current.revision != self.recorded.revision
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+
+            let mut active = self
+                .host
+                .actors
+                .values()
+                .filter(|actor| actor.process == *observed_process);
+            let actor = active.next().ok_or(HostError::Unauthenticated)?.clone();
+            if active.next().is_some() || actor.actor_id != *actor_selector {
+                return Err(HostError::Unauthenticated.into());
+            }
+            let expected = durable_actor(&actor);
+            for snapshot in [&current, &self.recorded] {
+                let mut matching = snapshot
+                    .actors
+                    .iter()
+                    .filter(|record| actor_record_matches_process(record, observed_process));
+                if matching.next() != Some(&expected) || matching.next().is_some() {
+                    return Err(HostError::Unauthenticated.into());
+                }
+            }
+            if let PeerOrigin::Pod {
+                actor_id,
+                pod_id,
+                incarnation,
+            } = &actor.origin
+            {
+                if actor_id != &actor.actor_id {
+                    return Err(HostError::Unauthenticated.into());
+                }
+                let pod = self
+                    .host
+                    .pods
+                    .get(pod_id)
+                    .ok_or(HostError::Unauthenticated)?;
+                if pod.scope_id != actor.scope_id || pod.incarnation != *incarnation {
+                    return Err(HostError::Unauthenticated.into());
+                }
+                let expected_pod = durable_pod(pod);
+                for snapshot in [&current, &self.recorded] {
+                    let mut matching = snapshot
+                        .pods
+                        .iter()
+                        .filter(|record| record.pod_id == pod_id.as_str());
+                    if matching.next() != Some(&expected_pod) || matching.next().is_some() {
+                        return Err(HostError::Unauthenticated.into());
+                    }
+                }
+            }
+
+            let public_key = self.store.current_actor_verifier(
+                current.owner_epoch,
+                current.revision,
+                &expected,
+            )?;
+            let store_lineage = StoreLineageId::try_from(self.manager_claim.store_lineage())
+                .map_err(|_| DurableAuthorityError::Corrupt("invalid store lineage"))?;
+            let verifier_witness = SqliteActorVerifierWitness::for_actor(
+                &self.canonical_database,
+                self.manager_claim.store_lineage(),
+                current.owner_epoch,
+                current.revision,
+                expected,
+                public_key,
+            )?;
+            self.recheck_actor_resolution_manager()?;
+            let final_snapshot = self.store.authority_snapshot()?;
+            if final_snapshot.owner_epoch != current.owner_epoch
+                || final_snapshot.revision != current.revision
+                || !verifier_witness.is_current()
+            {
+                return Err(HostError::StaleGuard.into());
+            }
+            Ok(ActorAuthCandidate {
+                actor_id: actor.actor_id,
+                scope_id: actor.scope_id,
+                generation: actor.credential_generation,
+                process: actor.process,
+                origin: actor.origin,
+                store_lineage,
+                public_key,
+                verifier_witness,
+            })
+        }
     }
 
     /// Resolves a live local transport observation to one active actor. The
