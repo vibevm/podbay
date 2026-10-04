@@ -1,0 +1,186 @@
+//! Narrow host-backed `commands.get` projection. No mutation reaches a port.
+
+use podbay_core::ScopeId;
+use podbay_host::{
+    AuthenticatedTransport, DurableAuthority, DurableAuthorityError, HostDispatchPort, HostError,
+};
+use podbay_store::{
+    CommandInspection, CommandLookupSelector, EffectState, ObservedStage, StoreError,
+};
+use podbay_wire::{
+    CommandEnvelope, CommandSelector, CommandStage, ReadBody, ReadEnvelope, Receipt, RuntimeError,
+    RuntimeErrorCode, Target,
+};
+use serde_json::{Value, json};
+
+use crate::Handler;
+
+pub(crate) struct HostReadHandler<'a, P: HostDispatchPort> {
+    authority: &'a mut DurableAuthority<P>,
+}
+
+impl<'a, P: HostDispatchPort> HostReadHandler<'a, P> {
+    pub(crate) fn new(authority: &'a mut DurableAuthority<P>) -> Self {
+        Self { authority }
+    }
+}
+
+impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
+    fn command<T: AuthenticatedTransport>(
+        &mut self,
+        _transport: &T,
+        _request: CommandEnvelope,
+    ) -> Result<Receipt<Value>, RuntimeError> {
+        Err(refusal(
+            RuntimeErrorCode::Unsupported,
+            "mutation is unavailable on this read endpoint",
+        ))
+    }
+
+    fn read<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: ReadEnvelope,
+    ) -> Result<Value, RuntimeError> {
+        let ReadBody::CommandsGet(body) = request.body else {
+            return Err(refusal(
+                RuntimeErrorCode::Unsupported,
+                "read operation is unavailable",
+            ));
+        };
+        let Target::Scope { scope_id } = request.target else {
+            return Err(refusal(
+                RuntimeErrorCode::InvalidInput,
+                "scope target required",
+            ));
+        };
+        let scope = ScopeId::try_from(scope_id.as_str())
+            .map_err(|_| refusal(RuntimeErrorCode::InvalidInput, "invalid scope target"))?;
+        let selector = match body.selector {
+            CommandSelector::Id { command_id } => CommandLookupSelector::Id { command_id },
+            CommandSelector::Key { key } => CommandLookupSelector::Key { key },
+        };
+        let inspected = self
+            .authority
+            .lookup_command(transport, &scope, &selector)
+            .map_err(authority_error)?;
+        Ok(inspection_json(inspected))
+    }
+}
+
+fn inspection_json(inspected: CommandInspection) -> Value {
+    // These are the facts established by the store. A claimed effect remains
+    // uncertain; host acceptance does not imply provider consumption.
+    let (state, effect_state) = match inspected.effect_state {
+        EffectState::Prepared => (CommandStage::Persisted, "prepared"),
+        EffectState::ClaimedUncertain => (CommandStage::Uncertain, "claimed_uncertain"),
+        EffectState::Observed => match inspected.observed_stage {
+            Some(ObservedStage::HostAccepted) => (CommandStage::HostAccepted, "observed"),
+            Some(ObservedStage::LegacyUnverified) | None => (CommandStage::Uncertain, "observed"),
+        },
+    };
+    let receipt = inspected.receipt;
+    let mut response = json!({
+        "receipt": {
+            "commandId": receipt.command_id,
+            "eventSequence": receipt.event_sequence.to_string(),
+            "outboxId": receipt.outbox_id.to_string(),
+            "digestVersion": receipt.digest_version,
+            "requestDigest": receipt.request_digest,
+        },
+        "state": state,
+        "effectState": effect_state,
+    });
+    if let Some(stage) = inspected.observed_stage {
+        response["observedStage"] = json!(match stage {
+            ObservedStage::HostAccepted => "host_accepted",
+            ObservedStage::LegacyUnverified => "legacy_unverified",
+        });
+    }
+    if let Some(sequence) = inspected.observation_event_sequence {
+        response["observationEventSequence"] = json!(sequence.to_string());
+    }
+    response
+}
+
+fn refusal(code: RuntimeErrorCode, message: &str) -> RuntimeError {
+    RuntimeError {
+        code,
+        message: message.into(),
+        retry: "never".into(),
+        command_id: None,
+    }
+}
+
+fn authority_error(error: DurableAuthorityError) -> RuntimeError {
+    let (code, message) = match error {
+        DurableAuthorityError::Store(StoreError::NotFound) => {
+            (RuntimeErrorCode::Forbidden, "command unavailable")
+        }
+        DurableAuthorityError::Store(StoreError::InvalidInput(_)) => (
+            RuntimeErrorCode::InvalidInput,
+            "command selector is invalid",
+        ),
+        DurableAuthorityError::Store(StoreError::Conflict(_)) => (
+            RuntimeErrorCode::Conflict,
+            "command record is ambiguous or inconsistent",
+        ),
+        DurableAuthorityError::Store(StoreError::StaleEpoch)
+        | DurableAuthorityError::Host(HostError::StaleGuard) => (
+            RuntimeErrorCode::StaleGuard,
+            "manager or actor state changed",
+        ),
+        DurableAuthorityError::Host(HostError::Unauthenticated | HostError::Unauthorised) => (
+            RuntimeErrorCode::Forbidden,
+            "authenticated actor unavailable",
+        ),
+        DurableAuthorityError::Host(HostError::Unsupported) => {
+            (RuntimeErrorCode::Unsupported, "host read unavailable")
+        }
+        DurableAuthorityError::Busy => (RuntimeErrorCode::Busy, "manager is busy"),
+        DurableAuthorityError::Store(_)
+        | DurableAuthorityError::Io(_)
+        | DurableAuthorityError::Corrupt(_) => (
+            RuntimeErrorCode::StorageFailure,
+            "durable command read unavailable",
+        ),
+        DurableAuthorityError::Host(_) => (RuntimeErrorCode::Unavailable, "host read unavailable"),
+    };
+    refusal(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inspection(state: EffectState, observed_stage: Option<ObservedStage>) -> CommandInspection {
+        CommandInspection {
+            receipt: podbay_store::Receipt {
+                command_id: "command.fixture".into(),
+                event_sequence: 7,
+                outbox_id: 9,
+                digest_version: "pb04-request-bytes/1",
+                request_digest: "a".repeat(64),
+            },
+            effect_state: state,
+            observed_stage,
+            observation_event_sequence: observed_stage.map(|_| 11),
+        }
+    }
+
+    #[test]
+    fn uncertain_and_host_accepted_are_never_projected_as_settled() {
+        let uncertain = inspection_json(inspection(EffectState::ClaimedUncertain, None));
+        assert_eq!(uncertain["state"], "uncertain");
+        assert_eq!(uncertain["effectState"], "claimed_uncertain");
+        assert_eq!(uncertain["receipt"]["eventSequence"], "7");
+        let accepted = inspection_json(inspection(
+            EffectState::Observed,
+            Some(ObservedStage::HostAccepted),
+        ));
+        assert_eq!(accepted["state"], "host_accepted");
+        assert_eq!(accepted["observedStage"], "host_accepted");
+        assert_eq!(accepted["observationEventSequence"], "11");
+        assert!(accepted.get("payload").is_none());
+    }
+}

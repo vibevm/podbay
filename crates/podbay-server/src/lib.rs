@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 mod auth_prelude;
 #[cfg(target_os = "linux")]
+mod host_read_handler;
+#[cfg(target_os = "linux")]
 mod linux_peer;
 
 use std::fmt;
@@ -39,6 +41,20 @@ pub fn serve_authenticated_linux_one<P: podbay_host::HostDispatchPort, H: Handle
     let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
         .map_err(LinuxServeOneFault::Authentication)?;
     serve_one(&mut authenticated, handler).map_err(LinuxServeOneFault::Exchange)
+}
+
+/// Authenticate and perform one `commands.get` using the same manager owner
+/// for proof and read authority. Other reads and every mutation are refused
+/// by the handler without calling a host port. No listener loop lives here.
+#[cfg(target_os = "linux")]
+pub fn serve_authenticated_linux_commands_get_one<P: podbay_host::HostDispatchPort>(
+    socket: std::os::unix::net::UnixStream,
+    authority: &mut podbay_host::DurableAuthority<P>,
+) -> Result<(), LinuxServeOneFault> {
+    let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
+        .map_err(LinuxServeOneFault::Authentication)?;
+    let mut handler = host_read_handler::HostReadHandler::new(authority);
+    serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
 }
 
 #[cfg(target_os = "linux")]
