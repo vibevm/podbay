@@ -161,6 +161,8 @@ pub struct BoundPeerManifest {
     pub store_lineage: String,
     pub owner_epoch: u64,
     pub credential_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_revision: Option<u64>,
     pub resource_input_epochs: BTreeMap<String, u64>,
     pub manager_os_identity: String,
     pub manager_process_id: String,
@@ -208,6 +210,7 @@ impl BoundPeerManifest {
             || !self.store_path.is_absolute()
             || self.owner_epoch == 0
             || self.credential_epoch == 0
+            || self.authority_revision.is_some()
             || self.resource_input_epochs.len() != 1
         {
             return Err(PodError::Invalid(
@@ -311,6 +314,7 @@ impl BoundPeerManifest {
             || !self.store_path.is_absolute()
             || self.owner_epoch == 0
             || self.credential_epoch == 0
+            || self.authority_revision.is_none_or(|revision| revision == 0)
             || self.resource_input_epochs.len() != 1
             || !directory.is_absolute()
         {

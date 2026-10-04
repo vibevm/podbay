@@ -225,7 +225,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
     )
     .unwrap();
     let mut store = PodBayStore::open(&fixture.database).unwrap();
-    store.advance_owner_epoch(0, 1).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
     let record = match store
         .admit_bound_launch(BoundLaunchRequest {
             principal: VerifiedPrincipal::from_authenticated_boundary("principal.fixture").unwrap(),
@@ -240,7 +240,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
                 effective_spec: &effective,
                 descriptor: &descriptor,
                 expected_owner_epoch: 1,
-                expected_authority_revision: 0,
+                expected_authority_revision: 1,
             }),
         })
         .unwrap()
@@ -249,6 +249,11 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
         other => panic!("{other:?}"),
     };
     let lineage = store.initial_cursor("scope.fixture").unwrap().store_lineage;
+    let manager_peer = LinuxPeerEvidence::for_current_process().unwrap();
+    let manager_claim = store.current_manager_credential_claim(1).unwrap();
+    store
+        .register_current_manager_peer(&manager_claim, manager_peer.attested_peer())
+        .unwrap();
     let bootstrap = PodPeerBootstrap {
         store_path: fixture.database.clone(),
         store_lineage: lineage,
@@ -257,10 +262,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
         resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
         canonical_executable: sleep,
         executable_sha256: sha,
-        expected_manager_peer: LinuxPeerEvidence::for_current_process()
-            .unwrap()
-            .attested_peer()
-            .clone(),
+        expected_manager_peer: manager_peer.attested_peer().clone(),
     };
     (record, bootstrap)
 }

@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -24,8 +25,11 @@ use podbay_host::{
     RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedDriverTemplate,
     TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
-use podbay_launch_linux::{TrustedCodexCredentialSource, preflight_committed_codex_v2};
-use podbay_store::{LaunchDispatchStage, PodBayStore};
+use podbay_launch_linux::{
+    CodexV2Preflight, TrustedCodexCredentialSource, preflight_committed_codex_v2,
+};
+use podbay_pod::{CODEX_V2_CAPABILITY, PodError, launch_bound_codex_v2};
+use podbay_store::{EffectClaim, LaunchDispatchStage, PodBayStore};
 use podbay_wire::{CodexAppServerPolicyV2, ResourceDriver};
 use sha2::{Digest, Sha256};
 
@@ -53,7 +57,11 @@ impl Fixture {
         let workspace = directory.join("workspace");
         fs::create_dir(&workspace).unwrap();
         let executable = directory.join("agent.sh");
-        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nset -eu\n[ \"$1\" = app-server ]\n[ \"$2\" = --listen ]\n[ \"$3\" = stdio:// ]\n[ -r \"$CODEX_HOME/auth.json\" ]\nread -r initialize\nprintf '%s\\n' \"$initialize\" > \"$CODEX_HOME/frames.log\"\nprintf '{\"id\":1,\"result\":{\"codexHome\":\"%s\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"fixture\"}}\\n' \"$CODEX_HOME\"\nread -r initialized\nprintf '%s\\n' \"$initialized\" >> \"$CODEX_HOME/frames.log\"\nsleep 30\n",
+        )
+        .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let source = directory.join("credential.key");
         fs::write(&source, b"fixture-private-credential").unwrap();
@@ -71,6 +79,23 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if let Ok(entries) = fs::read_dir(&self.directory) {
+            for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                    && let Some(stem) = path.file_stem().and_then(|value| value.to_str())
+                    && stem.len() == 32
+                    && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    let _ = Command::new("systemctl")
+                        .args(["--user", "stop", &format!("podbay-pod-{stem}.service")])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -184,7 +209,7 @@ fn setup(
             },
         }],
         execution_mode: ExecutionMode::LinuxCooperative,
-        fixed_arguments: vec!["app-server".into()],
+        fixed_arguments: vec!["app-server".into(), "--listen".into(), "stdio://".into()],
         permitted_extra_arguments: BTreeSet::new(),
         default_model: "gpt-6-sol".into(),
         allowed_models: BTreeSet::from(["gpt-6-sol".into()]),
@@ -324,6 +349,25 @@ fn setup(
     (fixture, host, proof, source, calls)
 }
 
+fn launch_from_review(
+    fixture: &Fixture,
+    proof: &ResolvedNativeCodexLaunch,
+    reviewed: &CodexV2Preflight,
+    pod_binary: &Path,
+    source: &Path,
+) -> Result<podbay_pod::PodClient, PodError> {
+    launch_bound_codex_v2(
+        proof.committed_record().clone(),
+        reviewed.bootstrap().clone(),
+        proof.authority_revision(),
+        proof.store_file_identity(),
+        &fixture.directory,
+        pod_binary,
+        source,
+        reviewed.credential_source_identity(),
+    )
+}
+
 #[test]
 fn preflight_returns_exact_bootstrap_and_private_source_without_port_effect() {
     for role in [Role::Coordinator, Role::Worker] {
@@ -452,4 +496,114 @@ fn private_source_has_finite_size_and_parent_boundary() {
         TrustedCodexCredentialSource::from_trusted_policy(reference, fixture.source.clone())
             .is_err()
     );
+}
+
+#[test]
+fn launch_entry_refuses_revision_store_and_credential_syntax_drift_before_manifest() {
+    let binary = fs::canonicalize("/bin/true").unwrap();
+    let (fixture, _host, proof, source, calls) = setup(Role::Coordinator);
+    let reviewed = preflight_committed_codex_v2(&proof, &source).unwrap();
+    let colon = fixture.directory.join("credential:ambiguous.key");
+    assert!(matches!(
+        launch_from_review(&fixture, &proof, &reviewed, &binary, &colon),
+        Err(PodError::Invalid("systemd credential source path"))
+    ));
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    store
+        .apply_authority_mutation(
+            snapshot.owner_epoch,
+            snapshot.revision,
+            podbay_store::AuthorityMutation::PutActor(snapshot.actors[0].clone()),
+        )
+        .unwrap();
+    let after = store.authority_snapshot().unwrap();
+    assert_eq!(after.resources, snapshot.resources);
+    assert!(after.revision > snapshot.revision);
+    assert!(matches!(
+        launch_from_review(
+            &fixture,
+            &proof,
+            &reviewed,
+            &binary,
+            reviewed.credential_source()
+        ),
+        Err(PodError::Refused("current Codex V2 authority changed"))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !fs::read_dir(&fixture.directory)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+    );
+
+    let (fixture, _host, proof, source, calls) = setup(Role::Coordinator);
+    let reviewed = preflight_committed_codex_v2(&proof, &source).unwrap();
+    let original = fixture.directory.join("old.sqlite");
+    fs::rename(&fixture.database, &original).unwrap();
+    fs::copy(&original, &fixture.database).unwrap();
+    assert!(matches!(
+        launch_from_review(
+            &fixture,
+            &proof,
+            &reviewed,
+            &binary,
+            reviewed.credential_source()
+        ),
+        Err(PodError::Refused("Codex V2 store file identity changed"))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_v2_launch_serve_status_stop_without_model_turn() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let (fixture, _host, proof, source, calls) = setup(Role::Coordinator);
+    let reviewed = preflight_committed_codex_v2(&proof, &source).unwrap();
+    let record = proof.committed_record();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let claim = store
+        .claim_effect(
+            proof.outbox_id(),
+            &record.scope_id,
+            &record.pod_id,
+            proof.owner_epoch(),
+            record.pod_incarnation,
+            proof.authority_revision(),
+            &format!("claim.{}", record.receipt.command_id),
+        )
+        .unwrap();
+    assert_eq!(claim, EffectClaim::NewClaim);
+    let client = launch_from_review(
+        &fixture,
+        &proof,
+        &reviewed,
+        &binary,
+        reviewed.credential_source(),
+    )
+    .unwrap();
+    assert!(client.status().unwrap().child_running);
+    assert_eq!(
+        client.bound_status().unwrap().capability,
+        CODEX_V2_CAPABILITY
+    );
+    let duplicate = launch_from_review(
+        &fixture,
+        &proof,
+        &reviewed,
+        &binary,
+        reviewed.credential_source(),
+    )
+    .unwrap();
+    assert!(duplicate.status().unwrap().child_running);
+    assert_eq!(
+        duplicate.bound_status().unwrap(),
+        client.bound_status().unwrap()
+    );
+    let frames = fixture.directory.join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2);
+    assert!(!client.stop().unwrap().child_running);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

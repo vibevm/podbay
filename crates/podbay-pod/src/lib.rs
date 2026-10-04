@@ -4,6 +4,8 @@
 #[cfg(target_os = "linux")]
 mod codex_credential;
 #[cfg(target_os = "linux")]
+mod codex_launch;
+#[cfg(target_os = "linux")]
 mod codex_resource;
 #[cfg(target_os = "linux")]
 mod linux_peer;
@@ -27,11 +29,16 @@ pub use codex_credential::{
     CODEX_AUTH_CREDENTIAL_NAME, PreparedCodexHome, prepare_codex_home_from_systemd_credential,
 };
 #[cfg(target_os = "linux")]
+pub use codex_launch::launch_bound_codex_v2;
+#[cfg(target_os = "linux")]
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
-pub use manifest::{BoundPeerManifest, BoundPodStatus, PodManifest, PodPeerBootstrap, PodStatus};
+pub use manifest::{
+    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, PodManifest, PodPeerBootstrap,
+    PodStatus,
+};
 pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
 };

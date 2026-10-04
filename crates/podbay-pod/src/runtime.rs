@@ -12,14 +12,20 @@ use podbay_core::{
     OwnerEpoch, OwnerEpochWitness, PeerGrant, PeerGrantId, PeerRequest, PodFenceCheckpoint,
     PodFenceIdentity, PodId, PodPeerFence, RebindPhase, ResourceId, ScopeId, StoreLineageId,
 };
-use podbay_store::{BoundLaunchRecord, SqliteManagerPeerWitness, SqliteOwnerEpochWitness};
+use podbay_store::{
+    BoundLaunchFormat, BoundLaunchRecord, PodBayStore, SqliteManagerPeerWitness,
+    SqliteOwnerEpochWitness,
+};
 use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole};
 use serde::{Deserialize, Serialize};
 
+use crate::codex_credential::prepare_codex_home_from_systemd_credential;
+use crate::codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
-    BoundPeerManifest, BoundPodStatus, LaunchDescriptor, PEER_BINDING_PROTOCOL, PROTOCOL, PodError,
-    PodManifest, PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
+    BoundPeerManifest, BoundPodStatus, CODEX_V2_CAPABILITY, LaunchDescriptor,
+    PEER_BINDING_PROTOCOL, PEER_BINDING_V2_PROTOCOL, PROTOCOL, PodError, PodManifest,
+    PodPeerBootstrap, PodRole, PodStatus, SYNTHETIC_CAPABILITY, hex, manifest_path,
     private_directory, read_manifest, unit_name, write_manifest,
 };
 use crate::peer_checkpoint::{
@@ -155,6 +161,7 @@ fn inspect_allowed(
 enum ChildResource {
     Pipe(Child),
     Pty(Box<dyn TerminalResource>),
+    Codex(PodCodexResource),
 }
 
 impl ChildResource {
@@ -165,18 +172,21 @@ impl ChildResource {
                 .process_identity()?
                 .parse()
                 .map_err(|_| PodError::Invalid("Linux PTY process ID")),
+            Self::Codex(resource) => Ok(resource.pid()),
         }
     }
     fn try_wait(&mut self) -> Result<Option<Option<i32>>, PodError> {
         match self {
             Self::Pipe(child) => Ok(child.try_wait()?.map(|status| status.code())),
             Self::Pty(pty) => Ok(pty.try_wait()?.map(Some)),
+            Self::Codex(resource) => resource.try_wait(),
         }
     }
     fn kill(&mut self) -> Result<(), PodError> {
         match self {
             Self::Pipe(child) => child.kill().map_err(PodError::from),
             Self::Pty(pty) => pty.stop(),
+            Self::Codex(resource) => resource.stop(),
         }
     }
 }
@@ -719,6 +729,7 @@ pub fn launch_bound(
         store_lineage: bootstrap.store_lineage,
         owner_epoch: bootstrap.owner_epoch,
         credential_epoch: bootstrap.credential_epoch,
+        authority_revision: None,
         resource_input_epochs: bootstrap.resource_input_epochs,
         manager_os_identity: peer.os_identity().into(),
         manager_process_id: peer.native_process_id().into(),
@@ -823,17 +834,74 @@ fn bound_identity(
     })
 }
 
+/// Recheck the manager's exact committed V2 launch through an existing
+/// read-only store handle. The pod never becomes a second SQLite writer.
+fn current_codex_v2_binding(
+    binding: &BoundPeerManifest,
+    descriptor: &LaunchDescriptor,
+) -> Result<(), PodError> {
+    let revision = binding
+        .authority_revision
+        .filter(|value| *value > 0)
+        .ok_or(PodError::Refused("Codex V2 authority revision is missing"))?;
+    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+        .map_err(|_| PodError::Refused("Codex V2 store witness unavailable"))?;
+    let current = store
+        .current_bound_pod_snapshot(&descriptor.scope_id, &descriptor.pod_id)
+        .map_err(|_| PodError::Refused("Codex V2 committed launch is unavailable"))?;
+    let inputs = current
+        .resources()
+        .iter()
+        .map(|resource| {
+            (
+                resource.id().as_str().to_owned(),
+                resource.input_epoch().get(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if current.store_lineage().as_str() != binding.store_lineage
+        || current.owner_epoch().get() != binding.owner_epoch
+        || current.authority_revision() != revision
+        || current.pod_incarnation().get() != descriptor.incarnation
+        || current.attempt_id().as_str() != descriptor.attempt_id
+        || current.launch().format != BoundLaunchFormat::CodexV2
+        || current.launch().descriptor != binding.wire_descriptor
+        || current.launch().effective_spec != binding.effective_spec
+        || current.launch().resources.len() != 1
+        || current.launch().resources[0].id != descriptor.resource_id
+        || current.launch().resources[0].epoch != binding.resource_epoch
+        || current.resources().len() != 1
+        || inputs != binding.resource_input_epochs
+    {
+        return Err(PodError::Refused("Codex V2 committed authority changed"));
+    }
+    Ok(())
+}
+
 /// Internal systemd service entry. The authenticated socket binds before any child is spawned.
 pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let manifest = read_manifest(manifest_path.as_ref())?;
     let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
         "unbound bearer-only pod service is retired",
     ))?;
-    if binding.protocol != PEER_BINDING_PROTOCOL || binding.capability != SYNTHETIC_CAPABILITY {
-        return Err(PodError::Unsupported(
-            "Codex V2 structured resource runtime is not wired",
-        ));
-    }
+    let codex_launch = match (binding.protocol.as_str(), binding.capability.as_str()) {
+        (PEER_BINDING_PROTOCOL, SYNTHETIC_CAPABILITY) => None,
+        (PEER_BINDING_V2_PROTOCOL, CODEX_V2_CAPABILITY) => {
+            Some(ValidatedCodexResourceLaunch::from_peer_binding(
+                binding,
+                &manifest.descriptor,
+                manifest_path
+                    .as_ref()
+                    .parent()
+                    .ok_or(PodError::Invalid("manifest parent"))?,
+            )?)
+        }
+        _ => {
+            return Err(PodError::Unsupported(
+                "pod resource capability is unavailable",
+            ));
+        }
+    };
     let identity = bound_identity(&manifest.descriptor, binding)?;
     let manager_peer = binding.manager_peer()?;
     let owner_epoch =
@@ -853,6 +921,12 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     if witness.current_owner_epoch(&identity.store_lineage, &identity.scope_id) != Some(owner_epoch)
     {
         return Err(PodError::Refused("bound owner witness unavailable"));
+    }
+    if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
+        return Err(PodError::Refused("bound manager credential changed"));
+    }
+    if codex_launch.is_some() {
+        current_codex_v2_binding(binding, &manifest.descriptor)?;
     }
     match read_peer_checkpoint(manifest_path.as_ref().parent().unwrap(), &identity) {
         Ok(_) => {
@@ -917,21 +991,59 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
     let listener = UnixListener::bind(&manifest.socket_path)?;
     fs::set_permissions(&manifest.socket_path, fs::Permissions::from_mode(0o600))?;
     let descriptor = &manifest.descriptor;
-    let mut child = match descriptor.pty {
-        Some(spec) => {
-            ChildResource::Pty(LinuxBackend.spawn(descriptor, spec, manifest_path.as_ref())?)
+    let mut child = if let Some(reviewed) = codex_launch {
+        current_codex_v2_binding(binding, descriptor)?;
+        if !manager_witness.matches_current(
+            owner_epoch.get(),
+            credential_epoch.get(),
+            &manager_peer,
+        ) {
+            return Err(PodError::Refused(
+                "manager credential changed before Codex child",
+            ));
         }
-        None => ChildResource::Pipe(
-            Command::new(&descriptor.executable)
-                .args(&descriptor.args)
-                .current_dir(&descriptor.cwd)
-                .env_clear()
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        ),
+        let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").ok_or(PodError::Refused(
+            "systemd Codex credential directory is absent",
+        ))?;
+        let home = prepare_codex_home_from_systemd_credential(
+            &manifest.unit_name,
+            manifest_path
+                .as_ref()
+                .parent()
+                .ok_or(PodError::Invalid("manifest parent"))?,
+            Path::new(&credentials),
+        )?;
+        ChildResource::Codex(PodCodexResource::spawn_initialized(reviewed, home)?)
+    } else {
+        match descriptor.pty {
+            Some(spec) => {
+                ChildResource::Pty(LinuxBackend.spawn(descriptor, spec, manifest_path.as_ref())?)
+            }
+            None => ChildResource::Pipe(
+                Command::new(&descriptor.executable)
+                    .args(&descriptor.args)
+                    .current_dir(&descriptor.cwd)
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            ),
+        }
     };
+    if binding.protocol == PEER_BINDING_V2_PROTOCOL {
+        current_codex_v2_binding(binding, descriptor)
+            .map_err(|_| PodError::Uncertain("Codex V2 authority changed after child start"))?;
+        if !manager_witness.matches_current(
+            owner_epoch.get(),
+            credential_epoch.get(),
+            &manager_peer,
+        ) {
+            return Err(PodError::Uncertain(
+                "manager credential changed after Codex child start",
+            ));
+        }
+    }
     let child_pid = child.id()?;
     let child_start_ticks = start_ticks(child_pid)?;
     let mut exit_code = None;
@@ -1142,6 +1254,11 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                 input_epoch: None,
             };
             if !current
+                || !manager_witness.matches_current(
+                    owner_epoch.get(),
+                    credential_epoch.get(),
+                    &manager_peer,
+                )
                 || fence
                     .authorize(observed.attested_peer(), &checked, &witness, now)
                     .is_err()

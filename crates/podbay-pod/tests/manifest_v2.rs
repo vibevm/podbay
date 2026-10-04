@@ -239,6 +239,7 @@ fn case(fixture: &Fixture, executable: &Path, workspace: &Path) -> Case {
         store_lineage: "lineage.fixture".into(),
         owner_epoch: 1,
         credential_epoch: 1,
+        authority_revision: Some(1),
         resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
         manager_os_identity: manager.os_identity().into(),
         manager_process_id: manager.native_process_id().into(),
@@ -275,6 +276,34 @@ fn codex_v2_manifest_accepts_exact_typed_binding_without_launching() {
         b"#!/bin/sh\nexit 0\n"
     );
     assert!(!fixture.root.join("store.sqlite").exists());
+}
+
+#[test]
+fn codex_v2_manifest_requires_positive_revision_and_legacy_omits_field() {
+    let fixture = Fixture::new();
+    let baseline = case(&fixture, &fixture.executable, &fixture.workspace);
+    assert_eq!(baseline.peer.authority_revision, Some(1));
+    for revision in [None, Some(0)] {
+        let mut changed = baseline.clone();
+        changed.peer.authority_revision = revision;
+        changed.peer.binding_digest = changed.peer.digest().unwrap();
+        assert!(
+            changed
+                .peer
+                .validate(&changed.launch, &fixture.root)
+                .is_err()
+        );
+    }
+    let mut legacy_shape = baseline.peer;
+    legacy_shape.protocol = "podbay.peer-binding/1".into();
+    legacy_shape.capability = "synthetic_fixture_only".into();
+    legacy_shape.authority_revision = None;
+    let json = serde_json::to_vec(&legacy_shape).unwrap();
+    assert!(
+        !json
+            .windows(b"authority_revision".len())
+            .any(|window| { window == b"authority_revision" })
+    );
 }
 
 #[test]
