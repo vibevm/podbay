@@ -4,6 +4,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use crate::authority::advance_policy_fence_epoch;
 use crate::bound_launch::{ensure_current_dispatch_eligible, read_bound_record};
 
 use crate::model::{
@@ -14,8 +15,16 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const MAX_BYTES: usize = 1_048_576;
+// A V2 launch gains no policy assertion on migration. Only a future V3
+// atomic admission may insert this row beside its immutable launch binding.
+const LAUNCH_POLICY_FENCES_V20: &str = "CREATE TABLE launch_policy_fences (
+  command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES launch_bindings(command_rowid),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  policy_fence_epoch INTEGER NOT NULL CHECK(policy_fence_epoch>=1),
+  admission_authority_revision INTEGER NOT NULL CHECK(admission_authority_revision>=1)
+) STRICT";
 const CURRENT_SCOPE_SESSIONS_INDEX_V19: &str = "CREATE INDEX runtime_sessions_open_scope_v19
   ON runtime_sessions(scope_id,session_id) WHERE state='open'";
 const CURRENT_SCOPE_RESOURCES_INDEX_V19: &str = "CREATE INDEX authority_resources_pod_v19
@@ -306,6 +315,7 @@ impl PodBayStore {
         verify_actor_verifier_schema(&transaction)?;
         verify_owner_rotation_schema(&transaction)?;
         verify_current_scope_schema(&transaction)?;
+        verify_policy_fence_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -739,7 +749,9 @@ impl PodBayStore {
                 |row| row.get(0),
             )?;
             if occupied != 0 {
-                return Err(StoreError::Conflict("v18 bootstrap schema name already exists"));
+                return Err(StoreError::Conflict(
+                    "v18 bootstrap schema name already exists",
+                ));
             }
             transaction.execute_batch(&format!("{CODEX_BOOTSTRAP_SENDS_V18};"))?;
         }
@@ -773,6 +785,71 @@ impl PodBayStore {
                 }
             }
         }
+        if version < 20 {
+            verify_runtime_schema(&transaction)?;
+            let policy: Option<i64> = transaction
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let table: Option<String> = transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='launch_policy_fences'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match (policy, table.as_deref()) {
+                (None, None) => {
+                    let changed = transaction.execute(
+                        "INSERT INTO metadata(key,value)
+                         SELECT 'policy_fence_epoch',MAX(1,value)
+                         FROM metadata WHERE key='authority_revision'",
+                        [],
+                    )?;
+                    if changed != 1 {
+                        return Err(StoreError::Conflict("v20 policy epoch source is missing"));
+                    }
+                    transaction.execute_batch(&format!("{LAUNCH_POLICY_FENCES_V20};"))?;
+                }
+                (Some(value), Some(sql)) if value >= 1 && sql == LAUNCH_POLICY_FENCES_V20 => {
+                    // Exact already-installed schema can survive a synthetic
+                    // old-version fixture, but it cannot carry V3 policy
+                    // evidence under an old user_version or lower the fence
+                    // below the old global revision's migration floor.
+                    let rows: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM launch_policy_fences",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if rows != 0 {
+                        return Err(StoreError::Conflict(
+                            "v20 policy rows exist under an older schema version",
+                        ));
+                    }
+                    let revision: i64 = transaction.query_row(
+                        "SELECT value FROM metadata WHERE key='authority_revision'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let floor = revision.max(1);
+                    if value < floor {
+                        transaction.execute(
+                            "UPDATE metadata SET value=?1
+                             WHERE key='policy_fence_epoch' AND value=?2",
+                            params![floor, value],
+                        )?;
+                    }
+                }
+                _ => {
+                    return Err(StoreError::Conflict(
+                        "v20 policy fence schema name already exists",
+                    ));
+                }
+            }
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
@@ -784,6 +861,7 @@ impl PodBayStore {
         verify_actor_verifier_schema(&transaction)?;
         verify_owner_rotation_schema(&transaction)?;
         verify_current_scope_schema(&transaction)?;
+        verify_policy_fence_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -806,6 +884,21 @@ impl PodBayStore {
         Ok(value as u64)
     }
 
+    /// Positive policy invalidation fence, independent of the global
+    /// authority write/CAS revision. No V2 manifest may reinterpret this as
+    /// its historical `authority_revision`.
+    pub fn policy_fence_epoch(&self) -> Result<u64, StoreError> {
+        let value: i64 = self.connection.query_row(
+            "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(StoreError::Conflict("v20 policy fence epoch is invalid"))
+    }
+
     pub fn advance_owner_epoch(&mut self, expected: u64, next: u64) -> Result<(), StoreError> {
         let (expected, next) = successive_epochs(expected, next)?;
         let transaction = self
@@ -818,6 +911,9 @@ impl PodBayStore {
         if changed != 1 {
             return Err(StoreError::StaleEpoch);
         }
+        // This legacy owner transition has no v10 manager claim, but it must
+        // still invalidate every policy-bound future launch.
+        advance_policy_fence_epoch(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2493,7 +2589,9 @@ fn verify_writer_lease_schema(transaction: &rusqlite::Transaction<'_>) -> Result
     Ok(())
 }
 
-fn verify_codex_bootstrap_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+fn verify_codex_bootstrap_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
     let actual: Option<String> = transaction
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='codex_bootstrap_sends'",
@@ -2554,6 +2652,34 @@ fn verify_current_scope_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v19 current scope index differs"));
         }
+    }
+    Ok(())
+}
+
+fn verify_policy_fence_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='launch_policy_fences'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(LAUNCH_POLICY_FENCES_V20) {
+        return Err(StoreError::Conflict(
+            "v20 launch policy fence schema differs",
+        ));
+    }
+    let epoch: Option<i64> = transaction
+        .query_row(
+            "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if epoch.is_none_or(|value| value < 1) {
+        return Err(StoreError::Conflict(
+            "v20 policy fence epoch is absent or invalid",
+        ));
     }
     Ok(())
 }

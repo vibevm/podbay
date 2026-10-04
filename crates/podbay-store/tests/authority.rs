@@ -660,7 +660,7 @@ fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!((version, count), (18, 0));
+    assert_eq!((version, count), (20, 0));
 }
 
 #[test]
@@ -1028,6 +1028,7 @@ fn owner_rotation_commits_actor_verifier_revocation_and_idempotent_receipt_toget
     let fixture = Fixture::new();
     let mut store = PodBayStore::open(&fixture.database).unwrap();
     let (old, revision, lineage) = seed_owner(&mut store);
+    let before_policy = store.policy_fence_epoch().unwrap();
     let proof = owner_rotation(&old, revision, &lineage);
     let witness = SqliteActorVerifierWitness::for_actor(
         &fixture.database,
@@ -1044,6 +1045,7 @@ fn owner_rotation_commits_actor_verifier_revocation_and_idempotent_receipt_toget
     assert_eq!(receipt.prior_generation, 1);
     assert_eq!(receipt.next_generation, 2);
     assert_eq!(receipt.authority_revision, revision + 1);
+    assert_eq!(store.policy_fence_epoch().unwrap(), before_policy + 1);
     assert_eq!(receipt.intent_digest.len(), 64);
     assert!(!witness.is_current());
     assert_eq!(
@@ -1073,6 +1075,7 @@ fn owner_rotation_commits_actor_verifier_revocation_and_idempotent_receipt_toget
         store.rotate_owner_actor_from_trusted_host(&proof).unwrap(),
         receipt
     );
+    assert_eq!(store.policy_fence_epoch().unwrap(), before_policy + 1);
     assert_eq!(
         store.authority_snapshot().unwrap().revision,
         receipt.authority_revision
@@ -1097,6 +1100,7 @@ fn owner_rotation_commits_actor_verifier_revocation_and_idempotent_receipt_toget
         reopened.authority_snapshot().unwrap().actors,
         vec![proof.next_actor]
     );
+    assert_eq!(reopened.policy_fence_epoch().unwrap(), before_policy + 1);
 }
 
 #[test]
@@ -1179,6 +1183,7 @@ fn owner_rotation_faults_roll_back_actor_verifier_revision_and_receipt() {
         let fixture = Fixture::new();
         let mut store = PodBayStore::open(&fixture.database).unwrap();
         let (old, revision, lineage) = seed_owner(&mut store);
+        let before_policy = store.policy_fence_epoch().unwrap();
         let proof = owner_rotation(&old, revision, &lineage);
         let connection = rusqlite::Connection::open(&fixture.database).unwrap();
         connection.execute_batch(trigger).unwrap();
@@ -1190,6 +1195,7 @@ fn owner_rotation_faults_roll_back_actor_verifier_revision_and_receipt() {
             vec![old.clone()]
         );
         assert_eq!(reopened.authority_snapshot().unwrap().revision, revision);
+        assert_eq!(reopened.policy_fence_epoch().unwrap(), before_policy);
         assert_eq!(
             reopened.current_actor_verifier(1, revision, &old).unwrap(),
             [7; 32]

@@ -1685,7 +1685,60 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
+}
+
+#[test]
+fn v19_to_v20_keeps_historical_v2_binding_without_inventing_policy_fence() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let before = store
+        .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str())
+        .unwrap();
+    let revision = store.authority_snapshot().unwrap().revision;
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE launch_policy_fences;
+         DELETE FROM metadata WHERE key='policy_fence_epoch';
+         PRAGMA user_version=19;",
+        )
+        .unwrap();
+    drop(connection);
+    let mut reopened = fixture.open();
+    assert_eq!(reopened.policy_fence_epoch().unwrap(), revision.max(1));
+    assert_eq!(
+        reopened
+            .inspect_native_writer_lease(&target)
+            .unwrap()
+            .writer_epoch(),
+        writer_epoch
+    );
+    assert_eq!(
+        reopened
+            .current_manager_credential_claim(1)
+            .unwrap()
+            .credential_epoch(),
+        manager_credential
+    );
+    assert_eq!(
+        reopened
+            .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str(),)
+            .unwrap()
+            .launch(),
+        before.launch()
+    );
+    let count: i64 = rusqlite::Connection::open(&fixture.database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM launch_policy_fences", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "migration may not invent V3 policy evidence for a V2 launch"
+    );
 }
 
 #[test]
