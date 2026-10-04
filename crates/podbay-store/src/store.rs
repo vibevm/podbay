@@ -15,8 +15,38 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const MAX_BYTES: usize = 1_048_576;
+// Later turns are admitted only by a future authenticated host. Migration
+// creates no native thread anchor, command, or evidence of provider input.
+const CODEX_LATER_TURNS_V22: &str = "CREATE TABLE codex_later_turns (
+  command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
+  bootstrap_command_rowid INTEGER NOT NULL REFERENCES codex_bootstrap_sends(command_rowid),
+  store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL REFERENCES runtime_sessions(session_id),
+  session_revision INTEGER NOT NULL CHECK(session_revision>=1),
+  run_id TEXT NOT NULL CHECK(length(run_id)>0),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id)>0),
+  pod_id TEXT NOT NULL CHECK(length(pod_id)>0),
+  pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  resource_epoch INTEGER NOT NULL CHECK(resource_epoch>=1),
+  resource_input_epoch INTEGER NOT NULL CHECK(resource_input_epoch>=1),
+  native_thread_id TEXT NOT NULL CHECK(length(native_thread_id) BETWEEN 1 AND 256),
+  holder_actor_id TEXT NOT NULL CHECK(length(holder_actor_id)>0),
+  holder_credential_generation INTEGER NOT NULL CHECK(holder_credential_generation>=1),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  manager_credential_epoch INTEGER NOT NULL CHECK(manager_credential_epoch>=1),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision>=1),
+  writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
+  lease_expires_at_unix_seconds INTEGER NOT NULL CHECK(lease_expires_at_unix_seconds>=1),
+  wire_payload_digest TEXT NOT NULL CHECK(length(wire_payload_digest)=64),
+  prompt_digest TEXT NOT NULL CHECK(length(prompt_digest)=64),
+  binding_digest TEXT NOT NULL CHECK(length(binding_digest)=64)
+) STRICT";
+const CODEX_LATER_TURNS_SESSION_V22: &str = "CREATE INDEX codex_later_turns_session_v22
+  ON codex_later_turns(session_id,command_rowid)";
 // A V2 launch gains no policy assertion on migration. Only a future V3
 // atomic admission may insert this row beside its immutable launch binding.
 const LAUNCH_POLICY_FENCES_V20: &str = "CREATE TABLE launch_policy_fences (
@@ -380,6 +410,7 @@ impl PodBayStore {
         verify_current_scope_schema(&transaction)?;
         verify_policy_fence_schema(&transaction)?;
         verify_supersession_schema(&transaction)?;
+        verify_codex_later_turn_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -985,6 +1016,35 @@ impl PodBayStore {
                 )),
             }
         }
+        if version < 22 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                 ('codex_later_turns','codex_later_turns_session_v22')",
+                [],
+                |row| row.get(0),
+            )?;
+            match occupied {
+                0 => {
+                    for sql in [CODEX_LATER_TURNS_V22, CODEX_LATER_TURNS_SESSION_V22] {
+                        transaction.execute_batch(&format!("{sql};"))?;
+                    }
+                }
+                2 => {
+                    verify_codex_later_turn_schema(&transaction)?;
+                    let rows: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM codex_later_turns",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if rows != 0 {
+                        return Err(StoreError::Conflict(
+                            "v22 later turn rows exist under an older schema version",
+                        ));
+                    }
+                }
+                _ => return Err(StoreError::Conflict("v22 later turn schema name already exists")),
+            }
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
@@ -998,6 +1058,7 @@ impl PodBayStore {
         verify_current_scope_schema(&transaction)?;
         verify_policy_fence_schema(&transaction)?;
         verify_supersession_schema(&transaction)?;
+        verify_codex_later_turn_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         if matches!(before_version, 19 | 20) {
@@ -2836,6 +2897,31 @@ fn verify_supersession_schema(transaction: &rusqlite::Transaction<'_>) -> Result
         ).optional()?;
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict("v21 supersession schema differs"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_codex_later_turn_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    for (kind, name, expected) in [
+        ("table", "codex_later_turns", CODEX_LATER_TURNS_V22),
+        (
+            "index",
+            "codex_later_turns_session_v22",
+            CODEX_LATER_TURNS_SESSION_V22,
+        ),
+    ] {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(expected) {
+            return Err(StoreError::Conflict("v22 later turn schema differs"));
         }
     }
     Ok(())

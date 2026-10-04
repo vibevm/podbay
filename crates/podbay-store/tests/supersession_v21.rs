@@ -29,7 +29,9 @@ fn downgrade_empty_v21_to_v20(path: &PathBuf) {
     let connection = rusqlite::Connection::open(path).unwrap();
     connection
         .execute_batch(
-            "DROP INDEX rebind_supersession_latest_v21;
+            "DROP INDEX codex_later_turns_session_v22;
+         DROP TABLE codex_later_turns;
+         DROP INDEX rebind_supersession_latest_v21;
          DROP TABLE rebind_supersession_resources;
          DROP TABLE rebind_supersession_attempts;
          PRAGMA user_version=20;",
@@ -38,7 +40,7 @@ fn downgrade_empty_v21_to_v20(path: &PathBuf) {
 }
 
 #[test]
-fn fresh_v21_and_empty_v20_upgrade_create_no_recovery_evidence() {
+fn fresh_v22_and_empty_v20_upgrade_create_no_recovery_evidence() {
     let fixture = Fixture::new();
     drop(PodBayStore::open(&fixture.0).unwrap());
     let read_only = PodBayStore::open_existing_read_only(&fixture.0).unwrap();
@@ -63,7 +65,7 @@ fn fresh_v21_and_empty_v20_upgrade_create_no_recovery_evidence() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!((version, attempts, resources), (21, 0, 0));
+    assert_eq!((version, attempts, resources), (22, 0, 0));
 }
 
 #[test]

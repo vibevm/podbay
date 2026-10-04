@@ -15,6 +15,7 @@ use podbay_store::{
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
     LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
+    TrustedLaterCodexSendRequest,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
 use podbay_wire::{
@@ -1108,7 +1109,8 @@ fn v15_existing_v2_run_migrates_to_default_deny_budget() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
+            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
              DROP TABLE run_child_budgets; PRAGMA user_version=15;",
         )
         .unwrap();
@@ -1484,7 +1486,9 @@ fn v17_writer_lease_schema_is_verified_exactly() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends;
+            "DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends;
              DROP TABLE native_writer_leases;
              CREATE TABLE native_writer_leases(resource_id TEXT PRIMARY KEY) STRICT;",
         )
@@ -1529,7 +1533,8 @@ fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() 
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases; PRAGMA user_version=16;")
+        .execute_batch("DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
+                        DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases; PRAGMA user_version=16;")
         .unwrap();
     drop(connection);
     let mut migrated = fixture.open();
@@ -1980,7 +1985,8 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE codex_bootstrap_sends; PRAGMA user_version=17;")
+        .execute_batch("DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
+                        DROP TABLE codex_bootstrap_sends; PRAGMA user_version=17;")
         .unwrap();
     drop(connection);
     let mut reopened = fixture.open();
@@ -1997,7 +2003,7 @@ fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 21);
+    assert_eq!(version, 22);
 }
 
 #[test]
@@ -2045,7 +2051,7 @@ fn v19_with_historical_v2_refuses_default_migration_without_changing_database() 
 }
 
 #[test]
-fn v19_without_launch_state_upgrades_to_v21_with_empty_policy_and_recovery_rows() {
+fn v19_without_launch_state_upgrades_to_v22_with_empty_policy_and_recovery_rows() {
     let fixture = Fixture::new();
     drop(fixture.open());
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
@@ -2063,7 +2069,7 @@ fn v19_without_launch_state_upgrades_to_v21_with_empty_policy_and_recovery_rows(
     let rows: i64 = connection.query_row(
         "SELECT COUNT(*) FROM launch_policy_fences", [], |row| row.get(0),
     ).unwrap();
-    assert_eq!((version, rows), (21, 0));
+    assert_eq!((version, rows), (22, 0));
 }
 
 #[test]
@@ -2073,7 +2079,9 @@ fn v18_bootstrap_schema_is_verified_exactly() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE codex_bootstrap_sends;
+            "DROP INDEX codex_later_turns_session_v22;
+             DROP TABLE codex_later_turns;
+             DROP TABLE codex_bootstrap_sends;
          CREATE TABLE codex_bootstrap_sends(command_rowid INTEGER PRIMARY KEY) STRICT;",
         )
         .unwrap();
@@ -2202,4 +2210,325 @@ fn v18_bootstrap_rejects_artifact_and_steering_before_admission() {
         })
         .unwrap();
     assert_eq!(count, 0);
+}
+
+fn later_ready(
+    fixture: &Fixture,
+    v3: bool,
+) -> (PodBayStore, NativeWriterTarget, u64, u64, CommandId) {
+    let (mut store, target, manager_credential, writer_epoch) =
+        bootstrap_ready_for_format(fixture, v3);
+    let (_, revision) = store
+        .current_native_writer_target_for_session(&target.scope_id, &target.session_id)
+        .unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.bootstrap", "request.v22.bootstrap", "First turn", revision, writer_epoch,
+    );
+    let request = bootstrap_request(&mut store, target.clone(), manager_credential, &envelope);
+    let receipt = match store.admit_bootstrap_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected bootstrap intent: {other:?}"),
+    };
+    let bootstrap_id = CommandId::try_from(receipt.command_id.as_str()).unwrap();
+    let selector = BootstrapSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: bootstrap_id.clone(),
+        native_target: target.clone(),
+    };
+    assert_eq!(store.claim_bootstrap_send(&selector).unwrap(), EffectClaim::NewClaim);
+    (store, target, manager_credential, writer_epoch, bootstrap_id)
+}
+
+fn later_request<'a>(
+    store: &mut PodBayStore,
+    target: NativeWriterTarget,
+    manager_credential: u64,
+    bootstrap_command_id: CommandId,
+    native_thread_id: &'a str,
+    envelope: &'a CommandEnvelope,
+) -> TrustedLaterCodexSendRequest<'a> {
+    TrustedLaterCodexSendRequest {
+        principal: VerifiedPrincipal::from_authenticated_boundary("actor.codex.fixture").unwrap(),
+        scope_id: target.scope_id.clone(), envelope, native_target: target,
+        bootstrap_command_id, native_thread_id,
+        holder_actor_id: ActorId::try_from("actor.codex.fixture").unwrap(),
+        holder_credential_generation: 1, expected_owner_epoch: 1,
+        expected_manager_credential_epoch: manager_credential,
+        expected_authority_revision: store.authority_snapshot().unwrap().revision,
+    }
+}
+
+#[test]
+fn v22_later_turn_admits_exact_intent_and_reopens_without_provider_effect() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, false);
+    let (_, revision) = store
+        .current_native_writer_target_for_session(&target.scope_id, &target.session_id)
+        .unwrap();
+    let thread_id = "0199a0c8-ced1-7df2-8d90-000000000001";
+    let envelope = bootstrap_envelope(
+        "key.v22.turn.one", "request.v22.turn.one", "Second turn", revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), thread_id, &envelope);
+    let receipt = match store.admit_later_codex_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected later turn intent: {other:?}"),
+    };
+    let command_id = CommandId::try_from(receipt.command_id.as_str()).unwrap();
+    let record = store.inspect_later_codex_send(
+        &request.principal, &target.scope_id, &command_id,
+    ).unwrap();
+    assert_eq!(record.receipt(), &receipt);
+    assert_eq!(record.native_target(), &target);
+    assert_eq!(record.bootstrap_command_id(), &bootstrap_id);
+    assert_eq!(record.native_thread_id(), thread_id);
+    assert_eq!(record.prompt_text(), "Second turn");
+    assert_eq!(record.effect_state(), podbay_store::EffectState::Prepared);
+    assert_eq!(store.effect_state(receipt.outbox_id).unwrap(), podbay_store::EffectState::Prepared);
+    assert_eq!(store.lookup_later_codex_send_by_key(
+        &request.principal, &target.scope_id, &envelope, &bootstrap_id, thread_id,
+    ).unwrap(), Some(record.clone()));
+    drop(store);
+    let mut reopened = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(reopened.inspect_later_codex_send(
+        &request.principal, &target.scope_id, &command_id,
+    ).unwrap(), record);
+}
+
+#[test]
+fn v22_later_turn_duplicate_precedes_mutable_fences_but_changed_digest_conflicts() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, false);
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.duplicate", "request.v22.original", "Second turn", revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.one", &envelope);
+    let receipt = match store.admit_later_codex_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected later turn intent: {other:?}"),
+    };
+    let retry = bootstrap_envelope(
+        "key.v22.duplicate", "request.v22.retry", "Second turn", revision, writer_epoch,
+    );
+    let mut duplicate = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.one", &retry);
+    duplicate.expected_authority_revision = 0;
+    assert_eq!(store.admit_later_codex_send(&duplicate).unwrap(), Admission::Duplicate(receipt.clone()));
+    let changed = bootstrap_envelope(
+        "key.v22.duplicate", "request.v22.changed", "Changed turn", revision, writer_epoch,
+    );
+    let changed_request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.one", &changed);
+    assert!(matches!(store.admit_later_codex_send(&changed_request),
+        Err(StoreError::Conflict("later turn key changed canonical payload"))));
+    let wrong_thread = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.other", &retry);
+    assert!(matches!(store.admit_later_codex_send(&wrong_thread),
+        Err(StoreError::Conflict("later turn key changed canonical payload"))));
+    let second = bootstrap_envelope(
+        "key.v22.turn.two", "request.v22.turn.two", "Third turn", revision, writer_epoch,
+    );
+    let second_request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.one", &second);
+    assert!(matches!(store.admit_later_codex_send(&second_request), Ok(Admission::Committed(_))));
+    let changed_anchor = bootstrap_envelope(
+        "key.v22.turn.three", "request.v22.turn.three", "Fourth turn", revision, writer_epoch,
+    );
+    let changed_anchor_request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id, "thread.v22.other", &changed_anchor);
+    assert!(matches!(store.admit_later_codex_send(&changed_anchor_request),
+        Err(StoreError::Conflict("later turn native thread anchor differs"))));
+    let foreign = VerifiedPrincipal::from_authenticated_boundary("actor.foreign.fixture").unwrap();
+    assert!(matches!(store.inspect_later_codex_send(&foreign, &target.scope_id,
+        &CommandId::try_from(receipt.command_id.as_str()).unwrap()), Err(StoreError::NotFound)));
+    let mut foreign_scope = later_request(&mut store, target.clone(), manager_credential,
+        CommandId::try_from("command.v22.bootstrap.foreign").unwrap(),
+        "thread.v22.one", &retry);
+    foreign_scope.scope_id = ScopeId::try_from("scope.foreign").unwrap();
+    foreign_scope.native_target.scope_id = foreign_scope.scope_id.clone();
+    assert!(matches!(store.admit_later_codex_send(&foreign_scope), Err(StoreError::NotFound)));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let rows: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn v22_later_turn_requires_current_writer_bootstrap_anchor_and_when_idle() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, true);
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.fence", "request.v22.fence", "Second turn", revision, writer_epoch,
+    );
+    let mut wrong_bootstrap = later_request(&mut store, target.clone(), manager_credential,
+        CommandId::try_from("command.not.bootstrap").unwrap(), "thread.v22.one", &envelope);
+    assert!(matches!(store.admit_later_codex_send(&wrong_bootstrap), Err(StoreError::NotFound)));
+    wrong_bootstrap.bootstrap_command_id = bootstrap_id.clone();
+    wrong_bootstrap.expected_authority_revision += 1;
+    assert!(matches!(store.admit_later_codex_send(&wrong_bootstrap), Err(StoreError::StaleEpoch)));
+    let mut stale_writer = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.one", &envelope);
+    stale_writer.envelope = &envelope;
+    stale_writer.holder_credential_generation += 1;
+    assert!(matches!(store.admit_later_codex_send(&stale_writer), Err(StoreError::StaleEpoch)));
+    let mut steer = envelope.clone();
+    steer.body = CommandBody::SessionSend(SessionSendBody {
+        content: vec![ContentBlock::Text { text: "Second turn".into() }],
+        policy: SendPolicy::Steer { expected_interval_id: "interval.fixture".into() },
+    });
+    let steer_request = later_request(&mut store, target, manager_credential,
+        bootstrap_id, "thread.v22.one", &steer);
+    assert!(matches!(store.admit_later_codex_send(&steer_request), Err(StoreError::InvalidInput(_))));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let rows: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn v22_v3_later_turn_requires_current_policy_fence() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, true);
+    let policy_epoch = store.policy_fence_epoch().unwrap();
+    let revision = store.authority_snapshot().unwrap().revision;
+    let revision = store.apply_authority_mutation(1, revision,
+        AuthorityMutation::PutGrant(AuthorityGrantRecord {
+            grant_id: 17, scope_id: "scope.launch".into(),
+            actor_id: "actor.codex.other".into(), credential_generation: 1,
+            mode: "controller".into(), remaining_delegation_depth: 0,
+            rights: vec![AuthorityRightRecord {
+                operation: "launch_pod".into(), target_kind: "scope".into(),
+                target_id: "scope.launch".into(),
+            }],
+        }),
+    ).unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch);
+    let (_, session_revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.policy.additive", "request.v22.policy.additive", "Second turn",
+        session_revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id.clone(), "thread.v22.policy", &envelope);
+    assert_eq!(request.expected_authority_revision, revision);
+    assert!(matches!(store.admit_later_codex_send(&request), Ok(Admission::Committed(_))));
+    store.apply_authority_mutation(1, revision, AuthorityMutation::RevokeGrant(17)).unwrap();
+    assert_eq!(store.policy_fence_epoch().unwrap(), policy_epoch + 1);
+    let after = bootstrap_envelope(
+        "key.v22.policy.revoked", "request.v22.policy.revoked", "Third turn",
+        session_revision, writer_epoch,
+    );
+    let fresh = later_request(&mut store, target, manager_credential,
+        bootstrap_id, "thread.v22.policy", &after);
+    assert!(matches!(store.admit_later_codex_send(&fresh), Err(StoreError::StaleEpoch)));
+}
+
+#[test]
+fn v22_later_turn_refuses_unclaimed_bootstrap_intent() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let first = bootstrap_envelope(
+        "key.v22.unclaimed.bootstrap", "request.v22.unclaimed.bootstrap",
+        "First turn", revision, writer_epoch,
+    );
+    let first_request = bootstrap_request(&mut store, target.clone(), manager_credential, &first);
+    let receipt = match store.admit_bootstrap_send(&first_request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected bootstrap intent: {other:?}"),
+    };
+    let next = bootstrap_envelope(
+        "key.v22.after.unclaimed", "request.v22.after.unclaimed",
+        "Second turn", revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target, manager_credential,
+        CommandId::try_from(receipt.command_id.as_str()).unwrap(), "thread.v22.unclaimed", &next);
+    assert!(matches!(store.admit_later_codex_send(&request),
+        Err(StoreError::Conflict("later turn bootstrap anchor differs"))));
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let turns: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
+    assert_eq!(turns, 0);
+}
+
+#[test]
+fn v21_to_v22_migration_is_additive_and_invents_no_later_turn() {
+    let fixture = Fixture::new();
+    let (store, target, manager_credential, writer_epoch, _) = later_ready(&fixture, false);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "DROP INDEX codex_later_turns_session_v22;
+         DROP TABLE codex_later_turns;
+         PRAGMA user_version=21;",
+    ).unwrap();
+    drop(connection);
+    assert!(matches!(PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::UnsupportedSchema(21))));
+    let mut migrated = fixture.open();
+    let lease = migrated.inspect_native_writer_lease(&target).unwrap();
+    assert_eq!(lease.writer_epoch(), writer_epoch);
+    assert_eq!(lease.manager_credential_epoch(), manager_credential);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let turns: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
+    assert_eq!((version, turns), (22, 0));
+}
+
+#[test]
+fn v22_later_turn_failed_binding_insert_rolls_back_command_event_and_outbox() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, false);
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.rollback", "request.v22.rollback", "Second turn", revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target, manager_credential,
+        bootstrap_id, "thread.v22.one", &envelope);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let count = |table: &str| -> i64 {
+        connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap()
+    };
+    let before = [count("commands"), count("events"), count("outbox"), count("codex_later_turns")];
+    connection.execute_batch(
+        "CREATE TRIGGER fail_later_binding AFTER INSERT ON codex_later_turns
+         BEGIN SELECT RAISE(ABORT,'injected later-turn failure'); END;",
+    ).unwrap();
+    assert!(matches!(store.admit_later_codex_send(&request), Err(StoreError::Storage(_))));
+    let after = [count("commands"), count("events"), count("outbox"), count("codex_later_turns")];
+    assert_eq!(after, before);
+    connection.execute_batch("DROP TRIGGER fail_later_binding").unwrap();
+    assert!(matches!(store.admit_later_codex_send(&request), Ok(Admission::Committed(_))));
+}
+
+#[test]
+fn v22_schema_tamper_refuses_both_open_modes() {
+    let fixture = Fixture::new();
+    drop(fixture.open());
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "DROP INDEX codex_later_turns_session_v22;
+         CREATE INDEX codex_later_turns_session_v22 ON codex_later_turns(resource_id);",
+    ).unwrap();
+    drop(connection);
+    assert!(matches!(PodBayStore::open_existing_read_only(&fixture.database),
+        Err(StoreError::Conflict("v22 later turn schema differs"))));
+    assert!(matches!(PodBayStore::open(&fixture.database),
+        Err(StoreError::Conflict("v22 later turn schema differs"))));
 }

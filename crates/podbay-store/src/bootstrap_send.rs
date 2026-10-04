@@ -242,7 +242,7 @@ fn decode_payload(bytes: &[u8]) -> Result<(String, Option<String>, String), Stor
     Ok((digest, deadline, text))
 }
 
-fn first_text<'a>(
+pub(crate) fn first_text<'a>(
     envelope: &'a CommandEnvelope,
     session_id: &SessionId,
 ) -> Result<&'a str, StoreError> {
@@ -272,7 +272,7 @@ fn first_text<'a>(
     Ok(text)
 }
 
-fn session_revision(
+pub(crate) fn session_revision(
     transaction: &Transaction<'_>,
     target: &NativeWriterTarget,
 ) -> Result<u64, StoreError> {
@@ -294,7 +294,10 @@ fn session_revision(
     )
 }
 
-fn check_deadline(transaction: &Transaction<'_>, deadline: Option<&str>) -> Result<(), StoreError> {
+pub(crate) fn check_deadline(
+    transaction: &Transaction<'_>,
+    deadline: Option<&str>,
+) -> Result<(), StoreError> {
     let Some(deadline) = deadline else {
         return Ok(());
     };
@@ -313,7 +316,7 @@ fn check_deadline(transaction: &Transaction<'_>, deadline: Option<&str>) -> Resu
     Ok(())
 }
 
-fn check_host_accepted_launch(
+pub(crate) fn check_host_accepted_launch(
     transaction: &Transaction<'_>,
     target: &NativeWriterTarget,
     owner_epoch: u64,
@@ -795,7 +798,7 @@ impl PodBayStore {
     }
 }
 
-fn read_bootstrap_record(
+pub(crate) fn read_bootstrap_record(
     transaction: &Transaction<'_>,
     rowid: i64,
 ) -> Result<BootstrapSendRecord, StoreError> {
