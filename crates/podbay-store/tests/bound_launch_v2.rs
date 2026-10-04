@@ -14,7 +14,7 @@ use podbay_store::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
     LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
-    NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
+    LaterCodexSendSelector, NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
     TrustedLaterCodexSendRequest,
     TrustedNativeWriterLeaseRequest, VerifiedPrincipal,
 };
@@ -2462,6 +2462,83 @@ fn v22_later_turn_refuses_unclaimed_bootstrap_intent() {
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     let turns: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
     assert_eq!(turns, 0);
+}
+
+#[test]
+fn v22_later_turn_claim_once_survives_lost_reply_and_reopen() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, false);
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.claim", "request.v22.claim", "Second turn", revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id, "thread.v22.claim", &envelope);
+    let receipt = match store.admit_later_codex_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected later-turn intent: {other:?}"),
+    };
+    let selector = LaterCodexSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target.clone(),
+    };
+    assert!(matches!(store.inspect_claimed_later_codex_send(&selector), Err(StoreError::Conflict(_))));
+    assert_eq!(store.claim_later_codex_send(&selector).unwrap(), EffectClaim::NewClaim);
+    let claimed = store.inspect_claimed_later_codex_send(&selector).unwrap();
+    assert_eq!(claimed.receipt(), &receipt);
+    assert_eq!(claimed.prompt_text(), "Second turn");
+    assert_eq!(claimed.effect_state(), podbay_store::EffectState::ClaimedUncertain);
+    assert_eq!(store.claim_later_codex_send(&selector).unwrap(), EffectClaim::ExistingUncertain);
+    drop(store);
+    let mut reopened = fixture.open();
+    assert_eq!(reopened.claim_later_codex_send(&selector).unwrap(), EffectClaim::ExistingUncertain);
+    assert_eq!(reopened.inspect_claimed_later_codex_send(&selector).unwrap(), claimed);
+    let retry = bootstrap_envelope(
+        "key.v22.claim", "request.v22.claim.retry", "Second turn", revision, writer_epoch,
+    );
+    let duplicate = later_request(&mut reopened, target, manager_credential,
+        claimed.bootstrap_command_id().clone(), "thread.v22.claim", &retry);
+    assert_eq!(reopened.admit_later_codex_send(&duplicate).unwrap(), Admission::Duplicate(receipt));
+}
+
+#[test]
+fn v22_later_turn_claim_refuses_authority_drift_after_admission() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =
+        later_ready(&fixture, true);
+    let (_, session_revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = bootstrap_envelope(
+        "key.v22.claim.stale", "request.v22.claim.stale", "Second turn",
+        session_revision, writer_epoch,
+    );
+    let request = later_request(&mut store, target.clone(), manager_credential,
+        bootstrap_id, "thread.v22.claim.stale", &envelope);
+    let receipt = match store.admit_later_codex_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected later-turn intent: {other:?}"),
+    };
+    let selector = LaterCodexSendSelector {
+        scope_id: target.scope_id.clone(),
+        command_id: CommandId::try_from(receipt.command_id.as_str()).unwrap(),
+        native_target: target,
+    };
+    let revision = store.authority_snapshot().unwrap().revision;
+    store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(AuthorityGrantRecord {
+        grant_id: 17, scope_id: "scope.launch".into(), actor_id: "actor.codex.other".into(),
+        credential_generation: 1, mode: "controller".into(), remaining_delegation_depth: 0,
+        rights: vec![AuthorityRightRecord {
+            operation: "launch_pod".into(), target_kind: "scope".into(),
+            target_id: "scope.launch".into(),
+        }],
+    })).unwrap();
+    assert!(matches!(store.claim_later_codex_send(&selector), Err(StoreError::StaleEpoch)));
+    assert_eq!(store.effect_state(receipt.outbox_id).unwrap(), podbay_store::EffectState::Prepared);
 }
 
 #[test]

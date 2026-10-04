@@ -12,7 +12,7 @@ use crate::bootstrap_send::{
     check_deadline, check_host_accepted_launch, first_text, read_bootstrap_record, session_revision,
 };
 use crate::model::{
-    Admission, CommandRequest, EffectState, NativeWriterTarget, Receipt, StoreError,
+    Admission, CommandRequest, EffectClaim, EffectState, NativeWriterTarget, Receipt, StoreError,
     VerifiedPrincipal, DIGEST_VERSION,
 };
 use crate::store::{
@@ -45,6 +45,15 @@ pub struct TrustedLaterCodexSendRequest<'a> {
     pub expected_authority_revision: u64,
 }
 
+/// Selector only. The socket request must carry these identities and writer
+/// epoch, never prompt bytes or a self-asserted writer permit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaterCodexSendSelector {
+    pub scope_id: ScopeId,
+    pub command_id: CommandId,
+    pub native_target: NativeWriterTarget,
+}
+
 /// Protected committed input and its original fences. `receipt` acknowledges
 /// only fsynced intent; it does not mean a provider accepted or ran a turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +75,8 @@ pub struct LaterCodexSendRecord {
     prompt_text: String,
     deadline_at: Option<String>,
     effect_state: EffectState,
+    claim_key: Option<String>,
+    claim_owner_epoch: Option<u64>,
 }
 
 impl LaterCodexSendRecord {
@@ -904,9 +915,6 @@ fn read_later_record(
         || outbox.4 != EFFECT_KIND
         || outbox.5 != canonical
         || outbox.6 != sha256_hex(&outbox.5)
-        || outbox.7 != "prepared"
-        || outbox.8.is_some()
-        || outbox.9.is_some()
         || outbox.10.is_some()
         || outbox.11.is_some()
         || outbox.12.is_some()
@@ -916,6 +924,16 @@ fn read_later_record(
             "later turn outbox differs from command",
         ));
     }
+    let effect_state = match outbox.7.as_str() {
+        "prepared" if outbox.8.is_none() && outbox.9.is_none() => EffectState::Prepared,
+        "claimed_uncertain"
+            if outbox.8.as_deref() == Some(format!("claim.{command_id}").as_str())
+                && outbox.9 == Some(command_owner) =>
+        {
+            EffectState::ClaimedUncertain
+        }
+        _ => return Err(StoreError::Conflict("later turn outbox stage is malformed")),
+    };
     let event: Option<(
         String,
         Vec<u8>,
@@ -1014,6 +1032,140 @@ fn read_later_record(
         wire_payload_digest: wire_digest,
         prompt_text: text,
         deadline_at: deadline,
-        effect_state: EffectState::Prepared,
+        effect_state,
+        claim_key: outbox.8,
+        claim_owner_epoch: outbox.9.map(|value| value as u64),
     })
+}
+
+fn selected_record(
+    transaction: &Transaction<'_>,
+    selector: &LaterCodexSendSelector,
+) -> Result<(i64, LaterCodexSendRecord), StoreError> {
+    let rowid: Option<i64> = transaction
+        .query_row(
+            "SELECT command_rowid FROM commands WHERE command_id=?1 AND scope_id=?2
+         AND namespace=?3",
+            params![
+                selector.command_id.as_str(),
+                selector.scope_id.as_str(),
+                NAMESPACE
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let rowid = rowid.ok_or(StoreError::NotFound)?;
+    let record = read_later_record(transaction, rowid)?;
+    if record.scope_id != selector.scope_id {
+        return Err(StoreError::NotFound);
+    }
+    if record.native_target != selector.native_target {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok((rowid, record))
+}
+
+fn check_current_record(
+    transaction: &Transaction<'_>,
+    lineage: &str,
+    record: &LaterCodexSendRecord,
+) -> Result<(), StoreError> {
+    // The command was admitted at one exact authority revision. A changed
+    // grant or profile after admission cannot inherit its Prepared claim.
+    let current_revision: i64 = transaction.query_row(
+        "SELECT value FROM metadata WHERE key='authority_revision'",
+        [],
+        |row| row.get(0),
+    )?;
+    if current_revision != integer(record.authority_revision)? {
+        return Err(StoreError::StaleEpoch);
+    }
+    let lease = checked_native_writer_lease(
+        transaction,
+        lineage,
+        &record.native_target,
+        &record.holder_actor_id,
+        record.holder_credential_generation,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+        record.authority_revision,
+        record.writer_epoch,
+    )?;
+    if lease.expires_at_unix_seconds() != record.lease_expires_at_unix_seconds
+        || session_revision(transaction, &record.native_target)? != record.session_revision
+    {
+        return Err(StoreError::StaleEpoch);
+    }
+    check_deadline(transaction, record.deadline_at.as_deref())?;
+    check_host_accepted_launch(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+    )
+}
+
+impl PodBayStore {
+    /// CAS-claim before any pod/native call. A prior claim is uncertainty,
+    /// never permission to replay. The host must separately reauthenticate
+    /// the actor/grant and attest a live pod plus journal idle proof.
+    pub fn claim_later_codex_send(
+        &mut self,
+        selector: &LaterCodexSendSelector,
+    ) -> Result<EffectClaim, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, record) = selected_record(&transaction, selector)?;
+        let claim_key = format!("claim.{}", record.receipt.command_id);
+        if record.effect_state != EffectState::Prepared {
+            if record.claim_key.as_deref() != Some(claim_key.as_str())
+                || record.claim_owner_epoch != Some(record.owner_epoch)
+            {
+                return Err(StoreError::Conflict("later turn claim identity differs"));
+            }
+            return Ok(EffectClaim::ExistingUncertain);
+        }
+        check_current_record(&transaction, &self.store_lineage, &record)?;
+        let changed = transaction.execute(
+            "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
+             WHERE outbox_id=?3 AND state='prepared' AND kind=?4",
+            params![
+                claim_key,
+                integer(record.owner_epoch)?,
+                record.receipt.outbox_id,
+                EFFECT_KIND
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        transaction.commit()?;
+        Ok(EffectClaim::NewClaim)
+    }
+
+    /// Exact same-snapshot claimed input for an authenticated pod boundary.
+    /// This exposes protected prompt bytes only after a typed claim and fresh
+    /// durable fences; it cannot prove the connected manager or native child.
+    pub fn inspect_claimed_later_codex_send(
+        &mut self,
+        selector: &LaterCodexSendSelector,
+    ) -> Result<LaterCodexSendRecord, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (_, record) = selected_record(&transaction, selector)?;
+        if record.effect_state != EffectState::ClaimedUncertain
+            || record.claim_key.as_deref()
+                != Some(format!("claim.{}", record.receipt.command_id).as_str())
+            || record.claim_owner_epoch != Some(record.owner_epoch)
+        {
+            return Err(StoreError::Conflict(
+                "later turn has no current claimed effect",
+            ));
+        }
+        check_current_record(&transaction, &self.store_lineage, &record)?;
+        transaction.commit()?;
+        Ok(record)
+    }
 }

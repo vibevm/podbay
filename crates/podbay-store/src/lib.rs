@@ -26,7 +26,7 @@ pub use bound_launch::{
     CurrentLaunchPolicyFence, RunChildBudget,
 };
 pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
-pub use later_turn::{LaterCodexSendRecord, TrustedLaterCodexSendRequest};
+pub use later_turn::{LaterCodexSendRecord, LaterCodexSendSelector, TrustedLaterCodexSendRequest};
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
