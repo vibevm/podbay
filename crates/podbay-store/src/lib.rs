@@ -24,8 +24,9 @@ pub use model::{
     EffectClaim, EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
     HostObservedPriorCheckpoint, LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding,
     LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
-    ObservedStage, QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder,
-    StoreError, StoredEffect, VerifiedPrincipal,
+    ObservedStage, OwnerActorRotationReceipt, QuarantinedSourceEvent, Receipt, ScopeSnapshot,
+    SourceAnomaly, SourceOrder, StoreError, StoredEffect, TrustedOwnerRotationProof,
+    VerifiedPrincipal,
 };
 pub use peer_witness::SqliteOwnerEpochWitness;
 pub use rebind::{

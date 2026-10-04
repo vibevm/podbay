@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::model::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
     AuthorityResourceRecord, AuthorityRightRecord, AuthoritySnapshot, ManagerCredentialClaim,
-    StoreError,
+    OwnerActorRotationReceipt, StoreError, TrustedOwnerRotationProof,
 };
 use crate::store::PodBayStore;
 
@@ -402,6 +402,187 @@ impl PodBayStore {
         Ok(public_key)
     }
 
+    /// Atomically replaces one exact owner-cli birth and public verifier.
+    /// `proof` is only a forgeable trusted-host DTO: the caller must already
+    /// have verified kernel peer evidence, rotation authorization, and new-key
+    /// possession. This store method neither authenticates a process nor
+    /// issues grants or revokes independent input leases.
+    pub fn rotate_owner_actor_from_trusted_host(
+        &mut self,
+        proof: &TrustedOwnerRotationProof,
+    ) -> Result<OwnerActorRotationReceipt, StoreError> {
+        validate_owner_rotation(proof, &self.store_lineage)?;
+        let prior_digest = actor_binding_digest(&proof.expected_actor);
+        let next_digest = actor_binding_digest(&proof.next_actor);
+        let intent_digest = owner_rotation_intent_digest(proof, &prior_digest, &next_digest);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Resolve an already committed key before testing stale guards. A
+        // lost ACK may be queried using the exact original intent.
+        let prior: Option<(
+            String,
+            u64,
+            u64,
+            u64,
+            u64,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+        )> = transaction
+            .query_row(
+                "SELECT intent_digest,prior_generation,next_generation,owner_epoch,
+                            authority_revision,prior_binding_digest,prior_public_key,
+                            next_binding_digest,next_public_key,prior_revoked
+                     FROM owner_actor_rotations
+                     WHERE scope_id=?1 AND actor_id=?2 AND rotation_key=?3",
+                params![
+                    proof.expected_actor.scope_id,
+                    proof.expected_actor.actor_id,
+                    proof.rotation_key,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, i64>(4)? as u64,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((
+            digest,
+            old,
+            next,
+            owner,
+            revision,
+            old_binding,
+            old_key,
+            new_binding,
+            new_key,
+            revoked,
+        )) = prior
+        {
+            let expected_receipt_revision = proof
+                .expected_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidInput("authority revision exhausted"))?;
+            if digest != intent_digest
+                || old != proof.expected_actor.credential_generation
+                || next != proof.next_actor.credential_generation
+                || owner != proof.expected_owner_epoch
+                || revision != expected_receipt_revision
+                || old_binding != prior_digest
+                || old_key != proof.expected_public_key
+                || new_binding != next_digest
+                || new_key != proof.next_public_key
+                || revoked != 1
+            {
+                return Err(StoreError::Conflict("owner rotation key changed intent"));
+            }
+            transaction.commit()?;
+            return Ok(owner_rotation_receipt(proof, digest, revision));
+        }
+
+        require_current_actor(
+            &transaction,
+            proof.expected_owner_epoch,
+            proof.expected_revision,
+            &proof.expected_actor,
+        )?;
+        let verifier = require_matching_verifier(&transaction, &proof.expected_actor)?;
+        if verifier.revoked || verifier.public_key != proof.expected_public_key {
+            return Err(StoreError::Conflict("old owner verifier is not current"));
+        }
+        let reused: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM owner_actor_rotations
+             WHERE actor_id=?1 AND (prior_public_key=?2 OR next_public_key=?2)",
+            params![
+                proof.expected_actor.actor_id,
+                proof.next_public_key.as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        if reused != 0 {
+            return Err(StoreError::Conflict("owner verifier key was reused"));
+        }
+
+        let changed = transaction.execute(
+            "UPDATE authority_actors SET credential_generation=?1,process_identity=?2,
+                    start_identity=?3,containment_identity=?4
+             WHERE actor_id=?5 AND scope_id=?6 AND origin='owner_cli'
+               AND credential_generation=?7 AND process_identity=?8
+               AND start_identity=?9 AND containment_identity=?10",
+            params![
+                sqlite_integer(proof.next_actor.credential_generation)?,
+                proof.next_actor.process_identity,
+                sqlite_integer(proof.next_actor.start_identity)?,
+                proof.next_actor.containment_identity,
+                proof.expected_actor.actor_id,
+                proof.expected_actor.scope_id,
+                sqlite_integer(proof.expected_actor.credential_generation)?,
+                proof.expected_actor.process_identity,
+                sqlite_integer(proof.expected_actor.start_identity)?,
+                proof.expected_actor.containment_identity,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let changed = transaction.execute(
+            "UPDATE actor_verifiers SET credential_generation=?1,public_key=?2,
+                    binding_digest=?3,revoked=0
+             WHERE actor_id=?4 AND credential_generation=?5 AND public_key=?6
+               AND binding_digest=?7 AND revoked=0",
+            params![
+                sqlite_integer(proof.next_actor.credential_generation)?,
+                proof.next_public_key.as_slice(),
+                next_digest.as_slice(),
+                proof.expected_actor.actor_id,
+                sqlite_integer(proof.expected_actor.credential_generation)?,
+                proof.expected_public_key.as_slice(),
+                prior_digest.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let revision = advance_authority_revision(&transaction, proof.expected_revision)?;
+        transaction.execute(
+            "INSERT INTO owner_actor_rotations(
+               scope_id,actor_id,rotation_key,intent_digest,prior_generation,next_generation,
+               prior_binding_digest,prior_public_key,next_binding_digest,next_public_key,
+               owner_epoch,authority_revision,prior_revoked)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1)",
+            params![
+                proof.expected_actor.scope_id,
+                proof.expected_actor.actor_id,
+                proof.rotation_key,
+                intent_digest,
+                sqlite_integer(proof.expected_actor.credential_generation)?,
+                sqlite_integer(proof.next_actor.credential_generation)?,
+                prior_digest.as_slice(),
+                proof.expected_public_key.as_slice(),
+                next_digest.as_slice(),
+                proof.next_public_key.as_slice(),
+                sqlite_integer(proof.expected_owner_epoch)?,
+                sqlite_integer(revision)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(owner_rotation_receipt(proof, intent_digest, revision))
+    }
+
     /// A new manager fences old command writers and every old input lease atomically.
     pub fn begin_authority_replay(
         &mut self,
@@ -693,6 +874,11 @@ impl PodBayStore {
                 if let Some(prior) = existing {
                     if prior.scope_id != record.scope_id {
                         return Err(StoreError::WrongScope);
+                    }
+                    if prior.origin == "owner_cli" && prior != record {
+                        return Err(StoreError::Conflict(
+                            "owner actor replacement requires atomic rotation",
+                        ));
                     }
                     if prior.credential_generation > record.credential_generation {
                         return Err(StoreError::StaleEpoch);
@@ -1025,6 +1211,107 @@ fn actor_binding_digest(actor: &AuthorityActorRecord) -> [u8; 32] {
     hash.update(actor.credential_generation.to_be_bytes());
     hash.update(actor.start_identity.to_be_bytes());
     hash.finalize().into()
+}
+
+fn validate_owner_rotation(
+    proof: &TrustedOwnerRotationProof,
+    store_lineage: &str,
+) -> Result<(), StoreError> {
+    valid_identity(&proof.store_lineage)?;
+    valid_identity(&proof.rotation_key)?;
+    valid_identity(&proof.expected_actor.actor_id)?;
+    valid_identity(&proof.expected_actor.scope_id)?;
+    valid_identity(&proof.expected_actor.platform)?;
+    valid_identity(&proof.expected_actor.os_identity)?;
+    valid_identity(&proof.expected_actor.process_identity)?;
+    valid_identity(&proof.next_actor.process_identity)?;
+    if proof.store_lineage != store_lineage
+        || proof.expected_owner_epoch == 0
+        || proof.expected_revision == 0
+        || proof.expected_actor.origin != "owner_cli"
+        || proof.expected_actor.role != "coordinator"
+        || proof.expected_actor.parent_actor_id.is_some()
+        || proof.expected_actor.pod_id.is_some()
+        || proof.expected_actor.pod_incarnation.is_some()
+        || proof.expected_public_key == [0; 32]
+        || proof.next_public_key == [0; 32]
+        || proof.expected_public_key == proof.next_public_key
+        || proof.expected_actor.credential_generation == 0
+        || proof.expected_actor.start_identity == 0
+        || proof.next_actor.start_identity == 0
+        || proof.next_actor.containment_identity.is_empty()
+        || proof.next_actor.containment_identity.len() > 4096
+        || proof
+            .next_actor
+            .containment_identity
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(StoreError::InvalidInput(
+            "owner rotation binding is invalid",
+        ));
+    }
+    let next_generation = proof
+        .expected_actor
+        .credential_generation
+        .checked_add(1)
+        .ok_or(StoreError::InvalidInput("owner generation exhausted"))?;
+    let mut permitted = proof.expected_actor.clone();
+    permitted.credential_generation = next_generation;
+    permitted.process_identity = proof.next_actor.process_identity.clone();
+    permitted.start_identity = proof.next_actor.start_identity;
+    permitted.containment_identity = proof.next_actor.containment_identity.clone();
+    if permitted != proof.next_actor
+        || (proof.expected_actor.process_identity == proof.next_actor.process_identity
+            && proof.expected_actor.start_identity == proof.next_actor.start_identity)
+    {
+        return Err(StoreError::InvalidInput(
+            "owner rotation changed fixed identity or reused process birth",
+        ));
+    }
+    positive(proof.expected_owner_epoch)?;
+    positive(proof.expected_revision)?;
+    positive(next_generation)?;
+    positive(proof.next_actor.start_identity)?;
+    Ok(())
+}
+
+fn owner_rotation_intent_digest(
+    proof: &TrustedOwnerRotationProof,
+    prior_binding: &[u8; 32],
+    next_binding: &[u8; 32],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"podbay.owner-rotation.intent/1\0");
+    digest_text(&mut hash, &proof.store_lineage);
+    digest_text(&mut hash, &proof.rotation_key);
+    hash.update(proof.expected_owner_epoch.to_be_bytes());
+    hash.update(proof.expected_revision.to_be_bytes());
+    hash.update(prior_binding);
+    hash.update(proof.expected_public_key);
+    hash.update(next_binding);
+    hash.update(proof.next_public_key);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn owner_rotation_receipt(
+    proof: &TrustedOwnerRotationProof,
+    intent_digest: String,
+    authority_revision: u64,
+) -> OwnerActorRotationReceipt {
+    OwnerActorRotationReceipt {
+        scope_id: proof.expected_actor.scope_id.clone(),
+        actor_id: proof.expected_actor.actor_id.clone(),
+        rotation_key: proof.rotation_key.clone(),
+        intent_digest,
+        prior_generation: proof.expected_actor.credential_generation,
+        next_generation: proof.next_actor.credential_generation,
+        owner_epoch: proof.expected_owner_epoch,
+        authority_revision,
+    }
 }
 
 fn digest_text(hash: &mut Sha256, value: &str) {

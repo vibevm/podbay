@@ -14,7 +14,7 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const MAX_BYTES: usize = 1_048_576;
 
 // Version eight records immutable launch identities. A binding is absent for
@@ -192,6 +192,26 @@ const ACTOR_VERIFIERS_V14: &str = "CREATE TABLE actor_verifiers (
   revoked INTEGER NOT NULL CHECK(revoked IN (0,1))
 ) STRICT";
 
+// One committed key/digest receipt also retains the revoked old verifier.
+// The current verifier table keeps only the latest generation.
+const OWNER_ACTOR_ROTATIONS_V15: &str = "CREATE TABLE owner_actor_rotations (
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  actor_id TEXT NOT NULL REFERENCES authority_actors(actor_id),
+  rotation_key TEXT NOT NULL CHECK(length(rotation_key)>0),
+  intent_digest TEXT NOT NULL CHECK(length(intent_digest)=64),
+  prior_generation INTEGER NOT NULL CHECK(prior_generation>=1),
+  next_generation INTEGER NOT NULL CHECK(next_generation=prior_generation+1),
+  prior_binding_digest BLOB NOT NULL CHECK(length(prior_binding_digest)=32),
+  prior_public_key BLOB NOT NULL CHECK(length(prior_public_key)=32),
+  next_binding_digest BLOB NOT NULL CHECK(length(next_binding_digest)=32),
+  next_public_key BLOB NOT NULL CHECK(length(next_public_key)=32),
+  owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
+  authority_revision INTEGER NOT NULL CHECK(authority_revision>=1),
+  prior_revoked INTEGER NOT NULL CHECK(prior_revoked=1),
+  PRIMARY KEY(scope_id,actor_id,rotation_key),
+  UNIQUE(actor_id,next_generation)
+) STRICT";
+
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
     pub(crate) connection: Connection,
@@ -223,6 +243,7 @@ impl PodBayStore {
         verify_manager_peer_schema(&transaction)?;
         verify_prior_observation_schema(&transaction)?;
         verify_actor_verifier_schema(&transaction)?;
+        verify_owner_rotation_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -602,6 +623,19 @@ impl PodBayStore {
             }
             transaction.execute_batch(&format!("{ACTOR_VERIFIERS_V14};"))?;
         }
+        if version < 15 {
+            let occupied: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='owner_actor_rotations'",
+                [],
+                |row| row.get(0),
+            )?;
+            if occupied != 0 {
+                return Err(StoreError::Conflict(
+                    "v15 owner rotation schema name already exists",
+                ));
+            }
+            transaction.execute_batch(&format!("{OWNER_ACTOR_ROTATIONS_V15};"))?;
+        }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
@@ -609,6 +643,7 @@ impl PodBayStore {
         verify_manager_peer_schema(&transaction)?;
         verify_prior_observation_schema(&transaction)?;
         verify_actor_verifier_schema(&transaction)?;
+        verify_owner_rotation_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         let store_lineage: String = connection.query_row(
@@ -2447,6 +2482,20 @@ fn verify_actor_verifier_schema(transaction: &rusqlite::Transaction<'_>) -> Resu
         .optional()?;
     if actual.as_deref() != Some(ACTOR_VERIFIERS_V14) {
         return Err(StoreError::Conflict("v14 actor verifier schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_owner_rotation_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='owner_actor_rotations'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual.as_deref() != Some(OWNER_ACTOR_ROTATIONS_V15) {
+        return Err(StoreError::Conflict("v15 owner rotation schema differs"));
     }
     Ok(())
 }

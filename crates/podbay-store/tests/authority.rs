@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_store::{
     AuthorityActorRecord, AuthorityGrantRecord, AuthorityMutation, AuthorityPodRecord,
-    AuthorityRightRecord, PodBayStore, SqliteActorVerifierWitness, StoreError,
+    AuthorityRightRecord, OwnerActorRotationReceipt, PodBayStore, SqliteActorVerifierWitness,
+    StoreError, TrustedOwnerRotationProof,
 };
 
 struct Fixture {
@@ -103,6 +104,63 @@ fn seed_actor(store: &mut PodBayStore) -> (AuthorityActorRecord, u64) {
         .apply_authority_mutation(1, revision, AuthorityMutation::PutActor(record.clone()))
         .unwrap();
     (record, revision)
+}
+
+fn owner_actor() -> AuthorityActorRecord {
+    AuthorityActorRecord {
+        scope_id: "scope.main".into(),
+        actor_id: "actor.owner".into(),
+        role: "coordinator".into(),
+        origin: "owner_cli".into(),
+        parent_actor_id: None,
+        pod_id: None,
+        pod_incarnation: None,
+        credential_generation: 1,
+        platform: "linux".into(),
+        os_identity: "linux.uid.1000".into(),
+        process_identity: "linux.pid.123".into(),
+        start_identity: 456,
+        containment_identity: "/user.slice/zap-old.scope".into(),
+    }
+}
+
+fn seed_owner(store: &mut PodBayStore) -> (AuthorityActorRecord, u64, String) {
+    let snapshot = store.begin_authority_replay(0, 1).unwrap();
+    let actor = owner_actor();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            snapshot.revision,
+            AuthorityMutation::PutActor(actor.clone()),
+        )
+        .unwrap();
+    let revision = store
+        .register_actor_verifier_from_trusted_host(1, revision, &actor, [7; 32])
+        .unwrap();
+    let lineage = store.initial_cursor("scope.main").unwrap().store_lineage;
+    (actor, revision, lineage)
+}
+
+fn owner_rotation(
+    actor: &AuthorityActorRecord,
+    revision: u64,
+    lineage: &str,
+) -> TrustedOwnerRotationProof {
+    let mut next_actor = actor.clone();
+    next_actor.credential_generation = 2;
+    next_actor.process_identity = "linux.pid.124".into();
+    next_actor.start_identity = 457;
+    next_actor.containment_identity = "/user.slice/zap-new.scope".into();
+    TrustedOwnerRotationProof {
+        store_lineage: lineage.into(),
+        expected_owner_epoch: 1,
+        expected_revision: revision,
+        rotation_key: "rotation.owner.one".into(),
+        expected_actor: actor.clone(),
+        expected_public_key: [7; 32],
+        next_actor,
+        next_public_key: [9; 32],
+    }
 }
 
 #[test]
@@ -355,6 +413,7 @@ fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() 
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
+             DROP TABLE owner_actor_rotations;
              DROP TABLE actor_verifiers;
              DROP TABLE manager_rebind_prior_observations;
              DROP TABLE manager_peer_bindings;
@@ -429,7 +488,9 @@ fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
     drop(store);
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
-        .execute_batch("DROP TABLE actor_verifiers; PRAGMA user_version=13;")
+        .execute_batch(
+            "DROP TABLE owner_actor_rotations; DROP TABLE actor_verifiers; PRAGMA user_version=13;",
+        )
         .unwrap();
     drop(connection);
     let mut migrated = PodBayStore::open(&fixture.database).unwrap();
@@ -446,6 +507,41 @@ fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
         .query_row("SELECT COUNT(*) FROM actor_verifiers", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (actor, revision, _) = seed_owner(&mut store);
+    drop(store);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection
+        .execute_batch("DROP TABLE owner_actor_rotations; PRAGMA user_version=14;")
+        .unwrap();
+    drop(connection);
+    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        migrated.authority_snapshot().unwrap().actors,
+        vec![actor.clone()]
+    );
+    assert_eq!(migrated.authority_snapshot().unwrap().revision, revision);
+    assert_eq!(
+        migrated
+            .current_actor_verifier(1, revision, &actor)
+            .unwrap(),
+        [7; 32]
+    );
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM owner_actor_rotations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((version, count), (15, 0));
 }
 
 #[test]
@@ -785,4 +881,184 @@ fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
         )
         .unwrap();
     assert!(!witness(&fixture.database, &lineage, record, [3; 32]).is_current());
+}
+
+#[test]
+fn owner_rotation_commits_actor_verifier_revocation_and_idempotent_receipt_together() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (old, revision, lineage) = seed_owner(&mut store);
+    let proof = owner_rotation(&old, revision, &lineage);
+    let witness = SqliteActorVerifierWitness::for_actor(
+        &fixture.database,
+        &lineage,
+        1,
+        revision,
+        old.clone(),
+        [7; 32],
+    )
+    .unwrap();
+    assert!(witness.is_current());
+    let receipt: OwnerActorRotationReceipt =
+        store.rotate_owner_actor_from_trusted_host(&proof).unwrap();
+    assert_eq!(receipt.prior_generation, 1);
+    assert_eq!(receipt.next_generation, 2);
+    assert_eq!(receipt.authority_revision, revision + 1);
+    assert_eq!(receipt.intent_digest.len(), 64);
+    assert!(!witness.is_current());
+    assert_eq!(
+        store.authority_snapshot().unwrap().actors,
+        vec![proof.next_actor.clone()]
+    );
+    assert_eq!(
+        store
+            .current_actor_verifier(1, receipt.authority_revision, &proof.next_actor)
+            .unwrap(),
+        [9; 32]
+    );
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let history: (i64, Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT prior_revoked,prior_public_key,next_public_key
+             FROM owner_actor_rotations WHERE actor_id='actor.owner'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(history, (1, vec![7; 32], vec![9; 32]));
+    // Lost ACK: the original expected revision is stale, but the same
+    // key-and-intent must return the committed receipt without a new write.
+    assert!(proof.expected_revision < receipt.authority_revision);
+    assert_eq!(
+        store.rotate_owner_actor_from_trusted_host(&proof).unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store.authority_snapshot().unwrap().revision,
+        receipt.authority_revision
+    );
+    let mut changed = proof.clone();
+    changed.next_public_key = [11; 32];
+    // The same key with changed normalized intent cannot claim the receipt.
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&changed),
+        Err(StoreError::Conflict("owner rotation key changed intent"))
+    ));
+    drop(connection);
+    drop(store);
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(
+        reopened
+            .rotate_owner_actor_from_trusted_host(&proof)
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        reopened.authority_snapshot().unwrap().actors,
+        vec![proof.next_actor]
+    );
+}
+
+#[test]
+fn owner_rotation_refuses_stale_guards_key_reuse_and_generic_owner_replacement() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let (old, revision, lineage) = seed_owner(&mut store);
+    let proof = owner_rotation(&old, revision, &lineage);
+    assert!(matches!(
+        store.apply_authority_mutation(
+            1,
+            revision,
+            AuthorityMutation::PutActor(proof.next_actor.clone())
+        ),
+        Err(StoreError::Conflict(
+            "owner actor replacement requires atomic rotation"
+        ))
+    ));
+    let mut stale = proof.clone();
+    stale.expected_revision -= 1;
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = proof.clone();
+    stale.expected_owner_epoch = 2;
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = proof.clone();
+    stale.expected_public_key = [8; 32];
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::Conflict("old owner verifier is not current"))
+    ));
+    stale = proof.clone();
+    stale.expected_actor.start_identity += 1;
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::StaleEpoch)
+    ));
+    stale = proof.clone();
+    stale.next_actor.credential_generation = 3;
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::InvalidInput(_))
+    ));
+    stale = proof.clone();
+    stale.next_actor.scope_id = "scope.other".into();
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&stale),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert_eq!(store.authority_snapshot().unwrap().actors, vec![old]);
+    let receipt = store.rotate_owner_actor_from_trusted_host(&proof).unwrap();
+    let mut next = proof.clone();
+    next.expected_revision = receipt.authority_revision;
+    next.expected_actor = proof.next_actor.clone();
+    next.expected_public_key = proof.next_public_key;
+    next.next_actor.credential_generation = 3;
+    next.next_actor.process_identity = "linux.pid.125".into();
+    next.next_actor.start_identity = 458;
+    next.next_public_key = [7; 32];
+    next.rotation_key = "rotation.owner.two".into();
+    assert!(matches!(
+        store.rotate_owner_actor_from_trusted_host(&next),
+        Err(StoreError::Conflict("owner verifier key was reused"))
+    ));
+}
+
+#[test]
+fn owner_rotation_faults_roll_back_actor_verifier_revision_and_receipt() {
+    for trigger in [
+        "CREATE TRIGGER fail_rotation BEFORE UPDATE ON actor_verifiers
+         BEGIN SELECT RAISE(ABORT,'synthetic verifier fault'); END;",
+        "CREATE TRIGGER fail_rotation BEFORE INSERT ON owner_actor_rotations
+         BEGIN SELECT RAISE(ABORT,'synthetic receipt fault'); END;",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = PodBayStore::open(&fixture.database).unwrap();
+        let (old, revision, lineage) = seed_owner(&mut store);
+        let proof = owner_rotation(&old, revision, &lineage);
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection.execute_batch(trigger).unwrap();
+        assert!(store.rotate_owner_actor_from_trusted_host(&proof).is_err());
+        drop(store);
+        let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+        assert_eq!(
+            reopened.authority_snapshot().unwrap().actors,
+            vec![old.clone()]
+        );
+        assert_eq!(reopened.authority_snapshot().unwrap().revision, revision);
+        assert_eq!(
+            reopened.current_actor_verifier(1, revision, &old).unwrap(),
+            [7; 32]
+        );
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM owner_actor_rotations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

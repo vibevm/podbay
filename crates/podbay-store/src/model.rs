@@ -433,6 +433,34 @@ pub struct AuthorityActorRecord {
     pub containment_identity: String,
 }
 
+/// A forgeable DTO supplied only after the host has checked a fresh process,
+/// rotation authorization and new-key possession. The store cannot verify a
+/// signature or kernel peer from these fields; constructing this value is not
+/// authorization. Its old binding and revision are compare-and-set guards.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedOwnerRotationProof {
+    pub store_lineage: String,
+    pub expected_owner_epoch: u64,
+    pub expected_revision: u64,
+    pub rotation_key: String,
+    pub expected_actor: AuthorityActorRecord,
+    pub expected_public_key: [u8; 32],
+    pub next_actor: AuthorityActorRecord,
+    pub next_public_key: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerActorRotationReceipt {
+    pub scope_id: String,
+    pub actor_id: String,
+    pub rotation_key: String,
+    pub intent_digest: String,
+    pub prior_generation: u64,
+    pub next_generation: u64,
+    pub owner_epoch: u64,
+    pub authority_revision: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityRightRecord {
     pub operation: String,
