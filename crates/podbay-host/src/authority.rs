@@ -369,7 +369,7 @@ impl ProvenActorSession {
         if freshly_observed_process != &self.process {
             return Err(ActorAuthProofError::ProcessChanged);
         }
-        if !self.verifier_witness.is_current() {
+        if !self.verifier_witness.is_current_actor_binding() {
             return Err(ActorAuthProofError::StaleVerifier);
         }
         Ok(self.peer.clone())
@@ -2264,6 +2264,12 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         self.host.manager_epoch
     }
 
+    /// Stable store identity for projecting a committed command's event
+    /// sequence into a scope-bound wire cursor. This does not grant authority.
+    pub fn store_lineage_for_receipt(&self) -> &str {
+        self.manager_claim.store_lineage()
+    }
+
     pub fn recorded_snapshot(&self) -> &AuthoritySnapshot {
         &self.recorded
     }
@@ -2744,7 +2750,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     /// generation, credential, manager generation, and a preinstalled grant.
     /// An explicit deadline comes from the calling manager policy; this first
     /// slice refuses a wire `deadlineAt` until wall-to-monotonic conversion is
-    /// implemented. No server mutation endpoint calls this method yet.
+    /// implemented. A server may call it only with a separately configured
+    /// trusted policy; the request cannot supply the grant or deadline.
     pub fn launch_new_root_codex_v2_from_wire<T: AuthenticatedTransport>(
         &mut self,
         transport: &T,
@@ -2945,12 +2952,19 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let intent = planned_request.canonical_request.clone();
         let scope = planned_request.host_request.scope_id.clone();
         match self.dispatch_prepared_bound_root_codex_v2(transport, planned_request) {
-            Ok(dispatched) => Ok(dispatched),
+            Ok(mut dispatched) => {
+                // This is still the first wire admission. The dispatch API
+                // reads an already committed row internally, but that does
+                // not make the caller's original request a duplicate.
+                dispatched.duplicate = false;
+                Ok(dispatched)
+            }
             Err(source) => {
                 if let Ok(Some(record)) =
                     self.lookup_bound_root_codex_v2_by_key(transport, &scope, &key, &intent)
                 {
-                    if let Ok(current) = self.bound_receipt(record, true) {
+                    if let Ok(mut current) = self.bound_receipt(record, true) {
+                        current.duplicate = false;
                         return Ok(current);
                     }
                 }

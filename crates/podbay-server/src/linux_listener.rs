@@ -6,16 +6,22 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use podbay_host::{DurableAuthority, HostDispatchPort};
+use podbay_host::{
+    DurableAuthority, GrantId, HostDispatchPort, HostError, StablePortReceipt,
+    TrustedWireRootLaunchPolicy,
+};
 use podbay_pod::LinuxPeerEvidence;
 
-use crate::{LinuxServeOneFault, serve_authenticated_linux_commands_get_one};
+use crate::{
+    LinuxServeOneFault, serve_authenticated_linux_commands_get_one,
+    serve_authenticated_linux_launch_one,
+};
 
 pub const MANAGER_SOCKET_NAME: &str = "manager.sock";
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
@@ -23,6 +29,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 #[derive(Debug)]
 pub enum LinuxListenerError {
     Io(io::Error),
+    Configuration(HostError),
     PrivateDirectoryRequired,
     SocketIdentityChanged,
 }
@@ -31,6 +38,9 @@ impl Display for LinuxListenerError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "manager socket I/O failed: {error}"),
+            Self::Configuration(error) => {
+                write!(formatter, "manager launch policy failed: {error:?}")
+            }
             Self::PrivateDirectoryRequired => {
                 formatter.write_str("manager socket directory is not canonical, owned and private")
             }
@@ -44,6 +54,47 @@ impl Error for LinuxListenerError {}
 impl From<io::Error> for LinuxListenerError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+/// A trusted grant mapping and relative per-connection budget. The listener
+/// derives a fresh monotonic deadline for each accepted connection, so a
+/// long-lived manager never reuses an expired absolute Instant.
+pub struct TrustedWireRootLaunchTemplate {
+    grant_id: GrantId,
+    exchange_budget: Duration,
+    result_contract_ref: String,
+}
+
+impl TrustedWireRootLaunchTemplate {
+    pub fn from_trusted_policy(
+        grant_id: GrantId,
+        exchange_budget: Duration,
+        result_contract_ref: &str,
+    ) -> Result<Self, HostError> {
+        if exchange_budget.is_zero() || exchange_budget > Duration::from_secs(300) {
+            return Err(HostError::InvalidInput);
+        }
+        let deadline = Instant::now()
+            .checked_add(exchange_budget)
+            .ok_or(HostError::InvalidInput)?;
+        TrustedWireRootLaunchPolicy::from_trusted_policy(grant_id, deadline, result_contract_ref)?;
+        Ok(Self {
+            grant_id,
+            exchange_budget,
+            result_contract_ref: result_contract_ref.into(),
+        })
+    }
+
+    fn fresh(&self) -> Result<TrustedWireRootLaunchPolicy, HostError> {
+        let deadline = Instant::now()
+            .checked_add(self.exchange_budget)
+            .ok_or(HostError::InvalidInput)?;
+        TrustedWireRootLaunchPolicy::from_trusted_policy(
+            self.grant_id,
+            deadline,
+            &self.result_contract_ref,
+        )
     }
 }
 
@@ -120,6 +171,44 @@ impl LinuxManagerCommandsGetListener {
         authority: &mut DurableAuthority<P>,
         stop: &AtomicBool,
     ) -> Result<LinuxListenerReport, LinuxListenerError> {
+        self.serve_serial(authority, stop, |stream, authority| {
+            Ok(serve_authenticated_linux_commands_get_one(
+                stream, authority,
+            ))
+        })
+    }
+
+    /// Opt in to one narrow `launch` command on this same auth/1 socket while
+    /// retaining `commands.get`. Each accepted connection gets a fresh trusted
+    /// deadline and is handled serially; no command is retried by the loop.
+    pub fn serve_until_with_launch<P: HostDispatchPort>(
+        &mut self,
+        authority: &mut DurableAuthority<P>,
+        stop: &AtomicBool,
+        template: &TrustedWireRootLaunchTemplate,
+    ) -> Result<LinuxListenerReport, LinuxListenerError>
+    where
+        P::Receipt: StablePortReceipt,
+    {
+        self.serve_serial(authority, stop, |stream, authority| {
+            let policy = template
+                .fresh()
+                .map_err(LinuxListenerError::Configuration)?;
+            Ok(serve_authenticated_linux_launch_one(
+                stream, authority, &policy,
+            ))
+        })
+    }
+
+    fn serve_serial<P: HostDispatchPort>(
+        &mut self,
+        authority: &mut DurableAuthority<P>,
+        stop: &AtomicBool,
+        mut serve: impl FnMut(
+            UnixStream,
+            &mut DurableAuthority<P>,
+        ) -> Result<Result<(), LinuxServeOneFault>, LinuxListenerError>,
+    ) -> Result<LinuxListenerReport, LinuxListenerError> {
         let mut report = LinuxListenerReport::default();
         while !stop.load(Ordering::Acquire) {
             self.recheck_owned_socket()?;
@@ -134,7 +223,7 @@ impl LinuxManagerCommandsGetListener {
             };
             self.recheck_owned_socket()?;
             report.accepted = report.accepted.saturating_add(1);
-            match serve_authenticated_linux_commands_get_one(stream, authority) {
+            match serve(stream, authority)? {
                 Ok(()) => report.completed = report.completed.saturating_add(1),
                 Err(error) => {
                     match &error {

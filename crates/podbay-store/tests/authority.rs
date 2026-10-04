@@ -814,6 +814,7 @@ fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
     )
     .unwrap();
     assert!(old.is_current());
+    assert!(old.is_current_actor_binding());
 
     let revision = store
         .apply_authority_mutation(
@@ -827,6 +828,9 @@ fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
         )
         .unwrap();
     assert!(!old.is_current());
+    // A signed connection may survive an unrelated authority mutation, but
+    // a new challenge still requires the exact current global revision.
+    assert!(old.is_current_actor_binding());
     let current = SqliteActorVerifierWitness::for_actor(
         &fixture.database,
         &lineage,
@@ -840,6 +844,8 @@ fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
 
     let replay = store.begin_authority_replay(1, 2).unwrap();
     assert!(!current.is_current());
+    assert!(!current.is_current_actor_binding());
+    assert!(!old.is_current_actor_binding());
     let surviving = SqliteActorVerifierWitness::for_actor(
         &fixture.database,
         &lineage,
@@ -863,6 +869,7 @@ fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
         )
         .unwrap();
     assert!(!surviving.is_current());
+    assert!(!surviving.is_current_actor_binding());
     let revision = store
         .register_actor_verifier_from_trusted_host(2, revision, &rotated, [9; 32])
         .unwrap();
@@ -880,6 +887,7 @@ fn actor_witness_rechecks_revision_owner_rotation_and_revocation() {
         .revoke_actor_verifier_from_trusted_host(2, revision, &rotated)
         .unwrap();
     assert!(!renewed.is_current());
+    assert!(!renewed.is_current_actor_binding());
 }
 
 #[test]
@@ -909,6 +917,9 @@ fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
         };
     assert!(witness(&fixture.database, &lineage, record.clone(), [3; 32]).is_current());
     assert!(
+        witness(&fixture.database, &lineage, record.clone(), [3; 32]).is_current_actor_binding()
+    );
+    assert!(
         !witness(
             &fixture.database,
             "foreign.lineage",
@@ -919,18 +930,26 @@ fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
     );
     let mut foreign_scope = record.clone();
     foreign_scope.scope_id = "scope.foreign".into();
-    assert!(!witness(&fixture.database, &lineage, foreign_scope, [3; 32]).is_current());
+    let foreign = witness(&fixture.database, &lineage, foreign_scope, [3; 32]);
+    assert!(!foreign.is_current());
+    assert!(!foreign.is_current_actor_binding());
     let mut changed_birth = record.clone();
     changed_birth.start_identity += 1;
-    assert!(!witness(&fixture.database, &lineage, changed_birth, [3; 32]).is_current());
-    assert!(!witness(&fixture.database, &lineage, record.clone(), [4; 32]).is_current());
+    let changed = witness(&fixture.database, &lineage, changed_birth, [3; 32]);
+    assert!(!changed.is_current());
+    assert!(!changed.is_current_actor_binding());
+    let wrong_key = witness(&fixture.database, &lineage, record.clone(), [4; 32]);
+    assert!(!wrong_key.is_current());
+    assert!(!wrong_key.is_current_actor_binding());
 
     let missing = fixture.directory.join("missing.sqlite");
     assert!(!witness(&missing, &lineage, record.clone(), [3; 32]).is_current());
+    assert!(!witness(&missing, &lineage, record.clone(), [3; 32]).is_current_actor_binding());
     assert!(!missing.exists());
     let corrupt = fixture.directory.join("corrupt.sqlite");
     std::fs::write(&corrupt, b"not a SQLite database").unwrap();
     assert!(!witness(&corrupt, &lineage, record.clone(), [3; 32]).is_current());
+    assert!(!witness(&corrupt, &lineage, record.clone(), [3; 32]).is_current_actor_binding());
 
     let connection = rusqlite::Connection::open(&fixture.database).unwrap();
     connection
@@ -940,7 +959,9 @@ fn actor_witness_refuses_foreign_binding_key_and_unavailable_database() {
             [],
         )
         .unwrap();
-    assert!(!witness(&fixture.database, &lineage, record, [3; 32]).is_current());
+    let corrupted = witness(&fixture.database, &lineage, record, [3; 32]);
+    assert!(!corrupted.is_current());
+    assert!(!corrupted.is_current_actor_binding());
 }
 
 #[test]

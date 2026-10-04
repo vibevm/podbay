@@ -68,10 +68,18 @@ impl SqliteActorVerifierWitness {
     /// stale, foreign or corrupt state refuses. True only means the trusted
     /// public verifier is still current in this store snapshot.
     pub fn is_current(&self) -> bool {
-        self.check_current().unwrap_or(false)
+        self.check_current(true).unwrap_or(false)
     }
 
-    fn check_current(&self) -> Result<bool, StoreError> {
+    /// After a successful challenge, recheck the exact signed actor, process
+    /// binding and public key without pinning an unrelated global authority
+    /// revision. A committed launch itself advances that revision. The caller
+    /// must still recheck its manager/grant guards before any host effect.
+    pub fn is_current_actor_binding(&self) -> bool {
+        self.check_current(false).unwrap_or(false)
+    }
+
+    fn check_current(&self, require_revision: bool) -> Result<bool, StoreError> {
         let mut connection =
             Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -83,12 +91,16 @@ impl SqliteActorVerifierWitness {
         if lineage != self.store_lineage {
             return Ok(false);
         }
-        require_current_actor(
-            &transaction,
-            self.owner_epoch,
-            self.authority_revision,
-            &self.actor,
-        )?;
+        if require_revision {
+            require_current_actor(
+                &transaction,
+                self.owner_epoch,
+                self.authority_revision,
+                &self.actor,
+            )?;
+        } else {
+            require_current_actor_binding(&transaction, self.owner_epoch, &self.actor)?;
+        }
         let verifier = require_matching_verifier(&transaction, &self.actor)?;
         if verifier.revoked || verifier.public_key != self.public_key {
             return Ok(false);
@@ -1129,6 +1141,28 @@ fn require_current_actor(
     expected_revision: u64,
     actor: &AuthorityActorRecord,
 ) -> Result<(), StoreError> {
+    require_current_actor_at_revision(
+        transaction,
+        expected_owner_epoch,
+        Some(expected_revision),
+        actor,
+    )
+}
+
+fn require_current_actor_binding(
+    transaction: &rusqlite::Transaction<'_>,
+    expected_owner_epoch: u64,
+    actor: &AuthorityActorRecord,
+) -> Result<(), StoreError> {
+    require_current_actor_at_revision(transaction, expected_owner_epoch, None, actor)
+}
+
+fn require_current_actor_at_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    expected_owner_epoch: u64,
+    expected_revision: Option<u64>,
+    actor: &AuthorityActorRecord,
+) -> Result<(), StoreError> {
     valid_identity(&actor.actor_id)?;
     valid_identity(&actor.scope_id)?;
     let owner: i64 = transaction.query_row(
@@ -1141,8 +1175,10 @@ fn require_current_actor(
         [],
         |row| row.get(0),
     )?;
+    let expected_revision = expected_revision.map(sqlite_integer).transpose()?;
     if owner != sqlite_integer(expected_owner_epoch)?
-        || revision != sqlite_integer(expected_revision)?
+        || revision <= 0
+        || expected_revision.is_some_and(|expected| revision != expected)
     {
         return Err(StoreError::StaleEpoch);
     }

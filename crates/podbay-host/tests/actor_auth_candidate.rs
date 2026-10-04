@@ -167,6 +167,27 @@ fn owner_candidate_requires_active_exact_process_and_valid_one_time_proof() {
         pending.verify(&observed, wrong_signature.as_ref()),
         Err(ActorAuthProofError::Credential(_))
     ));
+
+    // A completed signature keeps the exact actor binding through an
+    // unrelated authority revision, while revocation still ends the session.
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let snapshot = store.authority_snapshot().unwrap();
+    let record = snapshot.actors[0].clone();
+    let revision = store
+        .apply_authority_mutation(
+            snapshot.owner_epoch,
+            snapshot.revision,
+            AuthorityMutation::PutActor(record.clone()),
+        )
+        .unwrap();
+    assert_eq!(session.verified_peer(&observed).unwrap(), expected_peer);
+    store
+        .revoke_actor_verifier_from_trusted_host(snapshot.owner_epoch, revision, &record)
+        .unwrap();
+    assert_eq!(
+        session.verified_peer(&observed),
+        Err(ActorAuthProofError::StaleVerifier)
+    );
 }
 
 #[test]
@@ -263,6 +284,13 @@ fn revoked_verifier_and_owner_or_revision_drift_refuse_pending_proof() {
         authority
             .reattest_actor_from_trusted_replay(&FakeTransport(peer), registration)
             .unwrap();
+        let signed = authority
+            .challenge_candidate_for_observed_process(&actor_id, &observed)
+            .unwrap()
+            .begin_challenge([5; 32])
+            .unwrap();
+        let signed_signature = signer.sk.sign(signed.transcript_bytes().unwrap(), None);
+        let session = signed.verify(&observed, signed_signature.as_ref()).unwrap();
         let pending = authority
             .challenge_candidate_for_observed_process(&actor_id, &observed)
             .unwrap()
@@ -302,5 +330,13 @@ fn revoked_verifier_and_owner_or_revision_drift_refuse_pending_proof() {
             pending.verify(&observed, signature.as_ref()),
             Err(ActorAuthProofError::StaleVerifier)
         ));
+        if drift == "revision" {
+            assert!(session.verified_peer(&observed).is_ok());
+        } else {
+            assert_eq!(
+                session.verified_peer(&observed),
+                Err(ActorAuthProofError::StaleVerifier)
+            );
+        }
     }
 }

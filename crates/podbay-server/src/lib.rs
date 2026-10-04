@@ -1,9 +1,12 @@
-//! Authenticated PodBay/1 reads over one exchange or an owned Linux socket.
-//! No host effect, provider, or automatic retry lives here.
+//! Authenticated PodBay/1 exchanges over an owned Linux socket. The default
+//! listener is read-only; an explicit trusted policy enables root launch.
+//! No provider turn or automatic retry lives here.
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 mod auth_prelude;
+#[cfg(target_os = "linux")]
+mod host_launch_handler;
 #[cfg(target_os = "linux")]
 mod host_read_handler;
 #[cfg(target_os = "linux")]
@@ -30,6 +33,7 @@ pub use auth_prelude::{
 #[cfg(target_os = "linux")]
 pub use linux_listener::{
     LinuxListenerError, LinuxListenerReport, LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME,
+    TrustedWireRootLaunchTemplate,
 };
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
@@ -60,6 +64,25 @@ pub fn serve_authenticated_linux_commands_get_one<P: podbay_host::HostDispatchPo
     let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
         .map_err(LinuxServeOneFault::Authentication)?;
     let mut handler = host_read_handler::HostReadHandler::new(authority);
+    serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
+}
+
+/// Opt-in one-exchange manager surface. The policy must be constructed from
+/// trusted manager configuration for this exchange; the wire request cannot
+/// create a grant or credential. Reads still use the same authenticated owner.
+#[cfg(target_os = "linux")]
+pub fn serve_authenticated_linux_launch_one<P>(
+    socket: std::os::unix::net::UnixStream,
+    authority: &mut podbay_host::DurableAuthority<P>,
+    policy: &podbay_host::TrustedWireRootLaunchPolicy,
+) -> Result<(), LinuxServeOneFault>
+where
+    P: podbay_host::HostDispatchPort,
+    P::Receipt: podbay_host::StablePortReceipt,
+{
+    let mut authenticated = authenticate_accepted_linux_stream(socket, authority)
+        .map_err(LinuxServeOneFault::Authentication)?;
+    let mut handler = host_launch_handler::HostLaunchHandler::new(authority, policy);
     serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
 }
 

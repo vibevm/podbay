@@ -19,3 +19,4 @@ podbay-pod = { path = "../podbay-pod" }
 [dev-dependencies]
 podbay-client = { path = "../podbay-client" }
 ed25519-compact = { version = "2", default-features = false }
+sha2 = "0.11"
