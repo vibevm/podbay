@@ -14,6 +14,9 @@ mod codex_resource;
 mod linux_peer;
 mod manifest;
 mod native_events;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Writer and trusted reader switch together after the rebind runtime settles.
+mod native_segment_checkpoint;
 mod peer_checkpoint;
 mod ports;
 #[cfg(target_os = "linux")]
@@ -57,9 +60,9 @@ pub use manifest::{
     LaunchDescriptor, PodError, PodRole, PtySpec, manifest_path, manifest_path_for_identity,
 };
 pub use native_events::{
-    CODEX_NATIVE_EVENTS_READ_PROTOCOL, MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES,
-    NativeEventCursor, NativeEventFidelity, NativeEventGap, NativeEventIdentity, NativeEventKind,
-    NativeEventRead, NativeEventSnapshot, NativeEventSpool, NativeEventStatus, PrivateNativeEvidence,
+    CODEX_NATIVE_EVENTS_READ_PROTOCOL, MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES, NativeEventCursor,
+    NativeEventFidelity, NativeEventGap, NativeEventIdentity, NativeEventKind, NativeEventRead,
+    NativeEventSnapshot, NativeEventSpool, NativeEventStatus, PrivateNativeEvidence,
     PublicNativeEvent, decode_private_native_evidence_for_trusted_reader,
 };
 pub use peer_checkpoint::{PeerCheckpointError, decode_peer_checkpoint, encode_peer_checkpoint};

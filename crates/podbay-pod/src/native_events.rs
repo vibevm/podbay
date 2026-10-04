@@ -67,7 +67,7 @@ impl NativeEventIdentity {
         }
     }
 
-    fn validate(&self) -> Result<(), PodError> {
+    pub(crate) fn validate(&self) -> Result<(), PodError> {
         if StoreLineageId::try_from(self.store_lineage.as_str()).is_err()
             || ScopeId::try_from(self.scope_id.as_str()).is_err()
             || SessionId::try_from(self.session_id.as_str()).is_err()
@@ -664,12 +664,8 @@ fn public_event(
 ) -> PublicNativeEvent {
     // Public IDs bind the resource source and sequence, never a digest of
     // private text that could expose low-entropy prompt/answer candidates.
-    let mut hash = Sha256::new();
-    hash.update(EVENT_DOMAIN);
-    hash.update(serde_json::to_vec(identity).expect("validated identity encodes"));
-    hash.update(sequence.to_be_bytes());
     PublicNativeEvent {
-        event_id: format!("native.{}", hex(hash.finalize().as_slice())),
+        event_id: native_event_id(identity, sequence),
         schema_version: 1,
         identity: identity.clone(),
         committed_cursor: sequence,
@@ -683,6 +679,14 @@ fn public_event(
         status,
         external_conflict,
     }
+}
+
+pub(crate) fn native_event_id(identity: &NativeEventIdentity, sequence: u64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(EVENT_DOMAIN);
+    hash.update(serde_json::to_vec(identity).expect("validated identity encodes"));
+    hash.update(sequence.to_be_bytes());
+    format!("native.{}", hex(hash.finalize().as_slice()))
 }
 
 fn apply_public(
