@@ -6,18 +6,24 @@ use std::path::{Path, PathBuf};
 
 use podbay_core::{Epoch, ScopeId};
 use podbay_host::{
-    AuthorisedBoundLaunch, AuthorisedDispatch, CredentialRef, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, ResolvedClaimedBootstrap, ResolvedNativeCodexLaunch,
-    ResolvedNativeLaunch,
+    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
+    BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
+    PortDispatchOutcome, PortReceiptRef, ResolvedClaimedBootstrap,
+    ResolvedClaimedBootstrapInspection, ResolvedNativeCodexLaunch, ResolvedNativeLaunch,
 };
 use podbay_pod::{
-    BootstrapControlStage, BoundPodStatus, CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodClient,
-    PodError, PodManifest, PodPeerBootstrap, PodStatus,
+    BootstrapControlStage, BoundPeerManifest, BoundPodStatus, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
+    CODEX_V2_CAPABILITY, LinuxPeerEvidence, PodClient, PodError, PodManifest, PodPeerBootstrap,
+    PodStatus,
 };
 use podbay_store::{
-    BoundLaunchRecord, EffectState, LaunchDispatchStage, NativeWriterTarget, PodBayStore,
+    BootstrapSendSelector, BoundLaunchRecord, EffectState, LaunchDispatchStage, NativeWriterTarget,
+    PodBayStore,
 };
-use podbay_wire::{NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver, TargetOs};
+use podbay_wire::{
+    EffectiveLaunchContractV2, ImmutableLaunchDescriptorV2, NativeResourceKind, NativeRole,
+    NativeWorkKind, ResourceDriver, TargetOs,
+};
 use sha2::{Digest, Sha256};
 
 use crate::codex_v2::{TrustedCodexCredentialSource, preflight_committed_codex_v2};
@@ -535,6 +541,174 @@ impl LinuxLaunchPort {
         }
         bootstrap_port_stage(response.stage, receipt)
     }
+
+    /// Read one already-claimed command's held pod journal. No claim, native
+    /// input, or retry is possible through this path.
+    fn inspect_claimed_bootstrap(
+        &self,
+        inspection: ResolvedClaimedBootstrapInspection,
+    ) -> Result<BootstrapNativeObservation, BootstrapObservationError> {
+        use BootstrapObservationError::{Invalid, Unavailable};
+
+        self.config.recheck().map_err(|_| Unavailable)?;
+        let selector = inspection.selector();
+        let target = &selector.native_target;
+        if selector.scope_id != target.scope_id || inspection.writer_epoch() == 0 {
+            return Err(Invalid);
+        }
+        let manager = LinuxPeerEvidence::for_current_process().map_err(|_| Unavailable)?;
+        if checked_store_file(inspection.store_path(), manager.uid()).map_err(|_| Unavailable)?
+            != inspection.store_file_identity()
+        {
+            return Err(Invalid);
+        }
+        let incarnation = Epoch::new(target.pod_incarnation).map_err(|_| Invalid)?;
+        let manifest_path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory,
+            &target.pod_id,
+            &target.attempt_id,
+            incarnation,
+        );
+        let manifest_meta = fs::symlink_metadata(&manifest_path).map_err(|_| Unavailable)?;
+        let manifest_identity = (manifest_meta.dev(), manifest_meta.ino());
+        if !manifest_meta.is_file()
+            || manifest_meta.nlink() != 1
+            || manifest_meta.uid() != manager.uid()
+            || manifest_meta.mode() & 0o077 != 0
+            || manifest_meta.len() == 0
+            || manifest_meta.len() > 1_048_576
+            || fs::canonicalize(&manifest_path).map_err(|_| Unavailable)? != manifest_path
+        {
+            return Err(Invalid);
+        }
+        let manifest: PodManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| Unavailable)?)
+                .map_err(|_| Invalid)?;
+        let binding = manifest.peer_binding.as_ref().ok_or(Invalid)?;
+        let wire = ImmutableLaunchDescriptorV2::decode_json(&binding.wire_descriptor)
+            .map_err(|_| Invalid)?;
+        let effective =
+            EffectiveLaunchContractV2::decode(&binding.effective_spec).map_err(|_| Invalid)?;
+        if binding.capability != CODEX_V2_CAPABILITY
+            || binding.protocol != "podbay.peer-binding/2"
+            || binding.store_path != inspection.store_path()
+            || binding.store_lineage != target.store_lineage.as_str()
+            || binding.owner_epoch != inspection.owner_epoch()
+            || binding.credential_epoch != inspection.manager_credential_epoch()
+            || binding.authority_revision != Some(inspection.authority_revision())
+            || binding.resource_epoch != target.resource_epoch
+            || binding.resource_input_epochs.len() != 1
+            || binding
+                .resource_input_epochs
+                .get(target.resource_id.as_str())
+                != Some(&target.resource_input_epoch)
+            || manifest.descriptor.scope_id != target.scope_id.as_str()
+            || manifest.descriptor.session_id != target.session_id.as_str()
+            || manifest.descriptor.run_id != target.run_id.as_str()
+            || manifest.descriptor.attempt_id != target.attempt_id.as_str()
+            || manifest.descriptor.pod_id != target.pod_id.as_str()
+            || manifest.descriptor.incarnation != target.pod_incarnation
+            || manifest.descriptor.resource_id != target.resource_id.as_str()
+            || manifest.descriptor.pty.is_some()
+            || binding.descriptor_digest != wire.digest()
+            || binding.effective_digest != effective.digest()
+            || binding.manager_os_identity != manager.attested_peer().os_identity()
+            || binding.manager_process_id != manager.attested_peer().native_process_id()
+            || binding.manager_boot_identity != manager.attested_peer().boot_identity()
+            || binding.manager_birth_identity != manager.attested_peer().birth_identity()
+            || binding.manager_containment != manager.attested_peer().containment_identity()
+        {
+            return Err(Invalid);
+        }
+
+        let mut store = PodBayStore::open_existing_read_only(inspection.store_path())
+            .map_err(|_| Unavailable)?;
+        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        let client = PodClient::connect(&manifest_path).map_err(|_| Unavailable)?;
+        let before = client.attested_status().map_err(|_| Unavailable)?;
+        if !inspection_status_matches(&before, target, &manifest, binding) {
+            return Err(Invalid);
+        }
+        self.config.recheck().map_err(|_| Unavailable)?;
+        let fresh_manifest_meta = fs::symlink_metadata(&manifest_path).map_err(|_| Unavailable)?;
+        if checked_store_file(inspection.store_path(), manager.uid()).map_err(|_| Unavailable)?
+            != inspection.store_file_identity()
+            || (fresh_manifest_meta.dev(), fresh_manifest_meta.ino()) != manifest_identity
+        {
+            return Err(Invalid);
+        }
+        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        let response = client
+            .inspect_claimed_codex_bootstrap(
+                &selector.command_id,
+                target,
+                inspection.writer_epoch(),
+            )
+            .map_err(|_| Unavailable)?;
+        let after = client.attested_status().map_err(|_| Unavailable)?;
+        if !inspection_status_matches(&after, target, &manifest, binding)
+            || after.supervisor_pid != before.supervisor_pid
+            || after.supervisor_start_ticks != before.supervisor_start_ticks
+            || after.child_pid != before.child_pid
+            || after.child_start_ticks != before.child_start_ticks
+            || after.boot_id != before.boot_id
+            || after.cgroup_path != before.cgroup_path
+            || after.unit_name != before.unit_name
+            || self.config.recheck().is_err()
+            || !LinuxPeerEvidence::for_current_process()
+                .is_ok_and(|peer| peer.attested_peer() == manager.attested_peer())
+            || fs::symlink_metadata(&manifest_path)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                != Some(manifest_identity)
+            || checked_store_file(inspection.store_path(), manager.uid())
+                .map_err(|_| Unavailable)?
+                != inspection.store_file_identity()
+        {
+            return Err(Invalid);
+        }
+        check_inspection_store(&mut store, &inspection, binding, &manager)?;
+        if response.request_digest.as_deref() != Some(inspection.expected_request_digest()) {
+            return Err(Invalid);
+        }
+        let stage = match response.stage {
+            BootstrapControlStage::ClaimedUnobserved => BootstrapNativeStage::ClaimedUnobserved,
+            BootstrapControlStage::ThreadCreateUncertain => {
+                BootstrapNativeStage::ThreadCreateUncertain
+            }
+            BootstrapControlStage::ThreadCreated {
+                native_thread_id,
+                native_session_id,
+            } => BootstrapNativeStage::ThreadCreated {
+                native_thread_id,
+                native_session_id,
+            },
+            BootstrapControlStage::BootstrapUncertain {
+                native_thread_id,
+                native_session_id,
+            } => BootstrapNativeStage::BootstrapUncertain {
+                native_thread_id,
+                native_session_id,
+            },
+            BootstrapControlStage::Submitted {
+                native_thread_id,
+                native_session_id,
+                native_turn_id,
+            } => BootstrapNativeStage::Submitted {
+                native_thread_id,
+                native_session_id,
+                native_turn_id,
+            },
+            BootstrapControlStage::RefusedBeforeEffect => return Err(Invalid),
+        };
+        BootstrapNativeObservation::from_attested_pod(
+            CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
+            selector.clone(),
+            inspection.writer_epoch(),
+            inspection.expected_request_digest().into(),
+            stage,
+        )
+    }
 }
 
 fn bootstrap_port_stage(
@@ -603,6 +777,80 @@ impl HostDispatchPort for LinuxLaunchPort {
     ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
         self.send_claimed_bootstrap(claimed)
     }
+
+    fn inspect_claimed_codex_bootstrap(
+        &self,
+        inspection: ResolvedClaimedBootstrapInspection,
+    ) -> Result<BootstrapNativeObservation, BootstrapObservationError> {
+        self.inspect_claimed_bootstrap(inspection)
+    }
+}
+
+fn check_inspection_store(
+    store: &mut PodBayStore,
+    inspection: &ResolvedClaimedBootstrapInspection,
+    binding: &BoundPeerManifest,
+    manager: &LinuxPeerEvidence,
+) -> Result<(), BootstrapObservationError> {
+    use BootstrapObservationError::{Invalid, Unavailable};
+    let selector: &BootstrapSendSelector = inspection.selector();
+    let target = &selector.native_target;
+    let proof = store
+        .inspect_claimed_bootstrap_send(selector)
+        .map_err(|_| Unavailable)?;
+    let lease = store
+        .inspect_native_writer_lease(target)
+        .map_err(|_| Unavailable)?;
+    let current = store
+        .current_bound_pod_snapshot(target.scope_id.as_str(), target.pod_id.as_str())
+        .map_err(|_| Unavailable)?;
+    let manager_claim = store
+        .current_manager_credential_claim(inspection.owner_epoch())
+        .map_err(|_| Unavailable)?;
+    if proof.receipt().command_id != selector.command_id.as_str()
+        || proof.receipt().request_digest != inspection.expected_request_digest()
+        || proof.native_target() != target
+        || proof.writer_epoch() != inspection.writer_epoch()
+        || proof.owner_epoch() != inspection.owner_epoch()
+        || proof.manager_credential_epoch() != inspection.manager_credential_epoch()
+        || proof.authority_revision() != inspection.authority_revision()
+        || lease.writer_epoch() != proof.writer_epoch()
+        || lease.target() != target
+        || lease.holder_actor_id() != proof.holder_actor_id()
+        || lease.holder_credential_generation() != proof.holder_credential_generation()
+        || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+        || current.store_lineage() != &target.store_lineage
+        || current.owner_epoch().get() != inspection.owner_epoch()
+        || current.authority_revision() != inspection.authority_revision()
+        || current.launch().session_id != target.session_id.as_str()
+        || current.launch().run_id != target.run_id.as_str()
+        || current.launch().attempt_id != target.attempt_id.as_str()
+        || current.launch().descriptor != binding.wire_descriptor
+        || current.launch().effective_spec != binding.effective_spec
+        || manager_claim.store_lineage() != target.store_lineage.as_str()
+        || manager_claim.credential_epoch() != inspection.manager_credential_epoch()
+        || !store
+            .current_manager_peer_matches(&manager_claim, manager.attested_peer())
+            .map_err(|_| Unavailable)?
+    {
+        return Err(Invalid);
+    }
+    Ok(())
+}
+
+fn inspection_status_matches(
+    status: &PodStatus,
+    target: &NativeWriterTarget,
+    manifest: &PodManifest,
+    binding: &BoundPeerManifest,
+) -> bool {
+    status.pod_id == target.pod_id.as_str()
+        && status.attempt_id == target.attempt_id.as_str()
+        && status.incarnation == target.pod_incarnation
+        && status.manifest_digest == manifest.digest
+        && status.unit_name == manifest.unit_name
+        && status.bound.as_ref()
+            == Some(&binding.status(target.resource_id.as_str(), target.scope_id.as_str()))
 }
 
 fn checked_store_file(path: &Path, expected_uid: u32) -> Result<(u64, u64), PodError> {

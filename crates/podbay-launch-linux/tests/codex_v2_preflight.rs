@@ -17,13 +17,13 @@ use podbay_core::{
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
-    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapPortObservation, BoundHostLaunchProposal,
-    BoundLaunchPodRequest, CredentialGeneration, CredentialRef, DurableAuthority, ExecutionMode,
-    GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort, HostError, HostRequest,
-    LaunchSelection, ManagerEpoch, Operation, PodIncarnation, PortDispatchError,
-    PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right,
-    Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate, TrustedLaunchProfileInput,
-    TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
+    AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeStage, BootstrapPortObservation,
+    BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
+    DurableAuthority, ExecutionMode, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
+    HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
+    PortDispatchError, PortDispatchOutcome, PortReceiptRef, RegisteredLaunchProfile,
+    ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy, TrustedDriverTemplate,
+    TrustedLaunchProfileInput, TrustedNativeHostConfig, WorkspaceAccess, WorkspaceSelection,
 };
 use podbay_launch_linux::{
     CodexV2Preflight, LinuxLaunchPort, TrustedCodexCredentialSource, TrustedLinuxLaunchConfig,
@@ -33,7 +33,10 @@ use podbay_pod::{
     CODEX_V2_CAPABILITY, CodexCommandJournal, CodexJournalIdentity, CodexJournalStage,
     LinuxBackend, PodClient, PodError, launch_bound_codex_v2,
 };
-use podbay_store::{EffectClaim, LaunchDispatchStage, PodBayStore};
+use podbay_store::{
+    CommandLookupSelector, EffectClaim, LaunchDispatchStage, PodBayStore,
+    TrustedNativeWriterLeaseRequest,
+};
 use podbay_wire::{
     CodexAppServerPolicyV2, CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard,
     ResourceDriver, SendPolicy, SessionSendBody, Target as WireTarget,
@@ -998,6 +1001,7 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
         .unwrap();
     assert_eq!(accepted.status.stage, LaunchDispatchStage::HostAccepted);
     let manifest = slot_manifest(&fixture).expect("one committed V2 pod manifest");
+    let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);
     let client = PodClient::connect(&manifest).unwrap();
     assert!(client.attested_status().unwrap().child_running);
 
@@ -1086,6 +1090,36 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
         ]
     );
 
+    // Treat the original port reply as lost. commands.get must recover the
+    // submitted fact from the held pod journal without resending native input.
+    let command_selector = CommandLookupSelector::Id {
+        command_id: submitted.receipt.command_id.clone(),
+    };
+    for _ in 0..2 {
+        let (durable, native) = host
+            .lookup_command_with_native_observation(&transport, &fixture.scope, &command_selector)
+            .unwrap();
+        assert_eq!(durable.receipt, submitted.receipt);
+        assert_eq!(
+            durable.effect_state,
+            podbay_store::EffectState::ClaimedUncertain
+        );
+        let native = native.expect("attested pod journal observation");
+        assert_eq!(native.request_digest(), submitted.receipt.request_digest);
+        assert_eq!(native.writer_epoch(), lease.writer_epoch());
+        assert!(matches!(
+            native.stage(),
+            BootstrapNativeStage::Submitted {
+                native_thread_id,
+                native_session_id,
+                native_turn_id,
+            } if native_thread_id == "thread.fixture"
+                && native_session_id == "native.session.fixture"
+                && native_turn_id == "turn.fixture"
+        ));
+        assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+    }
+
     let mut retry = envelope;
     retry.request_id = "request.codex.bootstrap.retry".into();
     let duplicate = host
@@ -1095,7 +1129,30 @@ fn disposable_codex_v2_claimed_bootstrap_sends_one_fake_native_turn() {
     assert!(!duplicate.port_called);
     assert_eq!(duplicate.receipt, submitted.receipt);
     assert_eq!(reopened_bootstrap_journal(&fixture), journal);
-    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 5);
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
+
+    // A new writer epoch removes the supplemental observation. The durable
+    // command receipt remains readable, and inspection cannot send again.
+    let takeover = PodBayStore::open(&fixture.database)
+        .unwrap()
+        .acquire_native_writer_lease_from_trusted_host(&TrustedNativeWriterLeaseRequest {
+            target: target.clone(),
+            holder_actor_id: lease.holder_actor_id().clone(),
+            holder_credential_generation: lease.holder_credential_generation(),
+            expected_owner_epoch: lease.owner_epoch(),
+            expected_manager_credential_epoch: lease.manager_credential_epoch(),
+            expected_authority_revision: lease.authority_revision(),
+            expected_writer_epoch: Some(lease.writer_epoch()),
+            ttl_seconds: 60,
+        })
+        .unwrap();
+    assert_eq!(takeover.writer_epoch(), lease.writer_epoch() + 1);
+    let (durable, native) = host
+        .lookup_command_with_native_observation(&transport, &fixture.scope, &command_selector)
+        .unwrap();
+    assert_eq!(durable.receipt, submitted.receipt);
+    assert!(native.is_none());
+    assert_eq!(fs::read_to_string(&frames).unwrap().lines().count(), 5);
     assert!(!client.stop().unwrap().child_running);
 }
 
