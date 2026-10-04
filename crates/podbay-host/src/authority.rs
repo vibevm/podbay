@@ -465,6 +465,9 @@ impl TrustedInitialOwnerPolicy {
         })
     }
 
+    pub fn actor_id(&self) -> &ActorId { &self.actor_id }
+    pub fn scope_id(&self) -> &ScopeId { &self.scope_id }
+
     fn grant_spec(&self) -> GrantSpec {
         GrantSpec {
             scope_id: self.scope_id.clone(),
@@ -3277,6 +3280,45 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
 
     pub fn recorded_snapshot(&self) -> &AuthoritySnapshot {
         &self.recorded
+    }
+
+    /// Resolve exactly one still-current, activated owner grant with the
+    /// reviewed policy rights. No request-supplied grant reference is used.
+    pub fn current_owner_grant_from_trusted_policy(
+        &mut self,
+        policy: &TrustedInitialOwnerPolicy,
+    ) -> Result<GrantId, DurableAuthorityError> {
+        #[cfg(target_os = "linux")]
+        self.recheck_actor_resolution_manager()?;
+        if self.store.authority_snapshot()? != self.recorded {
+            return Err(HostError::StaleGuard.into());
+        }
+        let actor = self.host.actors.get(policy.actor_id())
+            .ok_or(HostError::Unauthenticated)?;
+        if actor.scope_id != *policy.scope_id() {
+            return Err(HostError::Unauthorised.into());
+        }
+        let expected = policy.grant_spec();
+        let mut matches = self.recorded.grants.iter().filter_map(|record| {
+            if record.actor_id != policy.actor_id().as_str()
+                || record.scope_id != policy.scope_id().as_str()
+                || record.credential_generation != actor.credential_generation.get()
+            {
+                return None;
+            }
+            let spec = replay_grant_spec(record).ok()?;
+            (spec.scope_id == expected.scope_id
+                && spec.mode == expected.mode
+                && spec.rights == expected.rights
+                && spec.remaining_delegation_depth == expected.remaining_delegation_depth
+                && self.host.grants.contains_key(&GrantId(record.grant_id)))
+                .then_some(GrantId(record.grant_id))
+        });
+        let found = matches.next().ok_or(HostError::Unauthorised)?;
+        if matches.next().is_some() {
+            return Err(HostError::Unauthorised.into());
+        }
+        Ok(found)
     }
 
     /// Read-only recovery challenge for a trusted Linux listener's freshly

@@ -1,6 +1,6 @@
 /** Owner-only key custody for a future proof-bearing owner rotation. */
 import { createPrivateKey, createPublicKey, randomBytes, sign, type KeyObject } from "node:crypto";
-import { constants as fsConstants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 const SCHEMA = "podbay.owner-key-custody/1";
@@ -176,6 +176,28 @@ export function loadOwnerKeyCustody(
   };
 }
 
+/** Trusted local recovery code must validate the full host transcript before calling this signer. */
+export function loadOwnerKeyForRecovery(
+  path: string,
+  expected: Pick<OwnerKeyCustodyBinding, "actorId" | "scopeId" | "storeLineage">,
+  expectedPublicKey: Uint8Array,
+): { readonly publicKey: Uint8Array; signVerifiedTranscript(bytes: Uint8Array): Uint8Array } {
+  const material = loadOwnerKeyMaterial(path, expected);
+  if (!(expectedPublicKey instanceof Uint8Array) || expectedPublicKey.length !== 32 ||
+      !Buffer.from(material.publicKey).equals(Buffer.from(expectedPublicKey)))
+    throw new TypeError("owner recovery verifier differs from custody");
+  return {
+    publicKey: material.publicKey,
+    signVerifiedTranscript(bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.length < 32 || bytes.length > 8_192 ||
+          !Buffer.from(bytes).subarray(0, "podbay.owner-recovery/1\0".length)
+            .equals(Buffer.from("podbay.owner-recovery/1\0", "ascii")))
+        throw new TypeError("owner recovery transcript domain is invalid");
+      return new Uint8Array(sign(null, Buffer.from(bytes), material.privateKey));
+    },
+  };
+}
+
 /**
  * Reuse the exact pre-enrollment key after a cut before first setup proof.
  * A different process is admitted only after the prior PID and birth are gone.
@@ -227,6 +249,125 @@ export function recoverOwnerKeyForInitialEnrollment(
       verified.binding.startIdentity !== prior.startIdentity)
     throw new TypeError("owner custody changed during recovery");
   return { privateKey: verified.privateKey, publicKey: verified.publicKey };
+}
+
+/**
+ * Stages the next owner key under an exact generation directory without
+ * replacing any prior-generation key. The store's current actor generation
+ * and verifier, not a local pointer, decide which generation is authoritative.
+ */
+export function stageNextOwnerKeyCustody(
+  stateDirectory: string,
+  nextGeneration: bigint,
+  binding: OwnerKeyCustodyBinding,
+  generatedKey: KeyObject,
+): { readonly path: string; readonly privateKey: KeyObject; readonly publicKey: Uint8Array } {
+  if (nextGeneration < 2n || nextGeneration > MAX_U64 ||
+      !isAbsolute(stateDirectory) || stateDirectory.includes("\0"))
+    throw new TypeError("next owner custody generation or state directory is invalid");
+  const state = lstatSync(stateDirectory);
+  if (!state.isDirectory() || state.uid !== process.getuid?.() ||
+      (state.mode & 0o7777) !== 0o700 || realpathSync(stateDirectory) !== stateDirectory)
+    throw new TypeError("next owner custody state directory is not canonical and private");
+  const parent = openSync(stateDirectory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    const pinned = fstatSync(parent);
+    if (pinned.dev !== state.dev || pinned.ino !== state.ino)
+      throw new TypeError("next owner custody state directory changed");
+    const directory = join(stateDirectory, `owner-generation-${nextGeneration.toString()}`);
+    try { mkdirSync(directory, { mode: 0o700 }); }
+    catch (error) {
+      if (!isRecord(error) || error["code"] !== "EEXIST") throw error;
+    }
+    const child = lstatSync(directory);
+    if (!child.isDirectory() || child.uid !== state.uid ||
+        (child.mode & 0o7777) !== 0o700 || realpathSync(directory) !== directory)
+      throw new TypeError("next owner custody generation directory differs");
+    fsyncSync(parent);
+    const publicKey = rawPublicKey(generatedKey);
+    const keyDirectory = join(directory, `key-${publicKey.toString("hex")}`);
+    try { mkdirSync(keyDirectory, { mode: 0o700 }); }
+    catch (error) {
+      if (!isRecord(error) || error["code"] !== "EEXIST") throw error;
+    }
+    const keyDir = lstatSync(keyDirectory);
+    if (!keyDir.isDirectory() || keyDir.uid !== state.uid ||
+        (keyDir.mode & 0o7777) !== 0o700 || realpathSync(keyDirectory) !== keyDirectory)
+      throw new TypeError("next owner key directory differs");
+    const generationFd = openSync(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try { fsyncSync(generationFd); } finally { closeSync(generationFd); }
+    const path = join(keyDirectory, FILE_NAME);
+    let selected: { readonly privateKey: KeyObject; readonly publicKey: Uint8Array };
+    try {
+      persistOwnerKeyCustody(path, binding, generatedKey);
+      selected = { privateKey: generatedKey, publicKey: new Uint8Array(publicKey) };
+    } catch {
+      selected = recoverOwnerKeyForInitialEnrollment(path, binding, publicKey);
+    }
+    publishNextPublicReceipt(keyDirectory, nextGeneration, binding, selected.publicKey);
+    return { path, ...selected };
+  } finally { closeSync(parent); }
+}
+
+function publishNextPublicReceipt(
+  directory: string, generation: bigint, binding: OwnerKeyCustodyBinding, publicKey: Uint8Array,
+): void {
+  const record = {
+    schema: "podbay.owner-next-public/1", actorId: binding.actorId,
+    scopeId: binding.scopeId, storeLineage: binding.storeLineage,
+    credentialGeneration: generation.toString(),
+    ownerEpoch: binding.ownerEpoch.toString(),
+    authorityRevision: binding.authorityRevision.toString(),
+    osIdentity: binding.osIdentity, processIdentity: binding.processIdentity,
+    startIdentity: binding.startIdentity.toString(),
+    containmentIdentity: binding.containmentIdentity,
+    publicKey: Buffer.from(publicKey).toString("base64url"),
+  };
+  const bytes = Buffer.from(JSON.stringify(record), "utf8");
+  const path = join(directory, "owner-next-public.json");
+  const parent = openSync(directory, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+  try {
+    for (const name of readdirSync(directory)) {
+      const match = /^owner-next-public\.json\.tmp\.([1-9][0-9]*)\.([1-9][0-9]*)\.([a-f0-9]{32})$/u.exec(name);
+      if (!match) continue;
+      const live = processBirthStillLive(match[1]!, BigInt(match[2]!));
+      if (live && match[1] !== String(process.pid)) continue;
+      const temporary = join(directory, name);
+      const orphan = lstatSync(temporary);
+      if (!orphan.isFile() || orphan.uid !== process.getuid?.() ||
+          (orphan.mode & 0o7777) !== 0o600 || orphan.nlink < 1 || orphan.nlink > 2)
+        throw new TypeError("next owner public receipt temporary differs");
+      if (live && orphan.nlink === 1) continue;
+      if (orphan.nlink === 2) {
+        const final = lstatSync(path);
+        if (!final.isFile() || final.dev !== orphan.dev || final.ino !== orphan.ino ||
+            final.nlink !== 2 || final.uid !== orphan.uid || (final.mode & 0o7777) !== 0o600)
+          throw new TypeError("next owner public receipt link differs");
+      }
+      unlinkSync(temporary);
+      fsyncSync(parent);
+    }
+    if (!entryExists(path)) {
+      const temporary = `${path}.tmp.${String(process.pid)}.${binding.startIdentity.toString()}.${randomBytes(16).toString("hex")}`;
+      const file = openSync(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+      try { writeFileSync(file, bytes); fsyncSync(file); }
+      finally { closeSync(file); }
+      try { linkSync(temporary, path); }
+      finally { unlinkSync(temporary); }
+      fsyncSync(parent);
+    }
+    const file = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+    try {
+      const metadata = fstatSync(file);
+      if (!metadata.isFile() || metadata.uid !== process.getuid?.() ||
+          (metadata.mode & 0o7777) !== 0o600 || metadata.nlink !== 1 ||
+          metadata.size !== bytes.length || realpathSync(path) !== path ||
+          !readFileSync(file).equals(bytes))
+        throw new TypeError("next owner public receipt differs");
+      fsyncSync(file);
+    } finally { closeSync(file); }
+    fsyncSync(parent);
+  } finally { closeSync(parent); }
 }
 
 export function ownerKeyContinuityChallenge(nonce: Uint8Array): Uint8Array {

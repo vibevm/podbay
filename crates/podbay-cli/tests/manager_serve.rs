@@ -146,6 +146,10 @@ impl Fixture {
         self.state.join("owner-setup.sock")
     }
 
+    fn recovery_socket(&self) -> PathBuf {
+        self.state.join("owner-recovery.sock")
+    }
+
     fn owner_epoch(&self) -> u64 {
         PodBayStore::open(&self.database)
             .unwrap()
@@ -208,6 +212,23 @@ impl Running {
                 return;
             }
             assert!(Instant::now() < until, "owner setup socket did not appear");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_recovery_ready(&mut self, fixture: &Fixture) {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                let log = fs::read_to_string(fixture.root.join("manager.log")).unwrap_or_default();
+                panic!("manager exited before recovery socket: {status}; {log}");
+            }
+            if fs::symlink_metadata(fixture.recovery_socket()).is_ok_and(|metadata| {
+                metadata.file_type().is_socket() && metadata.mode() & 0o7777 == 0o600
+            }) {
+                return;
+            }
+            assert!(Instant::now() < until, "owner recovery socket did not appear");
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -643,15 +664,15 @@ fn private_trusted_policy_enables_reviewed_route_after_parent_enrollment() {
     assert!(manager.stop_with("TERM").success());
 
     // A new manager owner epoch cannot silently turn an old process-bound
-    // enrollment into a new first enrollment. Recovery is a separate path.
+    // enrollment into a new first enrollment. Invalid recovery proof refuses.
     let before = PodBayStore::open(&fixture.database)
         .unwrap()
         .authority_snapshot()
         .unwrap();
     let mut restarted = spawn_policy(&fixture, &policy);
-    restarted.wait_setup_ready(&fixture);
-    let mut socket = UnixStream::connect(fixture.setup_socket()).unwrap();
-    write_frame(&mut socket, signer.pk.as_ref());
+    restarted.wait_recovery_ready(&fixture);
+    let mut socket = UnixStream::connect(fixture.recovery_socket()).unwrap();
+    write_frame(&mut socket, &[0; 64]);
     drop(socket);
     assert!(!restarted.wait_exit().success());
     assert!(!fixture.socket().exists());
@@ -661,6 +682,7 @@ fn private_trusted_policy_enables_reviewed_route_after_parent_enrollment() {
         .unwrap();
     assert_eq!(after.actors, before.actors);
     assert_eq!(after.grants, before.grants);
+    assert_eq!(after.owner_epoch, before.owner_epoch + 1);
 }
 
 #[test]

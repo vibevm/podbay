@@ -12,9 +12,11 @@ podbay-store = { path = "../podbay-store" }
 podbay-core = { path = "../podbay-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+getrandom = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 podbay-pod = { path = "../podbay-pod" }
+libc = "0.2"
 
 [dev-dependencies]
 podbay-client = { path = "../podbay-client" }

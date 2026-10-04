@@ -4,11 +4,11 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { loadOwnerKeyCustody, ownerKeyContinuityChallenge, persistOwnerKeyCustody, recoverOwnerKeyForInitialEnrollment } from "../src/owner-key-custody.ts";
+import { loadOwnerKeyCustody, ownerKeyContinuityChallenge, persistOwnerKeyCustody, recoverOwnerKeyForInitialEnrollment, stageNextOwnerKeyCustody } from "../src/owner-key-custody.ts";
 import { INITIAL_OWNER_RIGHTS_DIGEST, InitialOwnerSetupClient, OwnerSetupError } from "../src/owner-setup.ts";
 
 const setupDomain = Buffer.from("podbay.owner-initial-enrollment/1\0", "ascii");
@@ -488,6 +488,69 @@ test("a second process cannot reuse custody while the first owner birth is live"
     assert.deepEqual(recovered.publicKey, loadOwnerKeyCustody(path, expected).publicKey);
   } finally {
     if (child.exitCode === null) child.kill("SIGTERM");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("next owner keys are private, generation-scoped and never replace earlier keys", {
+  skip: process.platform !== "linux",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "podbay-next-owner-custody-"));
+  await chmod(root, 0o700);
+  try {
+    const stat = await readFile("/proc/self/stat", "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    const cgroup = (await readFile("/proc/self/cgroup", "utf8")).trimEnd()
+      .split("\n").find((line) => line.startsWith("0::"));
+    assert.ok(cgroup);
+    const binding = {
+      actorId: "actor.owner.next", scopeId: "scope.owner.next",
+      storeLineage: "lineage.owner.next", credentialRef: "credential.owner.next",
+      ownerEpoch: 2n, authorityRevision: 7n,
+      osIdentity: `linux.uid.${String(process.getuid?.())}`,
+      processIdentity: `linux.pid.${String(process.pid)}`,
+      startIdentity: BigInt(fields[19]!), containmentIdentity: cgroup.slice(3),
+    };
+    const secondKey = generateKeyPairSync("ed25519").privateKey;
+    const second = stageNextOwnerKeyCustody(root, 2n, binding, secondKey);
+    assert.equal(second.path, join(root, "owner-generation-2",
+      `key-${Buffer.from(second.publicKey).toString("hex")}`, "owner-key-custody.json"));
+    assert.equal((await lstat(join(root, "owner-generation-2"))).mode & 0o7777, 0o700);
+    assert.equal((await lstat(second.path)).mode & 0o7777, 0o600);
+    const publicReceipt = join(dirname(second.path), "owner-next-public.json");
+    assert.equal((await lstat(publicReceipt)).mode & 0o7777, 0o600);
+    const publicText = await readFile(publicReceipt, "utf8");
+    assert.equal(publicText.includes("privateKeyPkcs8"), false);
+    assert.equal((JSON.parse(publicText) as { credentialGeneration: string }).credentialGeneration, "2");
+    const secondBytes = await readFile(second.path);
+    const linkedReceiptTemp = join(dirname(second.path), `owner-next-public.json.tmp.99999999.1.${"b".repeat(32)}`);
+    await link(publicReceipt, linkedReceiptTemp);
+    assert.equal((await lstat(publicReceipt)).nlink, 2);
+    assert.deepEqual(stageNextOwnerKeyCustody(root, 2n, binding, secondKey).publicKey, second.publicKey);
+    assert.equal((await lstat(publicReceipt)).nlink, 1);
+    await assert.rejects(() => lstat(linkedReceiptTemp));
+    await rm(publicReceipt);
+    const partialReceiptTemp = join(dirname(second.path), `owner-next-public.json.tmp.99999999.1.${"c".repeat(32)}`);
+    await writeFile(partialReceiptTemp, "partial", { mode: 0o600 });
+    assert.deepEqual(stageNextOwnerKeyCustody(root, 2n, binding, secondKey).publicKey, second.publicKey);
+    assert.equal((await lstat(publicReceipt)).mode & 0o7777, 0o600);
+    await assert.rejects(() => lstat(partialReceiptTemp));
+    assert.deepEqual(await readFile(second.path), secondBytes);
+    assert.deepEqual(stageNextOwnerKeyCustody(root, 2n, binding, secondKey).publicKey, second.publicKey);
+    assert.deepEqual(await readFile(second.path), secondBytes);
+    const alternate = stageNextOwnerKeyCustody(root, 2n, binding,
+      generateKeyPairSync("ed25519").privateKey);
+    assert.notEqual(alternate.path, second.path);
+    assert.notDeepEqual(alternate.publicKey, second.publicKey);
+    assert.deepEqual(await readFile(second.path), secondBytes);
+    const third = stageNextOwnerKeyCustody(root, 3n, binding,
+      generateKeyPairSync("ed25519").privateKey);
+    assert.equal(third.path, join(root, "owner-generation-3",
+      `key-${Buffer.from(third.publicKey).toString("hex")}`, "owner-key-custody.json"));
+    assert.deepEqual(await readFile(second.path), secondBytes);
+    assert.notDeepEqual(third.publicKey, second.publicKey);
+    assert.deepEqual(loadOwnerKeyCustody(third.path, binding).publicKey, third.publicKey);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

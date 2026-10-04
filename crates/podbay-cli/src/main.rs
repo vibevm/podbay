@@ -30,6 +30,7 @@ mod linux {
     use podbay_pod::LinuxPeerEvidence;
     use podbay_server::{
         InitialOwnerSetupError, LinuxInitialOwnerSetupListener, LinuxListenerError,
+        LinuxOwnerRecoveryListener, OWNER_RECOVERY_SOCKET_NAME,
         LinuxManagerCommandsGetListener, MANAGER_SOCKET_NAME, OWNER_SETUP_SOCKET_NAME,
         TrustedBootstrapSendTemplate, TrustedWireRootLaunchTemplate,
     };
@@ -138,11 +139,13 @@ mod linux {
         }
         let socket_path = config.state_dir.join(MANAGER_SOCKET_NAME);
         let setup_path = config.state_dir.join(OWNER_SETUP_SOCKET_NAME);
+        let recovery_path = config.state_dir.join(OWNER_RECOVERY_SOCKET_NAME);
         // A stale pathname must not advance the durable owner epoch. Probe it
         // before opening the manager; the later check still catches races.
         check_manager_socket_path(&socket_path)?;
         if owner_policy.is_some() {
             check_owner_setup_socket_path(&setup_path)?;
+            check_owner_recovery_socket_path(&recovery_path)?;
         }
         ensure_private_database(&config.database, &config.state_dir, self_peer.uid())?;
         // One lock and manager OS identity live for this entire serve loop.
@@ -154,33 +157,50 @@ mod linux {
         check_manager_socket_path(&socket_path)?;
         let mut enrolled_grant = None;
         if let Some(policy) = owner_policy {
-            check_owner_setup_socket_path(&setup_path)?;
-            let mut setup = LinuxInitialOwnerSetupListener::bind(
-                &config.state_dir,
-                parent.expect("setup requires captured launcher parent"),
-            )
-            .map_err(|error| format!("owner setup bind failed: {error}"))?;
-            eprintln!("podbay owner setup socket: {}", setup.path().display());
-            let enrolled = setup.serve(&mut authority, policy, &stop);
-            let cleanup = setup.shutdown();
-            match (enrolled, cleanup) {
-                (Ok(receipt), Ok(())) => {
-                    eprintln!(
-                        "podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
-                        receipt.actor_id.as_str(),
-                        receipt.scope_id.as_str(),
-                        receipt.grant_id.get(),
-                        receipt.owner_epoch,
-                    );
-                    enrolled_grant = Some(receipt.grant_id);
+            let parent = parent.expect("setup requires captured launcher parent");
+            let recorded_owner = authority.recorded_snapshot().actors.iter().any(|actor| {
+                actor.origin == "owner_cli"
+                    && actor.actor_id == policy.actor_id().as_str()
+                    && actor.scope_id == policy.scope_id().as_str()
+            });
+            if recorded_owner {
+                check_owner_recovery_socket_path(&recovery_path)?;
+                let mut recovery = LinuxOwnerRecoveryListener::bind(&config.state_dir, parent)
+                    .map_err(|error| format!("owner recovery bind failed: {error}"))?;
+                eprintln!("podbay owner recovery socket: {}", recovery.path().display());
+                let recovered = recovery.serve(&mut authority, &policy, &stop);
+                let cleanup = recovery.shutdown();
+                match (recovered, cleanup) {
+                    (Ok(receipt), Ok(())) => {
+                        eprintln!("podbay owner recovered: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                            receipt.rotation.actor_id, receipt.rotation.scope_id,
+                            receipt.grant_id.get(), receipt.rotation.owner_epoch);
+                        enrolled_grant = Some(receipt.grant_id);
+                    }
+                    (Err(error), Ok(())) => return Err(format!("owner recovery failed: {error}")),
+                    (Ok(_), Err(error)) => return Err(format!("owner recovery cleanup failed: {error}")),
+                    (Err(recovery_error), Err(cleanup_error)) => return Err(format!(
+                        "owner recovery failed: {recovery_error}; socket cleanup failed: {cleanup_error}")),
                 }
-                (Err(InitialOwnerSetupError::Stopped), Ok(())) => return Ok(()),
-                (Err(error), Ok(())) => return Err(format!("owner setup failed: {error}")),
-                (Ok(_), Err(error)) => return Err(format!("owner setup cleanup failed: {error}")),
-                (Err(setup_error), Err(cleanup_error)) => {
-                    return Err(format!(
-                        "owner setup failed: {setup_error}; cleanup failed: {cleanup_error}"
-                    ));
+            } else {
+                check_owner_setup_socket_path(&setup_path)?;
+                let mut setup = LinuxInitialOwnerSetupListener::bind(&config.state_dir, parent)
+                    .map_err(|error| format!("owner setup bind failed: {error}"))?;
+                eprintln!("podbay owner setup socket: {}", setup.path().display());
+                let enrolled = setup.serve(&mut authority, policy, &stop);
+                let cleanup = setup.shutdown();
+                match (enrolled, cleanup) {
+                    (Ok(receipt), Ok(())) => {
+                        eprintln!("podbay initial owner enrolled: actor={} scope={} grant=grant.{} ownerEpoch={}",
+                            receipt.actor_id.as_str(), receipt.scope_id.as_str(),
+                            receipt.grant_id.get(), receipt.owner_epoch);
+                        enrolled_grant = Some(receipt.grant_id);
+                    }
+                    (Err(InitialOwnerSetupError::Stopped), Ok(())) => return Ok(()),
+                    (Err(error), Ok(())) => return Err(format!("owner setup failed: {error}")),
+                    (Ok(_), Err(error)) => return Err(format!("owner setup cleanup failed: {error}")),
+                    (Err(setup_error), Err(cleanup_error)) => return Err(format!(
+                        "owner setup failed: {setup_error}; cleanup failed: {cleanup_error}")),
                 }
             }
         }
@@ -382,6 +402,14 @@ mod linux {
             Err(error) => Err(format!(
                 "owner setup socket path inspection failed: {error}"
             )),
+        }
+    }
+
+    fn check_owner_recovery_socket_path(path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Err(format!("existing owner recovery socket path {}; inspect the prior owner", path.display())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("owner recovery socket path inspection failed: {error}")),
         }
     }
 

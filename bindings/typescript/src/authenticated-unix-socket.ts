@@ -95,6 +95,11 @@ export function matchesCanonicalActorChallenge(
   return parsed !== undefined && matchesExpected(parsed, copyAndValidateExpected(expected));
 }
 
+/** Read-only decode for a trusted signer on a separate one-use recovery socket. */
+export function parseCanonicalActorChallenge(bytes: Uint8Array): CanonicalActorChallenge | null {
+  return bytes instanceof Uint8Array ? parseChallenge(Buffer.from(bytes)) ?? null : null;
+}
+
 type Phase = "connecting" | "challenge" | "signing" | "ack" | "response" | "reply_complete";
 
 /** Authenticates before writing one request; never retries uncertain input. */

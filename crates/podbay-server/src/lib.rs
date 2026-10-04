@@ -12,6 +12,8 @@ mod host_read_handler;
 #[cfg(target_os = "linux")]
 mod initial_owner_setup;
 #[cfg(target_os = "linux")]
+mod owner_recovery;
+#[cfg(target_os = "linux")]
 mod linux_listener;
 #[cfg(target_os = "linux")]
 mod linux_peer;
@@ -35,6 +37,11 @@ pub use auth_prelude::{
 #[cfg(target_os = "linux")]
 pub use initial_owner_setup::{
     InitialOwnerSetupError, LinuxInitialOwnerSetupListener, OWNER_SETUP_SOCKET_NAME,
+};
+#[cfg(target_os = "linux")]
+pub use owner_recovery::{
+    LinuxOwnerRecoveryListener, OwnerRecoveryError, OwnerRecoveryReceipt,
+    OWNER_RECOVERY_SOCKET_NAME,
 };
 #[cfg(target_os = "linux")]
 pub use linux_listener::{

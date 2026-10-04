@@ -135,6 +135,36 @@ impl PendingOwnerRecovery {
     pub fn challenge_bytes(&self) -> &[u8] {
         &self.transcript
     }
+    pub fn actor_id(&self) -> &str {
+        &self.prior.actor_id
+    }
+    pub fn scope_id(&self) -> &str {
+        &self.prior.scope_id
+    }
+    pub fn prior_generation(&self) -> u64 {
+        self.prior.credential_generation
+    }
+    pub fn next_generation(&self) -> u64 {
+        self.prior.credential_generation + 1
+    }
+    pub fn store_lineage(&self) -> &str {
+        &self.store_lineage
+    }
+    pub fn old_public_key(&self) -> &[u8; 32] {
+        &self.old_public_key
+    }
+    pub fn next_public_key(&self) -> &[u8; 32] {
+        &self.next_public_key
+    }
+    pub fn next_process(&self) -> &AuthenticatedProcessSubject {
+        &self.next_process
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
 
     pub fn verify(
         self,
