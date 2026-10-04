@@ -13,7 +13,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use podbay_core::{
     ActorId, Attempt, AttestedPeer, CommandId, CommandKey, CredentialEpoch, Epoch, LaunchBinding,
-    OwnerEpoch, PlannedRootBinding, Pod, PodId, RebindProposal, RequestDigest, Resource,
+    OwnerEpoch, PendingPodProcessEvidence, PlannedRootBinding, Pod, PodId, RebindPhase,
+    RebindProposal, RequestDigest, Resource,
     ResourceId, ResourceKind, Role, Run, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
 use podbay_store::{
@@ -1017,6 +1018,59 @@ pub struct PortRebindObservation {
     child_start_ticks: u64,
 }
 
+/// Read-only observation from a trusted native port after one nonce-bound
+/// pending-recovery socket exchange and independent process-tree attestation.
+/// It cannot plan/ACK a v21 row or grant control by construction.
+pub struct PortPendingRecoveryObservation {
+    abandoned: RebindProposal,
+    pending_phase: RebindPhase,
+    checkpoint_digest: String,
+    prior_checkpoint_digest: String,
+    pending_process: PendingPodProcessEvidence,
+    unit_name: String,
+    descriptor_digest: String,
+}
+
+impl PortPendingRecoveryObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trusted_port(
+        abandoned: RebindProposal,
+        pending_phase: RebindPhase,
+        checkpoint_digest: String,
+        prior_checkpoint_digest: String,
+        pending_process: PendingPodProcessEvidence,
+        unit_name: String,
+        descriptor_digest: String,
+    ) -> Result<Self, HostError> {
+        let valid_digest = |value: &str| value.len() == 64 && value.bytes().all(|byte|
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !matches!(pending_phase, RebindPhase::PendingStore | RebindPhase::PendingPod)
+            || !valid_digest(&checkpoint_digest)
+            || !valid_digest(&prior_checkpoint_digest)
+            || !valid_digest(&descriptor_digest)
+            || unit_name.is_empty()
+            || unit_name.len() > 256
+            || pending_process.supervisor_process_id.is_empty()
+            || pending_process.supervisor_birth_identity.is_empty()
+            || pending_process.child_process_id.is_empty()
+            || pending_process.child_birth_identity.is_empty()
+        {
+            return Err(HostError::InvalidInput);
+        }
+        Ok(Self {
+            abandoned, pending_phase, checkpoint_digest, prior_checkpoint_digest,
+            pending_process, unit_name, descriptor_digest,
+        })
+    }
+    pub fn abandoned(&self) -> &RebindProposal { &self.abandoned }
+    pub fn pending_phase(&self) -> RebindPhase { self.pending_phase }
+    pub fn checkpoint_digest(&self) -> &str { &self.checkpoint_digest }
+    pub fn prior_checkpoint_digest(&self) -> &str { &self.prior_checkpoint_digest }
+    pub fn pending_process(&self) -> &PendingPodProcessEvidence { &self.pending_process }
+    pub fn unit_name(&self) -> &str { &self.unit_name }
+    pub fn descriptor_digest(&self) -> &str { &self.descriptor_digest }
+}
+
 /// Private host-created proof passed only to its installed Linux port after
 /// the exact Pending store row commits. It carries no credential or bearer.
 #[derive(Clone)]
@@ -1372,6 +1426,15 @@ pub trait HostDispatchPort {
         &self,
         _launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortRebindObservation, HostError> {
+        Err(HostError::Unsupported)
+    }
+
+    /// No mutation or grant. A port must prove the surviving pod's kernel
+    /// peer, direct child birth, unit and exact Pending checkpoint.
+    fn inspect_pending_codex_v2_recovery(
+        &self,
+        _launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortPendingRecoveryObservation, HostError> {
         Err(HostError::Unsupported)
     }
 
@@ -3228,6 +3291,75 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 resource_input_epochs,
             })
         }
+    }
+
+    /// Read-only candidate for a v21 Pending(B) recovery. The port proves
+    /// this exact surviving supervisor/child and fsynced checkpoint; the host
+    /// compares its abandoned proposal with the durable B row and current C
+    /// owner/Resource vector twice. No supersession attempt or ACK is written.
+    pub fn inspect_pending_codex_v2_recovery(
+        &mut self,
+        scope: &ScopeId,
+        pod: &PodId,
+    ) -> Result<PortPendingRecoveryObservation, RebindContextError> {
+        let reviewed = self.inspect_committed_root_codex_v2(scope, pod)?;
+        let observed = self.host.port().inspect_pending_codex_v2_recovery(&reviewed)?;
+        let abandoned = observed.abandoned();
+        let row = self.store.lookup_prior_observed_rebind(abandoned)?
+            .ok_or(StoreError::NotFound)?;
+        let mut current = self.rebind_context(scope, pod)?;
+        let original_inputs = current.resource_input_epochs().clone();
+        if abandoned.identity != *current.identity()
+            || current.launch() != reviewed.committed_record()
+            || current.manager_peer() != reviewed.manager_peer()
+            || current.owner_epoch() != reviewed.owner_epoch()
+            || current.credential_epoch() != reviewed.credential_epoch()
+            || current.authority_revision() != reviewed.authority_revision()
+            || observed.descriptor_digest() != reviewed.descriptor().digest()
+            || row.checkpoint_digest != observed.prior_checkpoint_digest()
+            || row.supervisor_pid.to_string()
+                != observed.pending_process().supervisor_process_id
+            || row.supervisor_start_ticks.to_string()
+                != observed.pending_process().supervisor_birth_identity
+            || row.boot_id != observed.pending_process().boot_identity
+            || row.unit_name != observed.unit_name()
+            || row.cgroup_path != observed.pending_process().containment_identity
+            || row.receipt.request_digest != abandoned.digest.as_str()
+            || row.receipt.pod_checkpoint_ref.as_deref().is_some_and(|digest|
+                digest != observed.checkpoint_digest())
+            || (row.receipt.phase != DurableRebindPhase::Pending
+                && observed.pending_phase() != RebindPhase::PendingPod)
+            || abandoned.next_owner_epoch.get() >= current.owner_epoch()
+            || abandoned.next_credential_epoch.get() >= current.credential_epoch()
+            || abandoned.next_manager == *current.manager_peer()
+            || abandoned.next_manager.containment_identity()
+                != current.manager_peer().containment_identity()
+            || abandoned.next_input_epochs.len() != original_inputs.len()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        for (id, old) in &abandoned.next_input_epochs {
+            if original_inputs.get(id).is_none_or(|current| current.get() <= old.get()) {
+                return Err(HostError::StaleGuard.into());
+            }
+        }
+        current.recheck_current()?;
+        drop(current);
+        let fresh = self.store.lookup_prior_observed_rebind(abandoned)?
+            .ok_or(StoreError::NotFound)?;
+        let mut final_context = self.rebind_context(scope, pod)?;
+        if fresh != row
+            || final_context.launch() != reviewed.committed_record()
+            || final_context.owner_epoch() != reviewed.owner_epoch()
+            || final_context.credential_epoch() != reviewed.credential_epoch()
+            || final_context.authority_revision() != reviewed.authority_revision()
+            || final_context.manager_peer() != reviewed.manager_peer()
+            || final_context.resource_input_epochs() != &original_inputs
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        final_context.recheck_current()?;
+        Ok(observed)
     }
 
     /// Prepare one existing Codex V2 pod for manager rebind. This calls only

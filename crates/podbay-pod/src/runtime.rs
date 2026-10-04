@@ -52,6 +52,13 @@ use crate::rebind_protocol::{
     decode_activate_request, decode_active_response, decode_pending_response, decode_request,
     encode_activate_request, encode_active_response, encode_pending_response, encode_request,
 };
+use crate::rebind_recovery_protocol::{
+    PendingRecoveryInspection, RECOVER_INSPECT_PROTOCOL,
+    decode_inspect_request as decode_recovery_inspect_request,
+    decode_pending_reply as decode_recovery_pending_reply,
+    encode_inspect_request as encode_recovery_inspect_request,
+    encode_pending_reply as encode_recovery_pending_reply,
+};
 use crate::terminal::{PtyProcess, TerminalCommand, TerminalReply};
 
 const FRAME_LIMIT: u64 = 1_048_576;
@@ -749,6 +756,51 @@ impl PodClient {
             return Err(PodError::Invalid(
                 "rebind inspect response identity differs",
             ));
+        }
+        Ok(response)
+    }
+
+    /// Read only the exact fsynced Pending(B) checkpoint from the surviving
+    /// pod. The reply is nonce-bound and its server process is kernel-attested;
+    /// the trusted host must separately attest the direct child, B's death,
+    /// current C claim and durable B row before planning supersession.
+    pub fn inspect_pending_recovery(
+        manifest_path: impl AsRef<Path>,
+        expected: &PodFenceIdentity,
+        owner_epoch: u64,
+        credential_epoch: u64,
+    ) -> Result<PendingRecoveryInspection, PodError> {
+        let manifest = read_manifest(manifest_path.as_ref())?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "unbound recovery inspection is unavailable",
+        ))?;
+        if binding.protocol != PEER_BINDING_V2_PROTOCOL
+            || binding.capability != CODEX_V2_CAPABILITY
+            || bound_identity(&manifest.descriptor, binding)? != *expected
+        {
+            return Err(PodError::Refused("recovery inspection Pod binding differs"));
+        }
+        let mut nonce_bytes = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut nonce_bytes)?;
+        let nonce = hex(&nonce_bytes);
+        let request = encode_recovery_inspect_request(
+            expected, owner_epoch, credential_epoch, &nonce,
+        )?;
+        let (bytes, server_peer) = inspect_exchange(&manifest.socket_path, &request)?;
+        let response = decode_recovery_pending_reply(&bytes, expected, &nonce)
+            .map_err(|_| PodError::Refused("recovery inspect reply is not exact"))?;
+        if !unit_cgroup_exact(server_peer.cgroup(), &manifest.unit_name)
+            || server_peer.attested_peer().os_identity() != binding.manager_os_identity
+            || server_peer.attested_peer().boot_identity() != binding.manager_boot_identity
+            || response.unit_name != manifest.unit_name
+            || response.supervisor_pid != server_peer.pid() as u32
+            || response.supervisor_start_ticks != server_peer.start_ticks()
+            || response.boot_id != server_peer.boot_id()
+            || response.cgroup_path != server_peer.cgroup()
+            || response.abandoned.next_owner_epoch.get() >= owner_epoch
+            || response.abandoned.next_credential_epoch.get() >= credential_epoch
+        {
+            return Err(PodError::Refused("recovery inspect OS peer differs"));
         }
         Ok(response)
     }
@@ -2120,6 +2172,97 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
             (&mut stream)
                 .take(FRAME_LIMIT + 1)
                 .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(recover) = decode_recovery_inspect_request(&bytes, &identity)
+                && recover.protocol == RECOVER_INSPECT_PROTOCOL
+            {
+                let result = (|| -> Result<Vec<u8>, PodError> {
+                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                    {
+                        return Err(PodError::Refused("V2 pending recovery unavailable"));
+                    }
+                    let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "recovery manager OS peer unavailable",
+                    ))?;
+                    let recoverer = observed.attested_peer();
+                    let directory = manifest_path.as_ref().parent().ok_or(PodError::Invalid(
+                        "recovery checkpoint directory is absent",
+                    ))?;
+                    let durable = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Refused("pending recovery checkpoint unavailable"))?;
+                    let checkpoint = durable.checkpoint();
+                    let abandoned = checkpoint.pending_rebind().ok_or(PodError::Refused(
+                        "recovery requires a Pending rebind",
+                    ))?;
+                    let prior = prior_rebind_observation.as_ref().ok_or(PodError::Refused(
+                        "prior Active checkpoint observation was lost",
+                    ))?;
+                    let owner = OwnerEpoch::new(recover.owner_epoch)
+                        .map_err(|_| PodError::Refused("recovery owner epoch is invalid"))?;
+                    if !matches!(checkpoint.phase(), RebindPhase::PendingStore | RebindPhase::PendingPod)
+                        || checkpoint != &fence.checkpoint()
+                        || checkpoint.last_rebind() != Some(abandoned)
+                        || prior.identity != identity
+                        || prior.checkpoint_digest.len() != 64
+                        || abandoned.identity != identity
+                        || abandoned.next_owner_epoch.get() >= recover.owner_epoch
+                        || abandoned.next_credential_epoch.get() >= recover.credential_epoch
+                        || recoverer == &manager_peer
+                        || recoverer == &abandoned.next_manager
+                        || recoverer.containment_identity() != manager_peer.containment_identity()
+                        || witness.current_owner_epoch(&identity.store_lineage, &identity.scope_id)
+                            != Some(owner)
+                        || !manager_witness.matches_current(
+                            recover.owner_epoch, recover.credential_epoch, recoverer,
+                        )
+                        || observed.recheck_before_effect(&stream, recoverer).is_err()
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                        || crate::runtime::cgroup_path().ok().as_deref() != Some(cgroup_path.as_str())
+                    {
+                        return Err(PodError::Refused("pending recovery proof differs"));
+                    }
+                    let inspection = PendingRecoveryInspection {
+                        identity: identity.clone(),
+                        phase: checkpoint.phase(),
+                        checkpoint_digest: durable.digest().into(),
+                        prior_checkpoint_digest: prior.checkpoint_digest.clone(),
+                        abandoned: abandoned.clone(),
+                        supervisor_pid: std::process::id(),
+                        supervisor_start_ticks: start_ticks(std::process::id())?,
+                        child_pid,
+                        child_start_ticks,
+                        boot_id: boot_id.clone(),
+                        unit_name: manifest.unit_name.clone(),
+                        cgroup_path: cgroup_path.clone(),
+                    };
+                    let encoded = encode_recovery_pending_reply(&inspection, &recover.nonce)?;
+                    let fresh = read_peer_checkpoint_observation(directory, &identity)
+                        .map_err(|_| PodError::Refused("recovery checkpoint changed"))?;
+                    if fresh.digest() != durable.digest()
+                        || fresh.checkpoint() != checkpoint
+                        || observed.recheck_before_effect(&stream, recoverer).is_err()
+                        || !manager_witness.matches_current(
+                            recover.owner_epoch, recover.credential_epoch, recoverer,
+                        )
+                        || !child_attested_running(&mut child, child_pid, child_start_ticks, &cgroup_path)
+                    {
+                        return Err(PodError::Refused("recovery inspection changed"));
+                    }
+                    Ok(encoded)
+                })();
+                match result {
+                    Ok(encoded) => stream.write_all(&encoded)?,
+                    Err(_) => respond(&mut stream, Response {
+                        ok: false,
+                        status: None,
+                        error: Some("pending recovery inspection refused".into()),
+                        error_code: Some("refused".into()),
+                        terminal: None,
+                    })?,
+                }
+                return Ok(false);
+            }
             if bytes.len() as u64 <= FRAME_LIMIT
                 && let Ok(inspect) = serde_json::from_slice::<RebindInspectRequest>(&bytes)
             {

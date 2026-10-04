@@ -22,6 +22,8 @@ mod ports;
 #[cfg(target_os = "linux")]
 mod rebind_protocol;
 #[cfg(target_os = "linux")]
+mod rebind_recovery_protocol;
+#[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
 mod spool;
@@ -78,6 +80,8 @@ pub use runtime::{
     LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
     launch, launch_bound, serve,
 };
+#[cfg(target_os = "linux")]
+pub use rebind_recovery_protocol::{PendingRecoveryInspection, RECOVER_INSPECT_PROTOCOL};
 pub use terminal_protocol::{
     InputLease, LeaseKind, ScreenCheckpoint, ScreenFidelity, TerminalCommand, TerminalEvent,
     TerminalEventKind, TerminalEventPage, TerminalReply, TerminalView,

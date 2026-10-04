@@ -13,7 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
     ActorId, Attempt, AttemptId, CommandId, Epoch, LaunchBinding, Pod, PodId, Resource, ResourceId,
-    ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
+    RebindPhase, ResourceKind, Role, Run, RunId, ScopeId, Session, SessionId, StoreLineageId,
+    WorkKind,
 };
 use podbay_host::{
     ActorRegistration, AuthenticatedPeer, AuthenticatedProcessSubject, AuthenticatedTransport,
@@ -22,7 +23,8 @@ use podbay_host::{
     BoundHostLaunchProposal, BoundLaunchPodRequest, CredentialGeneration, CredentialRef,
     DurableAuthority, ExecutionMode, GrantId, GrantMode, GrantSpec, GuardSet, HostAction, HostDispatchPort,
     HostError, HostRequest, LaunchSelection, ManagerEpoch, Operation, PodIncarnation,
-    PortDispatchError, PortDispatchOutcome, PortReceiptRef, RebindCompletionStage,
+    PortDispatchError, PortDispatchOutcome, PortRebindObservation, PortReceiptRef,
+    PreparedCodexV2Rebind, RebindCompletionStage,
     RegisteredLaunchProfile, ResolvedNativeCodexLaunch, Right, Target, TrustedBootstrapSendPolicy,
     TrustedDriverTemplate, TrustedLaunchProfileInput, TrustedNativeHostConfig,
     TrustedWireRootLaunchPolicy, WorkspaceAccess, WorkspaceSelection,
@@ -179,6 +181,48 @@ impl Drop for DisposableUnitGuard {
 }
 
 struct NoPort(Arc<AtomicUsize>);
+
+/// Test-only interruption after the real pod has fsynced PendingPod. The
+/// trusted host sees uncertainty and cannot ACK or activate B by inference.
+struct PendingThenLostPort(LinuxLaunchPort);
+
+impl HostDispatchPort for PendingThenLostPort {
+    type Receipt = PortReceiptRef;
+
+    fn dispatch(
+        &mut self,
+        _: AuthorisedDispatch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn launch_bound(
+        &mut self,
+        _: AuthorisedBoundLaunch,
+    ) -> Result<PortDispatchOutcome<Self::Receipt>, PortDispatchError> {
+        Err(PortDispatchError::RefusedBeforeEffect)
+    }
+
+    fn inspect_existing_codex_v2_rebind(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortRebindObservation, HostError> {
+        <LinuxLaunchPort as HostDispatchPort>::inspect_existing_codex_v2_rebind(&self.0, launch)
+    }
+
+    fn prepare_existing_codex_v2_rebind(
+        &self,
+        prepared: &PreparedCodexV2Rebind,
+    ) -> Result<String, HostError> {
+        let _fsynced = <LinuxLaunchPort as HostDispatchPort>::prepare_existing_codex_v2_rebind(
+            &self.0, prepared,
+        )?;
+        Err(HostError::UncertainAfterPossibleEffect {
+            command_key: prepared.proposal().command_key.as_str().into(),
+            receipt_ref: None,
+        })
+    }
+}
 
 impl HostDispatchPort for NoPort {
     type Receipt = PortReceiptRef;
@@ -576,8 +620,8 @@ fn setup_v3_wire_port(
     (fixture, host, transport, grant, policy)
 }
 
-fn register_restarted_codex_profile(
-    host: &mut DurableAuthority<LinuxLaunchPort>,
+fn register_restarted_codex_profile<P: HostDispatchPort>(
+    host: &mut DurableAuthority<P>,
     fixture: &Fixture,
 ) {
     let executable_sha256 = Sha256::digest(fs::read(&fixture.executable).unwrap())
@@ -1562,6 +1606,73 @@ fn rebind_second_manager_process_helper() {
 }
 
 #[test]
+#[ignore = "helper for disposable three-manager pending recovery inspect fixture"]
+fn rebind_second_pending_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(
+            reference, fixture.source.clone(),
+        ).unwrap(),
+    ).unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, PendingThenLostPort(port)).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let pending = host.prepare_current_codex_v2_rebind(
+        &fixture.scope, &fixture.pod, "rebind.native.v21.pending",
+    ).unwrap();
+    assert_eq!(pending.phase, podbay_store::DurableRebindPhase::Pending);
+    let completed = host.complete_current_codex_v2_rebind(
+        &fixture.scope, &fixture.pod, "rebind.native.v21.pending",
+    ).unwrap();
+    assert_eq!(completed.durable.phase, podbay_store::DurableRebindPhase::Pending);
+    assert_eq!(completed.stage, RebindCompletionStage::PendingPodUnknown);
+    let context = host.rebind_context(&fixture.scope, &fixture.pod).unwrap();
+    let checkpoint = podbay_pod::read_peer_checkpoint(
+        &fixture.directory, context.identity(),
+    ).unwrap();
+    assert_eq!(checkpoint.phase(), RebindPhase::PendingPod);
+    assert!(checkpoint.checkpoint().pending_rebind().is_some());
+    fs::write(fixture.directory.join("rebind.second.pending"), b"pending_pod").unwrap();
+    drop(context);
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
+#[ignore = "helper for disposable three-manager pending recovery inspect fixture"]
+fn rebind_third_inspect_manager_process_helper() {
+    let fixture = Fixture::from_shared();
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let mut port = port_for(&fixture, &binary);
+    let reference = CredentialRef::from_trusted_vault(
+        fixture.scope.clone(), "vault.codex.preflight",
+    ).unwrap();
+    port.register_codex_credential_source_from_trusted_policy(
+        TrustedCodexCredentialSource::from_trusted_policy(
+            reference, fixture.source.clone(),
+        ).unwrap(),
+    ).unwrap();
+    let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
+    register_restarted_codex_profile(&mut host, &fixture);
+    let proof = host.inspect_pending_codex_v2_recovery(&fixture.scope, &fixture.pod).unwrap();
+    assert_eq!(proof.pending_phase(), RebindPhase::PendingPod);
+    assert_eq!(proof.abandoned().identity.pod_id, fixture.pod);
+    assert_eq!(proof.pending_process().child_process_id,
+        fs::read_to_string(fixture.directory.join("rebind.first.pid")).unwrap());
+    let store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(store.owner_epoch().unwrap(), 3);
+    fs::write(fixture.directory.join("rebind.third.inspected"),
+        proof.checkpoint_digest()).unwrap();
+    drop(store);
+    drop(host);
+    std::mem::forget(fixture);
+}
+
+#[test]
 #[ignore = "helper for disposable two-process V2 rebind fixture"]
 fn rebind_sibling_status_process_helper() {
     let fixture = Fixture::from_shared();
@@ -1626,6 +1737,44 @@ fn disposable_v2_rebind_keeps_exact_pod_and_child_across_two_manager_processes()
         !saved.socket_path.exists(),
         "disposable pod socket remained after stop"
     );
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_v21_pending_recovery_inspection_keeps_same_child_across_three_managers() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).expect("A left one bound manifest");
+    let guard = DisposableUnitGuard::for_manifest(&manifest);
+    let child_pid: u32 = fs::read_to_string(fixture.directory.join("rebind.first.pid"))
+        .unwrap().parse().unwrap();
+    run_rebind_manager_helper("rebind_second_pending_manager_process_helper", &fixture, &binary);
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.second.pending")).unwrap(),
+        "pending_pod");
+    assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
+    run_rebind_manager_helper("rebind_third_inspect_manager_process_helper", &fixture, &binary);
+    let digest = fs::read_to_string(fixture.directory.join("rebind.third.inspected")).unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(Path::new(&format!("/proc/{child_pid}/stat")).exists());
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2,
+        "recovery inspection must not submit provider input");
+    let store = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
+    assert_eq!(store.owner_epoch().unwrap(), 3);
+    drop(store);
+    assert!(Command::new("systemctl").args(["--user", "stop", &guard.0])
+        .status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=LoadState", "--value", &guard.0])
+            .output().unwrap();
+        assert!(state.status.success());
+        if String::from_utf8_lossy(&state.stdout).trim() == "not-found" { break; }
+        assert!(Instant::now() < deadline, "three-manager disposable unit remained loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

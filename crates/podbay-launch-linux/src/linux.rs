@@ -7,13 +7,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use podbay_core::{
-    AttemptId, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PodFenceIdentity, PodId,
+    AttemptId, CredentialEpoch, Epoch, InputEpoch, OwnerEpoch, PendingPodProcessEvidence,
+    PodFenceIdentity, PodId,
     RebindPhase, ResourceId, ScopeId, StoreLineageId,
 };
 use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, BootstrapNativeObservation, BootstrapNativeStage,
     BootstrapObservationError, CredentialRef, HostDispatchPort, PortDispatchError,
-    PortDispatchOutcome, PortRebindObservation, PortReceiptRef, PreparedCodexV2Rebind,
+    PortDispatchOutcome, PortPendingRecoveryObservation, PortRebindObservation,
+    PortReceiptRef, PreparedCodexV2Rebind,
     ResolvedClaimedBootstrap, ResolvedClaimedBootstrapInspection,
     ResolvedClaimedCodexV3Bootstrap, ResolvedNativeCodexLaunch, ResolvedNativeCodexV3Launch,
     ResolvedNativeLaunch,
@@ -1047,6 +1049,14 @@ impl HostDispatchPort for LinuxLaunchPort {
             .map_err(|_| podbay_host::HostError::StaleGuard)
     }
 
+    fn inspect_pending_codex_v2_recovery(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortPendingRecoveryObservation, podbay_host::HostError> {
+        self.inspect_codex_v2_pending_recovery(launch)
+            .map_err(|_| podbay_host::HostError::StaleGuard)
+    }
+
     fn prepare_existing_codex_v2_rebind(
         &self,
         prepared: &PreparedCodexV2Rebind,
@@ -1344,25 +1354,48 @@ fn attest_rebind_process_pair(
     expected_uid: u32,
     expected_gid: u32,
 ) -> Result<(), PodError> {
+    attest_rebind_process_pair_fields(
+        response.supervisor_pid,
+        response.supervisor_start_ticks,
+        response.child_pid,
+        response.child_start_ticks,
+        &response.boot_id,
+        &response.cgroup_path,
+        expected_uid,
+        expected_gid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attest_rebind_process_pair_fields(
+    supervisor_pid: u32,
+    supervisor_start_ticks: u64,
+    child_pid: u32,
+    child_start_ticks: u64,
+    boot_id: &str,
+    cgroup_path: &str,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(), PodError> {
     let boot = read_bounded_proc(Path::new("/proc/sys/kernel/random/boot_id"))?;
-    if boot.trim() != response.boot_id {
+    if boot.trim() != boot_id {
         return Err(PodError::Refused("V2 rebind boot identity changed"));
     }
-    let supervisor = read_rebind_process(response.supervisor_pid)?;
-    let child = read_rebind_process(response.child_pid)?;
-    if supervisor.start_ticks != response.supervisor_start_ticks
-        || child.start_ticks != response.child_start_ticks
-        || child.ppid != response.supervisor_pid
-        || supervisor.cgroup != response.cgroup_path
-        || child.cgroup != response.cgroup_path
+    let supervisor = read_rebind_process(supervisor_pid)?;
+    let child = read_rebind_process(child_pid)?;
+    if supervisor.start_ticks != supervisor_start_ticks
+        || child.start_ticks != child_start_ticks
+        || child.ppid != supervisor_pid
+        || supervisor.cgroup != cgroup_path
+        || child.cgroup != cgroup_path
         || supervisor.uid != expected_uid
         || supervisor.gid != expected_gid
         || child.uid != expected_uid
         || child.gid != expected_gid
-        || read_rebind_process(response.supervisor_pid)? != supervisor
-        || read_rebind_process(response.child_pid)? != child
+        || read_rebind_process(supervisor_pid)? != supervisor
+        || read_rebind_process(child_pid)? != child
         || read_bounded_proc(Path::new("/proc/sys/kernel/random/boot_id"))?.trim()
-            != response.boot_id
+            != boot_id
     {
         return Err(PodError::Refused("V2 rebind process tree changed"));
     }
@@ -1871,6 +1904,138 @@ impl LinuxLaunchPort {
             response.child_start_ticks,
         )
         .map_err(|_| PodError::Refused("V2 rebind port observation is invalid"))
+    }
+
+    /// Read-only proof of one live Pending(B) pod. It does not infer B's death
+    /// or grant a recovery mutation; the host must compare the abandoned
+    /// proposal with its durable v21 row before planning a successor.
+    fn inspect_codex_v2_pending_recovery(
+        &self,
+        launch: &ResolvedNativeCodexLaunch,
+    ) -> Result<PortPendingRecoveryObservation, PodError> {
+        self.config.recheck()?;
+        let wire = launch.descriptor();
+        let policy = launch.effective().codex_policy();
+        let scope = ScopeId::try_from(wire.scope_id())
+            .map_err(|_| PodError::Invalid("recovery scope ID"))?;
+        if policy.credential_scope() != wire.scope_id() {
+            return Err(PodError::Refused("recovery credential scope differs"));
+        }
+        let reference = CredentialRef::from_trusted_vault(scope.clone(), policy.credential_ref())
+            .map_err(|_| PodError::Refused("recovery credential mapping unavailable"))?;
+        let source = self.codex_credentials.get(&reference)
+            .ok_or(PodError::Refused("recovery credential source unavailable"))?;
+        preflight_committed_codex_v2_read_only(launch, source)?;
+        let manager = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Refused("recovery manager OS identity unavailable"))?;
+        if manager.attested_peer() != launch.manager_peer()
+            || checked_store_file(launch.store_path(), manager.uid())?
+                != launch.store_file_identity()
+        {
+            return Err(PodError::Refused("recovery manager or store changed"));
+        }
+        let record = launch.committed_record();
+        let identity = PodFenceIdentity {
+            scope_id: scope,
+            pod_id: PodId::try_from(record.pod_id.as_str())
+                .map_err(|_| PodError::Invalid("recovery Pod ID"))?,
+            attempt_id: AttemptId::try_from(record.attempt_id.as_str())
+                .map_err(|_| PodError::Invalid("recovery Attempt ID"))?,
+            incarnation: Epoch::new(record.pod_incarnation)
+                .map_err(|_| PodError::Invalid("recovery incarnation"))?,
+            store_lineage: StoreLineageId::try_from(launch.store_lineage())
+                .map_err(|_| PodError::Invalid("recovery lineage"))?,
+        };
+        let path = podbay_pod::manifest_path_for_identity(
+            &self.config.directory, &identity.pod_id, &identity.attempt_id,
+            identity.incarnation,
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != manager.uid()
+            || metadata.mode() & 0o077 != 0
+            || !(1..=1_048_576).contains(&metadata.len())
+            || fs::canonicalize(&path)? != path
+        {
+            return Err(PodError::Refused("recovery manifest identity differs"));
+        }
+        let bytes = read_rebind_manifest_bytes(&path)?;
+        let manifest: PodManifest = serde_json::from_slice(&bytes)?;
+        let binding = manifest.peer_binding.as_ref().ok_or(PodError::Refused(
+            "recovery manifest is unbound",
+        ))?;
+        if binding.protocol != "podbay.peer-binding/2"
+            || binding.capability != CODEX_V2_CAPABILITY
+            || binding.wire_descriptor != launch.descriptor_bytes()
+            || binding.effective_spec != launch.effective_spec_bytes()
+            || binding.store_path != launch.store_path()
+            || binding.store_lineage != launch.store_lineage()
+            || manifest.descriptor.pod_id != record.pod_id
+            || manifest.descriptor.attempt_id != record.attempt_id
+            || manifest.descriptor.incarnation != record.pod_incarnation
+        {
+            return Err(PodError::Refused("recovery immutable launch differs"));
+        }
+        let first = PodClient::inspect_pending_recovery(
+            &path, &identity, launch.owner_epoch(), launch.credential_epoch(),
+        )?;
+        if first.abandoned.identity != identity
+            || first.abandoned.next_owner_epoch.get() >= launch.owner_epoch()
+            || first.abandoned.next_credential_epoch.get() >= launch.credential_epoch()
+            || first.boot_id != manager.boot_id()
+            || first.unit_name != manifest.unit_name
+            || first.cgroup_path.rsplit('/').next() != Some(first.unit_name.as_str())
+        {
+            return Err(PodError::Refused("recovery pending checkpoint differs"));
+        }
+        attest_rebind_process_pair_fields(
+            first.supervisor_pid, first.supervisor_start_ticks,
+            first.child_pid, first.child_start_ticks, &first.boot_id,
+            &first.cgroup_path, manager.uid(), manager.gid(),
+        )?;
+        attest_rebind_systemd_unit(
+            &first.unit_name, first.supervisor_pid, &first.cgroup_path,
+        )?;
+        self.config.recheck()?;
+        preflight_committed_codex_v2_read_only(launch, source)?;
+        if fs::symlink_metadata(&path).map(|meta| (meta.dev(),meta.ino()))?
+            != (metadata.dev(),metadata.ino())
+            || read_rebind_manifest_bytes(&path)? != bytes
+            || !LinuxPeerEvidence::for_current_process().is_ok_and(|peer| peer == manager)
+        {
+            return Err(PodError::Refused("recovery manager or manifest changed"));
+        }
+        let second = PodClient::inspect_pending_recovery(
+            &path, &identity, launch.owner_epoch(), launch.credential_epoch(),
+        )?;
+        if second != first {
+            return Err(PodError::Refused("recovery pending checkpoint changed"));
+        }
+        attest_rebind_process_pair_fields(
+            second.supervisor_pid, second.supervisor_start_ticks,
+            second.child_pid, second.child_start_ticks, &second.boot_id,
+            &second.cgroup_path, manager.uid(), manager.gid(),
+        )?;
+        attest_rebind_systemd_unit(
+            &second.unit_name, second.supervisor_pid, &second.cgroup_path,
+        )?;
+        PortPendingRecoveryObservation::from_trusted_port(
+            second.abandoned,
+            second.phase,
+            second.checkpoint_digest,
+            second.prior_checkpoint_digest,
+            PendingPodProcessEvidence {
+                supervisor_process_id: second.supervisor_pid.to_string(),
+                supervisor_birth_identity: second.supervisor_start_ticks.to_string(),
+                child_process_id: second.child_pid.to_string(),
+                child_birth_identity: second.child_start_ticks.to_string(),
+                boot_identity: second.boot_id,
+                containment_identity: second.cgroup_path,
+            },
+            second.unit_name,
+            wire.digest().into(),
+        ).map_err(|_| PodError::Refused("recovery port evidence is malformed"))
     }
 
     /// Inspect an already-running pod without its old bearer. The path comes

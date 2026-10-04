@@ -4313,6 +4313,33 @@ fn v2_rebind_prepare_commits_pending_once_and_changed_child_birth_conflicts() {
 }
 
 #[test]
+fn v21_pending_recovery_inspection_default_denies_without_native_port_proof() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let mut host = restarted_codex_v2_rebind_host(&fixture, &who, port.codex_v2());
+    let before = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap()
+        .scope_snapshot(who.scope.as_str())
+        .unwrap()
+        .receipts
+        .len();
+    assert!(matches!(
+        host.inspect_pending_codex_v2_recovery(&who.scope, &who.pod),
+        Err(RebindContextError::Host(HostError::Unsupported))
+    ));
+    let after = PodBayStore::open_existing_read_only(&fixture.database)
+        .unwrap()
+        .scope_snapshot(who.scope.as_str())
+        .unwrap()
+        .receipts
+        .len();
+    assert_eq!(after, before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn v2_rebind_prepare_refuses_wrong_descriptor_peer_and_stale_manager() {
     for case in 0..4 {
         let fixture = Fixture::new();
