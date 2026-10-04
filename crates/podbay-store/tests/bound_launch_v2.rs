@@ -1082,75 +1082,6 @@ fn failure_after_command_insert_rolls_back_every_v2_admission_row() {
     ));
 }
 
-#[test]
-fn v15_existing_v2_run_migrates_to_default_deny_budget() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    store.advance_owner_epoch(0, 1).unwrap();
-    let proposal = ProposalFixture::new(Role::Coordinator, WorkKind::Service);
-    let original = match store
-        .admit_bound_root_launch_v2(proposal.request("key.before.v16", b"intent.before.v16"))
-        .unwrap()
-    {
-        BoundLaunchAdmission::Committed(record) => record,
-        other => panic!("expected committed V2 root: {other:?}"),
-    };
-    assert_eq!(
-        store
-            .inspect_run_child_budget(
-                &ScopeId::try_from("scope.launch").unwrap(),
-                &RunId::try_from("run.codex.fixture").unwrap(),
-            )
-            .unwrap()
-            .max_children(),
-        2
-    );
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
-             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
-             DROP TABLE run_child_budgets; PRAGMA user_version=15;",
-        )
-        .unwrap();
-    drop(connection);
-    let mut migrated = fixture.open();
-    let budget = migrated
-        .inspect_run_child_budget(
-            &ScopeId::try_from("scope.launch").unwrap(),
-            &RunId::try_from("run.codex.fixture").unwrap(),
-        )
-        .unwrap();
-    assert_eq!((budget.max_children(), budget.reserved_children()), (0, 0));
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM run_child_budgets", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 1);
-    drop(connection);
-    assert_eq!(
-        migrated
-            .current_bound_pod_snapshot("scope.launch", "pod.launch")
-            .unwrap()
-            .launch(),
-        &original
-    );
-    drop(migrated);
-    let read_only = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
-    assert_eq!(
-        read_only
-            .inspect_run_child_budget(
-                &ScopeId::try_from("scope.launch").unwrap(),
-                &RunId::try_from("run.codex.fixture").unwrap(),
-            )
-            .unwrap()
-            .max_children(),
-        0
-    );
-}
 
 #[test]
 fn v16_run_budget_schema_is_verified_exactly() {
@@ -1504,47 +1435,6 @@ fn v17_writer_lease_schema_is_verified_exactly() {
     ));
 }
 
-#[test]
-fn v17_writer_lease_failed_takeover_rolls_back_and_v16_migration_invents_none() {
-    let fixture = Fixture::new();
-    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
-    let request = writer_request(&mut store, target.clone(), manager_credential);
-    let first = store
-        .acquire_native_writer_lease_from_trusted_host(&request)
-        .unwrap();
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_writer_takeover AFTER UPDATE ON native_writer_leases
-             BEGIN SELECT RAISE(ABORT,'injected takeover failure'); END;",
-        )
-        .unwrap();
-    let mut takeover = request;
-    takeover.expected_writer_epoch = Some(1);
-    assert!(matches!(
-        store.acquire_native_writer_lease_from_trusted_host(&takeover),
-        Err(StoreError::Storage(_))
-    ));
-    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), first);
-    connection
-        .execute_batch("DROP TRIGGER fail_writer_takeover")
-        .unwrap();
-    drop(connection);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch("DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
-                        DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases; PRAGMA user_version=16;")
-        .unwrap();
-    drop(connection);
-    let mut migrated = fixture.open();
-    assert!(matches!(
-        migrated.inspect_native_writer_lease(&target),
-        Err(StoreError::NotFound)
-    ));
-    let read_only = PodBayStore::open_existing_read_only(&fixture.database).unwrap();
-    drop(read_only);
-}
 
 fn bootstrap_ready(fixture: &Fixture) -> (PodBayStore, NativeWriterTarget, u64, u64) {
     bootstrap_ready_for_format(fixture, false)
@@ -1978,36 +1868,9 @@ fn v18_bootstrap_rollback_and_prepared_reopen_are_truthful() {
     );
 }
 
-#[test]
-fn v17_to_v18_migration_invents_no_bootstrap_and_preserves_writer_lease() {
-    let fixture = Fixture::new();
-    let (store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch("DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
-                        DROP TABLE codex_bootstrap_sends; PRAGMA user_version=17;")
-        .unwrap();
-    drop(connection);
-    let mut reopened = fixture.open();
-    let lease = reopened.inspect_native_writer_lease(&target).unwrap();
-    assert_eq!(lease.manager_credential_epoch(), manager_credential);
-    assert_eq!(lease.writer_epoch(), writer_epoch);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM codex_bootstrap_sends", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 0);
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 22);
-}
 
 #[test]
-fn v19_with_historical_v2_refuses_default_migration_without_changing_database() {
+fn v19_with_historical_v2_refuses_open_without_changing_database() {
     let fixture = Fixture::new();
     let (mut store, target, manager_credential, writer_epoch) = bootstrap_ready(&fixture);
     let before = store
@@ -2029,9 +1892,7 @@ fn v19_with_historical_v2_refuses_default_migration_without_changing_database() 
     let original_wal = std::fs::read(&wal_path).ok();
     assert!(matches!(
         PodBayStore::open(&fixture.database),
-        Err(StoreError::Conflict(
-            "v19 launch state requires attested quiescence before v20 migration"
-        ))
+        Err(StoreError::UnsupportedSchema(19))
     ));
     assert_eq!(std::fs::read(&fixture.database).unwrap(), original_database);
     assert_eq!(std::fs::read(&wal_path).ok(), original_wal);
@@ -2050,27 +1911,6 @@ fn v19_with_historical_v2_refuses_default_migration_without_changing_database() 
     assert_eq!(target.pod_id.as_str(), before.pod_id().as_str());
 }
 
-#[test]
-fn v19_without_launch_state_upgrades_to_v22_with_empty_policy_and_recovery_rows() {
-    let fixture = Fixture::new();
-    drop(fixture.open());
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection.execute_batch(
-        "DROP TABLE launch_policy_fences;
-         DELETE FROM metadata WHERE key='policy_fence_epoch';
-         PRAGMA user_version=19;",
-    ).unwrap();
-    drop(connection);
-    let reopened = fixture.open();
-    assert_eq!(reopened.policy_fence_epoch().unwrap(), 1);
-    drop(reopened);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-    let rows: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM launch_policy_fences", [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!((version, rows), (22, 0));
-}
 
 #[test]
 fn v18_bootstrap_schema_is_verified_exactly() {
@@ -2547,29 +2387,6 @@ fn v22_later_turn_claim_refuses_authority_drift_after_admission() {
     assert_eq!(store.effect_state(receipt.outbox_id).unwrap(), podbay_store::EffectState::Prepared);
 }
 
-#[test]
-fn v21_to_v22_migration_is_additive_and_invents_no_later_turn() {
-    let fixture = Fixture::new();
-    let (store, target, manager_credential, writer_epoch, _) = later_ready(&fixture, false);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection.execute_batch(
-        "DROP INDEX codex_later_turns_session_v22;
-         DROP TABLE codex_later_turns;
-         PRAGMA user_version=21;",
-    ).unwrap();
-    drop(connection);
-    assert!(matches!(PodBayStore::open_existing_read_only(&fixture.database),
-        Err(StoreError::UnsupportedSchema(21))));
-    let mut migrated = fixture.open();
-    let lease = migrated.inspect_native_writer_lease(&target).unwrap();
-    assert_eq!(lease.writer_epoch(), writer_epoch);
-    assert_eq!(lease.manager_credential_epoch(), manager_credential);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-    let turns: i64 = connection.query_row("SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0)).unwrap();
-    assert_eq!((version, turns), (22, 0));
-}
 
 #[test]
 fn v22_later_turn_failed_binding_insert_rolls_back_command_event_and_outbox() {

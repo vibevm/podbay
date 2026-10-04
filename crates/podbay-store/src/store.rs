@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,8 +18,7 @@ use crate::model::{
 
 const SCHEMA_VERSION: i64 = 22;
 const MAX_BYTES: usize = 1_048_576;
-// Later turns are admitted only by a future authenticated host. Migration
-// creates no native thread anchor, command, or evidence of provider input.
+// Schema creation records no native thread anchor, command, or provider input.
 const CODEX_LATER_TURNS_V22: &str = "CREATE TABLE codex_later_turns (
   command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
   bootstrap_command_rowid INTEGER NOT NULL REFERENCES codex_bootstrap_sends(command_rowid),
@@ -47,8 +47,7 @@ const CODEX_LATER_TURNS_V22: &str = "CREATE TABLE codex_later_turns (
 ) STRICT";
 const CODEX_LATER_TURNS_SESSION_V22: &str = "CREATE INDEX codex_later_turns_session_v22
   ON codex_later_turns(session_id,command_rowid)";
-// A V2 launch gains no policy assertion on migration. Only a future V3
-// atomic admission may insert this row beside its immutable launch binding.
+// Only V3 atomic admission may insert this row beside its immutable binding.
 const LAUNCH_POLICY_FENCES_V20: &str = "CREATE TABLE launch_policy_fences (
   command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES launch_bindings(command_rowid),
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
@@ -57,7 +56,7 @@ const LAUNCH_POLICY_FENCES_V20: &str = "CREATE TABLE launch_policy_fences (
 ) STRICT";
 // Recovery attempts are append-only identities. A later manager appends a
 // successor instead of deleting or relabelling an abandoned rebind row.
-// Migration creates no supersession evidence for historical rebinds.
+// Fresh schema creation inserts no supersession evidence.
 const REBIND_SUPERSESSION_ATTEMPTS_V21: &str = "CREATE TABLE rebind_supersession_attempts (
   supersession_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
@@ -123,8 +122,8 @@ const CURRENT_SCOPE_SESSIONS_INDEX_V19: &str = "CREATE INDEX runtime_sessions_op
 const CURRENT_SCOPE_RESOURCES_INDEX_V19: &str = "CREATE INDEX authority_resources_pod_v19
   ON authority_resources(pod_id,resource_id)";
 
-// Version eight records immutable launch identities. A binding is absent for
-// every historical v7 launch; no migration guesses a Session, Run or resource.
+// Immutable launch identities and current runtime rows are created together
+// only by an authorized admission transaction.
 const RUNTIME_SESSIONS_V8: &str = "CREATE TABLE runtime_sessions (
   session_id TEXT PRIMARY KEY CHECK(length(session_id)>0),
   scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
@@ -150,14 +149,14 @@ const RUNTIME_RUNS_V8: &str = "CREATE TABLE runtime_runs (
   FOREIGN KEY(session_id,scope_id) REFERENCES runtime_sessions(session_id,scope_id),
   UNIQUE(run_id,session_id,scope_id)
 ) STRICT";
-// A Run's child capacity is a lifetime admission budget. Existing Runs get
-// zero capacity on migration; no process exit or uncertain effect refunds it.
+// A Run's child capacity is a lifetime admission budget. No process exit or
+// uncertain effect refunds it.
 const RUN_CHILD_BUDGETS_V16: &str = "CREATE TABLE run_child_budgets (
   run_id TEXT NOT NULL PRIMARY KEY REFERENCES runtime_runs(run_id) CHECK(length(run_id)>0),
   max_children INTEGER NOT NULL DEFAULT 0 CHECK(max_children>=0 AND max_children<=4294967295),
   reserved_children INTEGER NOT NULL DEFAULT 0 CHECK(reserved_children>=0 AND reserved_children<=max_children)
 ) STRICT";
-// No migration invents a native writer. One row is exclusive per ResourceId;
+// Fresh schema creation invents no native writer. One row is exclusive per ResourceId;
 // any takeover increments writer_epoch, independently of PTY input_epoch.
 const NATIVE_WRITER_LEASES_V17: &str = "CREATE TABLE native_writer_leases (
   resource_id TEXT NOT NULL PRIMARY KEY CHECK(length(resource_id)>0),
@@ -178,7 +177,7 @@ const NATIVE_WRITER_LEASES_V17: &str = "CREATE TABLE native_writer_leases (
   writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
   expires_at_unix_seconds INTEGER NOT NULL CHECK(expires_at_unix_seconds>=1)
 ) STRICT";
-// Historical sessions gain no bootstrap command. One Session may have only
+// Fresh schema creation adds no bootstrap command. One Session may have only
 // one first native turn; a changed key cannot create another bootstrap.
 const CODEX_BOOTSTRAP_SENDS_V18: &str = "CREATE TABLE codex_bootstrap_sends (
   command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
@@ -240,8 +239,7 @@ const LAUNCH_RESOURCES_V8: &str = "CREATE TABLE launch_resources (
 const LAUNCH_SLOT_BINDING_INDEX_V8: &str = "CREATE UNIQUE INDEX launch_slots_binding_identity
   ON launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)";
 
-// A rebind is durable evidence, never an OS peer/liveness attestation. Version
-// nine adds no rows for older launches or an invented initial manager peer.
+// A rebind is durable evidence, never an OS peer/liveness attestation.
 const MANAGER_REBINDS_V9: &str = "CREATE TABLE manager_rebinds (
   rebind_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
@@ -280,8 +278,8 @@ const MANAGER_REBIND_RESOURCES_V9: &str = "CREATE TABLE manager_rebind_resources
   PRIMARY KEY(rebind_rowid,resource_id)
 ) STRICT";
 
-// V12 widens only the database envelope. Rebind admission still requires +1
-// until a trusted prior pod-checkpoint observation is available.
+// The current rebind envelope permits monotonic jumps only with exact prior
+// pod-checkpoint evidence.
 fn manager_rebinds_v12() -> String {
     MANAGER_REBINDS_V9
         .replace(
@@ -301,8 +299,8 @@ fn manager_rebind_resources_v12() -> String {
     )
 }
 
-// An empty v10 table makes no claim about an old v9 manager or its pod peer.
-// Only a successful owner replay mints the current manager credential epoch.
+// An empty manager claim table makes no claim about a manager or its pod peer.
+// Only successful owner replay mints the current credential epoch.
 const MANAGER_CREDENTIAL_CLAIMS_V10: &str = "CREATE TABLE manager_credential_claims (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
@@ -310,8 +308,7 @@ const MANAGER_CREDENTIAL_CLAIMS_V10: &str = "CREATE TABLE manager_credential_cla
   credential_epoch INTEGER NOT NULL CHECK(credential_epoch>=1)
 ) STRICT";
 
-// Only the trusted host may register a kernel-attested peer after the v10
-// owner claim. Migration creates no peer for a historical manager.
+// Only the trusted host may register a kernel-attested peer after the owner claim.
 const MANAGER_PEER_BINDINGS_V11: &str = "CREATE TABLE manager_peer_bindings (
   store_lineage TEXT NOT NULL REFERENCES store_identity(lineage),
   owner_epoch INTEGER NOT NULL CHECK(owner_epoch>=1),
@@ -325,9 +322,8 @@ const MANAGER_PEER_BINDINGS_V11: &str = "CREATE TABLE manager_peer_bindings (
   PRIMARY KEY(store_lineage,owner_epoch,credential_epoch)
 ) STRICT";
 
-// A v13 observation is a trusted-host record of a pod's prior Active
-// checkpoint. The store validates association and durable fences, not OS peer.
-// Legacy v9/v12 rebinds have no child row and gain no implied proof.
+// A prior observation is a trusted-host record of a pod's Active checkpoint.
+// The store validates association and durable fences, not OS peer.
 const MANAGER_REBIND_PRIOR_OBSERVATIONS_V13: &str =
     "CREATE TABLE manager_rebind_prior_observations (
   rebind_rowid INTEGER PRIMARY KEY REFERENCES manager_rebinds(rebind_rowid),
@@ -341,7 +337,7 @@ const MANAGER_REBIND_PRIOR_OBSERVATIONS_V13: &str =
   cgroup_path TEXT NOT NULL CHECK(length(cgroup_path) BETWEEN 1 AND 4096)
 ) STRICT";
 
-// Migration never invents an actor credential. A trusted host registers one
+// Schema creation never invents an actor credential. A trusted host registers one
 // public verifier only after the exact actor generation and birth are known.
 const ACTOR_VERIFIERS_V14: &str = "CREATE TABLE actor_verifiers (
   actor_id TEXT PRIMARY KEY REFERENCES authority_actors(actor_id),
@@ -373,6 +369,19 @@ const OWNER_ACTOR_ROTATIONS_V15: &str = "CREATE TABLE owner_actor_rotations (
   UNIQUE(actor_id,next_generation)
 ) STRICT";
 
+/// SQLite's 100-byte database header stores user_version as a big-endian
+/// integer at offset 60. Reading it directly cannot create WAL/SHM sidecars
+/// while refusing a retired on-disk schema.
+fn database_header_version(path: &Path) -> Result<i64, StoreError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(StoreError::Conflict("database header is not SQLite"));
+    }
+    Ok(u32::from_be_bytes(header[60..64].try_into().unwrap()) as i64)
+}
+
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
     pub(crate) connection: Connection,
@@ -380,15 +389,19 @@ pub struct PodBayStore {
 }
 
 impl PodBayStore {
-    /// Open an already migrated store for a pod-side witness without becoming
-    /// a writer, creating a database, or running schema migrations. Mutating
-    /// methods on this handle still fail at SQLite's read-only boundary.
+    /// Open an existing current-schema store for a pod-side witness without
+    /// becoming a writer or creating a database. Mutating methods on this
+    /// handle still fail at SQLite's read-only boundary.
     pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if !path.is_absolute() {
             return Err(StoreError::InvalidInput(
                 "read-only database path must be absolute",
             ));
+        }
+        let header_version = database_header_version(path)?;
+        if header_version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema(header_version));
         }
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -423,627 +436,58 @@ impl PodBayStore {
         })
     }
 
+    /// Open only the current schema. An existing older database is inspected
+    /// through a read-only connection and refused before any WAL or DDL write.
+    /// A new file is initialized to the current schema in one transaction.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
             return Err(StoreError::InvalidInput("database path is empty"));
         }
-        if let Some(parent) = path.parent() {
+        let existing = match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if existing {
+            let header_version = database_header_version(path)?;
+            if header_version != SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema(header_version));
+            }
+            let probe = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let version: i64 = probe.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version != SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema(version));
+            }
+        } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut connection = Connection::open(path)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | if existing { OpenFlags::empty() } else { OpenFlags::SQLITE_OPEN_CREATE };
+        let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        let before_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        // An older pod may still be running against this file. Delay WAL mode
-        // changes until after the launch-state gate has passed under the
-        // same IMMEDIATE transaction as migration.
-        if matches!(before_version, 19 | 20) {
-            connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-        } else {
-            connection.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
-            )?;
+        // Recheck after opening for writing, before changing journal mode or
+        // entering a write transaction. A replacement file cannot be upgraded.
+        let before_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let expected_version = if existing { SCHEMA_VERSION } else { 0 };
+        if before_version != expected_version {
+            return Err(StoreError::UnsupportedSchema(before_version));
         }
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        let behavior = if existing {
+            TransactionBehavior::Deferred
+        } else {
+            TransactionBehavior::Immediate
+        };
+        let transaction = connection.transaction_with_behavior(behavior)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if !(0..=SCHEMA_VERSION).contains(&version) {
+        if version != expected_version {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        if matches!(version, 19 | 20) {
-            verify_runtime_schema(&transaction)?;
-            if version == 20 {
-                verify_policy_fence_schema(&transaction)?;
-            }
-            let occupied: i64 = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM launch_bindings LIMIT 1)
-                     OR EXISTS(SELECT 1 FROM launch_slots LIMIT 1)
-                     OR EXISTS(SELECT 1 FROM authority_pods LIMIT 1)
-                     OR EXISTS(SELECT 1 FROM runtime_sessions LIMIT 1)
-                     OR EXISTS(SELECT 1 FROM runtime_runs LIMIT 1)
-                     OR EXISTS(SELECT 1 FROM manager_rebinds LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    if version == 19 {
-                        "v19 launch state requires attested quiescence before v20 migration"
-                    } else {
-                        "v20 launch state requires attested quiescence before v21 migration"
-                    },
-                ));
-            }
-        }
-        transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS metadata (
-               key TEXT PRIMARY KEY, value INTEGER NOT NULL CHECK(value >= 0)
-             ) STRICT;
-             INSERT OR IGNORE INTO metadata(key,value) VALUES('owner_epoch',0);
-             CREATE TABLE IF NOT EXISTS target_epochs (
-               scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
-               epoch INTEGER NOT NULL CHECK(epoch >= 0),
-               PRIMARY KEY(scope_id,target_id)
-             ) STRICT;
-             CREATE TABLE IF NOT EXISTS commands (
-               command_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-               command_id TEXT NOT NULL UNIQUE,
-               principal TEXT NOT NULL, namespace TEXT NOT NULL, command_key TEXT NOT NULL,
-               scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
-               digest_version TEXT NOT NULL, request_digest TEXT NOT NULL,
-               canonical_request BLOB NOT NULL,
-               owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
-               event_sequence INTEGER, outbox_id INTEGER,
-               UNIQUE(principal,namespace,command_key)
-             ) STRICT;
-             -- Versions one and two have exactly one admission event per command.
-             -- The schema-three migration below expands this journal.
-             CREATE TABLE IF NOT EXISTS events (
-               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
-               scope_id TEXT NOT NULL, owner_epoch INTEGER NOT NULL,
-               target_epoch INTEGER NOT NULL, kind TEXT NOT NULL, payload BLOB NOT NULL
-             ) STRICT;
-             CREATE INDEX IF NOT EXISTS events_scope_sequence ON events(scope_id,sequence);
-             CREATE TABLE IF NOT EXISTS outbox (
-               outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
-               command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
-               scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
-               owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
-               kind TEXT NOT NULL, payload BLOB NOT NULL,
-               state TEXT NOT NULL CHECK(state IN ('prepared','claimed_uncertain','observed')),
-               claim_key TEXT,
-               claim_owner_epoch INTEGER
-             ) STRICT;
-             CREATE TABLE IF NOT EXISTS store_identity (
-               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-               lineage TEXT NOT NULL UNIQUE
-             ) STRICT;
-             INSERT OR IGNORE INTO store_identity(singleton,lineage)
-               VALUES(1,lower(hex(randomblob(16))));",
-        )?;
-        if version < 2 {
-            transaction.execute_batch(
-                "ALTER TABLE outbox ADD COLUMN observation_key TEXT;
-                 ALTER TABLE outbox ADD COLUMN observation_payload BLOB;",
-            )?;
-        }
-        if version < 3 {
-            transaction.execute_batch(
-                "CREATE TABLE events_v3 (
-                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                   event_id TEXT NOT NULL UNIQUE,
-                   schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
-                   command_rowid INTEGER NOT NULL REFERENCES commands(command_rowid),
-                   scope_id TEXT NOT NULL, target_id TEXT NOT NULL,
-                   owner_epoch INTEGER NOT NULL, target_epoch INTEGER NOT NULL,
-                   source_id TEXT NOT NULL, source_kind TEXT NOT NULL,
-                   source_epoch INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
-                   source_digest TEXT NOT NULL,
-                   source_order TEXT NOT NULL CHECK(source_order IN
-                     ('contiguous','gap','out_of_order')),
-                   source_order_reference INTEGER,
-                   kind TEXT NOT NULL, payload BLOB NOT NULL,
-                   recorded_at TEXT NOT NULL, occurred_at TEXT,
-                   provenance TEXT NOT NULL, correlation_id TEXT, causation_id TEXT,
-                   UNIQUE(scope_id,source_id,source_epoch,source_sequence)
-                 ) STRICT;
-                 INSERT INTO events_v3(
-                   sequence,event_id,schema_version,command_rowid,scope_id,target_id,
-                   owner_epoch,target_epoch,source_id,source_kind,source_epoch,
-                   source_sequence,source_digest,source_order,kind,payload,recorded_at,
-                   provenance)
-                 SELECT e.sequence,
-                   'event.pb07.legacy.' || (SELECT lineage FROM store_identity WHERE singleton=1)
-                     || '.' || e.sequence,
-                   1,e.command_rowid,e.scope_id,c.target_id,e.owner_epoch,e.target_epoch,
-                   c.command_id,'manager.admission',e.owner_epoch,1,c.request_digest,
-                   'contiguous',e.kind,e.payload,
-                   strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                   'legacy.admission.recorded_time_unavailable'
-                 FROM events e JOIN commands c ON c.command_rowid=e.command_rowid;
-                 DROP TABLE events;
-                 ALTER TABLE events_v3 RENAME TO events;
-                 CREATE INDEX events_scope_sequence ON events(scope_id,sequence);
-                 ALTER TABLE outbox ADD COLUMN observation_stage TEXT;
-                 ALTER TABLE outbox ADD COLUMN observation_event_sequence INTEGER
-                   REFERENCES events(sequence);
-                 UPDATE outbox SET observation_stage='legacy_unverified'
-                   WHERE state='observed';",
-            )?;
-        }
-        transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS event_quarantine (
-               quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
-               scope_id TEXT NOT NULL, source_id TEXT NOT NULL,
-               source_epoch INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
-               existing_event_id TEXT NOT NULL, incoming_digest TEXT NOT NULL,
-               incoming_payload BLOB NOT NULL, incoming_evidence BLOB NOT NULL,
-               recorded_at TEXT NOT NULL,
-               UNIQUE(scope_id,source_id,source_epoch,source_sequence,incoming_digest)
-             ) STRICT;
-             CREATE INDEX IF NOT EXISTS quarantine_scope_id
-               ON event_quarantine(scope_id,quarantine_id);",
-        )?;
-        if version < 4 {
-            transaction.execute_batch(
-                "INSERT OR IGNORE INTO metadata(key,value) VALUES('authority_revision',0);
-                 CREATE TABLE IF NOT EXISTS authority_pods (
-                   pod_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
-                   incarnation INTEGER NOT NULL CHECK(incarnation >= 1)
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS authority_resources (
-                   resource_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
-                   pod_id TEXT NOT NULL REFERENCES authority_pods(pod_id),
-                   pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation >= 1),
-                   resource_epoch INTEGER NOT NULL CHECK(resource_epoch >= 1),
-                   input_epoch INTEGER NOT NULL CHECK(input_epoch >= 1)
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS authority_actors (
-                   actor_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL,
-                   role TEXT NOT NULL, origin TEXT NOT NULL,
-                   parent_actor_id TEXT, pod_id TEXT REFERENCES authority_pods(pod_id),
-                   pod_incarnation INTEGER, credential_generation INTEGER NOT NULL
-                     CHECK(credential_generation >= 1),
-                   platform TEXT NOT NULL, os_identity TEXT NOT NULL,
-                   process_identity TEXT NOT NULL,
-                   start_identity INTEGER NOT NULL CHECK(start_identity >= 1),
-                   containment_identity TEXT NOT NULL
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS authority_grants (
-                   grant_id INTEGER PRIMARY KEY CHECK(grant_id >= 1),
-                   scope_id TEXT NOT NULL,
-                   actor_id TEXT NOT NULL REFERENCES authority_actors(actor_id),
-                   credential_generation INTEGER NOT NULL CHECK(credential_generation >= 1),
-                   mode TEXT NOT NULL,
-                   remaining_depth INTEGER NOT NULL CHECK(remaining_depth BETWEEN 0 AND 255)
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS authority_grant_rights (
-                   grant_id INTEGER NOT NULL REFERENCES authority_grants(grant_id)
-                     ON DELETE CASCADE,
-                   operation TEXT NOT NULL, target_kind TEXT NOT NULL,
-                   target_id TEXT NOT NULL,
-                   PRIMARY KEY(grant_id,operation,target_kind,target_id)
-                 ) STRICT;",
-            )?;
-        }
-        if version < 5 {
-            transaction.execute_batch(
-                "CREATE TABLE IF NOT EXISTS launch_dispatch_outcomes (
-                   outbox_id INTEGER PRIMARY KEY REFERENCES outbox(outbox_id),
-                   claim_key TEXT NOT NULL,
-                   stage TEXT NOT NULL CHECK(stage IN
-                     ('refused_before_effect','uncertain_after_possible_effect',
-                      'host_accepted','port_settled')),
-                   receipt_ref TEXT,
-                   recorded_at TEXT NOT NULL
-                 ) STRICT;",
-            )?;
-        }
-        let has_effect_digest = {
-            let mut statement = transaction.prepare("PRAGMA table_info(outbox)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "effect_digest")
-        };
-        if version < 6 && !has_effect_digest {
-            transaction.execute_batch("ALTER TABLE outbox ADD COLUMN effect_digest TEXT;")?;
-        } else if version >= 6 && !has_effect_digest {
-            return Err(StoreError::Conflict(
-                "outbox effect digest column is missing",
-            ));
-        }
-        if version < 6 {
-            let prior_effects = {
-                let mut statement = transaction.prepare("SELECT outbox_id,payload FROM outbox")?;
-                statement
-                    .query_map([], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for (outbox_id, payload) in prior_effects {
-                transaction.execute(
-                    "UPDATE outbox SET effect_digest=?1 WHERE outbox_id=?2",
-                    params![sha256_hex(&payload), outbox_id],
-                )?;
-            }
-        }
-        if version < 7 {
-            let nonpositive_launch: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM outbox WHERE kind='pod.offer' AND target_epoch<=0",
-                [],
-                |row| row.get(0),
-            )?;
-            if nonpositive_launch != 0 {
-                return Err(StoreError::Conflict(
-                    "legacy launch has nonpositive pod incarnation",
-                ));
-            }
-            let duplicate_launch_slot: Option<(String, String, i64)> = transaction
-                .query_row(
-                    "SELECT scope_id,target_id,target_epoch FROM outbox
-                     WHERE kind='pod.offer'
-                     GROUP BY scope_id,target_id,target_epoch HAVING COUNT(*)>1 LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            if duplicate_launch_slot.is_some() {
-                return Err(StoreError::Conflict(
-                    "legacy store has multiple launches for one pod incarnation",
-                ));
-            }
-            transaction.execute_batch(
-                "CREATE TABLE IF NOT EXISTS launch_slots (
-                   scope_id TEXT NOT NULL,pod_id TEXT NOT NULL,
-                   pod_incarnation INTEGER NOT NULL CHECK(pod_incarnation>=1),
-                   command_rowid INTEGER NOT NULL UNIQUE REFERENCES commands(command_rowid),
-                   PRIMARY KEY(scope_id,pod_id,pod_incarnation)
-                 ) STRICT;
-                 INSERT OR IGNORE INTO launch_slots(scope_id,pod_id,pod_incarnation,command_rowid)
-                 SELECT scope_id,target_id,target_epoch,command_rowid
-                 FROM outbox WHERE kind='pod.offer';",
-            )?;
-            let mismatched: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM outbox o LEFT JOIN launch_slots s
-                 ON s.scope_id=o.scope_id AND s.pod_id=o.target_id
-                   AND s.pod_incarnation=o.target_epoch
-                 WHERE o.kind='pod.offer'
-                   AND (s.command_rowid IS NULL OR s.command_rowid!=o.command_rowid)",
-                [],
-                |row| row.get(0),
-            )?;
-            let extra: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM launch_slots s LEFT JOIN outbox o
-                 ON o.command_rowid=s.command_rowid
-                 WHERE o.command_rowid IS NULL OR o.kind!='pod.offer'
-                   OR o.scope_id!=s.scope_id OR o.target_id!=s.pod_id
-                   OR o.target_epoch!=s.pod_incarnation",
-                [],
-                |row| row.get(0),
-            )?;
-            if mismatched != 0 || extra != 0 {
-                return Err(StoreError::Conflict(
-                    "legacy launch reservation does not match committed outbox",
-                ));
-            }
-        }
-        if version < 8 {
-            // A pre-existing v8 name in a v7 database is not evidence of a
-            // completed migration. Refuse it instead of accepting its shape.
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
-                 ('runtime_sessions','runtime_runs','launch_bindings',
-                  'launch_resources','launch_slots_binding_identity')",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict("v8 schema name already exists"));
-            }
-            for sql in [
-                LAUNCH_SLOT_BINDING_INDEX_V8,
-                RUNTIME_SESSIONS_V8,
-                RUNTIME_RUNS_V8,
-                LAUNCH_BINDINGS_V8,
-                LAUNCH_RESOURCES_V8,
-            ] {
-                transaction.execute_batch(&format!("{sql};"))?;
-            }
-        }
-        if version < 9 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
-                 ('manager_rebinds','manager_rebind_resources')",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict("v9 rebind schema name already exists"));
-            }
-            for sql in [MANAGER_REBINDS_V9, MANAGER_REBIND_RESOURCES_V9] {
-                transaction.execute_batch(&format!("{sql};"))?;
-            }
-        }
-        if version < 10 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_credential_claims'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v10 manager credential schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{MANAGER_CREDENTIAL_CLAIMS_V10};"))?;
-        }
-        if version < 11 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_peer_bindings'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v11 manager peer schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{MANAGER_PEER_BINDINGS_V11};"))?;
-        }
-        if version < 12 {
-            verify_rebind_schema_v9(&transaction)?;
-            rebuild_rebind_schema_v12(&transaction)?;
-        }
-        if version < 13 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='manager_rebind_prior_observations'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v13 prior observation schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{MANAGER_REBIND_PRIOR_OBSERVATIONS_V13};"))?;
-        }
-        if version < 14 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='actor_verifiers'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v14 actor verifier schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{ACTOR_VERIFIERS_V14};"))?;
-        }
-        if version < 15 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='owner_actor_rotations'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v15 owner rotation schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{OWNER_ACTOR_ROTATIONS_V15};"))?;
-        }
-        if version < 16 {
-            verify_runtime_schema_v8(&transaction)?;
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='run_child_budgets'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v16 run budget schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{RUN_CHILD_BUDGETS_V16};"))?;
-            transaction.execute(
-                "INSERT INTO run_child_budgets(run_id,max_children,reserved_children)
-                 SELECT run_id,0,0 FROM runtime_runs",
-                [],
-            )?;
-        }
-        if version < 17 {
-            verify_runtime_schema(&transaction)?;
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='native_writer_leases'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v17 writer lease schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{NATIVE_WRITER_LEASES_V17};"))?;
-        }
-        if version < 18 {
-            verify_writer_lease_schema(&transaction)?;
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='codex_bootstrap_sends'",
-                [],
-                |row| row.get(0),
-            )?;
-            if occupied != 0 {
-                return Err(StoreError::Conflict(
-                    "v18 bootstrap schema name already exists",
-                ));
-            }
-            transaction.execute_batch(&format!("{CODEX_BOOTSTRAP_SENDS_V18};"))?;
-        }
-        if version < 19 {
-            verify_runtime_schema(&transaction)?;
-            for (name, expected) in [
-                (
-                    "runtime_sessions_open_scope_v19",
-                    CURRENT_SCOPE_SESSIONS_INDEX_V19,
-                ),
-                (
-                    "authority_resources_pod_v19",
-                    CURRENT_SCOPE_RESOURCES_INDEX_V19,
-                ),
-            ] {
-                let existing: Option<(String, Option<String>)> = transaction
-                    .query_row(
-                        "SELECT type,sql FROM sqlite_master WHERE name=?1",
-                        [name],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                match existing {
-                    None => transaction.execute_batch(&format!("{expected};"))?,
-                    Some((kind, Some(sql))) if kind == "index" && sql == expected => {}
-                    Some(_) => {
-                        return Err(StoreError::Conflict(
-                            "v19 current scope index name already exists",
-                        ));
-                    }
-                }
-            }
-        }
-        if version < 20 {
-            verify_runtime_schema(&transaction)?;
-            let policy: Option<i64> = transaction
-                .query_row(
-                    "SELECT value FROM metadata WHERE key='policy_fence_epoch'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let table: Option<String> = transaction
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='launch_policy_fences'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match (policy, table.as_deref()) {
-                (None, None) => {
-                    let changed = transaction.execute(
-                        "INSERT INTO metadata(key,value)
-                         SELECT 'policy_fence_epoch',MAX(1,value)
-                         FROM metadata WHERE key='authority_revision'",
-                        [],
-                    )?;
-                    if changed != 1 {
-                        return Err(StoreError::Conflict("v20 policy epoch source is missing"));
-                    }
-                    transaction.execute_batch(&format!("{LAUNCH_POLICY_FENCES_V20};"))?;
-                }
-                (Some(value), Some(sql)) if value >= 1 && sql == LAUNCH_POLICY_FENCES_V20 => {
-                    // Exact already-installed schema can survive a synthetic
-                    // old-version fixture, but it cannot carry V3 policy
-                    // evidence under an old user_version or lower the fence
-                    // below the old global revision's migration floor.
-                    let rows: i64 = transaction.query_row(
-                        "SELECT COUNT(*) FROM launch_policy_fences",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if rows != 0 {
-                        return Err(StoreError::Conflict(
-                            "v20 policy rows exist under an older schema version",
-                        ));
-                    }
-                    let revision: i64 = transaction.query_row(
-                        "SELECT value FROM metadata WHERE key='authority_revision'",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    let floor = revision.max(1);
-                    if value < floor {
-                        transaction.execute(
-                            "UPDATE metadata SET value=?1
-                             WHERE key='policy_fence_epoch' AND value=?2",
-                            params![floor, value],
-                        )?;
-                    }
-                }
-                _ => {
-                    return Err(StoreError::Conflict(
-                        "v20 policy fence schema name already exists",
-                    ));
-                }
-            }
-        }
-        if version < 21 {
-            verify_rebind_schema(&transaction)?;
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
-                 ('rebind_supersession_attempts','rebind_supersession_resources',
-                  'rebind_supersession_latest_v21')",
-                [],
-                |row| row.get(0),
-            )?;
-            match occupied {
-                0 => {
-                    for sql in [
-                        REBIND_SUPERSESSION_ATTEMPTS_V21,
-                        REBIND_SUPERSESSION_RESOURCES_V21,
-                        REBIND_SUPERSESSION_LATEST_INDEX_V21,
-                    ] {
-                        transaction.execute_batch(&format!("{sql};"))?;
-                    }
-                }
-                3 => {
-                    verify_supersession_schema(&transaction)?;
-                    let rows: i64 = transaction.query_row(
-                        "SELECT (SELECT COUNT(*) FROM rebind_supersession_attempts)
-                              + (SELECT COUNT(*) FROM rebind_supersession_resources)",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if rows != 0 {
-                        return Err(StoreError::Conflict(
-                            "v21 supersession rows exist under an older schema version",
-                        ));
-                    }
-                }
-                _ => return Err(StoreError::Conflict(
-                    "v21 supersession schema name already exists",
-                )),
-            }
-        }
-        if version < 22 {
-            let occupied: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name IN
-                 ('codex_later_turns','codex_later_turns_session_v22')",
-                [],
-                |row| row.get(0),
-            )?;
-            match occupied {
-                0 => {
-                    for sql in [CODEX_LATER_TURNS_V22, CODEX_LATER_TURNS_SESSION_V22] {
-                        transaction.execute_batch(&format!("{sql};"))?;
-                    }
-                }
-                2 => {
-                    verify_codex_later_turn_schema(&transaction)?;
-                    let rows: i64 = transaction.query_row(
-                        "SELECT COUNT(*) FROM codex_later_turns",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if rows != 0 {
-                        return Err(StoreError::Conflict(
-                            "v22 later turn rows exist under an older schema version",
-                        ));
-                    }
-                }
-                _ => return Err(StoreError::Conflict("v22 later turn schema name already exists")),
-            }
+        if !existing {
+            transaction.execute_batch(include_str!("schema_v22.sql"))?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
@@ -1059,20 +503,17 @@ impl PodBayStore {
         verify_policy_fence_schema(&transaction)?;
         verify_supersession_schema(&transaction)?;
         verify_codex_later_turn_schema(&transaction)?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction.commit()?;
-        if matches!(before_version, 19 | 20) {
-            connection.execute_batch("PRAGMA journal_mode=WAL;")?;
-        }
-        let store_lineage: String = connection.query_row(
+        let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
             |row| row.get(0),
         )?;
-        Ok(Self {
-            connection,
-            store_lineage,
-        })
+        transaction.commit()?;
+        // For a new file, commit user_version to its main header before WAL
+        // mode. Future read-only version probes can reject older files without
+        // opening SQLite or creating a sidecar.
+        connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(Self { connection, store_lineage })
     }
 
     pub fn owner_epoch(&self) -> Result<u64, StoreError> {
@@ -2933,15 +2374,6 @@ fn verify_rebind_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), S
     verify_rebind_tables(transaction, &parent, &child, "v12 rebind schema differs")
 }
 
-fn verify_rebind_schema_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    verify_rebind_tables(
-        transaction,
-        MANAGER_REBINDS_V9,
-        MANAGER_REBIND_RESOURCES_V9,
-        "v9 rebind schema differs",
-    )
-}
-
 fn verify_rebind_tables(
     transaction: &rusqlite::Transaction<'_>,
     parent: &str,
@@ -2962,87 +2394,6 @@ fn verify_rebind_tables(
         if actual.as_deref() != Some(expected) {
             return Err(StoreError::Conflict(error));
         }
-    }
-    Ok(())
-}
-
-fn rebuild_rebind_schema_v12(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    let old_sequence: Option<i64> = transaction
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name='manager_rebinds'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    transaction.execute_batch(
-        "ALTER TABLE manager_rebind_resources RENAME TO manager_rebind_resources_v9_old;
-         ALTER TABLE manager_rebinds RENAME TO manager_rebinds_v9_old;",
-    )?;
-    transaction.execute_batch(&format!(
-        "{};{};",
-        manager_rebinds_v12(),
-        manager_rebind_resources_v12()
-    ))?;
-    transaction.execute_batch(
-        "INSERT INTO manager_rebinds(
-           rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
-           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
-           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
-           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref)
-         SELECT rebind_rowid,store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
-           expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,
-           manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,
-           manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref
-         FROM manager_rebinds_v9_old ORDER BY rebind_rowid;
-         INSERT INTO manager_rebind_resources(
-           rebind_rowid,resource_id,expected_input_epoch,next_input_epoch)
-         SELECT rebind_rowid,resource_id,expected_input_epoch,next_input_epoch
-         FROM manager_rebind_resources_v9_old ORDER BY rebind_rowid,resource_id;",
-    )?;
-    for (old, new) in [
-        ("manager_rebinds_v9_old", "manager_rebinds"),
-        (
-            "manager_rebind_resources_v9_old",
-            "manager_rebind_resources",
-        ),
-    ] {
-        let old_count: i64 =
-            transaction.query_row(&format!("SELECT COUNT(*) FROM {old}"), [], |row| row.get(0))?;
-        let new_count: i64 =
-            transaction.query_row(&format!("SELECT COUNT(*) FROM {new}"), [], |row| row.get(0))?;
-        if old_count != new_count {
-            return Err(StoreError::Conflict("v12 rebind copy count differs"));
-        }
-    }
-    transaction.execute_batch(
-        "DROP TABLE manager_rebind_resources_v9_old;
-         DROP TABLE manager_rebinds_v9_old;",
-    )?;
-    if let Some(old_sequence) = old_sequence {
-        let new_sequence: Option<i64> = transaction
-            .query_row(
-                "SELECT seq FROM sqlite_sequence WHERE name='manager_rebinds'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if new_sequence.unwrap_or(0) < old_sequence {
-            if new_sequence.is_some() {
-                transaction.execute(
-                    "UPDATE sqlite_sequence SET seq=?1 WHERE name='manager_rebinds'",
-                    [old_sequence],
-                )?;
-            } else {
-                transaction.execute(
-                    "INSERT INTO sqlite_sequence(name,seq) VALUES('manager_rebinds',?1)",
-                    [old_sequence],
-                )?;
-            }
-        }
-    }
-    let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
-    if statement.query([])?.next()?.is_some() {
-        return Err(StoreError::Conflict("v12 rebind foreign key check failed"));
     }
     Ok(())
 }

@@ -34,30 +34,6 @@ impl Drop for Fixture {
     }
 }
 
-fn restore_historical_rebind_tables(connection: &rusqlite::Connection) {
-    let source = include_str!("../src/store.rs");
-    let ddl = |name: &str| {
-        let marker = format!("const {name}: &str = \"");
-        source
-            .split_once(&marker)
-            .unwrap()
-            .1
-            .split_once("\";")
-            .unwrap()
-            .0
-            .to_owned()
-    };
-    let parent = ddl("MANAGER_REBINDS_V9");
-    let child = ddl("MANAGER_REBIND_RESOURCES_V9");
-    assert!(parent.contains("next_credential_epoch=expected_credential_epoch+1"));
-    assert!(child.contains("next_input_epoch=expected_input_epoch+1"));
-    connection
-        .execute_batch("DROP TABLE manager_rebind_resources; DROP TABLE manager_rebinds;")
-        .unwrap();
-    connection
-        .execute_batch(&format!("{parent};{child};"))
-        .unwrap();
-}
 
 fn peer(birth: &str) -> AttestedPeer {
     AttestedPeer::from_port(
@@ -225,34 +201,6 @@ fn pod_witness_uses_read_only_current_lineage_identity_and_kernel_peer_tuple() {
     assert!(!missing.exists());
 }
 
-#[test]
-fn migrated_v10_owner_has_no_synthetic_manager_peer() {
-    let fixture = Fixture::new();
-    let mut store = PodBayStore::open(&fixture.database).unwrap();
-    store.begin_authority_replay(0, 1).unwrap();
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    restore_historical_rebind_tables(&connection);
-    connection
-        .execute_batch("DROP TABLE manager_rebind_prior_observations; DROP TABLE manager_peer_bindings; PRAGMA user_version=10;")
-        .unwrap();
-    drop(connection);
-    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
-    let claim = migrated.current_manager_credential_claim(1).unwrap();
-    assert!(
-        !migrated
-            .current_manager_peer_matches(&claim, &peer("birth.one"))
-            .unwrap()
-    );
-    migrated
-        .register_current_manager_peer(&claim, &peer("birth.one"))
-        .unwrap();
-    assert!(
-        migrated
-            .current_manager_peer_matches(&claim, &peer("birth.one"))
-            .unwrap()
-    );
-}
 
 #[test]
 fn competing_peer_registrations_have_one_winner() {
@@ -289,32 +237,4 @@ fn competing_peer_registrations_have_one_winner() {
             .count(),
         1
     );
-}
-
-#[test]
-fn malformed_v11_name_refuses_migration_atomically() {
-    let fixture = Fixture::new();
-    drop(PodBayStore::open(&fixture.database).unwrap());
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    restore_historical_rebind_tables(&connection);
-    connection
-        .execute_batch(
-            "DROP TABLE manager_rebind_prior_observations;
-         DROP TABLE manager_peer_bindings;
-         CREATE TABLE manager_peer_bindings(owner_epoch INTEGER PRIMARY KEY) STRICT;
-         PRAGMA user_version=10;",
-        )
-        .unwrap();
-    drop(connection);
-    assert!(matches!(
-        PodBayStore::open(&fixture.database),
-        Err(StoreError::Conflict(
-            "v11 manager peer schema name already exists"
-        ))
-    ));
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 10);
 }

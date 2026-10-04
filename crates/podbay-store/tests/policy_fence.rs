@@ -81,44 +81,6 @@ fn mutate(store: &mut PodBayStore, revision: u64, mutation: AuthorityMutation) -
         .unwrap()
 }
 
-#[test]
-fn v19_upgrade_mints_positive_epoch_and_no_historical_launch_policy_row() {
-    let fixture = Fixture::new();
-    drop(fixture.open());
-    let connection = fixture.connection();
-    connection
-        .execute_batch(
-            "DROP TABLE launch_policy_fences;
-         DELETE FROM metadata WHERE key='policy_fence_epoch';
-         UPDATE metadata SET value=7 WHERE key='authority_revision';
-         PRAGMA user_version=19;",
-        )
-        .unwrap();
-    drop(connection);
-    let store = fixture.open();
-    assert_eq!(store.policy_fence_epoch().unwrap(), 7);
-    drop(store);
-    let connection = fixture.connection();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM launch_policy_fences", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    // The rehearsal applies v20's policy epoch/table before advancing the
-    // empty store through v21 and v22 without inventing historical rows.
-    assert_eq!((version, count), (22, 0));
-    drop(connection);
-    assert_eq!(
-        PodBayStore::open_existing_read_only(&fixture.database)
-            .unwrap()
-            .policy_fence_epoch()
-            .unwrap(),
-        7
-    );
-}
 
 #[test]
 fn v20_table_is_exact_and_cannot_invent_unbound_launch_or_zero_epoch() {
@@ -168,68 +130,7 @@ fn v20_table_is_exact_and_cannot_invent_unbound_launch_or_zero_epoch() {
     ));
 }
 
-#[test]
-fn malformed_v19_to_v20_preexisting_table_refuses_without_partial_epoch() {
-    let fixture = Fixture::new();
-    drop(fixture.open());
-    let connection = fixture.connection();
-    connection
-        .execute_batch(
-            "DROP TABLE launch_policy_fences;
-         DELETE FROM metadata WHERE key='policy_fence_epoch';
-         CREATE TABLE launch_policy_fences(command_rowid INTEGER PRIMARY KEY) STRICT;
-         PRAGMA user_version=19;",
-        )
-        .unwrap();
-    drop(connection);
-    assert!(matches!(
-        PodBayStore::open(&fixture.database),
-        Err(StoreError::Conflict(
-            "v20 policy fence schema name already exists"
-        ))
-    ));
-    let connection = fixture.connection();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    let epoch_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM metadata WHERE key='policy_fence_epoch'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!((version, epoch_count), (19, 0));
-}
 
-#[test]
-fn old_version_with_exact_empty_v20_table_cannot_lower_policy_below_migration_floor() {
-    let fixture = Fixture::new();
-    let mut store = fixture.open();
-    let mut revision = store.begin_authority_replay(0, 1).unwrap().revision;
-    revision = mutate(
-        &mut store,
-        revision,
-        AuthorityMutation::PutActor(actor("actor.policy.fixture", 1)),
-    );
-    revision = mutate(
-        &mut store,
-        revision,
-        AuthorityMutation::PutPod(AuthorityPodRecord {
-            scope_id: "scope.policy.fixture".into(),
-            pod_id: "pod.policy.one".into(),
-            incarnation: 1,
-        }),
-    );
-    assert!(revision > store.policy_fence_epoch().unwrap());
-    drop(store);
-    fixture
-        .connection()
-        .execute_batch("PRAGMA user_version=19;")
-        .unwrap();
-    let reopened = fixture.open();
-    assert_eq!(reopened.policy_fence_epoch().unwrap(), revision);
-}
 
 #[test]
 fn additive_topology_actor_verifier_and_grant_hold_policy_epoch() {

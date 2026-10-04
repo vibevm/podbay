@@ -298,58 +298,6 @@ fn event_watermark_and_current_revision_share_one_sqlite_snapshot_under_writer()
     writer.join().unwrap();
 }
 
-#[test]
-fn v18_upgrade_adds_exact_indexes_without_rewriting_current_rows() {
-    let fixture = Fixture::new();
-    let mut store = PodBayStore::open(&fixture.database).unwrap();
-    let (actor, revision) = ready(&mut store, "scope.main");
-    insert_current_graph(&fixture, &mut store);
-    drop(store);
-    let connection = fixture.connection();
-    connection
-        .execute_batch(
-            "DROP INDEX runtime_sessions_open_scope_v19;
-         DROP INDEX authority_resources_pod_v19;
-         PRAGMA user_version=18;",
-        )
-        .unwrap();
-    drop(connection);
-    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
-    let current = reopened
-        .current_scope_snapshot("scope.main", &actor, 1, 1, revision)
-        .unwrap();
-    assert_eq!(
-        current.sessions[0]
-            .run
-            .as_ref()
-            .unwrap()
-            .attempt
-            .as_ref()
-            .unwrap()
-            .pod
-            .resources
-            .len(),
-        1
-    );
-    let connection = fixture.connection();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 22);
-    for name in [
-        "runtime_sessions_open_scope_v19",
-        "authority_resources_pod_v19",
-    ] {
-        let sql: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
-                [name],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(sql.starts_with("CREATE INDEX "));
-    }
-}
 
 #[test]
 fn altered_v19_scope_index_refuses_open() {
@@ -368,31 +316,4 @@ fn altered_v19_scope_index_refuses_open() {
         PodBayStore::open(&fixture.database),
         Err(StoreError::Conflict("v19 current scope index differs"))
     ));
-}
-
-#[test]
-fn v18_upgrade_refuses_colliding_changed_index_without_bumping_version() {
-    let fixture = Fixture::new();
-    drop(PodBayStore::open(&fixture.database).unwrap());
-    let connection = fixture.connection();
-    connection
-        .execute_batch(
-            "DROP INDEX runtime_sessions_open_scope_v19;
-             CREATE INDEX runtime_sessions_open_scope_v19
-               ON runtime_sessions(scope_id,session_id);
-             PRAGMA user_version=18;",
-        )
-        .unwrap();
-    drop(connection);
-    assert!(matches!(
-        PodBayStore::open(&fixture.database),
-        Err(StoreError::Conflict(
-            "v19 current scope index name already exists"
-        ))
-    ));
-    let version: i64 = fixture
-        .connection()
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 18);
 }

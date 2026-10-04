@@ -492,80 +492,7 @@ fn actor_identity_cannot_change_within_credential_generation() {
     assert_eq!(store.authority_snapshot().unwrap().grants, vec![grant]);
 }
 
-#[test]
-fn stale_version_with_malformed_authority_table_refuses_migration() {
-    let fixture = Fixture::new();
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE authority_pods(pod_id TEXT PRIMARY KEY) STRICT;
-             PRAGMA user_version=3;",
-        )
-        .unwrap();
-    drop(connection);
-    assert!(matches!(
-        PodBayStore::open(&fixture.database),
-        Err(StoreError::Conflict(
-            "authority schema columns do not match"
-        ))
-    ));
-}
 
-#[test]
-fn schema_three_open_adds_empty_authority_ledger_without_changing_owner_epoch() {
-    let fixture = Fixture::new();
-    let store = PodBayStore::open(&fixture.database).unwrap();
-    assert_eq!(store.owner_epoch().unwrap(), 0);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "PRAGMA foreign_keys=OFF;
-             BEGIN IMMEDIATE;
-             DROP INDEX codex_later_turns_session_v22;
-             DROP TABLE codex_later_turns;
-             DROP INDEX rebind_supersession_latest_v21;
-             DROP TABLE rebind_supersession_resources;
-             DROP TABLE rebind_supersession_attempts;
-             DROP TABLE launch_policy_fences;
-             DELETE FROM metadata WHERE key='policy_fence_epoch';
-             DROP INDEX runtime_sessions_open_scope_v19;
-             DROP INDEX authority_resources_pod_v19;
-             DROP TABLE codex_bootstrap_sends;
-             DROP TABLE native_writer_leases;
-             DROP TABLE run_child_budgets;
-             DROP TABLE owner_actor_rotations;
-             DROP TABLE actor_verifiers;
-             DROP TABLE manager_rebind_prior_observations;
-             DROP TABLE manager_peer_bindings;
-             DROP TABLE manager_credential_claims;
-             DROP TABLE manager_rebind_resources;
-             DROP TABLE manager_rebinds;
-             DROP TABLE launch_resources;
-             DROP TABLE launch_bindings;
-             DROP TABLE runtime_runs;
-             DROP TABLE runtime_sessions;
-             DROP INDEX launch_slots_binding_identity;
-             DROP TABLE authority_grant_rights;
-             DROP TABLE authority_grants;
-             DROP TABLE authority_actors;
-             DROP TABLE authority_resources;
-             DROP TABLE authority_pods;
-             DELETE FROM metadata WHERE key='authority_revision';
-             PRAGMA user_version=3;
-             COMMIT;",
-        )
-        .unwrap();
-    drop(connection);
-    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
-    let snapshot = migrated.authority_snapshot().unwrap();
-    assert_eq!(snapshot.owner_epoch, 0);
-    assert_eq!(snapshot.revision, 0);
-    assert!(snapshot.pods.is_empty());
-    assert!(snapshot.resources.is_empty());
-    assert!(snapshot.actors.is_empty());
-    assert!(snapshot.grants.is_empty());
-}
 
 #[test]
 fn pod_registration_and_replay_share_command_target_epoch() {
@@ -601,78 +528,7 @@ fn pod_registration_and_replay_share_command_target_epoch() {
     assert_eq!(store.target_epoch("scope.main", "pod.worker").unwrap(), 2);
 }
 
-#[test]
-fn v13_upgrade_keeps_existing_actor_without_inventing_a_verifier() {
-    let fixture = Fixture::new();
-    let mut store = PodBayStore::open(&fixture.database).unwrap();
-    let (record, revision) = seed_actor(&mut store);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
-             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
-             DROP TABLE run_child_budgets;
-             DROP TABLE owner_actor_rotations; DROP TABLE actor_verifiers;
-             PRAGMA user_version=13;",
-        )
-        .unwrap();
-    drop(connection);
-    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
-    assert_eq!(
-        migrated.authority_snapshot().unwrap().actors,
-        vec![record.clone()]
-    );
-    assert!(matches!(
-        migrated.current_actor_verifier(1, revision, &record),
-        Err(StoreError::NotFound)
-    ));
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM actor_verifiers", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
-}
 
-#[test]
-fn v14_upgrade_adds_empty_owner_rotation_history_without_changing_verifier() {
-    let fixture = Fixture::new();
-    let mut store = PodBayStore::open(&fixture.database).unwrap();
-    let (actor, revision, _) = seed_owner(&mut store);
-    drop(store);
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    connection
-        .execute_batch(
-            "DROP INDEX codex_later_turns_session_v22; DROP TABLE codex_later_turns;
-             DROP TABLE codex_bootstrap_sends; DROP TABLE native_writer_leases;
-             DROP TABLE run_child_budgets;
-             DROP TABLE owner_actor_rotations; PRAGMA user_version=14;",
-        )
-        .unwrap();
-    drop(connection);
-    let mut migrated = PodBayStore::open(&fixture.database).unwrap();
-    assert_eq!(
-        migrated.authority_snapshot().unwrap().actors,
-        vec![actor.clone()]
-    );
-    assert_eq!(migrated.authority_snapshot().unwrap().revision, revision);
-    assert_eq!(
-        migrated
-            .current_actor_verifier(1, revision, &actor)
-            .unwrap(),
-        [7; 32]
-    );
-    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM owner_actor_rotations", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!((version, count), (22, 0));
-}
 
 #[test]
 fn actor_verifier_survives_reopen_but_rotation_and_revoke_fence_old_key() {
