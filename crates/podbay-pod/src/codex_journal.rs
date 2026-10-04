@@ -59,7 +59,7 @@ impl CodexJournalIdentity {
         }
     }
 
-    fn validate(&self) -> Result<(), PodError> {
+    pub(crate) fn validate(&self) -> Result<(), PodError> {
         let valid = StoreLineageId::try_from(self.store_lineage.as_str()).is_ok()
             && ScopeId::try_from(self.scope_id.as_str()).is_ok()
             && SessionId::try_from(self.session_id.as_str()).is_ok()

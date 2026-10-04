@@ -10,6 +10,7 @@ mod codex_journal;
 mod codex_launch;
 #[cfg(target_os = "linux")]
 mod codex_resource;
+mod codex_turn_journal;
 #[cfg(target_os = "linux")]
 mod linux_peer;
 mod manifest;
@@ -25,6 +26,8 @@ mod rebind_protocol;
 mod rebind_recovery_protocol;
 #[cfg(target_os = "linux")]
 mod runtime;
+#[cfg(target_os = "linux")]
+mod segmented_native_events;
 #[cfg(target_os = "linux")]
 mod spool;
 #[cfg(target_os = "linux")]
@@ -51,6 +54,9 @@ pub use codex_journal::{
 pub use codex_launch::{launch_bound_codex_v2, launch_bound_codex_v3};
 #[cfg(target_os = "linux")]
 pub use codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
+pub use codex_turn_journal::{
+    CodexLaterTurnJournal, LaterTurnIntentResult, LaterTurnStage, LaterTurnTerminal, LaterTurnView,
+};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxPeerError, LinuxPeerEvidence};
 #[cfg(target_os = "linux")]
@@ -72,6 +78,11 @@ pub use peer_checkpoint::{
     peer_checkpoint_observation_digest,
 };
 #[cfg(target_os = "linux")]
+pub use native_segment_checkpoint::{
+    IndexedPrivateFrame, LinuxNativeSegmentDirectory, NativeSegmentCheckpoint, NativeSegmentMeta,
+    NativeSegmentOffset,
+};
+#[cfg(target_os = "linux")]
 pub use peer_checkpoint::{read_peer_checkpoint, write_peer_checkpoint};
 pub use ports::{
     DurableAppendLog, DurableFileIdentity, DurableFiles, LocalConnection, LocalControlTransport,
@@ -80,8 +91,8 @@ pub use ports::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding,
-    launch, launch_bound, serve,
+    LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
+    launch_bound, serve,
 };
 #[cfg(target_os = "linux")]
 pub use rebind_recovery_protocol::{PendingRecoveryInspection, RECOVER_INSPECT_PROTOCOL};

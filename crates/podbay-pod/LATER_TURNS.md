@@ -1,0 +1,20 @@
+# Subsequent Codex turns: admission boundary
+
+This slice adds an idle-only adapter operation and a portable pod-local later-turn journal. It does **not** make later `session.send` available to clients. The journal proves what the pod fsynced; an in-memory `WriterPermit` and a caller-built journal command are not manager admission or native writer authority.
+
+## Current local sequence
+
+1. Reopen and recheck the held bootstrap journal. Its stage must be `BootstrapCompleted`; anchor the later-turn log to its exact Resource, native thread ID, native Session ID, and bootstrap turn ID. A different anchor refuses.
+2. For each distinct command key, fsync `Intent` with the canonical request digest, client message ID, and writer epoch. A duplicate key with the same digest returns its earlier view without another intent; changed content conflicts. An unsettled prior command blocks a new key.
+3. A future trusted pod bridge will recheck the claimed manager command, writer lease, OS peer, child birth, and held logs. It will call the adapter's checked idle-only operation with the anchored native IDs. The adapter performs a fresh metadata-only `thread/read`; the caller's read-only preflight then runs immediately before one `turn/start`.
+4. Fsync the exact native turn ID on a valid `inProgress` reply. A lost, malformed, or ambiguous reply is `SubmissionUncertain` and is never resent. A matching state-applied `turn/completed` is a separate `CompletionObserved` fact. Only a later fresh idle/no-waiting/no-pending-request `thread/read` may fsync terminal settlement. Failed and interrupted outcomes remain distinct.
+
+The later-turn journal uses a separate private held append log and bounded checksummed frames. It retains no prompt or credential bytes. Its current 16 MiB / 65,536-record limit deliberately fails closed; long-lived production use needs a compact checkpoint/segment successor before this bound is reachable.
+
+## Required manager/store admission atom
+
+At this atom's base, the store is schema v19. Versions v20 and v21 are reserved for policy/topology and rebind supersession; v22 is provisionally reserved for this admission. Use v22 only after those earlier migrations are accepted. Add a distinct `codex.turn` effect and per-command committed input table; do not reinterpret the one-bootstrap-per-Session `codex.bootstrap` row. The transaction must bind the authenticated principal, scope, canonical request key/digest, Session revision, current Run/Attempt/Pod/Resource incarnation, exact active native writer lease and writer epoch, owner/manager credential epoch, authority revision, text and deadline. It must atomically commit the command, event, receipt, outbox and protected input. Duplicate key/digest lookup precedes mutable checks; changed digest conflicts. Claim the outbox once under owner/authority compare-and-swap and never blindly retry a possible native effect.
+
+Before that admission, the host must obtain an attested pod read proving the **fsynced** bootstrap settlement and anchored native IDs, and persist a manager-side accepted settlement fact bound to the same launch/Resource/lease lineage. A store DTO or pod JSON alone cannot authenticate the manager, actor, grant, pod liveness or native writer. The host reauthenticates actor and send grant, validates the current manager/store file, peer and child, and checks the exact lease immediately before claim. Pod IPC carries selectors only; the pod reads the claimed input from the manager store read-only and rechecks the same fences before every native write.
+
+`commands.get` must expose admitted, claimed, native intent, submitted, uncertain, completion observed and fresh-idle settled as separate facts. A lost pod reply is reconciled through the exact journal and native observation without issuing another `turn/start`. The control loop still needs a **nonblocking** later-turn completion/read bridge; this slice's fake adapter fixture does not make a blocking `thread/read` safe inside pod socket service. No steering, question answer, permission grant or rebind mutation is implied by this design.

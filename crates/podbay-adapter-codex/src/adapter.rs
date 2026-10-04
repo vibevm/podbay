@@ -1126,6 +1126,119 @@ impl<T: JsonlTransport> CodexResource<T> {
         Ok(accepted)
     }
 
+    /// Start a later turn only after an external per-command intent has been
+    /// fsynced. This is idle-only: steering needs a distinct durable contract.
+    /// The caller's read-only preflight runs after the fresh native read and
+    /// directly before `turn/start`; WriterPermit remains a local fence, not
+    /// durable PodBay authority. Any attempted/lost native reply is Uncertain
+    /// and this adapter instance cannot send it again.
+    pub fn send_turn_after_checkpoint_checked(
+        &mut self,
+        permit: &WriterPermit,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        text: &str,
+        client_message_id: &str,
+        mut before_turn_start: impl FnMut(&Self) -> Result<(), CodexError>,
+    ) -> Result<TurnSubmission, CodexError> {
+        self.check_permit(permit)?;
+        if text.is_empty()
+            || text.len() > 1_000_000
+            || !valid_token(client_message_id)
+            || !valid_native_id(expected_thread_id)
+            || !valid_native_id(expected_session_id)
+        {
+            return Err(CodexError::InvalidInput(
+                "later turn text or identity is invalid",
+            ));
+        }
+        if !matches!(self.bootstrap, BootstrapState::Completed { .. }) {
+            return Err(CodexError::Blocked(BlockReason::BootstrapUnsettled));
+        }
+        if self
+            .last_submission
+            .as_ref()
+            .is_some_and(|submission| submission.client_message_id == client_message_id)
+        {
+            return Err(CodexError::Blocked(BlockReason::DuplicateMessageKey));
+        }
+        self.check_native_blockers()?;
+        self.read_thread()?;
+        self.check_native_blockers()?;
+        let bound = self
+            .thread
+            .as_ref()
+            .ok_or(CodexError::Blocked(BlockReason::ObservationUnknown))?;
+        if bound.thread_id != expected_thread_id || bound.session_id != expected_session_id {
+            self.poisoned = true;
+            return Err(CodexError::Mismatch(
+                "later-turn native thread or Session changed",
+            ));
+        }
+        if !self.bootstrap_ready() {
+            return Err(CodexError::Blocked(BlockReason::NativeBusy));
+        }
+        let uncertain = TurnSubmission {
+            client_message_id: client_message_id.into(),
+            mode: TurnMode::Start,
+            stage: TurnSubmissionStage::Uncertain,
+        };
+        self.last_submission = Some(uncertain.clone());
+        if let Err(error) = before_turn_start(self) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.check_permit(permit)?;
+        self.check_native_blockers()?;
+        if self.thread.as_ref().is_none_or(|thread| {
+            thread.thread_id != expected_thread_id || thread.session_id != expected_session_id
+        }) || !self.bootstrap_ready()
+        {
+            self.poisoned = true;
+            return Err(CodexError::Blocked(BlockReason::ObservationUnknown));
+        }
+        let response = match self.request(
+            "turn/start",
+            json!({
+                "threadId": expected_thread_id,
+                "input": [{"type":"text", "text":text}],
+                "clientUserMessageId": client_message_id,
+                "model": self.config.model,
+                "effort": self.config.effort,
+            }),
+        ) {
+            Ok(response) => response,
+            Err(_) => {
+                self.poisoned = true;
+                return Ok(uncertain);
+            }
+        };
+        let turn_id = match (
+            nonempty_string(response.pointer("/turn/id")),
+            response.pointer("/turn/status").and_then(Value::as_str),
+        ) {
+            (Some(turn_id), Some("inProgress")) => turn_id.to_owned(),
+            _ => {
+                self.poisoned = true;
+                return Ok(uncertain);
+            }
+        };
+        self.owned_active_turn_id = Some(turn_id.clone());
+        self.observed_active_turn_id = Some(turn_id.clone());
+        self.native_status = ThreadStatus::Active;
+        self.idle_after_completion = false;
+        let accepted = TurnSubmission {
+            client_message_id: client_message_id.into(),
+            mode: TurnMode::Start,
+            stage: TurnSubmissionStage::Accepted { turn_id },
+        };
+        self.last_submission = Some(accepted.clone());
+        if self.apply_queued().is_err() {
+            self.poisoned = true;
+        }
+        Ok(accepted)
+    }
+
     /// RPC success is only an interrupt request receipt. A matching native
     /// `turn/completed` with `status: interrupted` settles it.
     pub fn interrupt_turn(
@@ -2174,6 +2287,13 @@ fn completion_target_matches(
 fn valid_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_native_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
         && value.trim() == value
         && !value.chars().any(char::is_control)
 }
