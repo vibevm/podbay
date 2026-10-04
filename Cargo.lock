@@ -412,6 +412,7 @@ dependencies = [
 name = "podbay-store"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "podbay-core",
  "podbay-wire",
  "rusqlite",

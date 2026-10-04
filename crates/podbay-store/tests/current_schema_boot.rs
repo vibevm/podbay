@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -164,6 +166,65 @@ fn every_retired_schema_version_refuses_without_repair() {
             "version {version} changed"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_zero_byte_placeholder_initializes_in_place_and_shared_paths_refuse() {
+    let fixture = Fixture::new();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fixture.database();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let before = fs::symlink_metadata(&path).unwrap();
+    let first = PodBayStore::open(&path).unwrap();
+    assert_eq!(first.policy_fence_epoch().unwrap(), 1);
+    drop(first);
+    let after = fs::symlink_metadata(&path).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    drop(PodBayStore::open(&path).unwrap());
+
+    let shared = fixture.0.join("shared.sqlite");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&shared)
+        .unwrap();
+    let hardlink = fixture.0.join("hardlink.sqlite");
+    fs::hard_link(&shared, &hardlink).unwrap();
+    assert!(matches!(
+        PodBayStore::open(&hardlink),
+        Err(StoreError::Conflict(
+            "empty database placeholder is not private and stable"
+        ))
+    ));
+    let alias = fixture.0.join("alias.sqlite");
+    symlink(&shared, &alias).unwrap();
+    assert!(PodBayStore::open(&alias).is_err());
+    assert_eq!(fs::metadata(&shared).unwrap().len(), 0);
+
+    let loose = fixture.0.join("loose.sqlite");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&loose)
+        .unwrap();
+    assert!(matches!(
+        PodBayStore::open(&loose),
+        Err(StoreError::Conflict(
+            "empty database placeholder is not private and stable"
+        ))
+    ));
+    assert_eq!(fs::metadata(&loose).unwrap().len(), 0);
 }
 
 #[test]

@@ -1,4 +1,6 @@
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -382,6 +384,39 @@ fn database_header_version(path: &Path) -> Result<i64, StoreError> {
     Ok(u32::from_be_bytes(header[60..64].try_into().unwrap()) as i64)
 }
 
+#[cfg(unix)]
+fn private_placeholder_identity(
+    path: &Path,
+    expected: Option<(u64, u64)>,
+) -> Result<(u64, u64), StoreError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let parent = path.parent().ok_or(StoreError::InvalidInput(
+        "empty database placeholder has no parent",
+    ))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    // The manager caller acquires its separate lifetime lock before this
+    // check. This generic store API validates the file and directory, while
+    // the caller remains responsible for proving that lock.
+    let uid = nix::unistd::geteuid().as_raw();
+    let identity = (metadata.dev(), metadata.ino());
+    if !metadata.is_file()
+        || metadata.len() != 0
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != uid
+        || parent_metadata.mode() & 0o7777 != 0o700
+        || std::fs::canonicalize(path)? != path
+        || expected.is_some_and(|prior| prior != identity)
+    {
+        return Err(StoreError::Conflict(
+            "empty database placeholder is not private and stable",
+        ));
+    }
+    Ok(identity)
+}
+
 /// One connection is the one writer. SQLite's IMMEDIATE transaction locks fence other writers.
 pub struct PodBayStore {
     pub(crate) connection: Connection,
@@ -444,12 +479,31 @@ impl PodBayStore {
         if path.as_os_str().is_empty() {
             return Err(StoreError::InvalidInput("database path is empty"));
         }
-        let existing = match std::fs::symlink_metadata(path) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        let existing_metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        if existing {
+        // The trusted manager precreates a private 0600 file under its
+        // lifetime lock. A regular zero-byte file has no SQLite schema yet;
+        // every nonempty file must already have the exact current version.
+        let precreated_empty = existing_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() == 0);
+        #[cfg(unix)]
+        let placeholder_identity = if precreated_empty {
+            Some(private_placeholder_identity(path, None)?)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        if precreated_empty {
+            return Err(StoreError::InvalidInput(
+                "precreated database placeholder is unsupported on this platform",
+            ));
+        }
+        let fresh = existing_metadata.is_none() || precreated_empty;
+        if existing_metadata.is_some() && !precreated_empty {
             let header_version = database_header_version(path)?;
             if header_version != SCHEMA_VERSION {
                 return Err(StoreError::UnsupportedSchema(header_version));
@@ -459,33 +513,47 @@ impl PodBayStore {
             if version != SCHEMA_VERSION {
                 return Err(StoreError::UnsupportedSchema(version));
             }
-        } else if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        } else if existing_metadata.is_none() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        #[cfg(unix)]
+        if let Some(identity) = placeholder_identity {
+            private_placeholder_identity(path, Some(identity))?;
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | if existing { OpenFlags::empty() } else { OpenFlags::SQLITE_OPEN_CREATE };
+            | if existing_metadata.is_some() {
+                OpenFlags::empty()
+            } else {
+                OpenFlags::SQLITE_OPEN_CREATE
+            };
         let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         // Recheck after opening for writing, before changing journal mode or
         // entering a write transaction. A replacement file cannot be upgraded.
         let before_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let expected_version = if existing { SCHEMA_VERSION } else { 0 };
+        let expected_version = if fresh { 0 } else { SCHEMA_VERSION };
         if before_version != expected_version {
             return Err(StoreError::UnsupportedSchema(before_version));
         }
+        #[cfg(unix)]
+        if let Some(identity) = placeholder_identity {
+            private_placeholder_identity(path, Some(identity))?;
+        }
         connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-        let behavior = if existing {
-            TransactionBehavior::Deferred
-        } else {
+        let behavior = if fresh {
             TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
         };
         let transaction = connection.transaction_with_behavior(behavior)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != expected_version {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        if !existing {
+        if fresh {
             transaction.execute_batch(include_str!("schema_v22.sql"))?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
