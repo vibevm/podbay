@@ -974,7 +974,16 @@ impl PodBayStore {
                     valid_identity(&right.operation)?;
                     valid_identity(&right.target_kind)?;
                     valid_identity(&right.target_id)?;
-                    if right.target_kind == "pod" {
+                    if right.target_kind == "scope" {
+                        if right.operation != "launch_pod" {
+                            return Err(StoreError::InvalidInput(
+                                "scope right supports launch_pod only",
+                            ));
+                        }
+                        if right.target_id != record.scope_id {
+                            return Err(StoreError::WrongScope);
+                        }
+                    } else if right.target_kind == "pod" {
                         let scope: Option<String> = transaction
                             .query_row(
                                 "SELECT scope_id FROM authority_pods WHERE pod_id=?1",

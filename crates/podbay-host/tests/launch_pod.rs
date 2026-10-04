@@ -812,6 +812,104 @@ fn codex_v2_root_coordinator_and_root_worker_commit_without_port_effect() {
 }
 
 #[test]
+fn scope_launch_grant_admits_new_pod_and_replays_original_receipt() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    install_codex_root_policy(&mut host, &who);
+    let credential =
+        CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.one").unwrap();
+    let scoped = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([
+                    Right::new(Operation::LaunchPod, Target::Scope(who.scope.clone())),
+                    Right::new(Operation::UseCredential, Target::Credential(credential)),
+                ]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let launch_only = host
+        .install_grant_from_trusted_policy(
+            &who.actor,
+            GrantSpec {
+                scope_id: who.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: BTreeSet::from([Right::new(
+                    Operation::LaunchPod,
+                    Target::Scope(who.scope.clone()),
+                )]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let missing_credential = codex_root_request(
+        &who,
+        launch_only,
+        Role::Coordinator,
+        b"scope.missing.credential",
+    );
+    assert!(matches!(
+        host.admit_bound_root_codex_v2(&who.transport, missing_credential.clone()),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert_command_not_admitted(&fixture, &who, &missing_credential);
+    assert!(host.recorded_snapshot().pods.is_empty());
+    drop(host);
+    let (port, reopened_calls, _) = FakeLaunchPort::new(Mode::Accepted);
+    let mut reopened = DurableAuthority::open(&fixture.database, port).unwrap();
+    replay(&mut reopened, &who, scoped);
+    reopened
+        .register_launch_profile_from_trusted_policy(
+            RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+                .unwrap()
+                .with_codex_policy_from_trusted_policy(codex_policy(&who))
+                .unwrap(),
+        )
+        .unwrap();
+    let mut request = codex_root_request(&who, scoped, Role::Coordinator, b"scope.launch.intent");
+    request.host_request.guards.manager_epoch = ManagerEpoch::new(2).unwrap();
+    let mut foreign = request.clone();
+    foreign.host_request.scope_id = ScopeId::try_from("scope.foreign").unwrap();
+    assert!(matches!(
+        reopened.admit_bound_root_codex_v2(&who.transport, foreign),
+        Err(LaunchPodError::Host(HostError::Unauthorised))
+    ));
+    assert_command_not_admitted(&fixture, &who, &request);
+
+    let first = reopened
+        .admit_bound_root_codex_v2(&who.transport, request.clone())
+        .unwrap();
+    assert_eq!(first.status.stage, LaunchDispatchStage::Prepared);
+    assert!(!first.duplicate);
+    assert!(!first.port_called);
+    let mut stop = request.host_request.clone();
+    stop.command_key = "stop.scope.grant".into();
+    stop.action = HostAction::StopPod {
+        pod_id: who.pod.clone(),
+    };
+    assert!(matches!(
+        reopened.dispatch(&who.transport, stop),
+        Err(HostError::Unauthorised)
+    ));
+    let mut duplicate = request.clone();
+    duplicate.proposal = None;
+    let again = reopened
+        .admit_bound_root_codex_v2(&who.transport, duplicate.clone())
+        .unwrap();
+    assert!(again.duplicate);
+    assert_eq!(again.receipt, first.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert_eq!(reopened_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn codex_v2_dispatch_claims_once_for_concurrent_same_key_and_never_retries_port() {
     let fixture = Fixture::new();
     let who = identity(&fixture);

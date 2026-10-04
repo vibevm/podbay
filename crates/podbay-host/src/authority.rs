@@ -443,6 +443,7 @@ pub enum Operation {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Target {
+    Scope(ScopeId),
     Pod(PodId),
     Resource(ResourceId),
     Credential(CredentialRef),
@@ -1316,6 +1317,9 @@ impl<P: HostDispatchPort> HostAuthority<P> {
 
     fn rights_match_scope(&self, spec: &GrantSpec) -> bool {
         spec.rights.iter().all(|right| match &right.target {
+            Target::Scope(scope) => {
+                right.operation == Operation::LaunchPod && scope == &spec.scope_id
+            }
             Target::Pod(id) => {
                 matches!(right.operation, Operation::LaunchPod | Operation::StopPod)
                     && match right.operation {
@@ -1557,12 +1561,21 @@ impl<P: HostDispatchPort> HostAuthority<P> {
             return Err(HostError::DeadlineExpired);
         }
         let actor = self.authenticate(transport)?;
-        self.check_grant(
-            actor,
-            request.grant_id,
-            &request.scope_id,
-            &Right::new(Operation::LaunchPod, Target::Pod(pod_id.clone())),
-        )?;
+        let exact = Right::new(Operation::LaunchPod, Target::Pod(pod_id.clone()));
+        if self
+            .check_grant(actor, request.grant_id, &request.scope_id, &exact)
+            .is_err()
+        {
+            self.check_grant(
+                actor,
+                request.grant_id,
+                &request.scope_id,
+                &Right::new(
+                    Operation::LaunchPod,
+                    Target::Scope(request.scope_id.clone()),
+                ),
+            )?;
+        }
         if request.guards.manager_epoch != self.manager_epoch
             || request.guards.pod_incarnation.get() != 1
             || request.guards.resource_epoch.is_some()
@@ -3636,6 +3649,7 @@ fn durable_grant(id: GrantId, grant: &Grant) -> AuthorityGrantRecord {
                     Operation::UseCredential => "use_credential",
                 };
                 let (kind, id) = match &right.target {
+                    Target::Scope(id) => ("scope", id.as_str()),
                     Target::Pod(id) => ("pod", id.as_str()),
                     Target::Resource(id) => ("resource", id.as_str()),
                     Target::Credential(reference) => ("credential", reference.as_str()),
@@ -3676,6 +3690,10 @@ fn replay_grant_spec(record: &AuthorityGrantRecord) -> Result<GrantSpec, Durable
             }
         };
         let target = match right.target_kind.as_str() {
+            "scope" => Target::Scope(
+                ScopeId::try_from(right.target_id.as_str())
+                    .map_err(|_| DurableAuthorityError::Corrupt("invalid durable scope target"))?,
+            ),
             "pod" => Target::Pod(
                 PodId::try_from(right.target_id.as_str())
                     .map_err(|_| DurableAuthorityError::Corrupt("invalid durable pod target"))?,

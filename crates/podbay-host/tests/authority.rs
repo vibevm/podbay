@@ -967,6 +967,84 @@ fn credential_reference_needs_exact_grant_and_fresh_host_fails_closed() {
 }
 
 #[test]
+fn scope_launch_right_never_grants_stop_or_credential_use() {
+    let mut f = fixture();
+    let grant = f
+        .host
+        .install_grant_from_trusted_policy(
+            &f.owner_actor,
+            GrantSpec {
+                scope_id: f.scope.clone(),
+                mode: GrantMode::Controller,
+                rights: rights([(Operation::LaunchPod, Target::Scope(f.scope.clone()))]),
+                remaining_delegation_depth: 0,
+            },
+        )
+        .unwrap();
+    let launch = HostAction::LaunchPod {
+        pod_id: f.child_pod.clone(),
+        role: Role::Worker,
+        credential: None,
+    };
+    assert_eq!(
+        f.host.dispatch(
+            &f.owner,
+            request(&f.scope, grant, guards(1, 1, None, 1), launch)
+        ),
+        Err(HostError::Unauthorised)
+    );
+    assert_eq!(
+        f.host.dispatch(
+            &f.owner,
+            request(
+                &f.scope,
+                grant,
+                guards(1, 1, None, 1),
+                HostAction::StopPod {
+                    pod_id: f.child_pod.clone()
+                }
+            )
+        ),
+        Err(HostError::Unauthorised)
+    );
+    let reference = CredentialRef::from_trusted_vault(f.scope.clone(), "vault.scope.only").unwrap();
+    assert_eq!(
+        f.host.dispatch(
+            &f.owner,
+            request(
+                &f.scope,
+                grant,
+                guards(1, 1, None, 1),
+                HostAction::LaunchPod {
+                    pod_id: f.child_pod.clone(),
+                    role: Role::Worker,
+                    credential: Some(reference),
+                }
+            )
+        ),
+        Err(HostError::Unauthorised)
+    );
+    for right in [
+        Right::new(Operation::LaunchPod, Target::Scope(f.sibling_scope.clone())),
+        Right::new(Operation::StopPod, Target::Scope(f.scope.clone())),
+    ] {
+        assert_eq!(
+            f.host.install_grant_from_trusted_policy(
+                &f.owner_actor,
+                GrantSpec {
+                    scope_id: f.scope.clone(),
+                    mode: GrantMode::Controller,
+                    rights: BTreeSet::from([right]),
+                    remaining_delegation_depth: 0,
+                }
+            ),
+            Err(HostError::Unauthorised)
+        );
+    }
+    assert_eq!(f.host.port().calls.len(), 0);
+}
+
+#[test]
 fn linux_subject_accepts_realistic_cgroup_but_rejects_relative_identity() {
     let real = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
         1000,

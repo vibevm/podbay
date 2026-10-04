@@ -199,6 +199,59 @@ fn preissued_exact_launch_pod_grant_creates_no_pod_or_target_epoch() {
 }
 
 #[test]
+fn scope_launch_right_persists_without_pod_and_refuses_foreign_or_stop_scope() {
+    let fixture = Fixture::new();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    store.begin_authority_replay(0, 1).unwrap();
+    let revision = store
+        .apply_authority_mutation(
+            1,
+            1,
+            AuthorityMutation::PutActor(unattached_actor("scope.main")),
+        )
+        .unwrap();
+    let scoped = grant(
+        "scope.main",
+        "actor.worker",
+        "launch_pod",
+        "scope",
+        "scope.main",
+    );
+    let revision = store
+        .apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(scoped.clone()))
+        .unwrap();
+    assert_eq!(
+        store.authority_snapshot().unwrap().grants,
+        vec![scoped.clone()]
+    );
+    assert!(store.authority_snapshot().unwrap().pods.is_empty());
+    let mut foreign = scoped.clone();
+    foreign.grant_id = 2;
+    foreign.rights[0].target_id = "scope.other".into();
+    assert!(matches!(
+        store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(foreign)),
+        Err(StoreError::WrongScope)
+    ));
+    let mut stop = scoped.clone();
+    stop.grant_id = 3;
+    stop.rights[0].operation = "stop_pod".into();
+    assert!(matches!(
+        store.apply_authority_mutation(1, revision, AuthorityMutation::PutGrant(stop)),
+        Err(StoreError::InvalidInput(
+            "scope right supports launch_pod only"
+        ))
+    ));
+    drop(store);
+    let mut reopened = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(reopened.authority_snapshot().unwrap().grants, vec![scoped]);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    let targets: i64 = connection
+        .query_row("SELECT COUNT(*) FROM target_epochs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(targets, 0);
+}
+
+#[test]
 fn proposed_launch_grant_refuses_foreign_existing_pod() {
     let fixture = Fixture::new();
     let mut store = PodBayStore::open(&fixture.database).unwrap();
