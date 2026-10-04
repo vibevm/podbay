@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::manifest::{BoundPeerManifest, LaunchDescriptor, PodError};
 
 pub const CODEX_BOOTSTRAP_PROTOCOL: &str = "podbay.codex-bootstrap/1";
+pub const CODEX_BOOTSTRAP_INSPECT_PROTOCOL: &str = "podbay.codex-bootstrap.inspect/1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +58,17 @@ impl BootstrapControlRequest {
         }
     }
 
+    pub(crate) fn for_inspection(
+        selector: &BootstrapSendSelector,
+        writer_epoch: u64,
+        token: &str,
+    ) -> Self {
+        let mut request = Self::from_selector(selector, writer_epoch, token);
+        request.protocol = CODEX_BOOTSTRAP_INSPECT_PROTOCOL.into();
+        request.operation = "codex.bootstrap.inspect".into();
+        request
+    }
+
     /// Request values are selectors. Compare them to the immutable manifest
     /// before using them to read the claimed command from the store.
     pub(crate) fn checked_selector(
@@ -64,8 +76,31 @@ impl BootstrapControlRequest {
         binding: &BoundPeerManifest,
         launch: &LaunchDescriptor,
     ) -> Result<(BootstrapSendSelector, u64), PodError> {
-        if self.protocol != CODEX_BOOTSTRAP_PROTOCOL
-            || self.operation != "codex.bootstrap"
+        self.checked_selector_for(binding, launch, CODEX_BOOTSTRAP_PROTOCOL, "codex.bootstrap")
+    }
+
+    pub(crate) fn checked_inspection_selector(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+    ) -> Result<(BootstrapSendSelector, u64), PodError> {
+        self.checked_selector_for(
+            binding,
+            launch,
+            CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
+            "codex.bootstrap.inspect",
+        )
+    }
+
+    fn checked_selector_for(
+        &self,
+        binding: &BoundPeerManifest,
+        launch: &LaunchDescriptor,
+        protocol: &str,
+        operation: &str,
+    ) -> Result<(BootstrapSendSelector, u64), PodError> {
+        if self.protocol != protocol
+            || self.operation != operation
             || self.store_lineage != binding.store_lineage
             || self.scope_id != launch.scope_id
             || self.session_id != launch.session_id
@@ -117,6 +152,8 @@ impl BootstrapControlRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BootstrapControlStage {
     RefusedBeforeEffect,
+    /// Current claimed command, with no durable native journal fact in this pod.
+    ClaimedUnobserved,
     ThreadCreateUncertain,
     ThreadCreated {
         native_thread_id: String,
@@ -160,7 +197,7 @@ impl BootstrapControlReceipt {
         stage: BootstrapControlStage,
     ) -> Self {
         Self {
-            protocol: CODEX_BOOTSTRAP_PROTOCOL.into(),
+            protocol: request.protocol.clone(),
             command_id: request.command_id.clone(),
             store_lineage: request.store_lineage.clone(),
             scope_id: request.scope_id.clone(),
@@ -233,5 +270,26 @@ mod tests {
             receipt
         );
         assert!(!encoded.windows(9).any(|window| window == b"completed"));
+    }
+
+    #[test]
+    fn inspection_frame_is_distinct_and_contains_no_native_input() {
+        let request = BootstrapControlRequest::for_inspection(&selector(), 3, "bearer.fixture");
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(request.protocol, CODEX_BOOTSTRAP_INSPECT_PROTOCOL);
+        assert_eq!(request.operation, "codex.bootstrap.inspect");
+        assert!(!encoded.windows(6).any(|window| window == b"prompt"));
+        assert!(!encoded.windows(6).any(|window| window == b"permit"));
+        let reply = BootstrapControlReceipt::new(
+            &request,
+            Some(&"a".repeat(64)),
+            BootstrapControlStage::ClaimedUnobserved,
+        );
+        assert_eq!(reply.protocol, CODEX_BOOTSTRAP_INSPECT_PROTOCOL);
+        assert_eq!(
+            serde_json::from_slice::<BootstrapControlReceipt>(&serde_json::to_vec(&reply).unwrap())
+                .unwrap(),
+            reply,
+        );
     }
 }

@@ -20,7 +20,10 @@ use podbay_wire::{EffectiveLaunchContract, ImmutableLaunchDescriptor, NativeRole
 use serde::{Deserialize, Serialize};
 
 use crate::codex_credential::prepare_codex_home_from_systemd_credential;
-use crate::codex_bootstrap::{BootstrapControlReceipt, BootstrapControlRequest, BootstrapControlStage, CODEX_BOOTSTRAP_PROTOCOL};
+use crate::codex_bootstrap::{
+    BootstrapControlReceipt, BootstrapControlRequest, BootstrapControlStage,
+    CODEX_BOOTSTRAP_INSPECT_PROTOCOL, CODEX_BOOTSTRAP_PROTOCOL,
+};
 use crate::codex_resource::{PodCodexResource, ValidatedCodexResourceLaunch};
 use crate::linux_peer::LinuxPeerEvidence;
 use crate::manifest::{
@@ -782,6 +785,7 @@ impl PodClient {
                 && !value.chars().any(char::is_control)
         };
         let ids_valid = match &response.stage {
+            BootstrapControlStage::ClaimedUnobserved => false,
             BootstrapControlStage::RefusedBeforeEffect
             | BootstrapControlStage::ThreadCreateUncertain => true,
             BootstrapControlStage::ThreadCreated { native_thread_id, native_session_id }
@@ -792,6 +796,110 @@ impl PodClient {
         };
         if !ids_valid {
             return Err(PodError::Uncertain("bootstrap native receipt identity is invalid"));
+        }
+        Ok(response)
+    }
+
+    /// Reconcile a previously claimed send from the exact connected pod and
+    /// its held journal. This operation sends no native input and never
+    /// upgrades an absent journal to provider submission.
+    pub fn inspect_claimed_codex_bootstrap(
+        &self,
+        command_id: &CommandId,
+        target: &NativeWriterTarget,
+        writer_epoch: u64,
+    ) -> Result<BootstrapControlReceipt, PodError> {
+        let binding = self.manifest.peer_binding.as_ref().ok_or(PodError::Unsupported(
+            "Codex bootstrap inspection requires a peer binding",
+        ))?;
+        if binding.protocol != PEER_BINDING_V2_PROTOCOL || binding.capability != CODEX_V2_CAPABILITY {
+            return Err(PodError::Unsupported("Codex bootstrap inspection requires V2"));
+        }
+        let selector = BootstrapSendSelector {
+            scope_id: target.scope_id.clone(),
+            command_id: command_id.clone(),
+            native_target: target.clone(),
+        };
+        let request = BootstrapControlRequest::for_inspection(&selector, writer_epoch, &self.manifest.token);
+        request.checked_inspection_selector(binding, &self.manifest.descriptor)?;
+        let bytes = serde_json::to_vec(&request)?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Invalid("bootstrap inspection request exceeds frame bound"));
+        }
+        let mut socket = UnixStream::connect(&self.manifest.socket_path)?;
+        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let observed = LinuxPeerEvidence::from_connected(&socket)
+            .map_err(|_| PodError::Refused("bootstrap inspection server OS identity unavailable"))?;
+        socket.write_all(&bytes).map_err(|_| PodError::Uncertain(
+            "bootstrap inspection request may have reached pod"))?;
+        socket.shutdown(std::net::Shutdown::Write).map_err(|_| PodError::Uncertain(
+            "bootstrap inspection request completion unknown"))?;
+        let mut reply = Vec::new();
+        (&mut socket).take(FRAME_LIMIT + 1).read_to_end(&mut reply)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection reply lost"))?;
+        if reply.len() as u64 > FRAME_LIMIT {
+            return Err(PodError::Uncertain("bootstrap inspection reply exceeds frame bound"));
+        }
+        observed.recheck_connected(&socket)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection server changed"))?;
+        let fresh_manifest = read_manifest(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection manifest changed"))?;
+        let metadata = fs::symlink_metadata(&self.manifest_path)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection manifest unavailable"))?;
+        let current = LinuxPeerEvidence::for_current_process()
+            .map_err(|_| PodError::Uncertain("bootstrap inspection client identity unavailable"))?;
+        if serde_json::to_vec(&fresh_manifest)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection manifest encoding unknown"))?
+            != serde_json::to_vec(&self.manifest)
+                .map_err(|_| PodError::Uncertain("bootstrap inspection manifest encoding unknown"))?
+            || observed.uid() != metadata.uid()
+            || observed.uid() != current.uid()
+            || !unit_cgroup_exact(observed.cgroup(), &self.manifest.unit_name)
+        {
+            return Err(PodError::Uncertain("bootstrap inspection server identity differs"));
+        }
+        let response: BootstrapControlReceipt = serde_json::from_slice(&reply)
+            .map_err(|_| PodError::Uncertain("bootstrap inspection reply malformed"))?;
+        let digest_valid = response.request_digest.as_ref().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if response.protocol != CODEX_BOOTSTRAP_INSPECT_PROTOCOL
+            || response.command_id != command_id.as_str()
+            || response.store_lineage != target.store_lineage.as_str()
+            || response.scope_id != target.scope_id.as_str()
+            || response.session_id != target.session_id.as_str()
+            || response.run_id != target.run_id.as_str()
+            || response.attempt_id != target.attempt_id.as_str()
+            || response.pod_id != target.pod_id.as_str()
+            || response.pod_incarnation != target.pod_incarnation
+            || response.resource_id != target.resource_id.as_str()
+            || response.resource_epoch != target.resource_epoch
+            || response.resource_input_epoch != target.resource_input_epoch
+            || response.writer_epoch != writer_epoch
+            || (!matches!(response.stage, BootstrapControlStage::RefusedBeforeEffect) && !digest_valid)
+        {
+            return Err(PodError::Uncertain("bootstrap inspection reply identity differs"));
+        }
+        if response.stage == BootstrapControlStage::RefusedBeforeEffect {
+            return Err(PodError::Refused("claimed bootstrap inspection refused"));
+        }
+        let native_id = |value: &str| {
+            !value.is_empty() && value.len() <= 512 && value.trim() == value
+                && !value.chars().any(char::is_control)
+        };
+        let ids_valid = match &response.stage {
+            BootstrapControlStage::ClaimedUnobserved
+            | BootstrapControlStage::ThreadCreateUncertain => true,
+            BootstrapControlStage::ThreadCreated { native_thread_id, native_session_id }
+            | BootstrapControlStage::BootstrapUncertain { native_thread_id, native_session_id } =>
+                native_id(native_thread_id) && native_id(native_session_id),
+            BootstrapControlStage::Submitted { native_thread_id, native_session_id, native_turn_id } =>
+                native_id(native_thread_id) && native_id(native_session_id) && native_id(native_turn_id),
+            BootstrapControlStage::RefusedBeforeEffect => false,
+        };
+        if !ids_valid {
+            return Err(PodError::Uncertain("bootstrap inspection native identity is invalid"));
         }
         Ok(response)
     }
@@ -1538,6 +1646,102 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         },
                     )?;
                     return Ok(false);
+                }
+                stream.write_all(&encoded)?;
+                return Ok(false);
+            }
+            if bytes.len() as u64 <= FRAME_LIMIT
+                && let Ok(inspect) = serde_json::from_slice::<BootstrapControlRequest>(&bytes)
+                && inspect.protocol == CODEX_BOOTSTRAP_INSPECT_PROTOCOL
+            {
+                let verified = (|| -> Result<_, PodError> {
+                    if binding.protocol != PEER_BINDING_V2_PROTOCOL
+                        || binding.capability != CODEX_V2_CAPABILITY
+                        || !constant_time_equal(inspect.token.as_bytes(), manifest.token.as_bytes())
+                    {
+                        return Err(PodError::Refused("Codex bootstrap inspection capability unavailable"));
+                    }
+                    let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                        "bootstrap inspection manager OS peer unavailable"))?;
+                    if observed.attested_peer() != &manager_peer
+                        || observed.recheck_before_effect(&stream, &manager_peer).is_err()
+                        || !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer)
+                    {
+                        return Err(PodError::Refused("bootstrap inspection manager peer is stale"));
+                    }
+                    let (selector, expected_writer_epoch) = inspect.checked_inspection_selector(binding, descriptor)?;
+                    current_codex_v2_binding(binding, descriptor)?;
+                    let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                        .map_err(|_| PodError::Refused("bootstrap inspection store unavailable"))?;
+                    let proof = store.inspect_claimed_bootstrap_send(&selector)
+                        .map_err(|_| PodError::Refused("bootstrap inspection claimed proof stale"))?;
+                    let lease = store.inspect_native_writer_lease(&selector.native_target)
+                        .map_err(|_| PodError::Refused("bootstrap inspection writer lease stale"))?;
+                    if proof.writer_epoch() != expected_writer_epoch
+                        || proof.owner_epoch() != binding.owner_epoch
+                        || proof.manager_credential_epoch() != binding.credential_epoch
+                        || Some(proof.authority_revision()) != binding.authority_revision
+                        || lease.writer_epoch() != proof.writer_epoch()
+                        || lease.holder_actor_id() != proof.holder_actor_id()
+                        || lease.holder_credential_generation() != proof.holder_credential_generation()
+                        || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+                    {
+                        return Err(PodError::Refused("bootstrap inspection proof differs"));
+                    }
+                    Ok((selector, proof))
+                })();
+                let reply = match verified {
+                    Ok((selector, proof)) => {
+                        let stage = if let ChildResource::Codex(resource) = &mut child {
+                            match resource.inspect_claimed_bootstrap(&proof) {
+                                Ok(stage) => stage,
+                                Err(PodError::Refused(_) | PodError::Conflict(_) | PodError::Invalid(_)) =>
+                                    BootstrapControlStage::RefusedBeforeEffect,
+                                Err(_) => BootstrapControlStage::ThreadCreateUncertain,
+                            }
+                        } else {
+                            BootstrapControlStage::RefusedBeforeEffect
+                        };
+                        let fresh = (|| -> Result<(), PodError> {
+                            let observed = peer_evidence.as_ref().map_err(|_| PodError::Refused(
+                                "bootstrap inspection manager OS peer unavailable"))?;
+                            observed.recheck_before_effect(&stream, &manager_peer)
+                                .map_err(|_| PodError::Refused("bootstrap inspection manager peer changed"))?;
+                            if !manager_witness.matches_current(owner_epoch.get(), credential_epoch.get(), &manager_peer) {
+                                return Err(PodError::Refused("bootstrap inspection manager claim changed"));
+                            }
+                            current_codex_v2_binding(binding, descriptor)?;
+                            let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
+                                .map_err(|_| PodError::Refused("bootstrap inspection store unavailable"))?;
+                            let current = store.inspect_claimed_bootstrap_send(&selector)
+                                .map_err(|_| PodError::Refused("bootstrap inspection claim changed"))?;
+                            let lease = store.inspect_native_writer_lease(&selector.native_target)
+                                .map_err(|_| PodError::Refused("bootstrap inspection lease changed"))?;
+                            if current != proof
+                                || lease.writer_epoch() != proof.writer_epoch()
+                                || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+                            {
+                                return Err(PodError::Refused("bootstrap inspection proof changed"));
+                            }
+                            Ok(())
+                        })();
+                        if fresh.is_ok() {
+                            BootstrapControlReceipt::new(
+                                &inspect, Some(&proof.receipt().request_digest), stage,
+                            )
+                        } else {
+                            BootstrapControlReceipt::new(
+                                &inspect, None, BootstrapControlStage::RefusedBeforeEffect,
+                            )
+                        }
+                    }
+                    Err(_) => BootstrapControlReceipt::new(
+                        &inspect, None, BootstrapControlStage::RefusedBeforeEffect,
+                    ),
+                };
+                let encoded = serde_json::to_vec(&reply)?;
+                if encoded.len() as u64 > FRAME_LIMIT {
+                    return Err(PodError::Invalid("bootstrap inspection reply exceeds frame bound"));
                 }
                 stream.write_all(&encoded)?;
                 return Ok(false);

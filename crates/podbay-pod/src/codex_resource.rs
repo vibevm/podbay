@@ -232,6 +232,61 @@ impl PodCodexResource {
         self.child_birth.pid
     }
 
+    /// Read only the held, identity-checked journal for this exact claimed
+    /// command. Absence is a distinct fact; no native adapter method is used.
+    pub(crate) fn inspect_claimed_bootstrap(
+        &mut self,
+        proof: &BootstrapSendRecord,
+    ) -> Result<BootstrapControlStage, PodError> {
+        let target = proof.native_target();
+        let native = self.resource.identity();
+        if target.session_id != native.session_id
+            || target.run_id != native.run_id
+            || target.attempt_id != native.attempt_id
+            || target.pod_id != native.pod_id
+            || target.resource_id != native.resource_id
+            || target.resource_epoch != native.resource_epoch.get()
+            || target.pod_incarnation == 0
+            || proof.writer_epoch() == 0
+        {
+            return Err(PodError::Refused("bootstrap journal target differs"));
+        }
+        let identity = CodexJournalIdentity::from_resource(
+            &target.store_lineage,
+            &target.scope_id,
+            &target.session_id,
+            &target.run_id,
+            &target.attempt_id,
+            &target.pod_id,
+            Epoch::new(target.pod_incarnation)
+                .map_err(|_| PodError::Invalid("bootstrap Pod incarnation"))?,
+            &target.resource_id,
+            native.resource_epoch,
+        );
+        let Some(journal) = self.journal.as_mut() else {
+            return match fs::symlink_metadata(&self.journal_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(BootstrapControlStage::ClaimedUnobserved)
+                }
+                _ => Err(PodError::Uncertain(
+                    "Codex journal path exists without held identity",
+                )),
+            };
+        };
+        if !journal.matches_identity(&identity) {
+            return Err(PodError::Refused("held Codex journal belongs to another resource"));
+        }
+        journal.recheck_held_file()?;
+        let view = journal.view();
+        if view.command_key.as_deref().is_some_and(|key| key != proof.receipt().command_id)
+            || view.payload_digest.as_deref().is_some_and(|digest|
+                digest != proof.receipt().request_digest)
+        {
+            return Err(PodError::Conflict("held Codex journal belongs to another command"));
+        }
+        inspect_stage_from_journal_view(&view)
+    }
+
     /// A current authority failure cannot erase an earlier fsynced native
     /// intent. This read returns a conservative stage for the same CommandId.
     pub(crate) fn prior_uncertain_stage(
@@ -602,6 +657,39 @@ fn conservative_prior_stage(view: &CodexJournalView) -> BootstrapControlStage {
     }
 }
 
+fn inspect_stage_from_journal_view(view: &CodexJournalView) -> Result<BootstrapControlStage, PodError> {
+    let identities = || -> Result<(String, String), PodError> {
+        Ok((
+            view.native_thread_id.clone().ok_or(PodError::Uncertain("journal lacks thread ID"))?,
+            view.native_session_id.clone().ok_or(PodError::Uncertain("journal lacks native Session ID"))?,
+        ))
+    };
+    match view.stage {
+        CodexJournalStage::Empty => Ok(BootstrapControlStage::ClaimedUnobserved),
+        CodexJournalStage::ThreadCreateIntentDurable
+        | CodexJournalStage::ThreadCreateUnknownAfterReopen =>
+            Ok(BootstrapControlStage::ThreadCreateUncertain),
+        CodexJournalStage::ThreadCreated => {
+            let (native_thread_id, native_session_id) = identities()?;
+            Ok(BootstrapControlStage::ThreadCreated { native_thread_id, native_session_id })
+        }
+        CodexJournalStage::BootstrapIntentDurable
+        | CodexJournalStage::BootstrapUnknownAfterReopen
+        | CodexJournalStage::BootstrapUncertain => {
+            let (native_thread_id, native_session_id) = identities()?;
+            Ok(BootstrapControlStage::BootstrapUncertain { native_thread_id, native_session_id })
+        }
+        CodexJournalStage::BootstrapSubmitted | CodexJournalStage::BootstrapCompleted => {
+            let (native_thread_id, native_session_id) = identities()?;
+            let native_turn_id = view.native_turn_id.clone()
+                .ok_or(PodError::Uncertain("journal lacks native turn ID"))?;
+            Ok(BootstrapControlStage::Submitted { native_thread_id, native_session_id, native_turn_id })
+        }
+        CodexJournalStage::StorageUncertain =>
+            Err(PodError::Uncertain("Codex journal storage outcome unknown")),
+    }
+}
+
 #[cfg(test)]
 mod bootstrap_stage_tests {
     use super::*;
@@ -632,5 +720,27 @@ mod bootstrap_stage_tests {
             conservative_prior_stage(&view(CodexJournalStage::BootstrapSubmitted)),
             BootstrapControlStage::BootstrapUncertain { .. }
         ));
+    }
+
+    #[test]
+    fn read_only_inspection_separates_empty_claim_from_fsynced_submission() {
+        let mut empty = view(CodexJournalStage::Empty);
+        empty.command_key = None;
+        empty.payload_digest = None;
+        empty.native_thread_id = None;
+        empty.native_session_id = None;
+        empty.native_turn_id = None;
+        assert_eq!(
+            inspect_stage_from_journal_view(&empty).unwrap(),
+            BootstrapControlStage::ClaimedUnobserved,
+        );
+        assert_eq!(
+            inspect_stage_from_journal_view(&view(CodexJournalStage::BootstrapSubmitted)).unwrap(),
+            BootstrapControlStage::Submitted {
+                native_thread_id: "thread.fixture".into(),
+                native_session_id: "session.fixture".into(),
+                native_turn_id: "turn.fixture".into(),
+            },
+        );
     }
 }

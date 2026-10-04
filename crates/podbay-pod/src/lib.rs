@@ -37,7 +37,8 @@ pub use codex_journal::{
 };
 #[cfg(target_os = "linux")]
 pub use codex_bootstrap::{
-    BootstrapControlReceipt, BootstrapControlStage, CODEX_BOOTSTRAP_PROTOCOL,
+    BootstrapControlReceipt, BootstrapControlStage, CODEX_BOOTSTRAP_INSPECT_PROTOCOL,
+    CODEX_BOOTSTRAP_PROTOCOL,
 };
 #[cfg(target_os = "linux")]
 pub use codex_launch::launch_bound_codex_v2;
