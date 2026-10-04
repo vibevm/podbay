@@ -157,12 +157,9 @@ fn status(kind: &str, active_flags: &[&str]) -> Value {
     }})
 }
 
-fn read_response(id: u64, kind: &str, active_turn_id: Option<&str>) -> Value {
-    let mut thread = native_thread("thread.one", kind);
-    if let Some(turn_id) = active_turn_id {
-        thread["turns"] = json!([{"id":turn_id,"status":"inProgress","items":[]}]);
-    }
-    json!({"id":id,"result":{"thread":thread}})
+fn read_response(id: u64, kind: &str, _active_turn_id: Option<&str>) -> Value {
+    // Metadata-only thread/read always has an empty turns projection.
+    json!({"id":id,"result":{"thread":native_thread("thread.one", kind)}})
 }
 
 fn work_turn_response(id: u64, turn_id: &str) -> Value {
@@ -515,13 +512,18 @@ fn resume_reads_exact_thread_before_resuming_and_never_replays_bootstrap() {
         adapter.transport().methods(),
         ["initialize", "initialized", "thread/read", "thread/resume"]
     );
-    assert_eq!(
-        adapter.transport().writes[2]["params"]["includeTurns"],
-        true
+    assert!(
+        adapter.transport().writes[2]["params"]
+            .get("includeTurns")
+            .is_none()
     );
     assert_eq!(
         adapter.transport().writes[3]["params"]["threadId"],
         "thread.one"
+    );
+    assert_eq!(
+        adapter.transport().writes[3]["params"]["excludeTurns"],
+        true
     );
 }
 
@@ -553,6 +555,41 @@ fn resume_refuses_changed_effective_settings_after_read() {
     );
     assert!(adapter.native_thread().is_none());
     assert!(!adapter.bootstrap_ready());
+}
+
+#[test]
+fn resume_refuses_active_metadata_without_a_verified_turn_identity() {
+    let read = json!({"id":2,"result":{"thread":native_thread("thread.one","active")}});
+    let mut adapter = resource([initialized(), read]);
+    adapter.initialize().unwrap();
+    assert_eq!(
+        adapter.resume_existing("thread.one"),
+        Err(CodexError::Unsupported(
+            "active native thread cannot be resumed without verified turn identity"
+        ))
+    );
+    assert_eq!(
+        adapter.transport().methods(),
+        ["initialize", "initialized", "thread/read"]
+    );
+    assert!(adapter.native_thread().is_none());
+}
+
+#[test]
+fn resume_refuses_active_effective_response_without_claiming_readiness() {
+    let read = json!({"id":2,"result":{"thread":native_thread("thread.one","notLoaded")}});
+    let mut active = effective(3, "thread.one");
+    active["result"]["thread"] = native_thread("thread.one", "active");
+    let mut adapter = resource([initialized(), read, active]);
+    adapter.initialize().unwrap();
+    assert_eq!(
+        adapter.resume_existing("thread.one"),
+        Err(CodexError::Unsupported(
+            "active resumed thread has no verified turn identity"
+        ))
+    );
+    assert!(!adapter.bootstrap_ready());
+    assert!(adapter.native_thread().is_none());
 }
 
 #[test]
@@ -667,6 +704,13 @@ fn exact_owned_active_turn_steers_with_expected_turn_id() {
     adapter
         .send_turn(&writer_permit(1), "First", "message.one", None)
         .unwrap();
+    assert_eq!(
+        adapter
+            .turn_control_state()
+            .observed_active_turn_id
+            .as_deref(),
+        Some("turn.work")
+    );
     let steered = adapter
         .send_turn(
             &writer_permit(1),
@@ -676,6 +720,11 @@ fn exact_owned_active_turn_steers_with_expected_turn_id() {
         )
         .unwrap();
     assert_eq!(steered.mode, TurnMode::Steer);
+    assert_eq!(adapter.turn_control_state().observed_active_turn_id, None);
+    assert_eq!(
+        adapter.turn_control_state().owned_active_turn_id.as_deref(),
+        Some("turn.work")
+    );
     assert_eq!(steered.client_message_id, "message.two");
     assert_eq!(
         steered.stage,
@@ -733,6 +782,90 @@ fn competing_native_turn_refuses_without_start_or_steer() {
     );
     assert!(adapter.turn_control_state().external_conflict);
     assert_eq!(adapter.transport().methods().last(), Some(&"thread/read"));
+}
+
+#[test]
+fn owned_active_turn_does_not_depend_on_a_paginated_lifetime_history() {
+    let older = (0..129)
+        .map(|index| json!({"id":format!("turn.old.{index}"),"status":"completed","items":[]}))
+        .collect::<Vec<_>>();
+    let unused_history_page = json!({"id":10,"result":{"data":older,"nextCursor":"older"}});
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "active", Some("turn.work")),
+        json!({"id":7,"result":{"turnId":"turn.work"}}),
+        read_response(8, "active", Some("turn.work")),
+        json!({"id":9,"result":{}}),
+        unused_history_page,
+    ]);
+    adapter
+        .send_turn(&writer_permit(1), "First", "message.one", None)
+        .unwrap();
+    let steered = adapter
+        .send_turn(
+            &writer_permit(1),
+            "Continue",
+            "message.two",
+            Some("turn.work"),
+        )
+        .unwrap();
+    assert_eq!(steered.mode, TurnMode::Steer);
+    assert_eq!(
+        adapter.interrupt_turn(&writer_permit(1), "turn.work"),
+        Ok(InterruptState::Requested {
+            turn_id: "turn.work".into()
+        })
+    );
+    assert_eq!(
+        adapter.transport().writes[7]["params"]["expectedTurnId"],
+        "turn.work"
+    );
+    assert!(!adapter.transport().methods().contains(&"thread/turns/list"));
+    assert_eq!(
+        adapter.transport().methods().last(),
+        Some(&"turn/interrupt")
+    );
+    assert_eq!(
+        adapter.transport().reads.len(),
+        1,
+        "paginated history was not consulted"
+    );
+}
+
+#[test]
+fn rejected_native_expected_turn_cas_marks_conflict_and_never_retries() {
+    let mut adapter = bootstrapped([
+        read_response(4, "idle", None),
+        work_turn_response(5, "turn.work"),
+        read_response(6, "active", Some("turn.work")),
+        json!({"id":7,"error":{"code":-32600,"message":"expected turn changed"}}),
+    ]);
+    adapter
+        .send_turn(&writer_permit(1), "First", "message.one", None)
+        .unwrap();
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Steer", "message.two", Some("turn.work")),
+        Err(CodexError::RemoteError(-32600))
+    );
+    assert!(adapter.turn_control_state().external_conflict);
+    assert_eq!(adapter.transport().methods().last(), Some(&"turn/steer"));
+    let writes = adapter.transport().writes.len();
+    assert_eq!(
+        adapter.send_turn(&writer_permit(1), "Retry", "message.two", Some("turn.work")),
+        Err(CodexError::Blocked(BlockReason::DuplicateMessageKey))
+    );
+    assert_eq!(adapter.transport().writes.len(), writes);
+    assert_eq!(
+        adapter.send_turn(
+            &writer_permit(1),
+            "Another",
+            "message.three",
+            Some("turn.work")
+        ),
+        Err(CodexError::Blocked(BlockReason::ObservationUnknown))
+    );
+    assert_eq!(adapter.transport().writes.len(), writes);
 }
 
 #[test]

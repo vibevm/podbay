@@ -14,8 +14,9 @@ Selected non-experimental v2 shapes from that bundle:
 | --- | --- | --- |
 | `initialize` (v1) | `clientInfo` (`name`, `version`) | `codexHome`, `platformFamily`, `platformOs`, `userAgent` |
 | `thread/start` | none in schema; this adapter sends `model`, `cwd`, `approvalPolicy`, `sandbox`, `config.model_reasoning_effort` | `thread`, `model`, `reasoningEffort`, `approvalPolicy`, `sandbox`, `cwd` |
-| `thread/read` | `threadId` | `thread` with `id`, `sessionId`, `cwd`, `status`, `turns` |
-| `thread/resume` | `threadId` | same effective fields as `thread/start` |
+| `thread/read` | `threadId`; metadata-only omits `includeTurns` | `thread` with `id`, `sessionId`, `cwd`, live `status`, empty `turns` metadata projection |
+| `thread/turns/list` | `threadId`, optional `limit` and sort | Native page shape is documented; active-turn behavior remains unverified against a materialized real session |
+| `thread/resume` | `threadId`; adapter requests `excludeTurns: true` | same effective fields as `thread/start` when native saved-session continuation is available |
 | `turn/start` | `threadId`, `input` | `turn` with `id`, `status` |
 | `turn/steer` | `threadId`, `expectedTurnId`, `input` | `turnId` |
 | `turn/interrupt` | `threadId`, `turnId` | empty object receipt |
@@ -51,9 +52,17 @@ PB10b turn control uses a local `WriterPermit` comparison over the complete
 PodBay resource identity and a monotonically installed writer epoch. The
 permit is supplied by an authenticated higher layer and is **not** durable
 authority by itself. Every send or interrupt reads native thread state before
-its turn RPC. Idle chooses `turn/start`; an active turn permits `turn/steer`
-only when its ID matches both the locally owned turn and the caller's exact
-expected ID. Native permission requests remain pending and block new sends.
+its turn RPC. The 0.159.3 path uses metadata-only `thread/read` for status.
+Idle chooses `turn/start`. An active turn permits `turn/steer` only when this
+same adapter process owns the exact turn ID from its `turn/start` receipt and
+the caller supplies that ID. Native `expectedTurnId` is the final compare-and-set
+against a competing writer; a rejection blocks further input. Lifetime turn
+history and its pagination do not gate steering. A cold resume with active
+status has no locally owned turn ID and refuses. Native permission requests
+remain pending and block new sends.
+Every metadata-only read clears the reported observed turn ID because that
+response contains no turn identity; it retains the separate local ownership
+ID for the native compare-and-set.
 `turn/interrupt` success is a request receipt; only a matching
 `turn/completed` with `status: interrupted` settles it.
 
@@ -111,6 +120,18 @@ unsupported read as part of its thread-start gate. This does not establish
 provider entitlement, a durable native writer, pod ownership, or turn success.
 The focused rerun passed (one ignored test selected, exit 0), and the direct
 child was reaped by the fixture's bounded disposal path.
+
+An additional isolated no-turn probe against the same 0.159.3 binary found:
+metadata-only `thread/read` returned the exact fresh thread as idle with
+`turns=[]`; `thread/turns/list` returned RPC `-32600` because the thread was
+not materialized before its first user message; `thread/resume` with
+`excludeTurns: true` returned RPC `-32600` (`no rollout found for thread id`).
+These are facts about an **unmaterialized no-turn thread**, not a verdict on
+materialized session continuation or active-turn pagination. The focused
+ignored probe asserts these results without sending a turn. The adapter no
+longer requests unsupported full-history `thread/read`; it does not infer an
+active turn ID from an empty metadata projection. This no-turn probe does not
+establish whether `thread/turns/list` can reconcile active materialized sessions.
 
 ## Pod-side stdio transport boundary
 
