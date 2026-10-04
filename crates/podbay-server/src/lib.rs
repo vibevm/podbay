@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+mod auth_prelude;
+#[cfg(target_os = "linux")]
 mod linux_peer;
 
 use std::fmt;
@@ -16,6 +18,11 @@ use podbay_wire::{
 };
 use serde_json::Value;
 
+#[cfg(target_os = "linux")]
+pub use auth_prelude::{
+    AUTH_PRELUDE_PROTOCOL, LinuxAuthPreludeError, LinuxAuthPreludeLimits, LinuxAuthenticatedStream,
+    authenticate_accepted_linux_stream, authenticate_accepted_linux_stream_with_limits,
+};
 #[cfg(target_os = "linux")]
 pub use linux_peer::{LinuxAcceptedPeerError, LinuxAcceptedPeerEvidence};
 

@@ -352,10 +352,14 @@ dependencies = [
 name = "podbay-server"
 version = "0.1.0"
 dependencies = [
+ "ed25519-compact",
  "podbay-client",
+ "podbay-core",
  "podbay-host",
  "podbay-pod",
+ "podbay-store",
  "podbay-wire",
+ "serde",
  "serde_json",
 ]
 
