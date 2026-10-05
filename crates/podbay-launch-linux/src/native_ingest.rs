@@ -26,7 +26,7 @@ use crate::codex_v2::{
     preflight_committed_codex_v2_cached_read_only,
 };
 
-const MAX_PRIVATE_JSONL_BYTES: usize = 262_144;
+const MAX_PRIVATE_JSONL_BYTES: usize = 4 * 1_048_576;
 
 pub struct TrustedNativeEventDirectory {
     path: PathBuf,

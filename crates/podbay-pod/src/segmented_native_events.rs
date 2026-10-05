@@ -306,11 +306,20 @@ mod tests {
     fn large_bootstrap_notifications_replay_across_segments_without_gap() {
         let fixture = Fixture::new();
         let mut spool = fixture.open();
-        let private = raw_of_len(213_357);
-        for sequence in 1..=15 {
+        let max_frame = raw_of_len(4 * 1_048_576);
+        let observed_large_frame = raw_of_len(624_190);
+        let frames = [
+            &max_frame,
+            &observed_large_frame,
+            &observed_large_frame,
+            &observed_large_frame,
+            &observed_large_frame,
+        ];
+        for (index, private) in frames.iter().enumerate() {
+            let sequence = index as u64 + 1;
             assert_eq!(spool.reserve_native_take().unwrap(), sequence);
             spool
-                .append_applied(sequence, &private, NativeEventKind::Output, None, false)
+                .append_applied(sequence, private, NativeEventKind::Output, None, false)
                 .unwrap();
         }
         assert!(spool.checkpoint.segments.len() > 1);
@@ -329,13 +338,16 @@ mod tests {
                 break;
             }
             for frame in &page {
-                assert_eq!(frame.private_payload(), private);
+                assert_eq!(
+                    frame.private_payload(),
+                    frames[(frame.source_sequence() - 1) as usize]
+                );
             }
             count += page.len();
             after = page.last().unwrap().source_sequence();
         }
-        assert_eq!(count, 15);
-        assert_eq!(after, 15);
+        assert_eq!(count, frames.len());
+        assert_eq!(after, frames.len() as u64);
     }
 
     #[test]
@@ -346,7 +358,7 @@ mod tests {
         spool
             .append_applied(
                 sequence,
-                &raw_of_len(262_144),
+                &raw_of_len(4 * 1_048_576),
                 NativeEventKind::Output,
                 None,
                 false,
@@ -356,7 +368,7 @@ mod tests {
         assert!(matches!(
             spool.append_applied(
                 sequence,
-                &raw_of_len(262_145),
+                &raw_of_len(4 * 1_048_576 + 1),
                 NativeEventKind::Output,
                 None,
                 false,
@@ -459,6 +471,11 @@ mod tests {
         let mut spool = fixture.open();
         let body = raw(&"x".repeat(59_000));
         for expected in 1..=72 {
+            // Exercise the prune boundary without writing 32 MiB of fixture
+            // payload now that production segments hold large notifications.
+            if matches!(expected, 17 | 33 | 49 | 65) {
+                spool.rollover_before_take().unwrap();
+            }
             let sequence = spool.reserve_native_take().unwrap();
             assert_eq!(sequence, expected);
             spool

@@ -19,7 +19,7 @@ const EVENT_DOMAIN: &[u8] = b"podbay.native-event-id/1\0";
 const MAX_LOG_BYTES: u64 = 16 * 1_048_576;
 pub const MAX_PRIVATE_NATIVE_EVENT_LOG_BYTES: u64 = MAX_LOG_BYTES;
 const MAX_FRAME_BYTES: usize = 262_144;
-const MAX_RAW_BYTES: usize = 262_144;
+const MAX_RAW_BYTES: usize = 4 * 1_048_576;
 const MAX_RECORDS: u64 = 65_536;
 const TERMINAL_RESERVE_BYTES: u64 = MAX_FRAME_BYTES as u64 + HEADER_BYTES as u64;
 // A long Codex bootstrap can emit hundreds of JSONL observations before its
