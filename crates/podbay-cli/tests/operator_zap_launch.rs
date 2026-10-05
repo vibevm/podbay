@@ -1083,6 +1083,41 @@ fn installed_operator_until_stopped_service_has_unlimited_unit_and_exact_stop() 
 
 #[test]
 #[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
+fn exited_child_leaves_outer_unit_but_signed_stop_cannot_rebind() {
+    let (fixture, policy_path, first, _manifest) = setup_disposable_stop();
+    let unit = fixture.unit.as_deref().unwrap();
+    let child_pid = first["childPid"].as_u64().unwrap() as u32;
+    let child_birth = first["childStartTicks"].as_u64().unwrap();
+    assert_eq!(process_birth(child_pid), child_birth);
+    assert!(Command::new("kill")
+        .args(["-KILL", &child_pid.to_string()])
+        .status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let child_stat = format!("/proc/{child_pid}/stat");
+    while Path::new(&child_stat).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!Path::new(&child_stat).exists());
+    let shown = Command::new("systemctl")
+        .args(["--user", "show", "--property=ActiveState", "--value", unit])
+        .output().unwrap();
+    assert!(shown.status.success());
+    assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "active");
+    let refused = operator_stop_output(&policy_path, false);
+    assert!(!refused.status.success(), "unexpected signed stop: {}",
+        String::from_utf8_lossy(&refused.stdout));
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("operator stop rebind preparation failed: Host(StaleGuard)"));
+    assert!(!fixture.outer.join("operator-zap-stop-intent.json").exists());
+    // Disposal only: this bypass is intentionally outside the operator API.
+    assert!(Command::new("systemctl")
+        .args(["--user", "stop", unit])
+        .status().unwrap().success());
+    assert_unit_unloaded(unit);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd, PODBAY_TEST_POD_BINARY and PODBAY_TEST_ZAP_ROOT"]
 fn installed_operator_stop_refuses_wrong_actor_pod_then_settles_once_and_reads_duplicate() {
     let (fixture, policy_path, first, manifest) = setup_disposable_stop();
     let original = fs::read(&policy_path).unwrap();
