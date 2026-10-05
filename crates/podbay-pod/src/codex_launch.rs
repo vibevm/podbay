@@ -363,6 +363,9 @@ fn launch_bound_codex(
             "--collect",
             "--service-type=exec",
             "--property=KillMode=control-group",
+            // Codex handles SIGTERM. Bound the systemd cgroup grace period so
+            // an exact unit stop cannot wait for the manager's 90s default.
+            "--property=TimeoutStopSec=5s",
             "--property=NoNewPrivileges=yes",
         ])
         .arg(format!("--property=RuntimeMaxSec={}s", wire.wall_seconds()))

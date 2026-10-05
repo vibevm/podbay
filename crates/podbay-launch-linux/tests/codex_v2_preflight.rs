@@ -1230,6 +1230,16 @@ fn disposable_codex_v2_launch_serve_status_stop_without_model_turn() {
     )
     .unwrap();
     assert!(client.status().unwrap().child_running);
+    let unit = match client.status().unwrap().evidence {
+        podbay_pod::SupervisorEvidence::LinuxSystemd { unit_name, .. } => unit_name,
+        _ => panic!("Codex V2 fixture needs a user-systemd unit"),
+    };
+    let stop_timeout = Command::new("systemctl")
+        .args(["--user", "show", "--property=TimeoutStopUSec", "--value", &unit])
+        .output()
+        .unwrap();
+    assert!(stop_timeout.status.success());
+    assert_eq!(String::from_utf8_lossy(&stop_timeout.stdout).trim(), "5s");
     assert_eq!(
         client.bound_status().unwrap().capability,
         CODEX_V2_CAPABILITY
