@@ -1702,7 +1702,10 @@ impl<T: JsonlTransport> CodexResource<T> {
     /// completion notification. Each tick performs at most one atomic pipe
     /// write or one nonblocking frame read, so pod control stays responsive.
     /// A lost or malformed response is terminally uncertain and never causes
-    /// another native write. No thread content is retained.
+    /// another native write. Valid native notifications keep the bounded
+    /// response wait alive; an absolute deadline would discard a late reply
+    /// while app-server is still proving that the same connection is live.
+    /// No thread content is retained.
     pub fn poll_bootstrap_read_proof_once(
         &mut self,
         expected_thread_id: &str,
@@ -1752,6 +1755,21 @@ impl<T: JsonlTransport> CodexResource<T> {
         expected_session_id: &str,
         expected_turn_id: &str,
     ) -> Result<BootstrapReadPoll, CodexError> {
+        self.poll_exact_completion_read_proof_once_at(
+            expected_thread_id,
+            expected_session_id,
+            expected_turn_id,
+            Instant::now(),
+        )
+    }
+
+    fn poll_exact_completion_read_proof_once_at(
+        &mut self,
+        expected_thread_id: &str,
+        expected_session_id: &str,
+        expected_turn_id: &str,
+        now: Instant,
+    ) -> Result<BootstrapReadPoll, CodexError> {
         if self.poisoned || !self.initialized {
             return Err(CodexError::InvalidState("native connection is unavailable"));
         }
@@ -1787,12 +1805,13 @@ impl<T: JsonlTransport> CodexResource<T> {
                     thread_id: expected_thread_id.into(),
                     session_id: expected_session_id.into(),
                     turn_id: expected_turn_id.into(),
-                    deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                    deadline: now + COMPLETION_READ_TIMEOUT,
                 };
-                self.poll_exact_completion_read_proof_once(
+                self.poll_exact_completion_read_proof_once_at(
                     expected_thread_id,
                     expected_session_id,
                     expected_turn_id,
+                    now,
                 )
             }
             CompletionReadState::PendingWrite {
@@ -1803,7 +1822,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                 turn_id,
                 deadline,
             } => {
-                if Instant::now() >= deadline {
+                if now >= deadline {
                     self.completion_read = CompletionReadState::Inconclusive;
                     return Err(CodexError::TransportUncertain);
                 }
@@ -1825,7 +1844,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                             thread_id,
                             session_id,
                             turn_id,
-                            deadline: Instant::now() + COMPLETION_READ_TIMEOUT,
+                            deadline: now + COMPLETION_READ_TIMEOUT,
                         };
                         Ok(BootstrapReadPoll::Advanced)
                     }
@@ -1842,10 +1861,6 @@ impl<T: JsonlTransport> CodexResource<T> {
                 turn_id,
                 deadline,
             } => {
-                if Instant::now() >= deadline {
-                    self.poisoned = true;
-                    return Err(CodexError::TransportUncertain);
-                }
                 if let Some(event) = self.queued.pop_front() {
                     self.apply_event_or_poison(&event.value, &event.raw_jsonl)?;
                     self.completion_read = CompletionReadState::AwaitingReply {
@@ -1853,12 +1868,16 @@ impl<T: JsonlTransport> CodexResource<T> {
                         thread_id,
                         session_id,
                         turn_id,
-                        deadline,
+                        deadline: now + COMPLETION_READ_TIMEOUT,
                     };
                     return Ok(BootstrapReadPoll::Advanced);
                 }
                 let frame = match self.io.try_read_line() {
                     Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                        if now >= deadline {
+                            self.poisoned = true;
+                            return Err(CodexError::TransportUncertain);
+                        }
                         self.completion_read = CompletionReadState::AwaitingReply {
                             id,
                             thread_id,
@@ -1882,7 +1901,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                         thread_id,
                         session_id,
                         turn_id,
-                        deadline,
+                        deadline: now + COMPLETION_READ_TIMEOUT,
                     };
                     return Ok(BootstrapReadPoll::Advanced);
                 }
@@ -1936,7 +1955,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                     thread_id,
                     session_id,
                     turn_id,
-                    deadline,
+                    deadline: now + COMPLETION_READ_TIMEOUT,
                 };
                 Ok(BootstrapReadPoll::Advanced)
             }
@@ -1946,17 +1965,17 @@ impl<T: JsonlTransport> CodexResource<T> {
                 turn_id,
                 deadline,
             } => {
-                if Instant::now() >= deadline {
-                    self.poisoned = true;
-                    return Err(CodexError::TransportUncertain);
-                }
                 match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending) if now >= deadline => {
+                        self.poisoned = true;
+                        Err(CodexError::TransportUncertain)
+                    }
                     Ok(AvailableLine::Pending) if self.bootstrap_ready() => {
                         self.completion_read = CompletionReadState::Verified {
                             thread_id,
                             session_id,
                             turn_id,
-                            deadline,
+                            deadline: now + COMPLETION_READ_TIMEOUT,
                         };
                         Ok(BootstrapReadPoll::Verified)
                     }
@@ -1965,6 +1984,10 @@ impl<T: JsonlTransport> CodexResource<T> {
                         Ok(BootstrapReadPoll::Pending)
                     }
                     Ok(AvailableLine::IncompleteFrame) => {
+                        if now >= deadline {
+                            self.poisoned = true;
+                            return Err(CodexError::TransportUncertain);
+                        }
                         self.completion_read = CompletionReadState::Draining {
                             thread_id,
                             session_id,
@@ -1987,7 +2010,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                                 thread_id,
                                 session_id,
                                 turn_id,
-                                deadline,
+                                deadline: now + COMPLETION_READ_TIMEOUT,
                             }
                         } else {
                             CompletionReadState::Inconclusive
@@ -2006,11 +2029,11 @@ impl<T: JsonlTransport> CodexResource<T> {
                 turn_id,
                 deadline,
             } => {
-                if Instant::now() >= deadline {
-                    self.poisoned = true;
-                    return Err(CodexError::TransportUncertain);
-                }
                 match self.io.try_read_line() {
+                    Ok(AvailableLine::Pending) if now >= deadline => {
+                        self.poisoned = true;
+                        Err(CodexError::TransportUncertain)
+                    }
                     Ok(AvailableLine::Pending) if self.bootstrap_ready() => {
                         self.completion_read = CompletionReadState::Verified {
                             thread_id,
@@ -2020,7 +2043,20 @@ impl<T: JsonlTransport> CodexResource<T> {
                         };
                         Ok(BootstrapReadPoll::Verified)
                     }
-                    Ok(AvailableLine::Pending | AvailableLine::IncompleteFrame) => {
+                    Ok(AvailableLine::Pending) => {
+                        self.completion_read = CompletionReadState::Draining {
+                            thread_id,
+                            session_id,
+                            turn_id,
+                            deadline,
+                        };
+                        Ok(BootstrapReadPoll::Pending)
+                    }
+                    Ok(AvailableLine::IncompleteFrame) => {
+                        if now >= deadline {
+                            self.poisoned = true;
+                            return Err(CodexError::TransportUncertain);
+                        }
                         self.completion_read = CompletionReadState::Draining {
                             thread_id,
                             session_id,
@@ -2043,7 +2079,7 @@ impl<T: JsonlTransport> CodexResource<T> {
                                 thread_id,
                                 session_id,
                                 turn_id,
-                                deadline,
+                                deadline: now + COMPLETION_READ_TIMEOUT,
                             }
                         } else {
                             CompletionReadState::Inconclusive
@@ -2688,6 +2724,164 @@ mod split_thread_tests {
         fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
             Ok(self.reads.pop_front())
         }
+
+        fn try_read_line(&mut self) -> io::Result<AvailableLine> {
+            Ok(self
+                .reads
+                .pop_front()
+                .map_or(AvailableLine::Pending, AvailableLine::Frame))
+        }
+
+        fn try_write_line(&mut self, line: &[u8]) -> io::Result<AvailableWrite> {
+            self.write_line(line)?;
+            Ok(AvailableWrite::Written)
+        }
+    }
+
+    fn completion_read_resource(
+        reads: impl IntoIterator<Item = Value>,
+        deadline: Instant,
+    ) -> CodexResource<FakeTransport> {
+        let cwd = PathBuf::from("/tmp/podbay-codex-completion-fixture");
+        let identity = ResourceIdentity {
+            session_id: SessionId::try_from("session.fixture").unwrap(),
+            run_id: RunId::try_from("run.fixture").unwrap(),
+            attempt_id: AttemptId::try_from("attempt.fixture").unwrap(),
+            pod_id: PodId::try_from("pod.fixture").unwrap(),
+            resource_id: ResourceId::try_from("resource.fixture").unwrap(),
+            resource_epoch: Epoch::new(1).unwrap(),
+        };
+        let config = PinnedCodexConfig::new(
+            "gpt-6-sol",
+            "medium",
+            cwd,
+            ApprovalPolicy::Never,
+            Sandbox::DangerFullAccess,
+        )
+        .unwrap();
+        let io = FakeTransport {
+            reads: reads.into_iter().map(frame).collect(),
+            writes: Vec::new(),
+        };
+        let mut resource = CodexResource::new(io, identity, config);
+        resource.initialized = true;
+        resource.thread = Some(NativeThread {
+            thread_id: "thread.fixture".into(),
+            session_id: "session.fixture".into(),
+            status: ThreadStatus::Idle,
+        });
+        resource.bootstrap = BootstrapState::Completed {
+            turn_id: "turn.bootstrap".into(),
+        };
+        resource.native_status = ThreadStatus::Idle;
+        resource.idle_after_completion = true;
+        resource.last_later_turn_completion = Some(LaterTurnCompletionObservation {
+            native_thread_id: "thread.fixture".into(),
+            native_session_id: "session.fixture".into(),
+            native_turn_id: "turn.work".into(),
+            status: LaterTurnTerminalStatus::Completed,
+        });
+        resource.completion_read = CompletionReadState::AwaitingReply {
+            id: 9,
+            thread_id: "thread.fixture".into(),
+            session_id: "session.fixture".into(),
+            turn_id: "turn.work".into(),
+            deadline,
+        };
+        resource
+    }
+
+    fn child_output() -> Value {
+        json!({"method":"item/agentMessage/delta","params":{
+            "threadId":"thread.child","delta":"child is still working"
+        }})
+    }
+
+    fn idle_read_response() -> Value {
+        json!({"id":9,"result":{"thread":{
+            "id":"thread.fixture",
+            "sessionId":"session.fixture",
+            "cwd":"/tmp/podbay-codex-completion-fixture",
+            "status":{"type":"idle"},
+            "turns":[]
+        }}})
+    }
+
+    #[test]
+    fn live_child_notifications_extend_the_completion_read_wait() {
+        let started = Instant::now();
+        let mut resource = completion_read_resource(
+            [child_output(), idle_read_response()],
+            started + COMPLETION_READ_TIMEOUT,
+        );
+
+        assert_eq!(
+            resource
+                .poll_exact_completion_read_proof_once_at(
+                    "thread.fixture",
+                    "session.fixture",
+                    "turn.work",
+                    started + COMPLETION_READ_TIMEOUT + Duration::from_secs(1),
+                )
+                .unwrap(),
+            BootstrapReadPoll::Advanced,
+        );
+        let child = resource.take_applied_native_notification().unwrap();
+        assert_eq!(child.kind(), NativeObservationKind::Opaque);
+        assert_eq!(child.status(), None);
+
+        assert_eq!(
+            resource
+                .poll_exact_completion_read_proof_once_at(
+                    "thread.fixture",
+                    "session.fixture",
+                    "turn.work",
+                    started + COMPLETION_READ_TIMEOUT * 2 + Duration::from_secs(2),
+                )
+                .unwrap(),
+            BootstrapReadPoll::Advanced,
+        );
+        assert_eq!(
+            resource
+                .poll_exact_completion_read_proof_once_at(
+                    "thread.fixture",
+                    "session.fixture",
+                    "turn.work",
+                    started + COMPLETION_READ_TIMEOUT * 2 + Duration::from_secs(2),
+                )
+                .unwrap(),
+            BootstrapReadPoll::Verified,
+        );
+    }
+
+    #[test]
+    fn child_notification_alone_never_becomes_fresh_idle_proof() {
+        let started = Instant::now();
+        let mut resource = completion_read_resource(
+            [child_output()],
+            started + COMPLETION_READ_TIMEOUT,
+        );
+
+        assert_eq!(
+            resource
+                .poll_exact_completion_read_proof_once_at(
+                    "thread.fixture",
+                    "session.fixture",
+                    "turn.work",
+                    started + COMPLETION_READ_TIMEOUT + Duration::from_secs(1),
+                )
+                .unwrap(),
+            BootstrapReadPoll::Advanced,
+        );
+        assert_eq!(
+            resource.poll_exact_completion_read_proof_once_at(
+                "thread.fixture",
+                "session.fixture",
+                "turn.work",
+                started + COMPLETION_READ_TIMEOUT * 2 + Duration::from_secs(2),
+            ),
+            Err(CodexError::TransportUncertain),
+        );
     }
 
     #[test]
