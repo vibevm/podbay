@@ -31,3 +31,19 @@ the Pod journal and current process identity prove whether an intent was
 fsynced; never blindly resend after a possible input effect. The local MVP
 may retire this finite Coordinator through the signed exact stop path and
 start a fresh unlimited Service, preserving Zap/VibeVM history separately.
+
+## P1-003 — Outer Service cannot signed-stop after its child exits
+
+The live Zap outer Service `v25` survived its child exiting during headless
+config validation. `podbay operator zap stop` refused at rebind preparation
+with `Host(StaleGuard)`, leaving the systemd supervisor active. The exact unit
+was then stopped with `systemctl --user` after verifying the child had exited. The
+[terminal-only stop design](crates/podbay-cli/ORPHAN-OUTER-STOP-DESIGN.md)
+specifies the Pod attestation and one-use stop fence needed to make this a
+normal signed operator operation. The current disposable known-gap fixture
+compiles but was not run; the live failure is the operational evidence.
+
+**Owner decision before broader deployment:** implement the terminal-only
+stop path and its crash/foreign-unit proofs, or make the outer Pod supervisor
+terminate itself with a durable terminal receipt when its child exits. Do not
+weaken live-child rebind or issue an unchecked `systemctl stop` from PodBay.
