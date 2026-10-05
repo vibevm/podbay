@@ -914,8 +914,9 @@ impl LinuxNativeSegmentDirectory {
 
     /// Manager reads may overlap the pod's next reservation/append. The
     /// durable checkpoint remains the authority: verify every byte it names,
-    /// but ignore an in-progress temporary replacement and a pending frame
-    /// beyond the committed active segment length.
+    /// but ignore an in-progress temporary replacement and bytes beyond the
+    /// committed active segment length. The writer may reserve and append
+    /// after this reader captured an earlier, non-pending checkpoint.
     pub fn read_checkpoint_live(
         &self,
         expected: &NativeEventIdentity,
@@ -962,9 +963,8 @@ impl LinuxNativeSegmentDirectory {
         let current = self.read_checkpoint_payload(&previous.identity)?;
         if current == *previous {
             for segment in &current.segments {
-                let pending_tail = live && current.pending_source_sequence.is_some()
-                    && segment.id == current.active().id;
-                self.checked_segment_length(segment, pending_tail)?;
+                let live_active_tail = live && segment.id == current.active().id;
+                self.checked_segment_length(segment, live_active_tail)?;
             }
             self.verify_segment_inventory(&current)?;
             return Ok(current);
@@ -999,9 +999,8 @@ impl LinuxNativeSegmentDirectory {
                         ));
                     }
                 }
-                let pending_tail = live && current.pending_source_sequence.is_some()
-                    && segment.id == current.active().id;
-                self.verify_segment_suffix(segment, old, pending_tail)?;
+                let live_active_tail = live && segment.id == current.active().id;
+                self.verify_segment_suffix(segment, old, live_active_tail)?;
             }
         }
         self.verify_segment_inventory(&current)?;
@@ -1012,12 +1011,12 @@ impl LinuxNativeSegmentDirectory {
     fn checked_segment_length(
         &self,
         segment: &NativeSegmentMeta,
-        pending_tail: bool,
+        live_active_tail: bool,
     ) -> Result<(), PodError> {
         let path = self.segment_path(segment.id)?;
         let file = self.open_checked(&path, false)?;
         let len = file.metadata()?.len();
-        if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+        if len < segment.byte_len || (!live_active_tail && len != segment.byte_len)
             || len > MAX_SEGMENT_BYTES
         {
             return Err(PodError::Uncertain("native segment length changed"));
@@ -1029,12 +1028,12 @@ impl LinuxNativeSegmentDirectory {
         &self,
         segment: &NativeSegmentMeta,
         previous: Option<&NativeSegmentMeta>,
-        pending_tail: bool,
+        live_active_tail: bool,
     ) -> Result<(), PodError> {
         let path = self.segment_path(segment.id)?;
         let mut file = self.open_checked(&path, false)?;
         let len = file.metadata()?.len();
-        if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+        if len < segment.byte_len || (!live_active_tail && len != segment.byte_len)
             || len > MAX_SEGMENT_BYTES
         {
             return Err(PodError::Uncertain("native segment length changed"));
@@ -1226,9 +1225,8 @@ impl LinuxNativeSegmentDirectory {
             let path = self.segment_path(segment.id)?;
             let mut file = self.open_checked(&path, false)?;
             let len = file.metadata()?.len();
-            let pending_tail = live && checkpoint.pending_source_sequence.is_some()
-                && segment.id == checkpoint.active().id;
-            if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+            let live_active_tail = live && segment.id == checkpoint.active().id;
+            if len < segment.byte_len || (!live_active_tail && len != segment.byte_len)
                 || len > MAX_SEGMENT_BYTES {
                 return Err(PodError::Uncertain(
                     "segment tail differs from durable checkpoint",
@@ -1239,7 +1237,7 @@ impl LinuxNativeSegmentDirectory {
                 .take(MAX_SEGMENT_BYTES + 1)
                 .read_to_end(&mut bytes)?;
             if (bytes.len() as u64) < segment.byte_len
-                || (!pending_tail && bytes.len() as u64 != segment.byte_len)
+                || (!live_active_tail && bytes.len() as u64 != segment.byte_len)
             {
                 return Err(PodError::Uncertain("segment changed during read"));
             }
@@ -1584,6 +1582,41 @@ mod tests {
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.events[0].source_sequence, 2);
         assert_eq!(next.gap, None);
+    }
+
+    #[test]
+    fn live_reader_keeps_older_segment_prefix_when_active_segment_grows() {
+        let mut fixture = Fixture::new();
+        fixture.append(b"first segment frame");
+        fixture.rollover();
+        let captured = fixture.files.read_checkpoint(&identity()).unwrap();
+        assert_eq!(captured.segments.len(), 2);
+        assert!(captured.pending_source_sequence.is_none());
+        let cursor = NativeEventCursor { identity: identity(), sequence: 0 };
+        let reply = captured.redacted_read_after(Some(&cursor), 64).unwrap();
+
+        // The reader captured a completed checkpoint before scanning the
+        // retained first segment. The pod can reserve and append on segment 2
+        // while that scan runs, so the captured checkpoint has no pending bit.
+        fixture.append(b"new active segment frame");
+        assert!(fixture.files.verify_retained_segments(&captured).is_err());
+        fixture.files.verify_retained_segments_live(&captured).unwrap();
+        assert!(captured.contains_redacted_prefix(&reply, Some(&cursor), 64).unwrap());
+        let (frames, gap) = fixture.files.read_indexed_page(&captured, 0, 1).unwrap();
+        assert_eq!(gap, None);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].private_payload(), b"first segment frame");
+        let current = fixture.files.read_checkpoint(&identity()).unwrap();
+        let next = current.redacted_read_after(Some(&reply.next_cursor), 64).unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].source_sequence, 2);
+        assert_eq!(next.gap, None);
+
+        // Growth in an earlier segment is never a live append window.
+        let first_path = fixture.files.segment_path(1).unwrap();
+        OpenOptions::new().append(true).open(first_path).unwrap()
+            .write_all(b"x").unwrap();
+        assert!(fixture.files.verify_retained_segments_live(&current).is_err());
     }
 
     #[test]
