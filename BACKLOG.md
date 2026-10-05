@@ -62,3 +62,31 @@ weaken live-child rebind or issue an unchecked `systemctl stop` from PodBay.
 The VibeVM campaign reached a clean Coordinator checkpoint on 2026-10-05, but Zap's `project.pause.v1` had no PodBay pause operation to call. Zap then retained `pausing/unsupported`; the immediate stranded transition is a Zap defect tracked in its backlog. The broader PodBay supervisor plan already names generic Run pause/resume in [PM-01](POST-MVP-CAMPAIGN.md), but it has no local capability contract or implementation yet. Pausing a Pod process, holding new work at the manager boundary, interrupting a native turn, and stopping the Run are different effects and must not share one success label.
 
 **Priority and design gate:** define the local Run pause/resume semantics before Zap advertises a native pause capability. Specify whether the scope is admission-only, cooperative process/agent quiescence, or OS suspension; expose unsupported capabilities truthfully. Require exact Run/Pod/Resource and owner-epoch fences, a durable requested-versus-observed receipt, behavior across manager restart and lease expiry, and explicit handling of an in-flight native turn and child processes. A plain `SIGSTOP` or lack of new messages is not proof of a durable PodBay pause. Implement the smallest local slice needed for Zap first; remote machines and the wider PM-01 campaign remain deferred.
+
+## P1-005 — Manager handshake timeout blocks exact stop of a live Pod
+
+On 2026-10-06, the local VibeVM Coordinator Pod was alive at exact Run
+`run.64d8b3c06527bc287ad6ff68bf9dbffa`, Pod
+`pod.debe7036ac13e486fd56af701b330b39`, epoch `1`. Zap's
+`podbay.coordinator.stop.v1` failed twice **before effect** while reading the
+current launch guard: `PodBay root stop guard read failed`. Its stderr had
+repeated `AuthenticatedSocketTransportError: authenticated PodBay socket
+exchange failed: handshake_timeout` for native readback and writer renewal.
+Stopping/relaunching only the outer Zap/manager from `outer-v34` to
+`outer-v35` kept the inner Pod alive but did not repair the guard read.
+The PodBay event ledger contained no stop request or terminal stop receipt.
+For the owner-requested computer reboot, the operator verified the exact
+manifest Pod/Run, systemd unit, MainPID, no auto-restart and cgroup kill mode,
+then stopped that one unit with `systemctl --user`; it became inactive/dead
+and both Pod/Codex PIDs disappeared. This OS observation is **not** a signed
+PodBay stop receipt. The Lens session remains historically uncertain pending
+reconciliation after reboot.
+
+**Priority investigation:** retain the underlying authenticated exchange
+error and timing in the typed guard-read result; determine whether manager
+load, socket backlog, peer authentication or the native checkpoint loop caused
+the timeout. Add a bounded, exact-key stop/readback repair path that can
+reconcile a proved inactive unit without forging a successful PodBay stop or
+reissuing a possible native input. Test a live high-event Pod, manager restart,
+timeout before effect and terminal-only external stop. Do not automate an
+unchecked `systemctl stop` or weaken the current Pod/Run/epoch fence.
