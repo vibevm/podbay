@@ -6867,6 +6867,60 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         })
     }
 
+    /// Extend an unexpired current root writer lease under the same actor,
+    /// scope SendSession grant and manager claim. The caller must supply the
+    /// exact lease epoch and expiry it last observed; no pod or native input
+    /// call occurs here. A raced, expired or taken-over lease is refused.
+    pub fn renew_bootstrap_writer_lease<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        session_id: &SessionId,
+        policy: &TrustedBootstrapSendPolicy,
+        expected_writer_epoch: u64,
+        expected_expiry: u64,
+    ) -> Result<NativeWriterLease, BootstrapSendError> {
+        let ttl = policy.initial_writer_lease_seconds().ok_or(HostError::Unsupported)?;
+        if expected_writer_epoch == 0 || expected_expiry == 0 || policy.deadline <= Instant::now() {
+            return Err(HostError::StaleGuard.into());
+        }
+        let actor = self.current_bootstrap_actor(transport)?;
+        self.host.check_grant(
+            &actor,
+            policy.grant_id,
+            &actor.scope_id,
+            &Right::new(Operation::SendSession, Target::Scope(actor.scope_id.clone())),
+        )?;
+        let (target, _) = self.store.current_native_writer_target_for_session(
+            &actor.scope_id, session_id,
+        )?;
+        let lease = self.store.inspect_native_writer_lease(&target)?;
+        if lease.holder_actor_id() != &actor.actor_id
+            || lease.holder_credential_generation() != actor.credential_generation.get()
+            || lease.owner_epoch() != self.manager_claim.owner_epoch()
+            || lease.manager_credential_epoch() != self.manager_claim.credential_epoch()
+            || lease.writer_epoch() != expected_writer_epoch
+            || lease.expires_at_unix_seconds() != expected_expiry
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        let fresh = self.current_bootstrap_actor(transport)?;
+        if fresh.actor_id != actor.actor_id
+            || fresh.scope_id != actor.scope_id
+            || fresh.credential_generation != actor.credential_generation
+            || policy.deadline <= Instant::now()
+        {
+            return Err(HostError::StaleGuard.into());
+        }
+        self.host.check_grant(
+            &fresh,
+            policy.grant_id,
+            &fresh.scope_id,
+            &Right::new(Operation::SendSession, Target::Scope(fresh.scope_id.clone())),
+        )?;
+        self.store.renew_native_writer_lease_from_trusted_host(&lease, ttl)
+            .map_err(Into::into)
+    }
+
     /// Route an authenticated original bootstrap key to its original receipt.
     /// A distinct key after the claimed first send enters the later-turn
     /// authority path. An unclaimed first send cannot authorize a later turn.

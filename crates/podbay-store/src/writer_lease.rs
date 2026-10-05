@@ -17,6 +17,73 @@ use crate::store::PodBayStore;
 const MAX_TTL_SECONDS: u64 = 3_600;
 
 impl PodBayStore {
+    /// Extend only the exact, still-current lease witnessed by the caller.
+    /// The expiry is a CAS input, so a replay of an earlier renewal cannot
+    /// silently extend the lease again. Renewal never changes writer epoch.
+    pub fn renew_native_writer_lease_from_trusted_host(
+        &mut self,
+        expected: &NativeWriterLease,
+        ttl_seconds: u64,
+    ) -> Result<NativeWriterLease, StoreError> {
+        if !(1..=MAX_TTL_SECONDS).contains(&ttl_seconds) {
+            return Err(StoreError::InvalidInput("native writer lease bounds"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target = expected.target();
+        let format = check_current_target(&transaction, &self.store_lineage, target)?;
+        check_manager(
+            &transaction,
+            &self.store_lineage,
+            expected.owner_epoch(),
+            expected.manager_credential_epoch(),
+            expected.authority_revision(),
+            format != BoundLaunchFormat::CodexV3,
+        )?;
+        check_actor(
+            &transaction,
+            &target.scope_id,
+            expected.holder_actor_id(),
+            expected.holder_credential_generation(),
+        )?;
+        let now = current_unix_seconds(&transaction)?;
+        if expected.expires_at_unix_seconds() <= now
+            || read_lease(&transaction, &target.resource_id)?.as_ref() != Some(expected)
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        let expiry = now
+            .checked_add(ttl_seconds)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or(StoreError::InvalidInput("native writer expiry overflows"))?;
+        if expiry <= expected.expires_at_unix_seconds() {
+            return Err(StoreError::InvalidInput("native writer renewal must extend expiry"));
+        }
+        let changed = transaction.execute(
+            "UPDATE native_writer_leases SET expires_at_unix_seconds=?2
+             WHERE resource_id=?1 AND writer_epoch=?3 AND expires_at_unix_seconds=?4",
+            params![
+                target.resource_id.as_str(),
+                sql_integer(expiry)?,
+                sql_integer(expected.writer_epoch())?,
+                sql_integer(expected.expires_at_unix_seconds())?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let renewed = read_lease(&transaction, &target.resource_id)?.ok_or(StoreError::NotFound)?;
+        if renewed.writer_epoch() != expected.writer_epoch()
+            || renewed.expires_at_unix_seconds() != expiry
+            || renewed.target() != target
+        {
+            return Err(StoreError::Conflict("native writer renewal readback differs"));
+        }
+        transaction.commit()?;
+        Ok(renewed)
+    }
+
     /// Read the fenced prior writer only for a host-proven current rebind.
     /// This is a CAS input, never a usable current lease or a send permit.
     pub fn prior_native_writer_lease_for_rebind(

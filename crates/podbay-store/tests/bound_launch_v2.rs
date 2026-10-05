@@ -1314,6 +1314,42 @@ fn v17_writer_lease_acquire_is_exclusive_and_takeover_fences_old_epoch() {
 }
 
 #[test]
+fn current_writer_renewal_extends_once_without_changing_epoch() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let request = writer_request(&mut store, target.clone(), manager_credential);
+    let first = store.acquire_native_writer_lease_from_trusted_host(&request).unwrap();
+    let renewed = store.renew_native_writer_lease_from_trusted_host(&first, 120).unwrap();
+    assert_eq!(renewed.writer_epoch(), first.writer_epoch());
+    assert!(renewed.expires_at_unix_seconds() > first.expires_at_unix_seconds());
+    assert_eq!(store.inspect_native_writer_lease(&target).unwrap(), renewed);
+    assert!(matches!(
+        store.renew_native_writer_lease_from_trusted_host(&first, 120),
+        Err(StoreError::StaleEpoch)
+    ));
+    assert!(matches!(
+        store.renew_native_writer_lease_from_trusted_host(&renewed, 0),
+        Err(StoreError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn expired_writer_cannot_be_renewed() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let request = writer_request(&mut store, target, manager_credential);
+    let first = store.acquire_native_writer_lease_from_trusted_host(&request).unwrap();
+    rusqlite::Connection::open(&fixture.database).unwrap().execute(
+        "UPDATE native_writer_leases SET expires_at_unix_seconds=1",
+        [],
+    ).unwrap();
+    assert!(matches!(
+        store.renew_native_writer_lease_from_trusted_host(&first, 120),
+        Err(StoreError::StaleEpoch)
+    ));
+}
+
+#[test]
 fn v17_writer_lease_rechecks_target_manager_actor_and_expiry() {
     let fixture = Fixture::new();
     let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
