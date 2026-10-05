@@ -28,6 +28,21 @@ use crate::codex_v2::{
 
 const MAX_PRIVATE_JSONL_BYTES: usize = 4 * 1_048_576;
 
+/// A bounded private diagnostic for a native read refusal. PodError's dynamic
+/// I/O and JSON messages can contain paths or source text, so only its static
+/// variants may be recorded by the manager.
+pub(crate) fn native_read_diagnostic_reason(error: &PodError) -> &'static str {
+    match error {
+        PodError::Invalid(reason)
+        | PodError::Conflict(reason)
+        | PodError::Uncertain(reason)
+        | PodError::Refused(reason)
+        | PodError::Unsupported(reason) => reason,
+        PodError::Io(_) => "native evidence I/O",
+        PodError::Json(_) => "native evidence JSON",
+    }
+}
+
 pub struct TrustedNativeEventDirectory {
     path: PathBuf,
     identity: (u64, u64),
@@ -207,6 +222,16 @@ mod tests {
         assert!(!valid_private_jsonl_bytes(&vec![b'x'; MAX_PRIVATE_JSONL_BYTES + 1]));
         assert!(!valid_private_jsonl_bytes(&[]));
         assert!(!valid_private_jsonl_bytes(&[0xff]));
+    }
+
+    #[test]
+    fn native_read_diagnostic_hides_dynamic_error_text() {
+        let io = PodError::Io(std::io::Error::other("private path and content"));
+        assert_eq!(native_read_diagnostic_reason(&io), "native evidence I/O");
+        let json = PodError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        assert_eq!(native_read_diagnostic_reason(&json), "native evidence JSON");
+        assert_eq!(native_read_diagnostic_reason(&PodError::Uncertain("checkpoint race")),
+            "checkpoint race");
     }
 }
 

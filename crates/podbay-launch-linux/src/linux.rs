@@ -1399,7 +1399,14 @@ impl HostDispatchPort for LinuxLaunchPort {
             launch, source,
             held.as_ref().ok_or(podbay_host::HostError::StaleGuard)?,
             identity, after, limit,
-        ).map_err(|_| podbay_host::HostError::StaleGuard)
+        ).map_err(|error| {
+            // The authenticated wire still reports stale_guard. Keep the
+            // private diagnosis bounded to static PodError text; native
+            // JSONL, paths and credential values are never logged here.
+            let reason = crate::native_ingest::native_read_diagnostic_reason(&error);
+            eprintln!("podbay native.events.read stale_guard: {reason}");
+            podbay_host::HostError::StaleGuard
+        })
     }
 
     fn launch_resolved_codex_v2(
