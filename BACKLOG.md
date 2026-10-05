@@ -56,3 +56,9 @@ compiles but was not run; the live failure is the operational evidence.
 stop path and its crash/foreign-unit proofs, or make the outer Pod supervisor
 terminate itself with a durable terminal receipt when its child exits. Do not
 weaken live-child rebind or issue an unchecked `systemctl stop` from PodBay.
+
+## P1-004 — Local Run pause/resume capability and truthful observation
+
+The VibeVM campaign reached a clean Coordinator checkpoint on 2026-10-05, but Zap's `project.pause.v1` had no PodBay pause operation to call. Zap then retained `pausing/unsupported`; the immediate stranded transition is a Zap defect tracked in its backlog. The broader PodBay supervisor plan already names generic Run pause/resume in [PM-01](POST-MVP-CAMPAIGN.md), but it has no local capability contract or implementation yet. Pausing a Pod process, holding new work at the manager boundary, interrupting a native turn, and stopping the Run are different effects and must not share one success label.
+
+**Priority and design gate:** define the local Run pause/resume semantics before Zap advertises a native pause capability. Specify whether the scope is admission-only, cooperative process/agent quiescence, or OS suspension; expose unsupported capabilities truthfully. Require exact Run/Pod/Resource and owner-epoch fences, a durable requested-versus-observed receipt, behavior across manager restart and lease expiry, and explicit handling of an in-flight native turn and child processes. A plain `SIGSTOP` or lack of new messages is not proof of a durable PodBay pause. Implement the smallest local slice needed for Zap first; remote machines and the wider PM-01 campaign remain deferred.
