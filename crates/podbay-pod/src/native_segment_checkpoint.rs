@@ -24,8 +24,10 @@ const CHECKPOINT_DOMAIN: &[u8] = b"podbay.native-segment-checkpoint/2\0";
 const FRAME_DOMAIN: &[u8] = b"podbay.native-segment-frame/1\0";
 const CHAIN_DOMAIN: &[u8] = b"podbay.native-segment-chain/1\0";
 const MAX_SEGMENTS: usize = 4;
-const MAX_SEGMENT_BYTES: u64 = 1_048_576;
-const MAX_FRAME_PAYLOAD: usize = 262_144;
+// One segment can hold a maximum native notification plus the observed
+// multi-megabyte bootstrap stream; four segments bound retained private data.
+const MAX_SEGMENT_BYTES: u64 = 8 * 1_048_576;
+const MAX_FRAME_PAYLOAD: usize = 4 * 1_048_576;
 pub(crate) const MAX_SEGMENT_FRAME_BYTES: u64 = (MAX_FRAME_PAYLOAD + 4 + 32) as u64;
 // Codex's first bootstrap may burst well past one 64-event read page before
 // Zap can acknowledge it. Retain several pages in the durable index.
