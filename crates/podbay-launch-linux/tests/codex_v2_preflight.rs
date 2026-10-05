@@ -2456,11 +2456,42 @@ fn run_rebind_manager_helper_with_owner(
     }
 }
 
+struct DisposableRebindScope {
+    unit: String,
+    stopped: bool,
+}
+
+impl DisposableRebindScope {
+    fn stop(&mut self) {
+        let status = Command::new("systemctl")
+            .args(["--user", "stop", &self.unit])
+            .status().expect("stop disposable rebind scope");
+        assert!(status.success(), "failed to stop disposable scope {}", self.unit);
+        let output = Command::new("systemctl")
+            .args(["--user", "show", "--property=ActiveState", &self.unit])
+            .output().expect("inspect disposable rebind scope after stop");
+        assert!(output.status.success(), "failed to inspect disposable scope {}", self.unit);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ActiveState=inactive",
+            "disposable scope {} remained active", self.unit);
+        self.stopped = true;
+    }
+}
+
+impl Drop for DisposableRebindScope {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &self.unit]).status();
+        }
+    }
+}
+
 fn run_rebind_manager_helper_in_new_scope(name: &str, fixture: &Fixture, binary: &Path) {
     let unit = format!("podbay-rebind-cross-{}-{}", std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let mut scope = DisposableRebindScope { unit: format!("{unit}.scope"), stopped: false };
     let mut process = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--unit", &unit])
+        .args(["--user", "--scope", "--collect", "--quiet", "--unit", &unit])
         .arg(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", name, "--nocapture"])
         .env("PODBAY_REBIND_FIXTURE_DIR", &fixture.directory)
@@ -2472,6 +2503,7 @@ fn run_rebind_manager_helper_in_new_scope(name: &str, fixture: &Fixture, binary:
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(status) = process.try_wait().unwrap() {
+            scope.stop();
             assert!(status.success(), "{name} failed in a new cgroup with {status}");
             return;
         }
