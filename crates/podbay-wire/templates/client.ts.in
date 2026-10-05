@@ -96,6 +96,7 @@ export type CommandEnvelope =
   | (CommandCommon & { operation: "launch"; target: Extract<Target, { kind: "scope" }>; body: LaunchBody })
   | (CommandCommon & { operation: "session.close"; target: Extract<Target, { kind: "session" }>; body: Record<string, never> })
   | (CommandCommon & { operation: "session.send"; target: Extract<Target, { kind: "session" }>; body: { content: ContentBlock[]; policy: SendPolicy } })
+  | (CommandCommon & { operation: "session.writerLease.renew"; target: Extract<Target, { kind: "session" }>; body: { expectedWriterEpoch: DecimalString; expectedLeaseExpiresAtUnixSeconds: DecimalString } })
   | (CommandCommon & { operation: "run.interrupt"; target: Extract<Target, { kind: "run" }>; body: { expectedIntervalId: string } })
   | (CommandCommon & { operation: "run.pause"; target: Extract<Target, { kind: "run" }>; body: { policy: "drain" | "interrupt_current" } })
   | (CommandCommon & { operation: "run.resume"; target: Extract<Target, { kind: "run" }>; body: { policy: "live_only" | "continue_saved_session" } })
@@ -419,6 +420,12 @@ function commandBody(operation: MutationOperation, value: unknown): void {
     else throw new TypeError("unknown send policy");
     return;
   }
+  if (operation === "session.writerLease.renew") {
+    exact(body, ["expectedWriterEpoch", "expectedLeaseExpiresAtUnixSeconds"]);
+    decimal(body.expectedWriterEpoch, "body.expectedWriterEpoch", true);
+    decimal(body.expectedLeaseExpiresAtUnixSeconds, "body.expectedLeaseExpiresAtUnixSeconds", true);
+    return;
+  }
   if (operation === "run.interrupt") { exact(body, ["expectedIntervalId"]); identity(body.expectedIntervalId, "expectedIntervalId"); return; }
   if (operation === "run.pause") { exact(body, ["policy"]); if (body.policy !== "drain" && body.policy !== "interrupt_current") throw new TypeError("unknown pause policy"); return; }
   if (operation === "run.resume") { exact(body, ["policy"]); if (body.policy !== "live_only" && body.policy !== "continue_saved_session") throw new TypeError("unknown resume policy"); return; }
@@ -486,7 +493,7 @@ function validateCommand(value: unknown): CommandEnvelope {
   if (typeof item.payloadDigest !== "string" || !/^[0-9a-f]{64}$/u.test(item.payloadDigest)) throw new TypeError("invalid payloadDigest");
   const expectedKind =
     operation === "launch" ? "scope"
-    : operation === "session.close" || operation === "session.send" ? "session"
+    : operation === "session.close" || operation === "session.send" || operation === "session.writerLease.renew" ? "session"
     : operation === "delivery.ack" || operation === "delivery.cancel" ? "delivery"
     : operation === "question.answer" || operation === "question.cancel" ? "question"
     : operation === "permission.decide" ? "permission"

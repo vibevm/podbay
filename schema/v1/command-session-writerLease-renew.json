@@ -1,0 +1,19 @@
+{
+  "body": {
+    "expectedLeaseExpiresAtUnixSeconds": "1800000000",
+    "expectedWriterEpoch": "1"
+  },
+  "guard": {
+    "managerEpoch": "42",
+    "writerEpoch": "1"
+  },
+  "key": "key.pb24.renew.1",
+  "operation": "session.writerLease.renew",
+  "payloadDigest": "1bd38c0eb810a98e8915d70ce22039a825364185b42ecf2b1beeb7102b0d25a9",
+  "protocol": "podbay/1",
+  "requestId": "request.pb24.renew.1",
+  "target": {
+    "kind": "session",
+    "sessionId": "session.fixture"
+  }
+}

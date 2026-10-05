@@ -19,6 +19,8 @@ pub enum MutationOperation {
     SessionClose,
     #[serde(rename = "session.send")]
     SessionSend,
+    #[serde(rename = "session.writerLease.renew")]
+    SessionWriterLeaseRenew,
     #[serde(rename = "run.interrupt")]
     RunInterrupt,
     #[serde(rename = "run.pause")]
@@ -56,10 +58,11 @@ pub enum MutationOperation {
 }
 
 impl MutationOperation {
-    pub const SUPPORTED: [Self; 20] = [
+    pub const SUPPORTED: [Self; 21] = [
         Self::Launch,
         Self::SessionClose,
         Self::SessionSend,
+        Self::SessionWriterLeaseRenew,
         Self::RunInterrupt,
         Self::RunPause,
         Self::RunResume,
@@ -84,6 +87,7 @@ impl MutationOperation {
             Self::Launch => "launch",
             Self::SessionClose => "session.close",
             Self::SessionSend => "session.send",
+            Self::SessionWriterLeaseRenew => "session.writerLease.renew",
             Self::RunInterrupt => "run.interrupt",
             Self::RunPause => "run.pause",
             Self::RunResume => "run.resume",
@@ -109,6 +113,7 @@ impl MutationOperation {
             "launch" => Ok(Self::Launch),
             "session.close" => Ok(Self::SessionClose),
             "session.send" => Ok(Self::SessionSend),
+            "session.writerLease.renew" => Ok(Self::SessionWriterLeaseRenew),
             "run.interrupt" => Ok(Self::RunInterrupt),
             "run.pause" => Ok(Self::RunPause),
             "run.resume" => Ok(Self::RunResume),
@@ -262,6 +267,13 @@ pub enum SendPolicy {
 pub struct SessionSendBody {
     pub content: Vec<ContentBlock>,
     pub policy: SendPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionWriterLeaseRenewBody {
+    pub expected_writer_epoch: DecimalString,
+    pub expected_lease_expires_at_unix_seconds: DecimalString,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -620,6 +632,7 @@ pub enum CommandBody {
     Launch(LaunchBody),
     SessionClose(SessionCloseBody),
     SessionSend(SessionSendBody),
+    SessionWriterLeaseRenew(SessionWriterLeaseRenewBody),
     RunInterrupt(RunInterruptBody),
     RunPause(RunPauseBody),
     RunResume(RunResumeBody),
@@ -645,6 +658,7 @@ impl CommandBody {
             Self::Launch(_) => MutationOperation::Launch,
             Self::SessionClose(_) => MutationOperation::SessionClose,
             Self::SessionSend(_) => MutationOperation::SessionSend,
+            Self::SessionWriterLeaseRenew(_) => MutationOperation::SessionWriterLeaseRenew,
             Self::RunInterrupt(_) => MutationOperation::RunInterrupt,
             Self::RunPause(_) => MutationOperation::RunPause,
             Self::RunResume(_) => MutationOperation::RunResume,
@@ -670,6 +684,7 @@ impl CommandBody {
             Self::Launch(value) => serde_json::to_value(value)?,
             Self::SessionClose(value) => serde_json::to_value(value)?,
             Self::SessionSend(value) => serde_json::to_value(value)?,
+            Self::SessionWriterLeaseRenew(value) => serde_json::to_value(value)?,
             Self::RunInterrupt(value) => serde_json::to_value(value)?,
             Self::RunPause(value) => serde_json::to_value(value)?,
             Self::RunResume(value) => serde_json::to_value(value)?,
@@ -695,6 +710,8 @@ impl CommandBody {
             MutationOperation::Launch => Self::Launch(serde_json::from_value(value)?),
             MutationOperation::SessionClose => Self::SessionClose(serde_json::from_value(value)?),
             MutationOperation::SessionSend => Self::SessionSend(serde_json::from_value(value)?),
+            MutationOperation::SessionWriterLeaseRenew =>
+                Self::SessionWriterLeaseRenew(serde_json::from_value(value)?),
             MutationOperation::RunInterrupt => Self::RunInterrupt(serde_json::from_value(value)?),
             MutationOperation::RunPause => Self::RunPause(serde_json::from_value(value)?),
             MutationOperation::RunResume => Self::RunResume(serde_json::from_value(value)?),
@@ -809,6 +826,13 @@ impl CommandBody {
                 {
                     valid_identity(expected_interval_id)
                         .map_err(|_| WireError::InvalidField("body.policy.expectedIntervalId"))?;
+                }
+            }
+            Self::SessionWriterLeaseRenew(body) => {
+                if body.expected_writer_epoch.get() == 0
+                    || body.expected_lease_expires_at_unix_seconds.get() == 0
+                {
+                    return Err(WireError::InvalidField("body.writerLease"));
                 }
             }
             Self::RunInterrupt(body) => valid_identity(&body.expected_interval_id)
@@ -1073,7 +1097,8 @@ impl CommandEnvelope {
             (self.operation(), &self.target),
             (MutationOperation::Launch, Target::Scope { .. })
                 | (
-                    MutationOperation::SessionClose | MutationOperation::SessionSend,
+                    MutationOperation::SessionClose | MutationOperation::SessionSend
+                        | MutationOperation::SessionWriterLeaseRenew,
                     Target::Session { .. }
                 )
                 | (

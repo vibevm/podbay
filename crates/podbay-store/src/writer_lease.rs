@@ -8,15 +8,198 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::bound_launch::{BoundLaunchFormat, read_bound_record};
 use crate::model::{
-    NativeWriterLease, NativeWriterTarget, StoreError, TrustedNativeWriterLeaseRequest,
+    CommandRequest, NativeWriterLease, NativeWriterRenewalReceipt, NativeWriterRenewalRequest,
+    NativeWriterTarget, Receipt, StoreError, TrustedNativeWriterLeaseRequest, DIGEST_VERSION,
 };
-use crate::store::PodBayStore;
+use crate::store::{PodBayStore, digest_request, stable_command_id, validate_request, sha256_hex};
 
 /// A lease limits the time during which a future host/pod may start native
 /// input. An already accepted model turn is not cancelled when this expires.
 const MAX_TTL_SECONDS: u64 = 3_600;
 
 impl PodBayStore {
+    /// Atomically commit an exact renewal and its keyed, replayable command
+    /// receipt. A duplicate key returns its original expiry without touching
+    /// the lease, even after another renewal or the original expiry.
+    pub fn renew_native_writer_lease_with_receipt(
+        &mut self,
+        request: &NativeWriterRenewalRequest,
+    ) -> Result<NativeWriterRenewalReceipt, StoreError> {
+        if !(1..=MAX_TTL_SECONDS).contains(&request.ttl_seconds)
+            || request.expected_writer_epoch == 0 || request.expected_expiry == 0
+        {
+            return Err(StoreError::InvalidInput("native writer renewal bounds"));
+        }
+        let command = CommandRequest {
+            principal: request.principal.clone(),
+            namespace: "session.writerLease.renew".into(),
+            command_key: request.command_key.clone(),
+            scope_id: request.target.scope_id.as_str().into(),
+            target_id: request.target.session_id.as_str().into(),
+            expected_owner_epoch: request.owner_epoch,
+            expected_target_epoch: request.target.resource_epoch,
+            canonical_request: request.canonical_request.clone(),
+            event_kind: "native_writer_lease.renewed".into(),
+            event_payload: request.canonical_request.clone(),
+            effect_kind: "native_writer_lease.renew".into(),
+            effect_payload: request.canonical_request.clone(),
+        };
+        validate_request(&command)?;
+        let digest = digest_request(&command);
+        let command_id = stable_command_id(&command);
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(i64, String, String, Vec<u8>, i64, i64, i64, i64, i64, i64)> = transaction.query_row(
+            "SELECT c.command_rowid,c.command_id,c.request_digest,c.canonical_request,
+                    c.owner_epoch,c.target_epoch,c.event_sequence,c.outbox_id,
+                    r.writer_epoch,r.renewed_expiry
+             FROM commands c JOIN native_writer_renewals r ON r.command_rowid=c.command_rowid
+             WHERE c.principal=?1 AND c.namespace=?2 AND c.command_key=?3",
+            params![request.principal.as_str(), command.namespace, request.command_key],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                      row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+        ).optional()?;
+        if let Some((rowid, old_id, old_digest, old_bytes, owner, epoch, event, outbox, writer, expiry)) = existing {
+            let original: Option<(String,String,String,i64)> = transaction.query_row(
+                "SELECT r.scope_id,r.session_id,r.resource_id,r.expected_expiry
+                 FROM native_writer_renewals r WHERE r.command_rowid=?1",
+                [rowid], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).optional()?;
+            if old_id != command_id || old_digest != digest || old_bytes != command.canonical_request
+                || owner != sql_integer(request.owner_epoch)?
+                || epoch != sql_integer(request.target.resource_epoch)?
+                || original != Some((command.scope_id.clone(),command.target_id.clone(),
+                    request.target.resource_id.as_str().into(),sql_integer(request.expected_expiry)?))
+                || event < 1 || outbox < 1 || writer != sql_integer(request.expected_writer_epoch)?
+                || expiry <= sql_integer(request.expected_expiry)?
+            {
+                return Err(StoreError::Conflict("native writer renewal key changed"));
+            }
+            let lineage: Option<(String, String, String, String, String, Vec<u8>, i64, String, String, String)> = transaction.query_row(
+                "SELECT e.kind,e.provenance,o.kind,o.state,o.observation_stage,
+                        o.observation_payload,o.observation_event_sequence,
+                        o.effect_digest,observed.kind,observed.provenance
+                 FROM events e JOIN outbox o ON o.command_rowid=e.command_rowid
+                 JOIN events observed ON observed.sequence=o.observation_event_sequence
+                 WHERE e.sequence=?1 AND o.outbox_id=?2 AND e.command_rowid=?3",
+                params![event,outbox,rowid],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
+                    row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+            ).optional()?;
+            let expected_result = format!("{{\"writerEpoch\":\"{}\",\"leaseExpiresAtUnixSeconds\":\"{}\"}}",
+                writer, expiry).into_bytes();
+            if !lineage.is_some_and(|(event_kind, provenance, effect_kind, state, stage, payload, observed, effect_digest, observed_kind, observed_provenance)| {
+                event_kind == "native_writer_lease.renewed"
+                    && provenance == "authenticated.manager.admission"
+                    && effect_kind == "native_writer_lease.renew"
+                    && state == "observed" && stage == "lease_renewed"
+                    && payload == expected_result && observed > event
+                    && effect_digest == sha256_hex(&command.effect_payload)
+                    && observed_kind == "native_writer_lease.renewed"
+                    && observed_provenance == "authenticated.manager.lease"
+            }) {
+                return Err(StoreError::Conflict("native writer renewal receipt differs"));
+            }
+            transaction.commit()?;
+            return Ok(NativeWriterRenewalReceipt {
+                command: Receipt { command_id, event_sequence: event, outbox_id: outbox,
+                    digest_version: DIGEST_VERSION, request_digest: digest },
+                scope_id: request.target.scope_id.clone(),
+                writer_epoch: writer as u64, expires_at_unix_seconds: expiry as u64,
+                duplicate: true,
+            });
+        }
+        let format = check_current_target(&transaction, &self.store_lineage, &request.target)?;
+        check_manager(&transaction, &self.store_lineage, request.owner_epoch,
+            request.manager_credential_epoch, request.authority_revision,
+            format != BoundLaunchFormat::CodexV3)?;
+        check_actor(&transaction, &request.target.scope_id, &request.holder_actor_id,
+            request.holder_credential_generation)?;
+        let prior = read_lease(&transaction, &request.target.resource_id)?.ok_or(StoreError::NotFound)?;
+        let now = current_unix_seconds(&transaction)?;
+        if prior.target != request.target || prior.holder_actor_id != request.holder_actor_id
+            || prior.holder_credential_generation != request.holder_credential_generation
+            || prior.owner_epoch != request.owner_epoch
+            || prior.manager_credential_epoch != request.manager_credential_epoch
+            || (if format == BoundLaunchFormat::CodexV3 {
+                prior.authority_revision > request.authority_revision
+            } else {
+                prior.authority_revision != request.authority_revision
+            })
+            || prior.writer_epoch != request.expected_writer_epoch
+            || prior.expires_at_unix_seconds != request.expected_expiry
+            || prior.expires_at_unix_seconds <= now
+        { return Err(StoreError::StaleEpoch); }
+        let expiry = now.checked_add(request.ttl_seconds)
+            .filter(|value| *value <= i64::MAX as u64 && *value > request.expected_expiry)
+            .ok_or(StoreError::InvalidInput("native writer renewal must extend expiry"))?;
+        let changed = transaction.execute(
+            "UPDATE native_writer_leases SET expires_at_unix_seconds=?2
+             WHERE resource_id=?1 AND writer_epoch=?3 AND expires_at_unix_seconds=?4",
+            params![request.target.resource_id.as_str(),sql_integer(expiry)?,
+                sql_integer(request.expected_writer_epoch)?,sql_integer(request.expected_expiry)?],
+        )?;
+        if changed != 1 { return Err(StoreError::StaleEpoch); }
+        transaction.execute(
+            "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
+             digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![command_id,command.principal.as_str(),command.namespace,command.command_key,
+                command.scope_id,command.target_id,DIGEST_VERSION,digest,command.canonical_request,
+                sql_integer(command.expected_owner_epoch)?,sql_integer(command.expected_target_epoch)?],
+        )?;
+        let rowid = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO native_writer_renewals(command_rowid,scope_id,session_id,resource_id,
+             writer_epoch,expected_expiry,renewed_expiry) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![rowid,command.scope_id,command.target_id,request.target.resource_id.as_str(),
+                sql_integer(request.expected_writer_epoch)?,sql_integer(request.expected_expiry)?,sql_integer(expiry)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO events(event_id,schema_version,command_rowid,scope_id,target_id,
+             owner_epoch,target_epoch,source_id,source_kind,source_epoch,source_sequence,
+             source_digest,source_order,kind,payload,recorded_at,provenance,causation_id)
+             VALUES('event.pb24.' || lower(hex(randomblob(16))),1,?1,?2,?3,?4,?5,?6,
+             'manager.admission',?4,1,?7,'contiguous','native_writer_lease.renewed',?8,
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),'authenticated.manager.admission',?6)",
+            params![rowid,command.scope_id,command.target_id,sql_integer(request.owner_epoch)?,
+                sql_integer(request.target.resource_epoch)?,command_id,digest,command.event_payload],
+        )?;
+        let event = transaction.last_insert_rowid();
+        let result = format!("{{\"writerEpoch\":\"{}\",\"leaseExpiresAtUnixSeconds\":\"{}\"}}",
+            request.expected_writer_epoch, expiry).into_bytes();
+        transaction.execute(
+            "INSERT INTO events(event_id,schema_version,command_rowid,scope_id,target_id,
+             owner_epoch,target_epoch,source_id,source_kind,source_epoch,source_sequence,
+             source_digest,source_order,kind,payload,recorded_at,provenance,causation_id)
+             VALUES('event.pb24.' || lower(hex(randomblob(16))),1,?1,?2,?3,?4,?5,?6,
+             'manager.lease',?4,2,?7,'contiguous','native_writer_lease.renewed',?8,
+             strftime('%Y-%m-%dT%H:%M:%fZ','now'),'authenticated.manager.lease',?6)",
+            params![rowid,command.scope_id,command.target_id,sql_integer(request.owner_epoch)?,
+                sql_integer(request.target.resource_epoch)?,command_id,sha256_hex(&result),result],
+        )?;
+        let observed_event = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO outbox(command_rowid,scope_id,target_id,owner_epoch,target_epoch,
+             kind,payload,effect_digest,state,claim_key,claim_owner_epoch,observation_key,
+             observation_payload,observation_stage,observation_event_sequence)
+             VALUES(?1,?2,?3,?4,?5,'native_writer_lease.renew',?6,?7,'observed',?8,?4,?8,?9,
+             'lease_renewed',?10)",
+            params![rowid,command.scope_id,command.target_id,sql_integer(request.owner_epoch)?,
+                sql_integer(request.target.resource_epoch)?,command.effect_payload,
+                sha256_hex(&command.effect_payload),request.command_key,result,observed_event],
+        )?;
+        let outbox = transaction.last_insert_rowid();
+        transaction.execute("UPDATE commands SET event_sequence=?1,outbox_id=?2 WHERE command_rowid=?3",
+            params![event,outbox,rowid])?;
+        transaction.commit()?;
+        Ok(NativeWriterRenewalReceipt {
+            command: Receipt { command_id,event_sequence:event,outbox_id:outbox,
+                digest_version:DIGEST_VERSION,request_digest:digest },
+            scope_id:request.target.scope_id.clone(),
+            writer_epoch:request.expected_writer_epoch,expires_at_unix_seconds:expiry,duplicate:false,
+        })
+    }
+
     /// Extend only the exact, still-current lease witnessed by the caller.
     /// The expiry is a CAS input, so a replay of an earlier renewal cannot
     /// silently extend the lease again. Renewal never changes writer epoch.

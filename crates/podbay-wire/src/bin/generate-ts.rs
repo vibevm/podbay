@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard, PausePolicy, ResourceAction,
     ResourceCommandBody, ResumePolicy, RunPauseBody, RunResumeBody, RunStopBody, SendPolicy,
-    SessionSendBody, StopScope, Target, contract_manifest, typescript_source,
+    SessionSendBody, SessionWriterLeaseRenewBody, StopScope, Target, contract_manifest, typescript_source,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -75,6 +75,20 @@ fn command_fixtures() -> Result<Vec<(&'static str, CommandEnvelope)>, Box<dyn st
         })
     };
     Ok(vec![
+        (
+            "command-session-writerLease-renew.json",
+            CommandEnvelope::new(
+                "request.pb24.renew.1", "key.pb24.renew.1",
+                Target::Session { session_id: "session.fixture".to_owned() },
+                Some(Guard { manager_epoch: Some(DecimalString::new(42)),
+                    writer_epoch: Some(DecimalString::new(1)), ..Guard::default() }),
+                None,
+                CommandBody::SessionWriterLeaseRenew(SessionWriterLeaseRenewBody {
+                    expected_writer_epoch: DecimalString::new(1),
+                    expected_lease_expires_at_unix_seconds: DecimalString::new(1_800_000_000),
+                }),
+            )?,
+        ),
         (
             "command-session-send.json",
             CommandEnvelope::new(

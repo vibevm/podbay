@@ -27,7 +27,7 @@ pub use command::{
     QuestionResponse, Recipient, RequestedAuthority, ResourceAction, ResourceCommandBody,
     ResultDeclaration, ResumePolicy, RunFinishBody, RunInterruptBody, RunPauseBody, RunReportBody,
     RunResumeBody, RunStopBody, SendPolicy, SessionChoice, SessionCloseBody, SessionSendBody,
-    StopScope, Target, TaskRef, TerminalDetachBody, WorkKind, WorkspaceAccess, WorkspaceBinding,
+    SessionWriterLeaseRenewBody, StopScope, Target, TaskRef, TerminalDetachBody, WorkKind, WorkspaceAccess, WorkspaceBinding,
     command_digest, decode_command_json,
 };
 pub use cursor::EventCursor;

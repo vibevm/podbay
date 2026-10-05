@@ -14,7 +14,7 @@ use podbay_store::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRequest,
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandLookupSelector, EffectClaim,
     LaunchDispatchStage, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
-    LaterCodexSendSelector, NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
+    LaterCodexSendSelector, NativeWriterRenewalRequest, NativeWriterTarget, PodBayStore, StoreError, TrustedBootstrapSendRequest,
     NativeEvidenceEvent, NativeEvidenceIdentity, NativeEvidencePage, NativeEvidenceSnapshot,
     TrustedNativeEvidenceAdmission,
     TrustedLaterCodexSendRequest,
@@ -1331,6 +1331,67 @@ fn current_writer_renewal_extends_once_without_changing_epoch() {
         store.renew_native_writer_lease_from_trusted_host(&renewed, 0),
         Err(StoreError::InvalidInput(_))
     ));
+}
+
+#[test]
+fn keyed_writer_renewal_commits_once_and_replays_exact_expiry() {
+    let fixture = Fixture::new();
+    let (mut store, target, manager_credential) = admitted_writer_target(&fixture);
+    let acquire = writer_request(&mut store, target.clone(), manager_credential);
+    let first = store.acquire_native_writer_lease_from_trusted_host(&acquire).unwrap();
+    let principal = VerifiedPrincipal::from_authenticated_boundary(
+        first.holder_actor_id().as_str()).unwrap();
+    let request = NativeWriterRenewalRequest {
+        principal: principal.clone(),
+        command_key: "key.writer.renew.one".into(),
+        canonical_request: b"writer-renew-digest-one".to_vec(),
+        target: target.clone(),
+        holder_actor_id: first.holder_actor_id().clone(),
+        holder_credential_generation: first.holder_credential_generation(),
+        owner_epoch: first.owner_epoch(),
+        manager_credential_epoch: first.manager_credential_epoch(),
+        authority_revision: first.authority_revision(),
+        expected_writer_epoch: first.writer_epoch(),
+        expected_expiry: first.expires_at_unix_seconds(),
+        ttl_seconds: 120,
+    };
+    let committed = store.renew_native_writer_lease_with_receipt(&request).unwrap();
+    assert!(!committed.duplicate);
+    assert!(committed.expires_at_unix_seconds > request.expected_expiry);
+    let mut rival = request.clone();
+    rival.command_key = "key.writer.renew.rival".into();
+    assert!(matches!(store.renew_native_writer_lease_with_receipt(&rival),
+        Err(StoreError::StaleEpoch)));
+    let replay = store.renew_native_writer_lease_with_receipt(&request).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.command, committed.command);
+    assert_eq!(replay.expires_at_unix_seconds, committed.expires_at_unix_seconds);
+    rusqlite::Connection::open(&fixture.database).unwrap().execute(
+        "UPDATE native_writer_leases SET expires_at_unix_seconds=1 WHERE resource_id=?1",
+        [target.resource_id.as_str()],
+    ).unwrap();
+    let late_replay = store.renew_native_writer_lease_with_receipt(&request).unwrap();
+    assert_eq!(late_replay.command, committed.command);
+    assert_eq!(late_replay.expires_at_unix_seconds, committed.expires_at_unix_seconds);
+    let mut new_key = request.clone();
+    new_key.command_key = "key.writer.renew.two".into();
+    assert!(matches!(store.renew_native_writer_lease_with_receipt(&new_key),
+        Err(StoreError::StaleEpoch)));
+    let inspection = store.lookup_command(target.scope_id.as_str(), &principal,
+        &CommandLookupSelector::Key { key: request.command_key.clone() }).unwrap();
+    assert_eq!(inspection.receipt, committed.command);
+    assert_eq!(inspection.effect_state, podbay_store::EffectState::Observed);
+    assert_eq!(inspection.observed_stage, Some(podbay_store::ObservedStage::LeaseRenewed));
+    assert!(!store.pending_effects(target.scope_id.as_str(), 0, 10).unwrap()
+        .iter().any(|effect| effect.outbox_id == committed.command.outbox_id));
+    assert!(store.claim_effect(committed.command.outbox_id,
+        target.scope_id.as_str(), target.session_id.as_str(),
+        request.owner_epoch, target.resource_epoch, request.authority_revision,
+        "claim.writer.renew").is_err());
+    let mut changed = request.clone();
+    changed.canonical_request = b"writer-renew-digest-two".to_vec();
+    assert!(matches!(store.renew_native_writer_lease_with_receipt(&changed),
+        Err(StoreError::Conflict(_))));
 }
 
 #[test]

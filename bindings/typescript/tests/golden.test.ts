@@ -33,8 +33,8 @@ function fixture(name: string): unknown {
 
 test("Rust contract manifest and generated TypeScript vocabulary match", () => {
   assert.deepEqual(CONTRACT, fixture("contract.json"));
-  assert.equal(CONTRACT.supportedMutationSchemas.length, 20);
-  assert.equal(CONTRACT.supportedReadSchemas.length, 11);
+  assert.equal(CONTRACT.supportedMutationSchemas.length, 21);
+  assert.equal(CONTRACT.supportedReadSchemas.length, 12);
 });
 
 test("golden resource command digest and strict mutation decoding", async () => {
@@ -69,9 +69,10 @@ test("golden resource command digest and strict mutation decoding", async () => 
   }));
 });
 
-test("all five Rust-generated mutation fixtures execute in the TypeScript codec", async () => {
+test("Rust-generated mutation fixtures execute in the TypeScript codec", async () => {
   for (const [name, operation] of [
     ["command-session-send.json", "session.send"],
+    ["command-session-writerLease-renew.json", "session.writerLease.renew"],
     ["command-run-pause.json", "run.pause"],
     ["command-run-resume.json", "run.resume"],
     ["command-run-stop.json", "run.stop"],

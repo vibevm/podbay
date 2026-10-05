@@ -1,8 +1,8 @@
 # Local writer lease renewal wire atom
 
-Status: design for the next implementation atom. Commit `8a66a69` supplies the
-store CAS and authenticated host check for an unexpired current lease, but no
-wire operation is advertised yet.
+Status: implemented for a fresh v24 store. Commit `8a66a69` supplied the
+initial store CAS; the keyed wire path is the follow-up atom. No v23 migration
+is provided for this preproduction local MVP.
 
 ## Contract
 
@@ -25,7 +25,7 @@ must retain that key until it receives the receipt. No native frame is sent.
 
 ## Atomic durable receipt
 
-Keep the fresh v23 schema so an installed v23 store remains usable. Add one
+Use a fresh v24 schema with a dedicated `native_writer_renewals` table. Add one
 specialized `PodBayStore::renew_native_writer_lease_with_receipt` transaction
 in `writer_lease.rs`; do not compose `admit()` with the existing CAS, because
 that would leave a crash interval between the command receipt and expiry.
@@ -60,12 +60,10 @@ stage and its verifier/projection rather than labeling the renewal
 `host_accepted`. Its claim key is the original command key and its observation
 event is written in the same transaction; no later claim/observe call occurs.
 
-Do not add renewal to the generic `supported_effect_kind()` used by effect
-claim/dispatch. Give command inspection a separate recognized recorded kind so
-`commands.get` can verify and describe this already observed command while
-`claim_effect()` and `pending_effects()` can never dispatch it. Alternatively,
-add a dedicated `native_writer_renewals` table, but that requires a schema
-version/migration decision and cannot be slipped into the live v23 store.
+Command inspection recognizes the recorded renewal kind. `claim_effect()`
+refuses it, and its outbox is already observed so `pending_effects()` does not
+offer it for dispatch. The dedicated table stores the exact expected and
+renewed expiries with a foreign key to the command row.
 
 ## Routing and binding
 
@@ -77,8 +75,7 @@ version/migration decision and cannot be slipped into the live v23 store.
   and one canonical command fixture. Run generator `--check` afterward.
 - `podbay-host/src/authority.rs`: route through current authenticated actor,
   exact SendSession grant, current Session target and trusted TTL. Return a
-  typed durable receipt. The current `renew_bootstrap_writer_lease` is an
-  unreceipted lower-level atom and must not be called by the wire route.
+  typed durable receipt. The wire route never calls the unreceipted store CAS.
 - `podbay-server/src/host_launch_handler.rs`: opt-in only on the trusted manager
   listener; project committed epoch/expiry and duplicate flag. A post-commit
   projection error must report uncertain with the CommandId, never retry a

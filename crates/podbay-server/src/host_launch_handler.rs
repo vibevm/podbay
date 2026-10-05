@@ -6,7 +6,8 @@ use podbay_host::{
     DurableAuthority, HostDispatchPort, HostError, InitialBootstrapGuard, LaunchPodError,
     LaunchPodReceipt, StablePortReceipt, TrustedBootstrapSendPolicy, TrustedWireRootLaunchPolicy,
 };
-use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, StoreError};
+use podbay_store::{BoundLaunchRecord, EffectState, LaunchDispatchStage, StoreError,
+    NativeWriterRenewalReceipt};
 use podbay_wire::{
     CommandBody, CommandEnvelope, CommandStage, DecimalString, EventCursor, ProtocolVersion,
     ReadEnvelope, Receipt, RuntimeError, RuntimeErrorCode, Target,
@@ -55,6 +56,16 @@ where
         transport: &T,
         request: CommandEnvelope,
     ) -> Result<Receipt<Value>, RuntimeError> {
+        if matches!(&request.body, CommandBody::SessionWriterLeaseRenew(_)) {
+            let policy = self.bootstrap_send_policy.ok_or_else(|| refusal(
+                RuntimeErrorCode::Unsupported,
+                "writer lease renewal is unavailable on this manager endpoint",
+            ))?;
+            let outcome = self.authority
+                .renew_bootstrap_writer_lease_from_wire(transport, request, policy)
+                .map_err(renewal_error)?;
+            return project_writer_renewal_receipt(self.authority, outcome);
+        }
         if matches!(&request.body, CommandBody::SessionSend(_)) {
             let policy = self.bootstrap_send_policy.ok_or_else(|| {
                 refusal(
@@ -143,6 +154,37 @@ where
             None => HostReadHandler::new(self.authority).read(transport, request),
         }
     }
+}
+
+fn project_writer_renewal_receipt<P: HostDispatchPort>(
+    authority: &DurableAuthority<P>,
+    outcome: NativeWriterRenewalReceipt,
+) -> Result<Receipt<Value>, RuntimeError> {
+    let original = outcome.command;
+    let sequence = u64::try_from(original.event_sequence).ok().filter(|value| *value > 0)
+        .ok_or_else(|| committed_projection_error(&original.command_id))?;
+    let position = DecimalString::new(sequence);
+    let receipt = Receipt {
+        protocol: ProtocolVersion::V1,
+        command_id: original.command_id.clone(),
+        state: CommandStage::HostAccepted,
+        value: json!({
+            "revisionKind":"admission_event_sequence",
+            "leaseCommitted":true,
+            "writerEpoch":outcome.writer_epoch.to_string(),
+            "leaseExpiresAtUnixSeconds":outcome.expires_at_unix_seconds.to_string(),
+            "eventSequence":sequence.to_string(),
+            "outboxId":original.outbox_id.to_string(),
+            "duplicate":outcome.duplicate,
+            "digestVersion":original.digest_version,
+            "requestDigest":original.request_digest,
+        }),
+        revision: position,
+        cursor: EventCursor { store_lineage: authority.store_lineage_for_receipt().to_owned(),
+            scope_id: outcome.scope_id.as_str().to_owned(), sequence: position },
+    };
+    receipt.validate().map_err(|_| committed_projection_error(&original.command_id))?;
+    Ok(receipt)
 }
 
 fn project_bootstrap_send_receipt<P: HostDispatchPort>(
@@ -279,6 +321,12 @@ fn bootstrap_error(error: BootstrapSendError) -> RuntimeError {
             "session.send authority unavailable",
         ),
     }
+}
+
+fn renewal_error(error: BootstrapSendError) -> RuntimeError {
+    let mut result = bootstrap_error(error);
+    result.message = result.message.replace("session.send", "writer lease renewal");
+    result
 }
 
 fn project_launch_receipt<P: HostDispatchPort>(

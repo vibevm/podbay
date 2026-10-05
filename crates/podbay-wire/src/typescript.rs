@@ -7,6 +7,7 @@ pub fn typescript_source() -> String {
         "launch",
         "session.close",
         "session.send",
+        "session.writerLease.renew",
         "run.interrupt",
         "run.pause",
         "run.resume",

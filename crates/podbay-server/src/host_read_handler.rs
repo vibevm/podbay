@@ -316,6 +316,7 @@ fn inspection_json(
         EffectState::ClaimedUncertain => (CommandStage::Uncertain, "claimed_uncertain"),
         EffectState::Observed => match inspected.observed_stage {
             Some(ObservedStage::HostAccepted) => (CommandStage::HostAccepted, "observed"),
+            Some(ObservedStage::LeaseRenewed) => (CommandStage::HostAccepted, "observed"),
             Some(ObservedStage::LegacyUnverified) | None => (CommandStage::Uncertain, "observed"),
         },
     };
@@ -366,6 +367,7 @@ fn inspection_json(
     if let Some(stage) = inspected.observed_stage {
         response["observedStage"] = json!(match stage {
             ObservedStage::HostAccepted => "host_accepted",
+            ObservedStage::LeaseRenewed => "lease_renewed",
             ObservedStage::LegacyUnverified => "legacy_unverified",
         });
     }

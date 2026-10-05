@@ -258,8 +258,34 @@ pub enum EffectState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservedStage {
     HostAccepted,
+    LeaseRenewed,
     /// Schema-two evidence did not identify an authenticated source or proof type.
     LegacyUnverified,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeWriterRenewalRequest {
+    pub principal: VerifiedPrincipal,
+    pub command_key: String,
+    pub canonical_request: Vec<u8>,
+    pub target: NativeWriterTarget,
+    pub holder_actor_id: ActorId,
+    pub holder_credential_generation: u64,
+    pub owner_epoch: u64,
+    pub manager_credential_epoch: u64,
+    pub authority_revision: u64,
+    pub expected_writer_epoch: u64,
+    pub expected_expiry: u64,
+    pub ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWriterRenewalReceipt {
+    pub command: Receipt,
+    pub scope_id: ScopeId,
+    pub writer_epoch: u64,
+    pub expires_at_unix_seconds: u64,
+    pub duplicate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -49,13 +49,13 @@ fn fresh_open_creates_current_v23_directly_and_reopen_preserves_identity() {
     drop(first);
     let header = fs::read(&path).unwrap();
     assert_eq!(&header[..16], b"SQLite format 3\0");
-    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 23);
+    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 24);
 
     let connection = read_only(&path);
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let lineage: String = connection
         .query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
@@ -240,7 +240,7 @@ fn v19_visible_only_in_wal_refuses_without_changing_durable_bytes() {
     // Keep the writer open so the retired version remains in WAL while the
     // main database header still says 22.
     let header = fs::read(&path).unwrap();
-    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 23);
+    assert_eq!(u32::from_be_bytes(header[60..64].try_into().unwrap()), 24);
     let wal = PathBuf::from(format!("{}-wal", path.display()));
     let before = [fs::read(&path).unwrap(), fs::read(&wal).unwrap()];
     assert!(matches!(

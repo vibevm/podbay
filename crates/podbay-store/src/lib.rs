@@ -39,7 +39,7 @@ pub use model::{
     EffectObservation, EffectState, EventCursor, EventReference, HostAcceptanceProof,
     HostObservedPriorCheckpoint, LaunchDispatchStage, LaunchDispatchStatus, LaunchIntentBinding,
     LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult, ManagerCredentialClaim,
-    NativeWriterLease, NativeWriterTarget, ObservedStage, OwnerActorRotationReceipt,
+    NativeWriterLease, NativeWriterRenewalReceipt, NativeWriterRenewalRequest, NativeWriterTarget, ObservedStage, OwnerActorRotationReceipt,
     QuarantinedSourceEvent, Receipt, ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError,
     StoredEffect, TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
 };

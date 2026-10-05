@@ -18,7 +18,16 @@ use crate::model::{
     ScopeSnapshot, SourceAnomaly, SourceOrder, StoreError, StoredEffect, VerifiedPrincipal,
 };
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
+const NATIVE_WRITER_RENEWALS_V24: &str = "CREATE TABLE native_writer_renewals (
+  command_rowid INTEGER NOT NULL PRIMARY KEY REFERENCES commands(command_rowid),
+  scope_id TEXT NOT NULL CHECK(length(scope_id)>0),
+  session_id TEXT NOT NULL CHECK(length(session_id)>0),
+  resource_id TEXT NOT NULL CHECK(length(resource_id)>0),
+  writer_epoch INTEGER NOT NULL CHECK(writer_epoch>=1),
+  expected_expiry INTEGER NOT NULL CHECK(expected_expiry>=1),
+  renewed_expiry INTEGER NOT NULL CHECK(renewed_expiry>expected_expiry)
+) STRICT";
 const MAX_BYTES: usize = 1_048_576;
 const CODEX_NATIVE_SOURCES_V23: &str = "CREATE TABLE codex_native_sources (
   resource_id TEXT PRIMARY KEY CHECK(length(resource_id)>0),
@@ -598,12 +607,13 @@ impl PodBayStore {
             return Err(StoreError::UnsupportedSchema(version));
         }
         if fresh {
-            transaction.execute_batch(include_str!("schema_v23.sql"))?;
+            transaction.execute_batch(include_str!("schema_v24.sql"))?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         verify_authority_schema(&transaction)?;
         verify_runtime_schema(&transaction)?;
         verify_writer_lease_schema(&transaction)?;
+        verify_exact_table(&transaction, "native_writer_renewals", NATIVE_WRITER_RENEWALS_V24)?;
         verify_codex_bootstrap_schema(&transaction)?;
         verify_rebind_schema(&transaction)?;
         verify_manager_credential_schema(&transaction)?;
@@ -788,7 +798,7 @@ impl PodBayStore {
                 request_digest: digest,
             }));
         }
-        if !supported_effect_kind(&request.effect_kind) {
+        if request.effect_kind != "pod.offer" {
             return Err(StoreError::UnsupportedEffectKind);
         }
         let actual_owner: i64 = transaction.query_row(
@@ -1057,6 +1067,30 @@ impl PodBayStore {
                 "stored command identity or digest changed",
             ));
         }
+        if effect.kind == "native_writer_lease.renew" {
+            let renewal: Option<(String, String, i64, i64, i64)> = transaction.query_row(
+                "SELECT scope_id,session_id,writer_epoch,expected_expiry,renewed_expiry
+                 FROM native_writer_renewals WHERE command_rowid=?1",
+                [command_rowid],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional()?;
+            let Some((renew_scope, renew_session, writer_epoch, expected_expiry, renewed_expiry)) = renewal else {
+                return Err(StoreError::Conflict("writer renewal receipt is missing"));
+            };
+            let expected_payload = format!(
+                "{{\"writerEpoch\":\"{}\",\"leaseExpiresAtUnixSeconds\":\"{}\"}}",
+                writer_epoch, renewed_expiry,
+            ).into_bytes();
+            if namespace != "session.writerLease.renew"
+                || renew_scope != scope_id || renew_session != *target_id
+                || writer_epoch < 1 || expected_expiry < 1 || renewed_expiry <= expected_expiry
+                || effect.state != EffectState::Observed
+                || effect.observed_stage != Some(ObservedStage::LeaseRenewed)
+                || effect.observation_payload.as_deref() != Some(expected_payload.as_slice())
+            {
+                return Err(StoreError::Conflict("writer renewal receipt differs"));
+            }
+        }
         let claim = effect
             .claim_key
             .as_deref()
@@ -1120,6 +1154,9 @@ impl PodBayStore {
                 || (effect.observed_stage == Some(ObservedStage::HostAccepted)
                     && (kind != "effect.host_accepted"
                         || provenance != "authenticated.host.acceptance"))
+                || (effect.observed_stage == Some(ObservedStage::LeaseRenewed)
+                    && (kind != "native_writer_lease.renewed"
+                        || provenance != "authenticated.manager.lease"))
             {
                 return Err(StoreError::Conflict("observation event lineage differs"));
             }
@@ -1475,7 +1512,7 @@ impl PodBayStore {
         {
             return Err(StoreError::StaleEpoch);
         }
-        if !supported_effect_kind(&row.5) {
+        if row.5 != "pod.offer" {
             return Err(StoreError::UnsupportedEffectKind);
         }
         if sha256_hex(&row.6) != row.7 {
@@ -1998,7 +2035,7 @@ pub(crate) fn validate_request(request: &CommandRequest) -> Result<(), StoreErro
 }
 
 fn supported_effect_kind(kind: &str) -> bool {
-    matches!(kind, "pod.offer")
+    matches!(kind, "pod.offer" | "native_writer_lease.renew")
 }
 
 pub(crate) fn valid_id(value: &str) -> Result<(), StoreError> {
@@ -2059,6 +2096,7 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
     };
     let observed_stage = match row.get::<_, Option<String>>(13)?.as_deref() {
         Some("host_accepted") => Some(ObservedStage::HostAccepted),
+        Some("lease_renewed") => Some(ObservedStage::LeaseRenewed),
         Some("legacy_unverified") => Some(ObservedStage::LegacyUnverified),
         None => None,
         _ => return Err(rusqlite::Error::InvalidQuery),
@@ -2339,6 +2377,22 @@ fn verify_writer_lease_schema(transaction: &rusqlite::Transaction<'_>) -> Result
         .optional()?;
     if actual.as_deref() != Some(NATIVE_WRITER_LEASES_V17) {
         return Err(StoreError::Conflict("v17 writer lease schema differs"));
+    }
+    Ok(())
+}
+
+fn verify_exact_table(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    expected: &str,
+) -> Result<(), StoreError> {
+    let actual: Option<String> = transaction.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get(0),
+    ).optional()?;
+    if actual.as_deref() != Some(expected) {
+        return Err(StoreError::Conflict("native writer renewal schema differs"));
     }
     Ok(())
 }
