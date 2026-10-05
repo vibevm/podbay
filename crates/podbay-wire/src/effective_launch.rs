@@ -17,6 +17,8 @@ pub const EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION: &str =
     "podbay.effective-launch/operator-until-stopped/1";
 const PREFIX_OPERATOR_UNTIL_STOPPED: &[u8] =
     b"podbay.effective-launch/operator-until-stopped/1\0";
+const PREFIX_CODEX_UNTIL_STOPPED: &[u8] =
+    b"podbay.effective-launch/codex-until-stopped/1\0";
 pub const EFFECTIVE_LAUNCH_V2_VERSION: &str = "podbay.effective-launch/2";
 const PREFIX_V2: &[u8] = b"podbay.effective-launch/2\0";
 const DIGEST_DOMAIN_V2: &[u8] = b"podbay.effective-launch/2\0";
@@ -99,8 +101,12 @@ impl EffectiveLaunchContract {
             return Err(EffectiveLaunchError::TooLarge);
         }
         let mut reader = Reader { bytes, at: 0 };
-        let until_stopped = bytes.starts_with(PREFIX_OPERATOR_UNTIL_STOPPED);
-        let prefix = if until_stopped { PREFIX_OPERATOR_UNTIL_STOPPED } else { PREFIX };
+        let operator_until_stopped = bytes.starts_with(PREFIX_OPERATOR_UNTIL_STOPPED);
+        let codex_until_stopped = bytes.starts_with(PREFIX_CODEX_UNTIL_STOPPED);
+        let until_stopped = operator_until_stopped || codex_until_stopped;
+        let prefix = if operator_until_stopped { PREFIX_OPERATOR_UNTIL_STOPPED }
+            else if codex_until_stopped { PREFIX_CODEX_UNTIL_STOPPED }
+            else { PREFIX };
         if reader.take(prefix.len())? != prefix {
             return Err(EffectiveLaunchError::InvalidField("version"));
         }
@@ -192,7 +198,7 @@ impl EffectiveLaunchContract {
                 reference,
             });
         }
-        if until_stopped && (role != NativeRole::Coordinator
+        if operator_until_stopped && (role != NativeRole::Coordinator
             || parent_run_id.is_some()
             || profile_ref != OPERATOR_PROCESS_PROFILE_REF
             || max_children != 0
@@ -200,6 +206,12 @@ impl EffectiveLaunchContract {
             || !credential_refs.is_empty())
         {
             return Err(EffectiveLaunchError::InvalidField("operator Service lifetime"));
+        }
+        if codex_until_stopped && (role != NativeRole::Coordinator
+            || parent_run_id.is_some()
+            || credential_refs.len() != 1)
+        {
+            return Err(EffectiveLaunchError::InvalidField("Codex Service lifetime"));
         }
         if reader.at != bytes.len() {
             return Err(EffectiveLaunchError::TrailingBytes);
@@ -390,7 +402,9 @@ impl EffectiveLaunchContract {
     pub fn reencode(&self) -> Vec<u8> {
         let mut output = match self.lifetime {
             LifetimeLimit::Finite { .. } => PREFIX.to_vec(),
-            LifetimeLimit::UntilStopped => PREFIX_OPERATOR_UNTIL_STOPPED.to_vec(),
+            LifetimeLimit::UntilStopped if self.profile_ref == OPERATOR_PROCESS_PROFILE_REF =>
+                PREFIX_OPERATOR_UNTIL_STOPPED.to_vec(),
+            LifetimeLimit::UntilStopped => PREFIX_CODEX_UNTIL_STOPPED.to_vec(),
         };
         append_string(&mut output, self.pod_id.as_str());
         append_string(
@@ -683,8 +697,8 @@ impl EffectiveLaunchContractV2 {
                 "workspace.basisRef",
             ),
             (
-                descriptor.wall_seconds() == base.wall_seconds().expect("Codex effective lifetime finite"),
-                "wallSeconds",
+                descriptor.lifetime() == base.lifetime(),
+                "lifetime",
             ),
             (
                 descriptor.max_children() == u64::from(base.max_children()),
@@ -730,7 +744,8 @@ fn validate_codex_effective(
         .map_err(|_| EffectiveLaunchError::InvalidField("codexPolicy"))?;
     let credentials = base.credential_refs();
     if !matches!(base.role(), NativeRole::Coordinator | NativeRole::Worker)
-        || !matches!(base.lifetime(), LifetimeLimit::Finite { .. })
+        || (base.lifetime() == LifetimeLimit::UntilStopped
+            && (base.role() != NativeRole::Coordinator || base.parent_run_id().is_some()))
         || base.workspace_access() != EffectiveWorkspaceAccess::ReadWrite
         || credentials.len() != 1
         || credentials[0].scope_id().as_str() != codex_policy.credential_scope()

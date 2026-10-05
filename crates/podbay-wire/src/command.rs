@@ -422,7 +422,10 @@ pub struct RequestedAuthority {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchLimits {
-    pub wall_seconds: DecimalString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_seconds: Option<DecimalString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<crate::LifetimeLimit>,
     pub max_children: DecimalString,
 }
 
@@ -814,7 +817,15 @@ impl CommandBody {
                     valid_identity(tool)
                         .map_err(|_| WireError::InvalidField("body.toolBundleRefs"))?;
                 }
-                if body.limits.wall_seconds.get() == 0 || body.limits.max_children.get() > 1024 {
+                let valid_lifetime = match (body.limits.wall_seconds, body.limits.lifetime) {
+                    (Some(seconds), None) => (1..=604_800).contains(&seconds.get()),
+                    (None, Some(crate::LifetimeLimit::UntilStopped)) =>
+                        body.role == LaunchRole::Coordinator
+                            && body.work.kind == WorkKind::Service
+                            && body.parent_run_id.is_none(),
+                    _ => false,
+                };
+                if !valid_lifetime || body.limits.max_children.get() > 1024 {
                     return Err(WireError::InvalidField("body.limits"));
                 }
             }

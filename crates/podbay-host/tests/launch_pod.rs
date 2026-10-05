@@ -1024,7 +1024,8 @@ fn wire_root_body(grant: GrantId, model: &str) -> LaunchBody {
             grant_ref: format!("grant.{}", grant.get()),
         },
         limits: LaunchLimits {
-            wall_seconds: DecimalString::new(60),
+            wall_seconds: Some(DecimalString::new(60)),
+            lifetime: None,
             max_children: DecimalString::new(1),
         },
     }
@@ -1048,12 +1049,21 @@ fn install_wire_root_policy(
     host: &mut DurableAuthority<FakeLaunchPort>,
     who: &Identity,
 ) -> (GrantId, TrustedWireRootLaunchPolicy) {
-    host.register_launch_profile_from_trusted_policy(
-        RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(who))
+    install_wire_root_policy_lifetime(host, who, false)
+}
+
+fn install_wire_root_policy_lifetime(
+    host: &mut DurableAuthority<FakeLaunchPort>,
+    who: &Identity,
+    until_stopped: bool,
+) -> (GrantId, TrustedWireRootLaunchPolicy) {
+    let profile = RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(who))
             .unwrap()
             .with_codex_policy_from_trusted_policy(codex_policy(who))
-            .unwrap(),
-    )
+            .unwrap();
+    let profile = if until_stopped { profile.with_until_stopped_codex_service().unwrap() }
+        else { profile };
+    host.register_launch_profile_from_trusted_policy(profile)
     .unwrap();
     let credential =
         CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.one").unwrap();
@@ -2257,6 +2267,100 @@ fn codex_v2_root_coordinator_and_root_worker_commit_without_port_effect() {
             Err(LaunchPodError::Host(HostError::Unauthorised))
         ));
     }
+}
+
+#[test]
+fn codex_service_until_stopped_is_exact_and_does_not_launch_on_duplicate() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    let profile = RegisteredLaunchProfile::from_trusted_policy(codex_profile_input(&who))
+        .unwrap()
+        .with_codex_policy_from_trusted_policy(codex_policy(&who))
+        .unwrap()
+        .with_until_stopped_codex_service()
+        .unwrap();
+    host.register_launch_profile_from_trusted_policy(profile).unwrap();
+    let credential = CredentialRef::from_trusted_vault(who.scope.clone(), "vault.allowed.one").unwrap();
+    let grant = host.install_grant_from_trusted_policy(&who.actor, GrantSpec {
+        scope_id: who.scope.clone(),
+        mode: GrantMode::Controller,
+        rights: BTreeSet::from([
+            Right::new(Operation::LaunchPod, Target::Pod(who.pod.clone())),
+            Right::new(Operation::UseCredential, Target::Credential(credential)),
+        ]),
+        remaining_delegation_depth: 0,
+    }).unwrap();
+    let request = codex_root_request(&who, grant, Role::Coordinator, b"canonical.codex-unlimited");
+    let first = host.admit_bound_root_codex_v2(&who.transport, request.clone()).unwrap();
+    assert!(!first.duplicate);
+    let second = host.admit_bound_root_codex_v2(&who.transport, request).unwrap();
+    assert!(second.duplicate);
+    let record = host.inspect_committed_root_codex_v2(&who.scope, &who.pod).unwrap();
+    assert_eq!(record.descriptor().lifetime(), podbay_wire::LifetimeLimit::UntilStopped);
+    assert_eq!(record.descriptor().wall_seconds(), None);
+    assert_eq!(record.effective().base().lifetime(), podbay_wire::LifetimeLimit::UntilStopped);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn tagged_until_stopped_wire_launch_refuses_worker_and_task() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, _, _) = FakeLaunchPort::new(Mode::Accepted);
+    let (_, grant) = initial_authority(&fixture.database, port, &who);
+    let mut body = wire_root_body(grant, "gpt-6-sol");
+    body.limits.wall_seconds = None;
+    body.limits.lifetime = Some(podbay_wire::LifetimeLimit::UntilStopped);
+    let _ = wire_root_request("request.unlimited.root", "key.unlimited.root", body.clone());
+    body.role = LaunchRole::Worker;
+    body.work.kind = WireWorkKind::Task;
+    body.work.input = Some(vec![ContentBlock::Text { text: "task".into() }]);
+    assert!(CommandEnvelope::new(
+        "request.unlimited.worker", "key.unlimited.worker",
+        WireTarget::Scope { scope_id: "scope.launch".into() }, None, None,
+        CommandBody::Launch(body.clone()),
+    ).is_err());
+    body.role = LaunchRole::Coordinator;
+    assert!(CommandEnvelope::new(
+        "request.unlimited.task", "key.unlimited.task",
+        WireTarget::Scope { scope_id: "scope.launch".into() }, None, None,
+        CommandBody::Launch(body),
+    ).is_err());
+}
+
+#[test]
+fn tagged_until_stopped_wire_root_commits_once_without_port_effect() {
+    let fixture = Fixture::new();
+    let who = identity(&fixture);
+    let (port, calls, effects) = FakeLaunchPort::new(Mode::Accepted);
+    let (mut host, _) = initial_authority(&fixture.database, port, &who);
+    let (grant, policy) = install_wire_root_policy_lifetime(&mut host, &who, true);
+    let mut body = wire_root_body(grant, "gpt-6-sol");
+    body.limits.wall_seconds = None;
+    body.limits.lifetime = Some(podbay_wire::LifetimeLimit::UntilStopped);
+    let first = host.launch_new_root_codex_v2_from_wire(
+        &who.transport,
+        wire_root_request("request.unlimited.first", "key.unlimited.root", body.clone()),
+        &policy,
+    ).unwrap();
+    assert!(!first.duplicate);
+    assert_eq!(first.status.stage, LaunchDispatchStage::Prepared);
+    let again = host.launch_new_root_codex_v2_from_wire(
+        &who.transport,
+        wire_root_request("request.unlimited.retry", "key.unlimited.root", body),
+        &policy,
+    ).unwrap();
+    assert!(again.duplicate);
+    assert_eq!(again.receipt, first.receipt);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    let minted = PodId::try_from(host.recorded_snapshot().pods[0].pod_id.as_str()).unwrap();
+    let committed = host.inspect_committed_root_codex_v2(&who.scope, &minted).unwrap();
+    assert_eq!(committed.descriptor().lifetime(), podbay_wire::LifetimeLimit::UntilStopped);
+    assert_eq!(committed.effective().base().lifetime(), podbay_wire::LifetimeLimit::UntilStopped);
 }
 
 #[test]

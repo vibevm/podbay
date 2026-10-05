@@ -14,7 +14,7 @@ use podbay_host::{
     TrustedInitialOwnerPolicy, TrustedLaunchProfileInput, TrustedNativeHostConfig,
 };
 use podbay_launch_linux::TrustedCodexCredentialSource;
-use podbay_wire::{CodexAppServerPolicyV2, ResourceDriver};
+use podbay_wire::{CodexAppServerPolicyV2, LifetimeLimit, ResourceDriver};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -41,7 +41,10 @@ struct RawPolicy {
     reasoning_effort: String,
     approval_policy: String,
     sandbox: String,
-    wall_seconds: u64,
+    #[serde(default)]
+    wall_seconds: Option<u64>,
+    #[serde(default)]
+    lifetime: Option<LifetimeLimit>,
     max_children: u32,
     result_contract_ref: String,
     launch_deadline_seconds: u64,
@@ -114,7 +117,8 @@ impl PreparedManagerPolicy {
             || !(1..=300).contains(&raw.launch_deadline_seconds)
             || !(1..=300).contains(&raw.send_deadline_seconds)
             || !(1..=3600).contains(&raw.writer_lease_seconds)
-            || raw.wall_seconds == 0
+            || !matches!((raw.wall_seconds, raw.lifetime),
+                (Some(1..=604_800), None) | (None, Some(LifetimeLimit::UntilStopped)))
             || raw.max_children == 0
             || !valid_token(&raw.result_contract_ref)
         {
@@ -177,7 +181,7 @@ impl PreparedManagerPolicy {
             allowed_tool_bundle_refs: BTreeSet::new(),
             environment_refs: Vec::new(),
             credential_refs: vec![credential.clone()],
-            max_wall_seconds: raw.wall_seconds,
+            max_wall_seconds: raw.wall_seconds.unwrap_or(60),
             max_children: raw.max_children,
             allow_fallback: false,
         };
@@ -190,6 +194,9 @@ impl PreparedManagerPolicy {
         .map_err(|_| "trusted Codex V2 policy is invalid")?;
         let profile = RegisteredLaunchProfile::from_trusted_policy(profile)
             .and_then(|profile| profile.with_codex_policy_from_trusted_policy(codex))
+            .and_then(|profile| if raw.lifetime == Some(LifetimeLimit::UntilStopped) {
+                profile.with_until_stopped_codex_service()
+            } else { Ok(profile) })
             .map_err(|error| format!("trusted launch profile refused: {error:?}"))?;
         let native_host = TrustedNativeHostConfig::for_compiled_backend(raw.host_id)
             .and_then(|host| host.with_structured_driver(raw.driver_ref, raw.protocol_ref))

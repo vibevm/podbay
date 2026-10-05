@@ -46,6 +46,24 @@ test("launch session choice changes digest under the same key", async () => {
   assert.equal(existing.operation, "launch");
 });
 
+test("tagged untilStopped launch is root Coordinator Service only", async () => {
+  const finite = await decodeCommand(fixture("command-launch.json"));
+  const body = finite.body as Record<string, unknown>;
+  const tagged = { ...body, limits: { lifetime: { kind: "untilStopped" }, maxChildren: "1" } };
+  const base = {
+    requestId: "request.unlimited.ts", key: "key.unlimited.ts", target: finite.target,
+    operation: "launch" as const,
+  };
+  const accepted = await makeCommand({ ...base, body: tagged as never });
+  assert.equal((accepted.body as Record<string, unknown>).limits !== undefined, true);
+  await assert.rejects(() => makeCommand({ ...base, body: {
+    ...tagged, role: "worker", work: { ...(body.work as object), kind: "task", input: [{ kind: "text", text: "task" }] },
+  } as never }));
+  await assert.rejects(() => makeCommand({ ...base, body: {
+    ...tagged, limits: { ...(tagged.limits as object), wallSeconds: "60" },
+  } as never }));
+});
+
 test("question answers cannot become permission decisions or domain acceptance", async () => {
   const answer = fixture("command-question-answer.json") as Record<string, unknown>;
   await assert.rejects(() => decodeCommand({ ...answer, body: { ...(answer.body as object), decision: { kind: "allow_once" } } }));

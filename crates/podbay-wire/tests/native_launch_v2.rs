@@ -176,7 +176,7 @@ fn planned_child(
     (session, planned)
 }
 
-fn planned_root_worker() -> PlannedRootBinding {
+fn planned_root_for(role: Role, work: WorkKind) -> PlannedRootBinding {
     let mut session = Session::new(
         SessionId::try_from("session.codex.fixture").unwrap(),
         ActorId::try_from("actor.codex.fixture").unwrap(),
@@ -185,8 +185,8 @@ fn planned_root_worker() -> PlannedRootBinding {
     let run = Run::new(
         RunId::try_from("run.codex.fixture").unwrap(),
         &session,
-        Role::Worker,
-        WorkKind::Task,
+        role,
+        work,
         None,
     );
     session.bind_run(session.revision(), &run).unwrap();
@@ -211,6 +211,10 @@ fn planned_root_worker() -> PlannedRootBinding {
     );
     pod.attach_resource(pod.revision(), &resource).unwrap();
     LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource]).unwrap()
+}
+
+fn planned_root_worker() -> PlannedRootBinding {
+    planned_root_for(Role::Worker, WorkKind::Task)
 }
 
 fn codex_policy() -> CodexAppServerPolicyV2 {
@@ -617,6 +621,31 @@ fn codex_v2_refuses_mismatched_role_and_work_kind() {
             Err(LaunchDescriptorError::InvalidField("codexPolicy binding"))
         );
     }
+}
+
+#[test]
+fn until_stopped_codex_descriptor_requires_root_coordinator_service() {
+    let root = planned_root_for(Role::Coordinator, WorkKind::Service);
+    let descriptor = ImmutableLaunchDescriptorV2::from_planned_root_until_stopped(
+        &root,
+        reviewed_policy(root.identity(), &"a".repeat(64)),
+        codex_policy(),
+    ).unwrap();
+    assert_eq!(descriptor.lifetime(), podbay_wire::LifetimeLimit::UntilStopped);
+    assert_eq!(descriptor.wall_seconds(), None);
+    assert_eq!(
+        ImmutableLaunchDescriptorV2::decode_json(&descriptor.encode_json().unwrap()).unwrap(),
+        descriptor
+    );
+    let worker = planned_root_worker();
+    assert_eq!(
+        ImmutableLaunchDescriptorV2::from_planned_root_until_stopped(
+            &worker,
+            reviewed_policy(worker.identity(), &"a".repeat(64)),
+            codex_policy(),
+        ),
+        Err(LaunchDescriptorError::InvalidField("Codex lifetime"))
+    );
 }
 
 #[test]

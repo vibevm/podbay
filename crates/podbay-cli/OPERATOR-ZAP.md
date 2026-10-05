@@ -64,7 +64,9 @@ finite mode keeps its `RuntimeMaxSec` bound. `untilStopped` sets and verifies
 an unlimited systemd `RuntimeMaxUSec` for the outer Zap Service while retaining
 `KillMode=control-group`, `TasksMax=128`, and the signed exact-Pod stop path.
 It does not restart a crashed process or persist a transient unit across a
-machine reboot. Worker/Task Pods and the inner Codex Pod retain their own
-finite trusted budgets. Disposable fixtures prove outer A→B rebind, one nested
+machine reboot. Worker/Task Pods retain finite trusted budgets. The inner
+Codex Coordinator/Service may opt into its own tagged `untilStopped` lifetime
+through a private trusted manager policy and matching signed launch, while its
+renewable writer lease remains bounded independently. Disposable fixtures prove outer A→B rebind, one nested
 fake Codex coordinator with native output and cursor acknowledgement, and an
 explicit terminal stop of the unlimited outer Service.

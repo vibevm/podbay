@@ -154,7 +154,7 @@ fn launch_bound_codex(
             if driver_ref == wire.codex_policy().driver_ref()
                 && protocol_ref == wire.codex_policy().protocol_ref())
         || wire.arguments() != ["app-server", "--listen", "stdio://"]
-        || wire.wall_seconds() == 0
+        || wire.wall_seconds() == Some(0)
         || bootstrap.resource_input_epochs.len() != 1
         || bootstrap.resource_input_epochs.get(resource.resource_id) != Some(&1)
         || bootstrap.canonical_executable != Path::new(wire.executable())
@@ -229,7 +229,7 @@ fn launch_bound_codex(
     bound.binding_digest = bound.digest()?;
     bound.validate(&descriptor, directory)?;
     let expected_status = bound.status(resource.resource_id, wire.scope_id());
-    let status_wait = readiness_wait(wire.wall_seconds())?;
+    let status_wait = readiness_wait(wire.wall_seconds().unwrap_or(60))?;
     let path = manifest_path(directory, &descriptor)?;
     let source_text = credential_source
         .to_str()
@@ -356,6 +356,12 @@ fn launch_bound_codex(
     .map_err(|_| PodError::Uncertain("Codex V2 authority changed after manifest write"))?;
     recheck_store_file(&bootstrap.store_path, expected_store_file_identity)
         .map_err(|_| PodError::Uncertain("Codex V2 store file changed after manifest write"))?;
+    let runtime_max = match wire.lifetime() {
+        podbay_wire::LifetimeLimit::Finite { seconds } =>
+            format!("--property=RuntimeMaxSec={seconds}s"),
+        podbay_wire::LifetimeLimit::UntilStopped =>
+            "--property=RuntimeMaxSec=infinity".to_owned(),
+    };
     let started = Command::new("systemd-run")
         .args([
             "--user",
@@ -368,7 +374,7 @@ fn launch_bound_codex(
             "--property=TimeoutStopSec=5s",
             "--property=NoNewPrivileges=yes",
         ])
-        .arg(format!("--property=RuntimeMaxSec={}s", wire.wall_seconds()))
+        .arg(runtime_max)
         .arg(format!("--property=LoadCredential=auth.json:{source_text}"))
         .arg(format!("--unit={}", manifest.unit_name))
         .arg(pod_binary)
@@ -382,6 +388,17 @@ fn launch_bound_codex(
         return Err(PodError::Uncertain(
             "systemd Codex V2 admission not attested; manifest retained",
         ));
+    }
+    if wire.lifetime() == podbay_wire::LifetimeLimit::UntilStopped {
+        let shown = Command::new("systemctl")
+            .args(["--user", "show", "--property=RuntimeMaxUSec", "--value", &manifest.unit_name])
+            .output()?;
+        if !shown.status.success()
+            || shown.stdout.len() > 128
+            || String::from_utf8_lossy(&shown.stdout).trim() != "infinity"
+        {
+            return Err(PodError::Uncertain("Codex Service unit has no proved unlimited runtime"));
+        }
     }
     wait_for_ready(status_wait, STATUS_POLL_INTERVAL, || {
         attest_running(&client, &expected_status)

@@ -812,6 +812,15 @@ fn validate_body(body: &DescriptorBody) -> Result<(), LaunchDescriptorError> {
                 && body.environment_refs.is_empty()
                 && body.credential_refs.is_empty()
                 && body.max_children.get() == 0 => {}
+        (None, Some(LifetimeLimit::UntilStopped))
+            if body.target_os == TargetOs::Linux
+                && body.role == NativeRole::Coordinator
+                && body.work_kind == NativeWorkKind::Service
+                && body.parent_run_id.is_none()
+                && body.resources.len() == 1
+                && body.resources[0].kind == NativeResourceKind::StructuredProvider
+                && matches!(body.resources[0].driver, ResourceDriver::Structured { .. })
+                && body.credential_refs.len() == 1 => {}
         _ => return Err(LaunchDescriptorError::InvalidField("lifetime")),
     }
     if body.max_children.get() > 4096 {
@@ -855,6 +864,25 @@ impl ImmutableLaunchDescriptorV2 {
         codex_policy: CodexAppServerPolicyV2,
     ) -> Result<Self, LaunchDescriptorError> {
         let base = ImmutableLaunchDescriptor::from_identity(planned.identity(), policy)?;
+        Self::from_base(base, codex_policy)
+    }
+
+    /// Only a reviewed local root Coordinator/Service may omit the wall bound.
+    pub fn from_planned_root_until_stopped(
+        planned: &PlannedRootBinding,
+        policy: ReviewedNativePolicy,
+        codex_policy: CodexAppServerPolicyV2,
+    ) -> Result<Self, LaunchDescriptorError> {
+        let mut base = ImmutableLaunchDescriptor::from_identity(planned.identity(), policy)?;
+        base.body.wall_seconds = None;
+        base.body.lifetime = Some(LifetimeLimit::UntilStopped);
+        if base.body.role != NativeRole::Coordinator
+            || base.body.work_kind != NativeWorkKind::Service
+            || base.body.parent_run_id.is_some()
+            || base.body.target_os != TargetOs::Linux
+        {
+            return Err(LaunchDescriptorError::InvalidField("Codex lifetime"));
+        }
         Self::from_base(base, codex_policy)
     }
 
@@ -1068,8 +1096,13 @@ impl ImmutableLaunchDescriptorV2 {
     pub fn workspace_basis_ref(&self) -> &str {
         &self.body.base.workspace_basis_ref
     }
-    pub fn wall_seconds(&self) -> u64 {
-        self.body.base.wall_seconds.expect("V2 Codex lifetime is finite").get()
+    pub fn wall_seconds(&self) -> Option<u64> {
+        self.body.base.wall_seconds.map(Counter::get)
+    }
+    pub fn lifetime(&self) -> LifetimeLimit {
+        self.body.base.lifetime.unwrap_or_else(|| LifetimeLimit::Finite {
+            seconds: self.body.base.wall_seconds.expect("validated lifetime").get(),
+        })
     }
     pub fn max_children(&self) -> u64 {
         self.body.base.max_children.get()
@@ -1136,8 +1169,13 @@ fn require_planned_child_identity(
 
 fn validate_body_v2(body: &DescriptorBodyV2) -> Result<(), LaunchDescriptorError> {
     validate_body(&body.base)?;
-    if body.base.lifetime.is_some() || body.base.wall_seconds.is_none() {
-        return Err(LaunchDescriptorError::InvalidField("Codex lifetime must be finite"));
+    if body.base.lifetime == Some(LifetimeLimit::UntilStopped)
+        && (body.base.role != NativeRole::Coordinator
+            || body.base.work_kind != NativeWorkKind::Service
+            || body.base.parent_run_id.is_some()
+            || body.base.target_os != TargetOs::Linux)
+    {
+        return Err(LaunchDescriptorError::InvalidField("Codex lifetime"));
     }
     body.codex_policy
         .validate()

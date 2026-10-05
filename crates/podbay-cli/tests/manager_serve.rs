@@ -830,6 +830,30 @@ fn policy_file_must_be_private_canonical_and_fixed() {
     assert!(!fixture.database.exists());
 }
 
+#[test]
+fn trusted_until_stopped_policy_has_no_wall_field_and_keeps_lease_bounded() {
+    let fixture = Fixture::new();
+    let policy = fixture.trusted_policy_file();
+    let mut value: Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("wallSeconds");
+    value["lifetime"] = json!({"kind":"untilStopped"});
+    fs::write(&policy, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut manager = spawn_policy(&fixture, &policy);
+    manager.wait_setup_ready(&fixture);
+    assert!(manager.stop_with("TERM").success());
+
+    let second = Fixture::new();
+    let policy = second.trusted_policy_file();
+    let mut value: Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("wallSeconds");
+    value["lifetime"] = json!({"kind":"untilStopped"});
+    value["writerLeaseSeconds"] = json!(3601);
+    fs::write(&policy, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (status, error) = run_short_command(second.policy_command(&policy));
+    assert!(!status.success());
+    assert!(error.contains("fixed Codex fields"));
+}
+
 // This test is entered only by the separate test-harness process below. The
 // manager's *actual* direct parent is this process, so killing the launcher
 // exercises the pidfd fence rather than a forged argv selector.

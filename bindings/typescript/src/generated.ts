@@ -56,7 +56,7 @@ export interface LaunchBody {
   workspace: { scopeId: string; relativeCwd: string; basisRef?: string; access: "read_only" | "read_write" };
   toolBundleRefs: string[];
   authority: { grantRef: string };
-  limits: { wallSeconds: DecimalString; maxChildren: DecimalString };
+  limits: { wallSeconds?: DecimalString; lifetime?: { kind: "untilStopped" }; maxChildren: DecimalString };
 }
 export interface QuestionAskBody {
   recipient: { kind: "superior" } | { kind: "human" } | { kind: "actor"; actorId: string };
@@ -336,8 +336,15 @@ function launchBody(body: Record<string, unknown>): void {
   identityArray(body.toolBundleRefs, "toolBundleRefs");
   const authority = record(body.authority, "authority"); exact(authority, ["grantRef"]);
   identity(authority.grantRef, "authority.grantRef");
-  const limits = record(body.limits, "limits"); exact(limits, ["wallSeconds", "maxChildren"]);
-  decimal(limits.wallSeconds, "limits.wallSeconds", true);
+  const limits = record(body.limits, "limits"); exact(limits, ["maxChildren"], ["wallSeconds", "lifetime"]);
+  if (limits.lifetime === undefined) {
+    const seconds = BigInt(decimal(limits.wallSeconds, "limits.wallSeconds", true));
+    if (seconds > 604800n) throw new RangeError("wallSeconds exceeds bound");
+  } else {
+    const lifetime = record(limits.lifetime, "limits.lifetime"); exact(lifetime, ["kind"]);
+    if (lifetime.kind !== "untilStopped" || limits.wallSeconds !== undefined || body.role !== "coordinator"
+      || work.kind !== "service" || body.parentRunId !== undefined) throw new TypeError("invalid untilStopped lifetime");
+  }
   if (BigInt(decimal(limits.maxChildren, "limits.maxChildren")) > 1024n) throw new RangeError("maxChildren exceeds bound");
 }
 function questionAskBody(body: Record<string, unknown>): void {

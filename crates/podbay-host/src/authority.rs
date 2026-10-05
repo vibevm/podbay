@@ -7953,6 +7953,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return Err(HostError::Unauthorised.into());
         }
         let codex_policy = profile.codex_policy().ok_or(HostError::Unsupported)?;
+        if (body.limits.lifetime == Some(LifetimeLimit::UntilStopped))
+            != profile.codex_until_stopped()
+        {
+            return Err(HostError::Unauthorised.into());
+        }
         let credential =
             CredentialRef::from_trusted_vault(scope.clone(), codex_policy.credential_ref())?;
         let profile_generation = profile.generation();
@@ -8055,7 +8060,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     arguments: Vec::new(),
                     tool_bundle_refs: Vec::new(),
                     authority_ref: format!("grant.{}", policy.grant_id.get()),
-                    wall_seconds: body.limits.wall_seconds.get(),
+                    wall_seconds: body.limits.wall_seconds.map(|seconds| seconds.get()).unwrap_or(60),
                     max_children,
                     parent_run_id: None,
                 },
@@ -9180,9 +9185,11 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             &proposal.binding,
             effective.digest(),
         )?;
-        let descriptor =
+        let descriptor = if profile.codex_until_stopped() {
+            ImmutableLaunchDescriptorV2::from_planned_root_until_stopped(&planned, native, policy.clone())
+        } else {
             ImmutableLaunchDescriptorV2::from_planned_root(&planned, native, policy.clone())
-                .map_err(|_| HostError::Unauthorised)?;
+        }.map_err(|_| HostError::Unauthorised)?;
         effective
             .compare_with_descriptor(&descriptor)
             .map_err(|_| HostError::Unauthorised)?;

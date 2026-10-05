@@ -164,6 +164,7 @@ pub struct RegisteredLaunchProfile {
     input: TrustedLaunchProfileInput,
     codex_policy: Option<CodexAppServerPolicyV2>,
     operator_until_stopped: bool,
+    codex_until_stopped: bool,
 }
 
 impl RegisteredLaunchProfile {
@@ -238,6 +239,7 @@ impl RegisteredLaunchProfile {
             input,
             codex_policy: None,
             operator_until_stopped: false,
+            codex_until_stopped: false,
         })
     }
 
@@ -263,6 +265,25 @@ impl RegisteredLaunchProfile {
 
     pub(crate) fn operator_until_stopped(&self) -> bool {
         self.operator_until_stopped
+    }
+
+    pub fn with_until_stopped_codex_service(mut self) -> Result<Self, HostError> {
+        if self.codex_policy.is_none()
+            || self.operator_until_stopped
+            || self.input.profile_ref == OPERATOR_PROCESS_PROFILE_REF
+            || self.input.execution_mode != ExecutionMode::LinuxCooperative
+            || self.input.resource_layout.len() != 1
+            || self.input.resource_layout[0].kind != ResourceKind::StructuredProvider
+            || self.input.credential_refs.len() != 1
+        {
+            return Err(HostError::Unauthorised);
+        }
+        self.codex_until_stopped = true;
+        Ok(self)
+    }
+
+    pub(crate) fn codex_until_stopped(&self) -> bool {
+        self.codex_until_stopped
     }
 
     /// Explicit trusted-policy opt-in for the internal Codex V2 launch shape.
@@ -521,7 +542,7 @@ impl RegisteredLaunchProfile {
             arguments,
             tool_bundle_refs: base.tool_bundle_refs().to_vec(),
             authority_ref: format!("grant.{}", base.authority_grant_id()),
-            wall_seconds: base.wall_seconds().ok_or(HostError::StaleGuard)?,
+            wall_seconds: base.wall_seconds().unwrap_or(self.input.max_wall_seconds),
             max_children: base.max_children(),
             parent_run_id: None,
         };
@@ -688,8 +709,10 @@ impl RegisteredLaunchProfile {
             tool_bundle_refs,
             authority_grant_id: grant_id,
             wall_seconds: selection.wall_seconds,
-            operator_until_stopped: profile.profile_ref == OPERATOR_PROCESS_PROFILE_REF
-                && self.operator_until_stopped,
+            until_stopped: (profile.profile_ref == OPERATOR_PROCESS_PROFILE_REF
+                && self.operator_until_stopped)
+                || (self.codex_until_stopped && role == Role::Coordinator
+                    && selection.parent_run_id.is_none()),
             max_children: selection.max_children,
             environment_refs,
             credential_refs,
@@ -715,7 +738,7 @@ pub struct EffectiveLaunchSpec {
     tool_bundle_refs: Vec<String>,
     authority_grant_id: u64,
     wall_seconds: u64,
-    operator_until_stopped: bool,
+    until_stopped: bool,
     max_children: u32,
     environment_refs: Vec<String>,
     credential_refs: Vec<CredentialRef>,
@@ -759,8 +782,10 @@ impl EffectiveLaunchSpec {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, HostError> {
-        let mut output = if self.operator_until_stopped {
+        let mut output = if self.until_stopped && self.profile_ref == OPERATOR_PROCESS_PROFILE_REF {
             b"podbay.effective-launch/operator-until-stopped/1\0".to_vec()
+        } else if self.until_stopped {
+            b"podbay.effective-launch/codex-until-stopped/1\0".to_vec()
         } else {
             b"podbay.effective-launch/1\0".to_vec()
         };
@@ -791,7 +816,7 @@ impl EffectiveLaunchSpec {
         });
         append_list(&mut output, &self.tool_bundle_refs)?;
         output.extend_from_slice(&self.authority_grant_id.to_be_bytes());
-        if !self.operator_until_stopped {
+        if !self.until_stopped {
             output.extend_from_slice(&self.wall_seconds.to_be_bytes());
         }
         output.extend_from_slice(&self.max_children.to_be_bytes());

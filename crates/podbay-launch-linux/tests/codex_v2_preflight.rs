@@ -409,6 +409,24 @@ fn setup_with_port<P: HostDispatchPort>(
     Transport,
     BoundLaunchPodRequest,
 ) {
+    setup_with_port_lifetime(role, fixture, port, launch_budget, wall_seconds, false)
+}
+
+fn setup_with_port_lifetime<P: HostDispatchPort>(
+    role: Role,
+    fixture: Fixture,
+    port: P,
+    launch_budget: Duration,
+    wall_seconds: u64,
+    until_stopped: bool,
+) -> (
+    Fixture,
+    DurableAuthority<P>,
+    ResolvedNativeCodexLaunch,
+    TrustedCodexCredentialSource,
+    Transport,
+    BoundLaunchPodRequest,
+) {
     let mut host = DurableAuthority::open(&fixture.database, port).unwrap();
     let actor = ActorId::try_from("actor.codex.preflight").unwrap();
     let process = AuthenticatedProcessSubject::linux_from_verified_peercred_cgroup(
@@ -493,12 +511,13 @@ fn setup_with_port<P: HostDispatchPort>(
         "protocol.codex".into(),
     )
     .unwrap();
-    host.register_launch_profile_from_trusted_policy(
-        RegisteredLaunchProfile::from_trusted_policy(profile)
+    let profile = RegisteredLaunchProfile::from_trusted_policy(profile)
             .unwrap()
             .with_codex_policy_from_trusted_policy(policy)
-            .unwrap(),
-    )
+            .unwrap();
+    let profile = if until_stopped { profile.with_until_stopped_codex_service().unwrap() }
+        else { profile };
+    host.register_launch_profile_from_trusted_policy(profile)
     .unwrap();
     host.register_native_host_from_trusted_policy(
         TrustedNativeHostConfig::for_compiled_backend("host.codex.preflight".into())
@@ -667,7 +686,8 @@ fn v3_wire_root_body(fixture: &Fixture, grant: GrantId) -> LaunchBody {
         tool_bundle_refs: Vec::new(),
         authority: RequestedAuthority { grant_ref: format!("grant.{}", grant.get()) },
         limits: LaunchLimits {
-            wall_seconds: DecimalString::new(90),
+            wall_seconds: Some(DecimalString::new(90)),
+            lifetime: None,
             max_children: DecimalString::new(1),
         },
     }
@@ -1257,6 +1277,44 @@ fn disposable_codex_v2_launch_serve_status_stop_without_model_turn() {
         duplicate.bound_status().unwrap(),
         client.bound_status().unwrap()
     );
+    let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
+    assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2);
+    assert!(!client.stop().unwrap().child_running);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_codex_service_until_stopped_has_infinite_unit_and_one_child() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (fixture, _host, proof, source, _, _) = setup_with_port_lifetime(
+        Role::Coordinator, fixture, NoPort(calls.clone()), Duration::from_secs(30), 60, true,
+    );
+    let reviewed = preflight_committed_codex_v2(&proof, &source).unwrap();
+    let record = proof.committed_record();
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    assert_eq!(store.claim_effect(
+        proof.outbox_id(), &record.scope_id, &record.pod_id, proof.owner_epoch(),
+        record.pod_incarnation, proof.authority_revision(),
+        &format!("claim.{}", record.receipt.command_id),
+    ).unwrap(), EffectClaim::NewClaim);
+    let client = launch_from_review(&fixture, &proof, &reviewed, &binary, reviewed.credential_source()).unwrap();
+    let status = client.status().unwrap();
+    assert!(status.child_running);
+    let unit = match status.evidence {
+        podbay_pod::SupervisorEvidence::LinuxSystemd { unit_name, .. } => unit_name,
+        _ => panic!("Codex fixture needs a user-systemd unit"),
+    };
+    let shown = Command::new("systemctl")
+        .args(["--user", "show", "--property=RuntimeMaxUSec", "--value", &unit])
+        .output().unwrap();
+    assert!(shown.status.success());
+    assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), "infinity");
+    let duplicate = launch_from_review(&fixture, &proof, &reviewed, &binary, reviewed.credential_source()).unwrap();
+    assert_eq!(duplicate.attested_status().unwrap().child_pid,
+        client.attested_status().unwrap().child_pid);
     let frames = fixture_codex_slot(&fixture).join("home/codex/frames.log");
     assert_eq!(fs::read_to_string(frames).unwrap().lines().count(), 2);
     assert!(!client.stop().unwrap().child_running);
