@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
     ActorId, Attempt, AttemptId, CommandAdmission, CommandId, Epoch, LaunchBinding, Pod,
@@ -116,7 +116,7 @@ fn list(bytes: &mut Vec<u8>, values: &[&str]) {
         text(bytes, value);
     }
 }
-fn effective_bytes(executable: &str, generation: &str) -> Vec<u8> {
+fn effective_bytes(executable: &str, generation: &str, arguments: &[&str]) -> Vec<u8> {
     let mut bytes = b"podbay.effective-launch/1\0".to_vec();
     text(&mut bytes, "pod.fixture");
     text(&mut bytes, "worker");
@@ -125,7 +125,7 @@ fn effective_bytes(executable: &str, generation: &str) -> Vec<u8> {
     bytes.extend_from_slice(&1u64.to_be_bytes());
     text(&mut bytes, executable);
     text(&mut bytes, generation);
-    list(&mut bytes, &["60"]);
+    list(&mut bytes, arguments);
     text(&mut bytes, "none");
     text(&mut bytes, "none");
     bytes.push(0);
@@ -144,7 +144,16 @@ fn effective_bytes(executable: &str, generation: &str) -> Vec<u8> {
 }
 fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerBootstrap) {
     let (sleep, sha) = fixture.sleep_path_and_sha();
-    let executable = sleep.to_str().unwrap();
+    bound_record_for(fixture, sleep, sha, &["60"])
+}
+
+fn bound_record_for(
+    fixture: &Fixture,
+    executable_path: PathBuf,
+    sha: String,
+    arguments: &[&str],
+) -> (podbay_store::BoundLaunchRecord, PodPeerBootstrap) {
+    let executable = executable_path.to_str().unwrap();
     let generation = format!("sha256:{sha}");
     let mut session = Session::new(
         SessionId::try_from("session.fixture").unwrap(),
@@ -189,7 +198,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
     let binding =
         LaunchBinding::from_aggregates(&session, &run, &attempt, &pod, &[resource.clone()])
             .unwrap();
-    let effective = effective_bytes(executable, &generation);
+    let effective = effective_bytes(executable, &generation, arguments);
     let digest = EffectiveLaunchContract::decode(&effective)
         .unwrap()
         .digest()
@@ -208,7 +217,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
             workspace_basis_ref: "basis.fixture".into(),
             executable: executable.into(),
             cwd: fixture.directory.to_str().unwrap().into(),
-            arguments: vec!["60".into()],
+            arguments: arguments.iter().map(|arg| (*arg).into()).collect(),
             environment_refs: vec![],
             credential_refs: vec![],
             wall_seconds: 60,
@@ -260,7 +269,7 @@ fn bound_record(fixture: &Fixture) -> (podbay_store::BoundLaunchRecord, PodPeerB
         owner_epoch: 1,
         credential_epoch: 1,
         resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
-        canonical_executable: sleep,
+        canonical_executable: executable_path,
         executable_sha256: sha,
         expected_manager_peer: manager_peer.attested_peer().clone(),
     };
@@ -318,6 +327,12 @@ fn bound_synthetic_unit_pins_peer_and_refuses_copied_sibling_bearer() {
     assert!(status.child_running && status.child.start_identity.is_some());
     let manifest: PodManifest =
         serde_json::from_slice(&fs::read(fixture.manifest_path()).unwrap()).unwrap();
+    let stop_limit = Command::new("systemctl")
+        .args(["--user", "show", &manifest.unit_name, "-p", "TimeoutStopUSec", "--value"])
+        .output()
+        .unwrap();
+    assert!(stop_limit.status.success());
+    assert_eq!(String::from_utf8_lossy(&stop_limit.stdout).trim(), "5s");
     let task_limit = Command::new("systemctl")
         .args([
             "--user",
@@ -458,6 +473,58 @@ json.dump(responses,open(result,'w'))
     drop(client);
     std::thread::sleep(Duration::from_millis(100));
     assert!(fs::metadata(format!("/proc/{}", status.child.native_id)).is_ok());
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and Linux peer evidence"]
+fn bound_unit_stop_is_bounded_when_child_ignores_sigterm() {
+    assert_eq!(std::env::var("PODBAY_TEST_SYSTEMD").as_deref(), Ok("1"));
+    let fixture = Fixture::new();
+    let executable = fixture.directory.join("ignore-sigterm.py");
+    let ready = fixture.directory.join("sigterm-ignored");
+    fs::write(
+        &executable,
+        format!(
+            "#!/usr/bin/python3\nimport signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nopen({:?}, 'w').write('ready')\ntime.sleep(300)\n",
+            ready.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(fs::read(&executable).unwrap());
+    let sha = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let (record, bootstrap) = bound_record_for(&fixture, executable, sha, &["60"]);
+    let client = launch_bound(
+        record,
+        bootstrap,
+        &fixture.directory,
+        PathBuf::from(env!("CARGO_BIN_EXE_podbay-pod")),
+    )
+    .unwrap();
+    let manifest: PodManifest =
+        serde_json::from_slice(&fs::read(fixture.manifest_path()).unwrap()).unwrap();
+    let stop_limit = Command::new("systemctl")
+        .args(["--user", "show", &manifest.unit_name, "-p", "TimeoutStopUSec", "--value"])
+        .output()
+        .unwrap();
+    assert!(stop_limit.status.success());
+    assert_eq!(String::from_utf8_lossy(&stop_limit.stdout).trim(), "5s");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "SIGTERM-ignoring child did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(client.status().unwrap().child_running);
+    let started = Instant::now();
+    let stopped = Command::new("systemctl")
+        .args(["--user", "stop", &manifest.unit_name])
+        .status()
+        .unwrap();
+    assert!(stopped.success());
+    let elapsed = started.elapsed();
+    eprintln!("bound unit stop elapsed: {:.3}s", elapsed.as_secs_f64());
+    assert!(elapsed < Duration::from_secs(10), "bound unit stop exceeded 10s");
 }
 
 #[test]

@@ -1934,6 +1934,9 @@ pub fn launch_bound(
             "--collect",
             "--service-type=exec",
             "--property=KillMode=control-group",
+            // A bound child may handle SIGTERM without exiting. Keep exact
+            // unit stops bounded while systemd retains cgroup cleanup.
+            "--property=TimeoutStopSec=5s",
             "--property=NoNewPrivileges=yes",
         ])
         .arg(runtime_max)
