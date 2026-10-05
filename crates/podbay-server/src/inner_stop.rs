@@ -36,6 +36,7 @@ struct StopIntent {
     credential_ref: String,
     profile_ref: String,
     profile_generation: u64,
+    lifetime: podbay_wire::LifetimeLimit,
     launch_command_id: String,
     store_lineage: String,
     descriptor_digest: String,
@@ -270,6 +271,7 @@ fn prepare(
         credential_ref: descriptor.credential_refs()[0].clone(),
         profile_ref: descriptor.profile_ref().into(),
         profile_generation: descriptor.profile_generation(),
+        lifetime: descriptor.lifetime(),
         launch_command_id: reviewed.committed_record().receipt.command_id.clone(),
         store_lineage: reviewed.store_lineage().into(),
         descriptor_digest: descriptor.digest().into(),
@@ -580,6 +582,7 @@ pub(crate) fn dispatch<P: HostDispatchPort, T: AuthenticatedTransport>(
                 &credential,
                 &intent.profile_ref,
                 intent.profile_generation,
+                intent.lifetime,
             )
             .map_err(|_| {
                 error(

@@ -2365,28 +2365,36 @@ fn tagged_until_stopped_wire_root_commits_once_without_port_effect() {
 }
 
 #[test]
-fn exact_inner_stop_refuses_finite_worker_task() {
-    let fixture = Fixture::new();
-    let who = identity(&fixture);
-    let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
-    let (mut host, _) = initial_authority(&fixture.database, port, &who);
-    let (grant, policy) = install_wire_root_policy(&mut host, &who);
-    host.admit_bound_root_codex_v2(&who.transport,
-        codex_root_request(&who, grant, Role::Worker, b"canonical.worker.stop-refusal")).unwrap();
-    let stop = CommandEnvelope::new(
-        "request.worker.stop", "key.worker.stop",
-        WireTarget::Run { run_id: format!("run.{}", who.pod.as_str()) },
-        Some(WireGuard {
-            manager_epoch: Some(DecimalString::new(1)),
-            pod_epoch: Some(DecimalString::new(1)),
-            resource_epoch: Some(DecimalString::new(1)),
-            ..WireGuard::default()
-        }), None,
-        CommandBody::RunStop(RunStopBody { scope: StopScope::SelfOnly,
-            pod_id: Some(who.pod.as_str().into()) }),
-    ).unwrap();
-    assert!(host.review_current_inner_codex_stop(&who.transport, &stop, &policy).is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+fn exact_inner_stop_accepts_finite_root_service_and_refuses_worker_task() {
+    for role in [Role::Coordinator, Role::Worker] {
+        let fixture = Fixture::new();
+        let who = identity(&fixture);
+        let (port, calls, _) = FakeLaunchPort::new(Mode::Accepted);
+        let (mut host, _) = initial_authority(&fixture.database, port, &who);
+        let (grant, policy) = install_wire_root_policy(&mut host, &who);
+        host.admit_bound_root_codex_v2(&who.transport,
+            codex_root_request(&who, grant, role, b"canonical.finite.stop-review")).unwrap();
+        let stop = CommandEnvelope::new(
+            "request.finite.stop", "key.finite.stop",
+            WireTarget::Run { run_id: format!("run.{}", who.pod.as_str()) },
+            Some(WireGuard {
+                manager_epoch: Some(DecimalString::new(1)),
+                pod_epoch: Some(DecimalString::new(1)),
+                resource_epoch: Some(DecimalString::new(1)),
+                ..WireGuard::default()
+            }), None,
+            CommandBody::RunStop(RunStopBody { scope: StopScope::SelfOnly,
+                pod_id: Some(who.pod.as_str().into()) }),
+        ).unwrap();
+        let reviewed = host.review_current_inner_codex_stop(&who.transport, &stop, &policy);
+        if role == Role::Coordinator {
+            assert_eq!(reviewed.unwrap().descriptor().lifetime(),
+                podbay_wire::LifetimeLimit::Finite { seconds: 60 });
+        } else {
+            assert!(reviewed.is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

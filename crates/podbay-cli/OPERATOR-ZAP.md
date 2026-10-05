@@ -72,7 +72,7 @@ fake Codex coordinator with native output and cursor acknowledgement, and an
 explicit terminal stop of the unlimited outer Service.
 
 The inner manager accepts a signed `run.stop` only for its own current local
-Codex V2 root Coordinator/Service with an `untilStopped` lifetime. The request
+Codex V2 root Coordinator/Service with a finite or `untilStopped` lifetime. The request
 uses the exact Run target, `scope: "self_only"`, the exact `podId`, and current
 manager, Pod, and Resource epoch guards. Manager owner and credential grants
 must still match the committed launch. PodBay commits one stop intent and
@@ -82,3 +82,7 @@ and socket identity; retries never send another stop. `commands.get` reports
 `observedStage: "pod_stopped"` only after terminal proof. A claimed stop whose
 unit remains live is uncertain and requires operator inspection; no automatic
 second stop or relaunch is attempted.
+For a finite-to-unlimited cutover, stop the finite root under its original
+trusted policy and retain its `pod_stopped` receipt before changing the manager
+policy and launching a new root. Its native Codex process does not continue
+across that cutover.

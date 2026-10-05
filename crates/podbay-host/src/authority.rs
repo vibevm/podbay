@@ -7628,7 +7628,6 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             || record.run_id != run_id.as_str()
             || descriptor.role() != NativeRole::Coordinator
             || descriptor.work_kind() != NativeWorkKind::Service
-            || descriptor.lifetime() != LifetimeLimit::UntilStopped
             || descriptor.parent_run_id().is_some()
             || descriptor.resources_len() != 1
             || guard.resource_epoch.map(|epoch| epoch.get()) != descriptor.resource(0).map(|resource| resource.epoch)
@@ -7636,7 +7635,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return Err(HostError::StaleGuard);
         }
         let profile = self.launch_profiles.get(descriptor.profile_ref()).ok_or(HostError::StaleGuard)?;
-        if !profile.codex_until_stopped() || descriptor.credential_refs().len() != 1 {
+        if profile.codex_until_stopped()
+            != (descriptor.lifetime() == LifetimeLimit::UntilStopped)
+            || descriptor.credential_refs().len() != 1 {
             return Err(HostError::Unauthorised);
         }
         let credential = CredentialRef::from_trusted_vault(scope.clone(), &descriptor.credential_refs()[0])?;
@@ -7657,6 +7658,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         credential: &CredentialRef,
         profile_ref: &str,
         profile_generation: u64,
+        lifetime: LifetimeLimit,
     ) -> Result<(), HostError> {
         self.ensure_current_owner_epoch()?;
         if policy.deadline <= Instant::now() || credential.scope_id() != scope_id {
@@ -7672,7 +7674,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         self.host.check_grant(actor, policy.grant_id, scope_id,
             &Right::new(Operation::UseCredential, Target::Credential(credential.clone())))?;
         let profile = self.launch_profiles.get(profile_ref).ok_or(HostError::StaleGuard)?;
-        if !profile.codex_until_stopped() || profile.generation() != profile_generation
+        if profile.codex_until_stopped() != (lifetime == LifetimeLimit::UntilStopped)
+            || profile.generation() != profile_generation
             || profile.workspace_scope() != scope_id {
             return Err(HostError::StaleGuard);
         }

@@ -32,6 +32,7 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   }
   const podBinary = process.env["PODBAY_TEST_POD_BINARY"]!;
   const managerBinary = process.env["PODBAY_TEST_MANAGER_BINARY"]!;
+  const finiteStop = process.env["PODBAY_TEST_FINITE_STOP"] === "1";
   assert.equal((await stat(podBinary)).isFile(), true);
   assert.equal((await stat(managerBinary)).isFile(), true);
   const podDigest = createHash("sha256").update(await readFile(podBinary)).digest("hex");
@@ -53,7 +54,8 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
     hostId: "host.fake-e2e", driverRef: "driver.codex.fake-e2e",
     protocolRef: "protocol.codex.fake-e2e", modelId: "gpt-6-sol",
     reasoningEffort: "medium", approvalPolicy: "never", sandbox: "danger_full_access",
-    lifetime: { kind: "untilStopped" }, maxChildren: 2, resultContractRef: "result.none",
+    ...(finiteStop ? { wallSeconds: 60 } : { lifetime: { kind: "untilStopped" } }),
+    maxChildren: 2, resultContractRef: "result.none",
     launchDeadlineSeconds: 30, sendDeadlineSeconds: 30, writerLeaseSeconds: 120,
   }), { mode: 0o600 });
   await chmod(policyPath, 0o600);
@@ -119,7 +121,9 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
       selection: { modelId: "gpt-6-sol", reasoningEffort: "medium", fallback: "none" },
       workspace: { scopeId: "scope.zap.fake-e2e", relativeCwd: ".", basisRef: "basis.fake-e2e", access: "read_write" },
       toolBundleRefs: [], authority: { grantRef: enrolled.grantRef },
-      limits: { lifetime: { kind: "untilStopped" }, maxChildren: decimal("2") },
+      limits: finiteStop
+        ? { wallSeconds: decimal("60"), maxChildren: decimal("2") }
+        : { lifetime: { kind: "untilStopped" }, maxChildren: decimal("2") },
     },
   });
   const launchReceipt = await client.command(launch);
@@ -424,6 +428,28 @@ test("fresh owner process reconciles lost inner stop reply without another Pod e
   assert.equal(resumed["commandId"], saved["commandId"]);
   assert.equal(resumed["state"], "settled");
   assert.equal(record(resumed["value"])["portCalled"], false);
+});
+
+test("signed stop retires a disposable finite root Service with one terminal receipt", {
+  skip: process.env["PODBAY_TEST_STOP_PHASE"] === "A" || process.platform !== "linux" ||
+    !process.env["PODBAY_TEST_MANAGER_BINARY"] || !process.env["PODBAY_TEST_POD_BINARY"],
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "podbay-ts-finite-stop-"));
+  await chmod(root, 0o700);
+  t.after(async () => { await stopPodUnits(join(root, "pods")); await rm(root, { recursive: true, force: true }); });
+  const childEnv = { ...process.env, PODBAY_TEST_STOP_PHASE: "A", PODBAY_TEST_STOP_ROOT: root,
+    PODBAY_TEST_FINITE_STOP: "1" };
+  delete childEnv["NODE_TEST_CONTEXT"];
+  delete childEnv["PODBAY_TEST_INNER_STOP_DROP_REPLY"];
+  await exec(process.execPath, ["--experimental-strip-types", "--test", fileURLToPath(import.meta.url)],
+    { timeout: 30_000, env: childEnv });
+  const database = new DatabaseSync(join(root, "state", "podbay.sqlite"), { readOnly: true });
+  try {
+    const result = database.prepare("SELECT state,observation_stage FROM outbox WHERE kind='pod.stop'")
+      .get() as { state: string; observation_stage: string };
+    assert.equal(result.state, "observed");
+    assert.equal(result.observation_stage, "pod_stopped");
+  } finally { database.close(); }
 });
 
 function fakeCodexScript(): string {
