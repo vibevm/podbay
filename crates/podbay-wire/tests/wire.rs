@@ -4,7 +4,7 @@ use podbay_wire::{
     Capability, CapabilityEnvelope, CapabilitySupport, CommandBody, CommandEnvelope, DecimalString,
     ErrorEnvelope, EventCursor, Guard, ObservationKind, ProtocolVersion, Receipt, ResourceAction,
     ResourceCommandBody, SnapshotEnvelope, Target, WireError, contract_manifest,
-    decode_command_json, decode_event_json, decode_frame_bytes, encode_frame,
+    decode_command_json, decode_event_json, decode_frame_bytes, encode_frame, MAX_FRAME_BYTES,
 };
 use serde_json::{Value, json};
 
@@ -345,7 +345,7 @@ fn local_frames_are_bounded_and_exact() {
         decode_frame_bytes(&trailing),
         Err(WireError::FrameLengthMismatch)
     );
-    let oversized = [0, 16, 0, 1];
+    let oversized = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
     assert_eq!(
         decode_frame_bytes(&oversized),
         Err(WireError::FrameTooLarge)

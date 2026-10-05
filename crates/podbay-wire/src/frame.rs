@@ -3,7 +3,7 @@ use serde::Serialize;
 
 use crate::WireError;
 
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
+pub const MAX_FRAME_BYTES: usize = 16 * 1_048_576;
 
 pub fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, WireError> {
     let payload = serde_json::to_vec(value)?;

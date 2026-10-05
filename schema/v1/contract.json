@@ -11,7 +11,7 @@
   },
   "eventSchemaCompatibility": "unknown_schema_is_opaque_under_podbay/1",
   "frame": {
-    "maxBytes": 1048576,
+    "maxBytes": 16777216,
     "prefix": "u32_be"
   },
   "interactionKinds": [

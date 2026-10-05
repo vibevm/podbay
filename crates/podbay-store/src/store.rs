@@ -62,14 +62,14 @@ const CODEX_NATIVE_EVIDENCE_V23: &str = "CREATE TABLE codex_native_evidence (
   provenance TEXT NOT NULL CHECK(provenance='codex.app-server.pod-observed/1'),
   external_conflict INTEGER NOT NULL CHECK(external_conflict IN (0,1)),
   content_digest TEXT NOT NULL CHECK(length(content_digest)=64),
-  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 262144),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 4194304),
   PRIMARY KEY(resource_id,source_sequence)
 ) STRICT";
 const CODEX_NATIVE_CONFLICTS_V23: &str = "CREATE TABLE codex_native_conflicts (
   resource_id TEXT NOT NULL REFERENCES codex_native_sources(resource_id),
   source_sequence INTEGER NOT NULL CHECK(source_sequence>=1),
   incoming_digest TEXT NOT NULL CHECK(length(incoming_digest)=64),
-  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 262144),
+  raw_jsonl BLOB NOT NULL CHECK(length(raw_jsonl) BETWEEN 1 AND 4194304),
   PRIMARY KEY(resource_id,source_sequence,incoming_digest)
 ) STRICT";
 // Schema creation records no native thread anchor, command, or provider input.
