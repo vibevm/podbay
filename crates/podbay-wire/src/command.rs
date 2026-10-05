@@ -313,6 +313,8 @@ pub enum StopScope {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunStopBody {
     pub scope: StopScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -848,6 +850,11 @@ impl CommandBody {
             }
             Self::RunInterrupt(body) => valid_identity(&body.expected_interval_id)
                 .map_err(|_| WireError::InvalidField("body.expectedIntervalId"))?,
+            Self::RunStop(body) => {
+                if let Some(pod_id) = &body.pod_id {
+                    valid_identity(pod_id).map_err(|_| WireError::InvalidField("body.podId"))?;
+                }
+            }
             Self::RunReport(body) => {
                 if body.summary.is_empty()
                     || body.summary.len() > 64_000

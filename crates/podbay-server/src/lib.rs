@@ -8,6 +8,8 @@ mod auth_prelude;
 #[cfg(target_os = "linux")]
 mod host_launch_handler;
 #[cfg(target_os = "linux")]
+mod inner_stop;
+#[cfg(target_os = "linux")]
 mod host_read_handler;
 #[cfg(target_os = "linux")]
 mod initial_owner_setup;
@@ -119,6 +121,7 @@ where
         launch_policy,
         send_policy,
         LinuxAuthPreludeLimits::default(),
+        None,
     )
 }
 
@@ -132,6 +135,7 @@ pub fn serve_authenticated_linux_launch_and_first_send_one_with_limits<P>(
     launch_policy: &podbay_host::TrustedWireRootLaunchPolicy,
     send_policy: &podbay_host::TrustedBootstrapSendPolicy,
     limits: LinuxAuthPreludeLimits,
+    pod_directory: Option<&std::path::Path>,
 ) -> Result<(), LinuxServeOneFault>
 where
     P: podbay_host::HostDispatchPort,
@@ -144,6 +148,7 @@ where
         authority,
         launch_policy,
         send_policy,
+        pod_directory,
     );
     serve_one(&mut authenticated, &mut handler).map_err(LinuxServeOneFault::Exchange)
 }

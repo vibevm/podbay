@@ -286,6 +286,7 @@ impl LinuxManagerCommandsGetListener {
             stop,
             launch_template,
             send_template,
+            None,
             || Ok(()),
         )
     }
@@ -296,6 +297,7 @@ impl LinuxManagerCommandsGetListener {
         stop: &AtomicBool,
         launch_template: &TrustedWireRootLaunchTemplate,
         send_template: &TrustedBootstrapSendTemplate,
+        pod_directory: Option<&std::path::Path>,
         owner_check: impl FnMut() -> Result<(), LinuxListenerError>,
     ) -> Result<LinuxListenerReport, LinuxListenerError>
     where
@@ -325,6 +327,7 @@ impl LinuxManagerCommandsGetListener {
                     &launch_policy,
                     &send_policy,
                     limits,
+                    pod_directory,
                 ),
             )
         })

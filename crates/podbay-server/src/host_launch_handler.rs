@@ -13,6 +13,7 @@ use podbay_wire::{
     ReadEnvelope, Receipt, RuntimeError, RuntimeErrorCode, Target,
 };
 use serde_json::{Value, json};
+use std::path::Path;
 
 use crate::{Handler, host_read_handler::HostReadHandler};
 
@@ -20,6 +21,7 @@ pub(crate) struct HostLaunchHandler<'a, P: HostDispatchPort> {
     authority: &'a mut DurableAuthority<P>,
     policy: &'a TrustedWireRootLaunchPolicy,
     bootstrap_send_policy: Option<&'a TrustedBootstrapSendPolicy>,
+    stop_pod_directory: Option<&'a Path>,
 }
 
 impl<'a, P: HostDispatchPort> HostLaunchHandler<'a, P> {
@@ -31,6 +33,7 @@ impl<'a, P: HostDispatchPort> HostLaunchHandler<'a, P> {
             authority,
             policy,
             bootstrap_send_policy: None,
+            stop_pod_directory: None,
         }
     }
 
@@ -38,11 +41,13 @@ impl<'a, P: HostDispatchPort> HostLaunchHandler<'a, P> {
         authority: &'a mut DurableAuthority<P>,
         policy: &'a TrustedWireRootLaunchPolicy,
         bootstrap_send_policy: &'a TrustedBootstrapSendPolicy,
+        stop_pod_directory: Option<&'a Path>,
     ) -> Self {
         Self {
             authority,
             policy,
             bootstrap_send_policy: Some(bootstrap_send_policy),
+            stop_pod_directory,
         }
     }
 }
@@ -56,6 +61,11 @@ where
         transport: &T,
         request: CommandEnvelope,
     ) -> Result<Receipt<Value>, RuntimeError> {
+        if matches!(&request.body, CommandBody::RunStop(_)) {
+            let directory = self.stop_pod_directory.ok_or_else(|| refusal(
+                RuntimeErrorCode::Unsupported, "inner Pod stop is unavailable on this manager endpoint"))?;
+            return crate::inner_stop::dispatch(self.authority, transport, request, self.policy, directory);
+        }
         if matches!(&request.body, CommandBody::SessionWriterLeaseRenew(_)) {
             let policy = self.bootstrap_send_policy.ok_or_else(|| refusal(
                 RuntimeErrorCode::Unsupported,

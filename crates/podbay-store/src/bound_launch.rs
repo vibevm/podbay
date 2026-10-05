@@ -714,6 +714,12 @@ impl PodBayStore {
                AND b.scope_id=p.scope_id AND b.pod_id=p.pod_id
                AND b.pod_incarnation=p.incarnation
                AND (b.effective_spec_version=?3 OR b.descriptor_version=?4)
+               AND NOT EXISTS (
+                 SELECT 1 FROM commands AS stop_command
+                 JOIN outbox AS stop_effect ON stop_effect.command_rowid=stop_command.command_rowid
+                 WHERE stop_command.scope_id=p.scope_id AND stop_command.target_id=p.pod_id
+                   AND stop_command.target_epoch=p.incarnation AND stop_effect.kind='pod.stop'
+                   AND stop_effect.state IN ('claimed_uncertain','observed'))
              ORDER BY t.scope_id,t.target_id LIMIT ?5",
         )?;
         let rows = statement.query_map(

@@ -100,7 +100,7 @@ export type CommandEnvelope =
   | (CommandCommon & { operation: "run.interrupt"; target: Extract<Target, { kind: "run" }>; body: { expectedIntervalId: string } })
   | (CommandCommon & { operation: "run.pause"; target: Extract<Target, { kind: "run" }>; body: { policy: "drain" | "interrupt_current" } })
   | (CommandCommon & { operation: "run.resume"; target: Extract<Target, { kind: "run" }>; body: { policy: "live_only" | "continue_saved_session" } })
-  | (CommandCommon & { operation: "run.stop"; target: Extract<Target, { kind: "run" }>; body: { scope: "self_only" | "subtree" } })
+  | (CommandCommon & { operation: "run.stop"; target: Extract<Target, { kind: "run" }>; body: { scope: "self_only" | "subtree"; podId?: string } })
   | (CommandCommon & { operation: "run.report"; target: Extract<Target, { kind: "run" }>; body: { summary: string; artifactRefs: string[]; evidenceRefs: string[]; declaration: "succeeded" | "needs_follow_up" | "blocked" } })
   | (CommandCommon & { operation: "run.finish"; target: Extract<Target, { kind: "run" }>; body: { childPolicy: "join" | "cancel" } })
   | (CommandCommon & { operation: "delivery.ack"; target: Extract<Target, { kind: "delivery" }>; body: { kind: "received" | "processed"; evidenceRef: string } })
@@ -436,7 +436,7 @@ function commandBody(operation: MutationOperation, value: unknown): void {
   if (operation === "run.interrupt") { exact(body, ["expectedIntervalId"]); identity(body.expectedIntervalId, "expectedIntervalId"); return; }
   if (operation === "run.pause") { exact(body, ["policy"]); if (body.policy !== "drain" && body.policy !== "interrupt_current") throw new TypeError("unknown pause policy"); return; }
   if (operation === "run.resume") { exact(body, ["policy"]); if (body.policy !== "live_only" && body.policy !== "continue_saved_session") throw new TypeError("unknown resume policy"); return; }
-  if (operation === "run.stop") { exact(body, ["scope"]); if (body.scope !== "self_only" && body.scope !== "subtree") throw new TypeError("unknown stop scope"); return; }
+  if (operation === "run.stop") { exact(body, ["scope"], ["podId"]); if (body.scope !== "self_only" && body.scope !== "subtree") throw new TypeError("unknown stop scope"); if (body.podId !== undefined) identity(body.podId, "body.podId"); return; }
   if (operation === "run.report") {
     exact(body, ["summary", "artifactRefs", "evidenceRefs", "declaration"]);
     const summary = text(body.summary, "summary");

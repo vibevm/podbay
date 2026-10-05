@@ -146,6 +146,7 @@ fn command_fixtures() -> Result<Vec<(&'static str, CommandEnvelope)>, Box<dyn st
                 None,
                 CommandBody::RunStop(RunStopBody {
                     scope: StopScope::SelfOnly,
+                    pod_id: None,
                 }),
             )?,
         ),

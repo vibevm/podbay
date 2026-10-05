@@ -8,6 +8,7 @@ import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 import { AuthenticatedUnixSocketWireTransport } from "../src/authenticated-unix-socket.ts";
 import { decimal, makeCommand, makeRead, PodBayWireClient, type NativeEventCursor } from "../src/generated.ts";
@@ -16,10 +17,10 @@ import { INITIAL_OWNER_RIGHTS_DIGEST, InitialOwnerSetupClient } from "../src/own
 const exec = promisify(execFile);
 
 test("Node owner launches one fake Codex pod, bootstraps once and reads its native journal", {
-  skip: process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
+  skip: process.env["PODBAY_TEST_STOP_PHASE"] !== "A" || process.platform !== "linux" || !process.env["PODBAY_TEST_MANAGER_BINARY"] ||
     !process.env["PODBAY_TEST_POD_BINARY"],
 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "podbay-ts-fake-e2e-"));
+  const root = process.env["PODBAY_TEST_STOP_ROOT"] ?? await mkdtemp(join(tmpdir(), "podbay-ts-fake-e2e-"));
   await chmod(root, 0o700);
   const state = join(root, "state");
   const pods = join(root, "pods");
@@ -52,24 +53,25 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
     hostId: "host.fake-e2e", driverRef: "driver.codex.fake-e2e",
     protocolRef: "protocol.codex.fake-e2e", modelId: "gpt-6-sol",
     reasoningEffort: "medium", approvalPolicy: "never", sandbox: "danger_full_access",
-    wallSeconds: 60, maxChildren: 2, resultContractRef: "result.none",
+    lifetime: { kind: "untilStopped" }, maxChildren: 2, resultContractRef: "result.none",
     launchDeadlineSeconds: 30, sendDeadlineSeconds: 30, writerLeaseSeconds: 120,
   }), { mode: 0o600 });
   await chmod(policyPath, 0o600);
 
   const database = join(state, "podbay.sqlite");
-  const manager = spawn(managerBinary, [
+  const managerArgs = [
     "manager", "serve", "--state-dir", state, "--database", database,
     "--pod-dir", pods, "--pod-binary", podBinary, "--pod-sha256", podDigest,
     "--trusted-policy", policyPath,
-  ], { stdio: ["ignore", "ignore", "pipe"] });
+  ];
+  let manager = spawn(managerBinary, managerArgs, { stdio: ["ignore", "ignore", "pipe"] });
   t.after(async () => {
     await stopPodUnits(pods);
     if (manager.exitCode === null && manager.signalCode === null) {
       manager.kill("SIGTERM");
       await waitExit(manager);
     }
-    await rm(root, { recursive: true, force: true });
+    if (!process.env["PODBAY_TEST_STOP_ROOT"]) await rm(root, { recursive: true, force: true });
   });
 
   const setupSocket = join(state, "owner-setup.sock");
@@ -117,7 +119,7 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
       selection: { modelId: "gpt-6-sol", reasoningEffort: "medium", fallback: "none" },
       workspace: { scopeId: "scope.zap.fake-e2e", relativeCwd: ".", basisRef: "basis.fake-e2e", access: "read_write" },
       toolBundleRefs: [], authority: { grantRef: enrolled.grantRef },
-      limits: { wallSeconds: decimal("60"), maxChildren: decimal("2") },
+      limits: { lifetime: { kind: "untilStopped" }, maxChildren: decimal("2") },
     },
   });
   const launchReceipt = await client.command(launch);
@@ -340,6 +342,88 @@ test("Node owner launches one fake Codex pod, bootstraps once and reads its nati
   const repeatedLaunch = record(await readLaunch("request.fake-e2e.bootstrap.replay"));
   assert.deepEqual(record(repeatedLaunch["currentBootstrapCompletion"]), proof,
     "read-only completion projection must be stable");
+
+  const stopBody = { scope: "self_only" as const, podId: string(launchValue["podId"]) };
+  const stopGuard = {
+    managerEpoch: decimal(ownerEpoch.toString()), podEpoch: decimal("1"),
+    resourceEpoch: decimal(string(record(resources[0])["epoch"])),
+  };
+  const wrongPod = await makeCommand({ operation: "run.stop", requestId: "request.fake-e2e.stop.wrong-pod",
+    key: "key.fake-e2e.stop.wrong-pod", target: { kind: "run", runId: string(launchValue["runId"]) },
+    guard: stopGuard, body: { ...stopBody, podId: "pod.wrong.fake-e2e" } });
+  await assert.rejects(() => client.command(wrongPod));
+  const wrongEpoch = await makeCommand({ operation: "run.stop", requestId: "request.fake-e2e.stop.wrong-epoch",
+    key: "key.fake-e2e.stop.wrong-epoch", target: { kind: "run", runId: string(launchValue["runId"]) },
+    guard: { ...stopGuard, resourceEpoch: decimal("2") }, body: stopBody });
+  await assert.rejects(() => client.command(wrongEpoch));
+  const stop = await makeCommand({ operation: "run.stop", requestId: "request.fake-e2e.stop.first",
+    key: "key.fake-e2e.stop", target: { kind: "run", runId: string(launchValue["runId"]) },
+    guard: stopGuard, body: stopBody });
+  if (process.env["PODBAY_TEST_INNER_STOP_DROP_REPLY"] === "1") {
+    await assert.rejects(() => client.command(stop), /uncertain|lost stop reply/u);
+    const stopDb = new DatabaseSync(database, { readOnly: true });
+    const claimed = stopDb.prepare("SELECT COUNT(*) AS count FROM outbox WHERE kind='pod.stop' AND state='claimed_uncertain'").get() as { count: number };
+    stopDb.close();
+    assert.equal(claimed.count, 1, "one durable intent precedes the lost reply");
+  } else {
+    const firstStop = await client.command(stop);
+    assert.equal(firstStop.state, "settled");
+    assert.equal(record(firstStop.value)["portCalled"], true);
+  }
+  const retryStop = await makeCommand({ operation: "run.stop", requestId: "request.fake-e2e.stop.retry",
+    key: stop.key, target: stop.target, guard: stop.guard, body: stop.body });
+  const stopped = await client.command(retryStop);
+  assert.equal(stopped.state, "settled");
+  assert.equal(record(stopped.value)["duplicate"], true);
+  assert.equal(record(stopped.value)["portCalled"], false);
+  const readStop = record(await client.read(makeRead({ operation: "commands.get",
+    requestId: "request.fake-e2e.stop.read", target: { kind: "scope", scopeId: "scope.zap.fake-e2e" },
+    body: { selector: { kind: "key", key: stop.key } },
+  })));
+  assert.equal(readStop["state"], "settled");
+  assert.equal(readStop["observedStage"], "pod_stopped");
+  const newKey = await makeCommand({ operation: "run.stop", requestId: "request.fake-e2e.stop.new-key",
+    key: "key.fake-e2e.stop.new-key", target: stop.target, guard: stop.guard, body: stop.body });
+  await assert.rejects(() => client.command(newKey));
+  const finalDb = new DatabaseSync(database, { readOnly: true });
+  const stopCount = finalDb.prepare("SELECT COUNT(*) AS count FROM outbox WHERE kind='pod.stop'").get() as { count: number };
+  finalDb.close();
+  assert.equal(stopCount.count, 1, "no second stop intent or Pod effect was issued");
+
+  manager.kill("SIGTERM");
+  await waitExit(manager);
+  await writeFile(join(root, "stop-retry.json"), JSON.stringify({
+    key: stop.key, target: stop.target, guard: stop.guard, body: stop.body,
+    commandId: stopped.commandId,
+  }), { mode: 0o600 });
+});
+
+test("fresh owner process reconciles lost inner stop reply without another Pod effect", {
+  skip: process.env["PODBAY_TEST_STOP_PHASE"] === "A" || process.platform !== "linux" ||
+    !process.env["PODBAY_TEST_MANAGER_BINARY"] || !process.env["PODBAY_TEST_POD_BINARY"],
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "podbay-ts-stop-recovery-"));
+  await chmod(root, 0o700);
+  t.after(async () => { await stopPodUnits(join(root, "pods")); await rm(root, { recursive: true, force: true }); });
+  const thisTest = fileURLToPath(import.meta.url);
+  const childEnv = { ...process.env, PODBAY_TEST_STOP_PHASE: "A", PODBAY_TEST_STOP_ROOT: root,
+    PODBAY_TEST_INNER_STOP_DROP_REPLY: "1" };
+  delete childEnv["NODE_TEST_CONTEXT"];
+  const first = await exec(process.execPath, ["--experimental-strip-types", "--test", thisTest], {
+    timeout: 30_000,
+    env: childEnv,
+  });
+  const savedBytes = await readFile(join(root, "stop-retry.json"), "utf8")
+    .catch(() => { throw new Error(`initial stop fixture wrote no receipt: ${first.stdout}\n${first.stderr}`); });
+  const saved = record(JSON.parse(savedBytes));
+  const helper = fileURLToPath(new URL("./manager-inner-stop-retry.fixture.ts", import.meta.url));
+  const recovered = await exec(process.execPath, ["--experimental-strip-types", helper,
+    root, process.env["PODBAY_TEST_MANAGER_BINARY"]!, process.env["PODBAY_TEST_POD_BINARY"]!],
+    { timeout: 15_000 });
+  const resumed = record(JSON.parse(recovered.stdout));
+  assert.equal(resumed["commandId"], saved["commandId"]);
+  assert.equal(resumed["state"], "settled");
+  assert.equal(record(resumed["value"])["portCalled"], false);
 });
 
 function fakeCodexScript(): string {

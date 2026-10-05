@@ -331,6 +331,7 @@ fn inspection_json(
         EffectState::Observed => match inspected.observed_stage {
             Some(ObservedStage::HostAccepted) => (CommandStage::HostAccepted, "observed"),
             Some(ObservedStage::LeaseRenewed) => (CommandStage::HostAccepted, "observed"),
+            Some(ObservedStage::PodStopped) => (CommandStage::Settled, "observed"),
             Some(ObservedStage::LegacyUnverified) | None => (CommandStage::Uncertain, "observed"),
         },
     };
@@ -382,6 +383,7 @@ fn inspection_json(
         response["observedStage"] = json!(match stage {
             ObservedStage::HostAccepted => "host_accepted",
             ObservedStage::LeaseRenewed => "lease_renewed",
+            ObservedStage::PodStopped => "pod_stopped",
             ObservedStage::LegacyUnverified => "legacy_unverified",
         });
     }

@@ -14,7 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use podbay_core::{
     ActorId, Attempt, AttestedPeer, CommandId, CommandKey, CredentialEpoch, Epoch, LaunchBinding,
     OwnerEpoch, PendingPodProcessEvidence, PendingRebindSupersession,
-    PlannedRootBinding, Pod, PodId, RebindPhase,
+    PlannedRootBinding, Pod, PodId, RebindPhase, RunId,
     RebindProposal, RequestDigest, Resource,
     ResourceId, ResourceKind, Role, Run, ScopeId, Session, SessionId, StoreLineageId, WorkKind,
 };
@@ -24,14 +24,14 @@ use podbay_store::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundOperatorRootLaunchProposal, BoundOperatorRootLaunchRequest,
     BoundRootLaunchProposalV2, BoundRootLaunchRequestV2, CommandInspection,
-    CommandLookupSelector, CurrentScopeSnapshot, CurrentV2RebindCursor, CurrentV2RebindPage,
+    CommandLookupSelector, CommandRequest, CurrentScopeSnapshot, CurrentV2RebindCursor, CurrentV2RebindPage,
     DurableRebindPhase, DurableRebindReceipt,
     EffectClaim, EffectState, HostObservedPriorCheckpoint, LaunchDispatchStage,
     LaunchDispatchStatus, LaunchKeyLookupRequest, LaunchLookupRequest, LaunchPortResult,
     LaterCodexSendSelector, ManagerCredentialClaim, NativeWriterLease,
     NativeWriterRenewalReceipt, NativeWriterRenewalRequest,
     NativeEvidenceIdentity, NativeEvidencePage, TrustedNativeEvidenceAdmission,
-    OwnerActorRotationReceipt, PodBayStore, PriorPlannedRecovery, Receipt,
+    OwnerActorRotationReceipt, PodBayStore, PriorPlannedRecovery, Receipt, StoredEffect,
     SqliteActorVerifierWitness, StoreError, SupersessionReceipt, SupersessionStage,
     TrustedBootstrapSendRequest, TrustedLaterCodexSendRequest,
     TrustedNativeWriterLeaseRequest, TrustedOwnerRotationProof, VerifiedPrincipal,
@@ -40,7 +40,7 @@ use podbay_wire::{
     CommandBody, CommandEnvelope, ContentBlock, EffectiveLaunchContract, EffectiveLaunchContractV2,
     FallbackPolicy, ImmutableLaunchDescriptor, ImmutableLaunchDescriptorV2, LaunchRole, SendPolicy,
     NativeEventCursor, LifetimeLimit, OPERATOR_PROCESS_PROFILE_REF, NativeResourceKind, NativeRole, NativeWorkKind, ResourceDriver,
-    SessionChoice, Target as WireTarget, WorkKind as WireWorkKind,
+    SessionChoice, StopScope, Target as WireTarget, WorkKind as WireWorkKind,
     WorkspaceAccess as WireWorkspaceAccess,
 };
 
@@ -7575,6 +7575,188 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             return Err(HostError::StaleGuard.into());
         }
         Ok(())
+    }
+
+    /// The trusted local manager may stop only its own current unlimited V2
+    /// root. The signed Run and Pod IDs, exact guards, owner process, launch
+    /// grant and credential grant must all agree before any stop intent exists.
+    pub fn review_current_inner_codex_stop<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &CommandEnvelope,
+        policy: &TrustedWireRootLaunchPolicy,
+    ) -> Result<ResolvedNativeCodexLaunch, HostError> {
+        self.ensure_current_owner_epoch()?;
+        request.encode_json().map_err(|_| HostError::InvalidInput)?;
+        let WireTarget::Run { run_id } = &request.target else {
+            return Err(HostError::InvalidInput);
+        };
+        let CommandBody::RunStop(body) = &request.body else {
+            return Err(HostError::InvalidInput);
+        };
+        if body.scope != StopScope::SelfOnly || request.deadline_at.is_some()
+            || policy.deadline <= Instant::now() {
+            return Err(HostError::Unauthorised);
+        }
+        let pod_id = PodId::try_from(body.pod_id.as_deref().ok_or(HostError::InvalidInput)?)
+            .map_err(|_| HostError::InvalidInput)?;
+        let run_id = RunId::try_from(run_id.as_str()).map_err(|_| HostError::InvalidInput)?;
+        let guard = request.guard.as_ref().ok_or(HostError::StaleGuard)?;
+        if guard.manager_epoch != Some(podbay_wire::DecimalString::new(self.owner_epoch().get()))
+            || guard.pod_epoch != Some(podbay_wire::DecimalString::new(1))
+            || guard.resource_epoch.is_none()
+            || guard.target_revision.is_some()
+            || guard.writer_epoch.is_some() || guard.lease_epoch.is_some() {
+            return Err(HostError::StaleGuard);
+        }
+        let actor = self.host.authenticate(transport)?;
+        if actor.origin != PeerOrigin::OwnerCli {
+            return Err(HostError::Unauthorised);
+        }
+        let actor_id = actor.actor_id.clone();
+        let scope = actor.scope_id.clone();
+        self.host.check_grant(actor, policy.grant_id, &scope,
+            &Right::new(Operation::LaunchPod, Target::Scope(scope.clone())))?;
+        self.host.check_target_guards(&scope, &HostAction::StopPod { pod_id: pod_id.clone() },
+            GuardSet { manager_epoch: self.owner_epoch(), pod_incarnation: PodIncarnation::new(1)?,
+                resource_epoch: None, credential_generation: actor.credential_generation })?;
+        let reviewed = self.inspect_committed_root_codex_v2(&scope, &pod_id)
+            .map_err(|_| HostError::StaleGuard)?;
+        let record = reviewed.committed_record();
+        let descriptor = reviewed.descriptor();
+        if descriptor.actor_id() != actor_id.as_str()
+            || record.run_id != run_id.as_str()
+            || descriptor.role() != NativeRole::Coordinator
+            || descriptor.work_kind() != NativeWorkKind::Service
+            || descriptor.lifetime() != LifetimeLimit::UntilStopped
+            || descriptor.parent_run_id().is_some()
+            || descriptor.resources_len() != 1
+            || guard.resource_epoch.map(|epoch| epoch.get()) != descriptor.resource(0).map(|resource| resource.epoch)
+            || reviewed.authority_revision() != self.recorded.revision {
+            return Err(HostError::StaleGuard);
+        }
+        let profile = self.launch_profiles.get(descriptor.profile_ref()).ok_or(HostError::StaleGuard)?;
+        if !profile.codex_until_stopped() || descriptor.credential_refs().len() != 1 {
+            return Err(HostError::Unauthorised);
+        }
+        let credential = CredentialRef::from_trusted_vault(scope.clone(), &descriptor.credential_refs()[0])?;
+        let actor = self.host.authenticate(transport)?;
+        self.host.check_grant(actor, policy.grant_id, &scope,
+            &Right::new(Operation::UseCredential, Target::Credential(credential)))?;
+        Ok(reviewed)
+    }
+
+    /// A prior claimed stop may have removed the Pod before manager recovery.
+    /// Retry authority is checked without attempting to rebind or relaunch it.
+    pub fn review_inner_codex_stop_retry<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        policy: &TrustedWireRootLaunchPolicy,
+        actor_id: &ActorId,
+        scope_id: &ScopeId,
+        credential: &CredentialRef,
+        profile_ref: &str,
+        profile_generation: u64,
+    ) -> Result<(), HostError> {
+        self.ensure_current_owner_epoch()?;
+        if policy.deadline <= Instant::now() || credential.scope_id() != scope_id {
+            return Err(HostError::Unauthorised);
+        }
+        let actor = self.host.authenticate(transport)?;
+        if actor.origin != PeerOrigin::OwnerCli
+            || &actor.actor_id != actor_id || &actor.scope_id != scope_id {
+            return Err(HostError::Unauthorised);
+        }
+        self.host.check_grant(actor, policy.grant_id, scope_id,
+            &Right::new(Operation::LaunchPod, Target::Scope(scope_id.clone())))?;
+        self.host.check_grant(actor, policy.grant_id, scope_id,
+            &Right::new(Operation::UseCredential, Target::Credential(credential.clone())))?;
+        let profile = self.launch_profiles.get(profile_ref).ok_or(HostError::StaleGuard)?;
+        if !profile.codex_until_stopped() || profile.generation() != profile_generation
+            || profile.workspace_scope() != scope_id {
+            return Err(HostError::StaleGuard);
+        }
+        Ok(())
+    }
+
+    pub fn lookup_inner_codex_stop<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &CommandEnvelope,
+        pod_id: &PodId,
+    ) -> Result<Option<(Receipt, StoredEffect, ActorId, ScopeId)>, HostError> {
+        self.ensure_current_owner_epoch()?;
+        request.encode_json().map_err(|_| HostError::InvalidInput)?;
+        let actor = self.host.authenticate(transport)?;
+        if actor.origin != PeerOrigin::OwnerCli {
+            return Err(HostError::Unauthorised);
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())
+            .map_err(|_| HostError::InvalidInput)?;
+        let mut canonical = b"podbay.inner-run-stop/1\0".to_vec();
+        canonical.extend_from_slice(request.payload_digest.as_bytes());
+        self.store.lookup_pod_stop(&principal, actor.scope_id.as_str(), pod_id.as_str(),
+            &request.key, &canonical)
+            .map(|found| found.map(|(receipt, effect)|
+                (receipt, effect, actor.actor_id.clone(), actor.scope_id.clone())))
+            .map_err(|_| HostError::StaleGuard)
+    }
+
+    pub fn admit_inner_codex_stop<T: AuthenticatedTransport>(
+        &mut self,
+        transport: &T,
+        request: &CommandEnvelope,
+        reviewed: &ResolvedNativeCodexLaunch,
+        intent: Vec<u8>,
+    ) -> Result<(Receipt, bool), HostError> {
+        let actor = self.host.authenticate(transport)?;
+        if actor.actor_id.as_str() != reviewed.descriptor().actor_id()
+            || actor.scope_id.as_str() != reviewed.descriptor().scope_id() {
+            return Err(HostError::Unauthorised);
+        }
+        let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())
+            .map_err(|_| HostError::InvalidInput)?;
+        let mut canonical = b"podbay.inner-run-stop/1\0".to_vec();
+        canonical.extend_from_slice(request.payload_digest.as_bytes());
+        let admission = self.store.admit(&CommandRequest {
+            principal, namespace: "podbay.inner.stop".into(), command_key: request.key.clone(),
+            scope_id: reviewed.descriptor().scope_id().into(),
+            target_id: reviewed.descriptor().pod_id().into(),
+            expected_owner_epoch: reviewed.owner_epoch(),
+            expected_target_epoch: reviewed.descriptor().pod_incarnation(),
+            canonical_request: canonical,
+            event_kind: "pod.stop.requested".into(),
+            event_payload: b"{\"kind\":\"pod_stop_requested\"}".to_vec(),
+            effect_kind: "pod.stop".into(), effect_payload: intent,
+        }).map_err(|_| HostError::StaleGuard)?;
+        let (receipt, duplicate) = match admission {
+            Admission::Committed(receipt) => (receipt, false),
+            Admission::Duplicate(receipt) => (receipt, true),
+        };
+        if !duplicate {
+            match self.store.claim_effect(receipt.outbox_id, reviewed.descriptor().scope_id(),
+                reviewed.descriptor().pod_id(), reviewed.owner_epoch(),
+                reviewed.descriptor().pod_incarnation(), reviewed.authority_revision(),
+                &receipt.command_id).map_err(|_| HostError::StaleGuard)? {
+                EffectClaim::NewClaim => {},
+                _ => return Err(HostError::StaleGuard),
+            }
+        }
+        Ok((receipt, duplicate))
+    }
+
+    pub fn observe_inner_codex_stop(
+        &mut self,
+        receipt: &Receipt,
+        scope: &ScopeId,
+        pod: &PodId,
+        incarnation: u64,
+        evidence: &[u8],
+    ) -> Result<i64, HostError> {
+        self.ensure_current_owner_epoch()?;
+        self.store.observe_pod_stop(receipt, scope.as_str(), pod.as_str(),
+            self.owner_epoch().get(), incarnation, evidence)
+            .map_err(|_| HostError::StaleGuard)
     }
 
     /// Commit the same typed operator root without entering the OS port.

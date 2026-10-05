@@ -798,7 +798,7 @@ impl PodBayStore {
                 request_digest: digest,
             }));
         }
-        if request.effect_kind != "pod.offer" {
+        if !matches!(request.effect_kind.as_str(), "pod.offer" | "pod.stop") {
             return Err(StoreError::UnsupportedEffectKind);
         }
         let actual_owner: i64 = transaction.query_row(
@@ -829,6 +829,18 @@ impl PodBayStore {
                 return Err(StoreError::Conflict(
                     "launch slot already admitted for pod incarnation",
                 ));
+            }
+        }
+        if request.effect_kind == "pod.stop" {
+            let prior: Option<i64> = transaction.query_row(
+                "SELECT c.command_rowid FROM commands c JOIN outbox o ON o.command_rowid=c.command_rowid
+                 WHERE c.scope_id=?1 AND c.target_id=?2 AND c.target_epoch=?3
+                   AND o.kind='pod.stop' LIMIT 1",
+                params![request.scope_id, request.target_id, target_epoch],
+                |row| row.get(0),
+            ).optional()?;
+            if prior.is_some() {
+                return Err(StoreError::Conflict("Pod already has a stop intent"));
             }
         }
         transaction.execute(
@@ -1157,6 +1169,9 @@ impl PodBayStore {
                 || (effect.observed_stage == Some(ObservedStage::LeaseRenewed)
                     && (kind != "native_writer_lease.renewed"
                         || provenance != "authenticated.manager.lease"))
+                || (effect.observed_stage == Some(ObservedStage::PodStopped)
+                    && (kind != "pod.stopped"
+                        || provenance != "authenticated.manager.stop"))
             {
                 return Err(StoreError::Conflict("observation event lineage differs"));
             }
@@ -1512,7 +1527,7 @@ impl PodBayStore {
         {
             return Err(StoreError::StaleEpoch);
         }
-        if row.5 != "pod.offer" {
+        if !matches!(row.5.as_str(), "pod.offer" | "pod.stop") {
             return Err(StoreError::UnsupportedEffectKind);
         }
         if sha256_hex(&row.6) != row.7 {
@@ -1572,6 +1587,117 @@ impl PodBayStore {
             Some(_) => Err(StoreError::Conflict("unknown outbox state")),
             None => Err(StoreError::NotFound),
         }
+    }
+
+    /// Same-key stop lookup survives manager owner-epoch changes. The caller
+    /// must independently authenticate and recheck the exact current Pod.
+    pub fn lookup_pod_stop(
+        &self,
+        principal: &VerifiedPrincipal,
+        scope_id: &str,
+        pod_id: &str,
+        key: &str,
+        canonical_request: &[u8],
+    ) -> Result<Option<(Receipt, StoredEffect)>, StoreError> {
+        valid_id(scope_id)?;
+        valid_id(pod_id)?;
+        valid_id(key)?;
+        let row: Option<(String, String, Vec<u8>, i64, i64, String, String)> = self.connection
+            .query_row(
+                "SELECT command_id,target_id,canonical_request,event_sequence,outbox_id,
+                        digest_version,request_digest FROM commands
+                 WHERE principal=?1 AND namespace='podbay.inner.stop'
+                   AND command_key=?2 AND scope_id=?3",
+                params![principal.as_str(), key, scope_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?)),
+            ).optional()?;
+        let Some((command_id, target, original, event_sequence, outbox_id, version, digest)) = row
+        else { return Ok(None) };
+        if target != pod_id || original != canonical_request || version != DIGEST_VERSION
+            || event_sequence <= 0 || outbox_id <= 0 {
+            return Err(StoreError::Conflict("stop key changed exact intent"));
+        }
+        let effect = self.load_effect(outbox_id, scope_id, pod_id)?;
+        if effect.kind != "pod.stop" || effect.command_id != command_id {
+            return Err(StoreError::Conflict("stop effect differs"));
+        }
+        Ok(Some((Receipt { command_id, event_sequence, outbox_id,
+            digest_version: DIGEST_VERSION, request_digest: digest }, effect)))
+    }
+
+    /// Record independently verified terminal unit/process evidence. This
+    /// does not call a Pod and cannot turn a still-live unit into success.
+    pub fn observe_pod_stop(
+        &mut self,
+        receipt: &Receipt,
+        scope_id: &str,
+        pod_id: &str,
+        current_owner_epoch: u64,
+        pod_incarnation: u64,
+        terminal_evidence: &[u8],
+    ) -> Result<i64, StoreError> {
+        if terminal_evidence.is_empty() || terminal_evidence.len() > 16_384 {
+            return Err(StoreError::InvalidInput("stop terminal evidence size"));
+        }
+        let owner = integer(current_owner_epoch)?;
+        let target = integer(pod_incarnation)?;
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if current_owner(&transaction)? != owner
+            || current_target(&transaction, scope_id, pod_id)? != target {
+            return Err(StoreError::StaleEpoch);
+        }
+        let row: (i64, String, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, String,
+            Option<String>, Vec<u8>, String) =
+            transaction.query_row(
+                "SELECT o.command_rowid,o.scope_id,o.target_id,o.state,o.observation_stage,
+                        o.observation_payload,o.observation_event_sequence,c.command_id,
+                        o.claim_key,o.payload,o.effect_digest
+                 FROM outbox o JOIN commands c ON c.command_rowid=o.command_rowid
+                 WHERE o.outbox_id=?1 AND o.kind='pod.stop'",
+                [receipt.outbox_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(8)?, row.get(9)?, row.get(10)?)),
+            ).optional()?.ok_or(StoreError::NotFound)?;
+        if row.1 != scope_id || row.2 != pod_id || row.7 != receipt.command_id {
+            return Err(StoreError::WrongScope);
+        }
+        if row.8.as_deref() != Some(receipt.command_id.as_str())
+            || sha256_hex(&row.9) != row.10 {
+            return Err(StoreError::Conflict("stop claim or payload changed"));
+        }
+        if row.3 == "observed" {
+            return if row.4.as_deref() == Some("pod_stopped")
+                && row.5.as_deref() == Some(terminal_evidence) {
+                row.6.ok_or(StoreError::Conflict("stop observation event missing"))
+            } else { Err(StoreError::Conflict("stop terminal evidence changed")) };
+        }
+        if row.3 != "claimed_uncertain" {
+            return Err(StoreError::Conflict("stop effect was not claimed"));
+        }
+        let source_id = format!("manager.stop.{}", receipt.command_id);
+        let event_id = format!("event.stop.{}", receipt.command_id);
+        let evidence_digest = sha256_hex(terminal_evidence);
+        transaction.execute(
+            "INSERT INTO events(event_id,schema_version,command_rowid,scope_id,target_id,
+             owner_epoch,target_epoch,source_id,source_kind,source_epoch,source_sequence,
+             source_digest,source_order,kind,payload,recorded_at,provenance)
+             VALUES(?1,1,?2,?3,?4,?5,?6,?7,'manager',1,1,?8,'contiguous',
+                    'pod.stopped',?9,strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    'authenticated.manager.stop')",
+            params![event_id, row.0, scope_id, pod_id, owner, target, source_id,
+                evidence_digest, terminal_evidence],
+        )?;
+        let sequence = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE outbox SET state='observed',observation_key=?1,
+             observation_payload=?2,observation_stage='pod_stopped',
+             observation_event_sequence=?3 WHERE outbox_id=?4 AND state='claimed_uncertain'",
+            params![receipt.command_id, terminal_evidence, sequence, receipt.outbox_id],
+        )?;
+        transaction.commit()?;
+        Ok(sequence)
     }
 
     /// Reads durable dispatch material only within the caller's chosen scope and target.
@@ -2013,7 +2139,8 @@ pub(crate) fn validate_request(request: &CommandRequest) -> Result<(), StoreErro
     ] {
         valid_id(value)?;
     }
-    if request.effect_kind == "pod.offer" && request.expected_target_epoch == 0 {
+    if matches!(request.effect_kind.as_str(), "pod.offer" | "pod.stop")
+        && request.expected_target_epoch == 0 {
         return Err(StoreError::InvalidInput(
             "launch pod incarnation must be positive",
         ));
@@ -2097,6 +2224,7 @@ fn stored_effect_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEff
     let observed_stage = match row.get::<_, Option<String>>(13)?.as_deref() {
         Some("host_accepted") => Some(ObservedStage::HostAccepted),
         Some("lease_renewed") => Some(ObservedStage::LeaseRenewed),
+        Some("pod_stopped") => Some(ObservedStage::PodStopped),
         Some("legacy_unverified") => Some(ObservedStage::LegacyUnverified),
         None => None,
         _ => return Err(rusqlite::Error::InvalidQuery),

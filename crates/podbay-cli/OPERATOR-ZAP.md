@@ -70,3 +70,15 @@ through a private trusted manager policy and matching signed launch, while its
 renewable writer lease remains bounded independently. Disposable fixtures prove outer A→B rebind, one nested
 fake Codex coordinator with native output and cursor acknowledgement, and an
 explicit terminal stop of the unlimited outer Service.
+
+The inner manager accepts a signed `run.stop` only for its own current local
+Codex V2 root Coordinator/Service with an `untilStopped` lifetime. The request
+uses the exact Run target, `scope: "self_only"`, the exact `podId`, and current
+manager, Pod, and Resource epoch guards. Manager owner and credential grants
+must still match the committed launch. PodBay commits one stop intent and
+claims its outbox effect before its one Pod stop call. A lost reply or manager
+restart is reconciled from the original key and observed unit, process birth,
+and socket identity; retries never send another stop. `commands.get` reports
+`observedStage: "pod_stopped"` only after terminal proof. A claimed stop whose
+unit remains live is uncertain and requires operator inspection; no automatic
+second stop or relaunch is attempted.

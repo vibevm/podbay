@@ -259,6 +259,7 @@ pub enum EffectState {
 pub enum ObservedStage {
     HostAccepted,
     LeaseRenewed,
+    PodStopped,
     /// Schema-two evidence did not identify an authenticated source or proof type.
     LegacyUnverified,
 }

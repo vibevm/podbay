@@ -151,6 +151,7 @@ mod linux {
         } else {
             None
         };
+        let stop_pod_directory = config.pod_dir.clone();
         let port_config = TrustedLinuxLaunchConfig::from_trusted_policy(
             config.pod_binary,
             config.pod_sha256,
@@ -405,6 +406,7 @@ mod linux {
                 &stop,
                 launch,
                 send,
+                Some(&stop_pod_directory),
                 &mut owner_check,
             )
         } else {
