@@ -26,6 +26,8 @@ use crate::codex_v2::{
     preflight_committed_codex_v2_cached_read_only,
 };
 
+const MAX_PRIVATE_JSONL_BYTES: usize = 262_144;
+
 pub struct TrustedNativeEventDirectory {
     path: PathBuf,
     identity: (u64, u64),
@@ -143,7 +145,7 @@ pub(crate) fn read_committed_codex_native_page(
             return Err(PodError::Refused("private native EventId differs"));
         }
         let raw = private.private_jsonl();
-        if raw.is_empty() || raw.len() > 65_536 || std::str::from_utf8(raw).is_err() {
+        if !valid_private_jsonl_bytes(raw) {
             return Err(PodError::Refused("private native JSONL is malformed"));
         }
         let content_digest: String = Sha256::digest(raw)
@@ -187,6 +189,25 @@ pub(crate) fn read_committed_codex_native_page(
             earliest_available: gap.earliest_available,
         }),
     })
+}
+
+fn valid_private_jsonl_bytes(raw: &[u8]) -> bool {
+    !raw.is_empty()
+        && raw.len() <= MAX_PRIVATE_JSONL_BYTES
+        && std::str::from_utf8(raw).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_jsonl_ingest_bound_is_inclusive() {
+        assert!(valid_private_jsonl_bytes(&vec![b'x'; MAX_PRIVATE_JSONL_BYTES]));
+        assert!(!valid_private_jsonl_bytes(&vec![b'x'; MAX_PRIVATE_JSONL_BYTES + 1]));
+        assert!(!valid_private_jsonl_bytes(&[]));
+        assert!(!valid_private_jsonl_bytes(&[0xff]));
+    }
 }
 
 fn kind_name(value: NativeEventKind) -> &'static str {

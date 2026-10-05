@@ -259,6 +259,12 @@ mod tests {
             .into_bytes()
     }
 
+    fn raw_of_len(len: usize) -> Vec<u8> {
+        let overhead = raw("").len();
+        assert!(len >= overhead);
+        raw(&"x".repeat(len - overhead))
+    }
+
     #[test]
     fn fresh_append_reopen_and_public_projection_keep_private_frame_separate() {
         let fixture = Fixture::new();
@@ -294,6 +300,73 @@ mod tests {
             .unwrap();
         assert_eq!(gap, None);
         assert_eq!(private[0].private_payload(), secret);
+    }
+
+    #[test]
+    fn large_bootstrap_notifications_replay_across_segments_without_gap() {
+        let fixture = Fixture::new();
+        let mut spool = fixture.open();
+        let private = raw_of_len(213_357);
+        for sequence in 1..=15 {
+            assert_eq!(spool.reserve_native_take().unwrap(), sequence);
+            spool
+                .append_applied(sequence, &private, NativeEventKind::Output, None, false)
+                .unwrap();
+        }
+        assert!(spool.checkpoint.segments.len() > 1);
+        drop(spool);
+
+        let reopened = fixture.open();
+        let mut after = 0;
+        let mut count = 0;
+        loop {
+            let (page, gap) = reopened
+                .files
+                .read_indexed_page(&reopened.checkpoint, after, 4)
+                .unwrap();
+            assert_eq!(gap, None);
+            if page.is_empty() {
+                break;
+            }
+            for frame in &page {
+                assert_eq!(frame.private_payload(), private);
+            }
+            count += page.len();
+            after = page.last().unwrap().source_sequence();
+        }
+        assert_eq!(count, 15);
+        assert_eq!(after, 15);
+    }
+
+    #[test]
+    fn private_jsonl_accepts_exact_limit_and_rejects_one_byte_more() {
+        let fixture = Fixture::new();
+        let mut spool = fixture.open();
+        let sequence = spool.reserve_native_take().unwrap();
+        spool
+            .append_applied(
+                sequence,
+                &raw_of_len(262_144),
+                NativeEventKind::Output,
+                None,
+                false,
+            )
+            .unwrap();
+        let sequence = spool.reserve_native_take().unwrap();
+        assert!(matches!(
+            spool.append_applied(
+                sequence,
+                &raw_of_len(262_145),
+                NativeEventKind::Output,
+                None,
+                false,
+            ),
+            Err(PodError::Invalid(_))
+        ));
+        spool.mark_continuity_unknown().unwrap();
+        let reopened = fixture.open();
+        assert!(reopened.checkpoint.redacted_snapshot.quarantined);
+        assert_eq!(reopened.checkpoint.watermark, 1);
     }
 
     #[test]
