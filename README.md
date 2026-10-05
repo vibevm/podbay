@@ -6,6 +6,8 @@ owner-deferred phases, dependencies, acceptance gates, and the boundary that
 lets Zap and VibeVM proceed without waiting for remote or cross-platform work.
 Read [BACKLOG.md](BACKLOG.md) for evidence-backed owner decisions surfaced by
 local dogfooding.
+The [local MVP receipt](LOCAL-MVP-RECEIPT.md) records the tested PodBay → Zap
+→ VibeVM cutover and its remaining operational limits.
 
 PodBay is an independent Rust project for supervising arbitrary processes and their resources. Its design includes a distributed supervisor: a local pod owns process and PTY lifetime, while a future multi-host control plane routes guarded commands and observations across computers within PodBay itself. Agent providers such as Codex are adapters on that process foundation. Zap consumes PodBay's public contract and does not own the supervised processes. Coordinator, worker, and advisor are roles in one session/run/attempt/pod model.
 
