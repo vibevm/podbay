@@ -39,7 +39,7 @@ use podbay_pod::{
     BootstrapControlStage, BootstrapSettlementStage, CODEX_V2_CAPABILITY, CODEX_V3_CAPABILITY,
     CodexCommandJournal,
     CodexJournalIdentity, CodexJournalStage, LinuxBackend, NativeEventCursor, NativeEventKind,
-    LaterTurnControlStage, PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
+    LaterTurnControlStage, LaterTurnTerminal, PodClient, PodError, codex_private_slot_directory, launch_bound_codex_v2,
     manifest_path_for_identity,
 };
 use podbay_store::{
@@ -3337,6 +3337,7 @@ read -r later_turn
 printf '%s\n' "$later_turn" >> "$CODEX_HOME/frames.log"
 __LATER_TURN_DELAY__
 __LATER_TURN_REPLY__
+__LATER_TURN_SETTLEMENT__
 sleep __WAIT_AFTER_TURN__
 "#;
     let response = if lost_reply { "" } else {
@@ -3344,8 +3345,18 @@ sleep __WAIT_AFTER_TURN__
     };
     let delay = if delay_seconds == 0 { String::new() }
         else { format!("sleep {delay_seconds}") };
+    let settlement = if fixture.directory.join("rebind.v22.settled-readback").is_file() {
+        r#"sleep 1
+printf '{"method":"turn/completed","params":{"threadId":"thread.fixture","turn":{"id":"turn.later.fixture","status":"completed","items":[]}}}\n'
+printf '{"method":"thread/status/changed","params":{"threadId":"thread.fixture","status":{"type":"idle"}}}\n'
+read -r later_settlement_read
+printf '%s\n' "$later_settlement_read" >> "$CODEX_HOME/frames.log"
+printf '{"id":8,"result":{"thread":{"id":"thread.fixture","sessionId":"native.session.fixture","cwd":"%s","status":{"type":"idle"},"turns":[]}}}\n' "$(pwd)"
+"#
+    } else { "" };
     let replacement = replacement.replace("__LATER_TURN_DELAY__", &delay)
         .replace("__LATER_TURN_REPLY__", response)
+        .replace("__LATER_TURN_SETTLEMENT__", settlement)
         .replace("__WAIT_AFTER_TURN__", if lost_reply { "40" } else { "30" });
     let updated = original.replacen("sleep 30\n", &replacement, 1);
     assert_ne!(updated, original);
@@ -3622,6 +3633,41 @@ fn rebind_v22_first_completed_manager_process_helper() {
         assert!(Instant::now() < deadline, "A bootstrap did not complete before rebind");
         std::thread::sleep(Duration::from_millis(25));
     }
+    if fixture.directory.join("rebind.v22.settled-readback").is_file() {
+        let later = CommandEnvelope::new(
+            "request.v22.rebind.original.later", "key.v22.rebind.original.later",
+            WireTarget::Session { session_id: session.as_str().into() },
+            Some(Guard {
+                manager_epoch: Some(DecimalString::new(lease.owner_epoch())),
+                pod_epoch: Some(DecimalString::new(target.pod_incarnation)),
+                resource_epoch: Some(DecimalString::new(target.resource_epoch)),
+                writer_epoch: Some(DecimalString::new(lease.writer_epoch())),
+                lease_epoch: None, target_revision: Some(DecimalString::new(revision)),
+            }), None,
+            CommandBody::SessionSend(SessionSendBody {
+                content: vec![ContentBlock::Text { text: "fixture original later turn".into() }],
+                policy: SendPolicy::WhenIdle,
+            }),
+        ).unwrap();
+        let receipt = host.send_codex_session_from_wire(&transport, later, &policy).unwrap();
+        let selector = LaterCodexSendSelector {
+            scope_id: fixture.scope.clone(),
+            command_id: CommandId::try_from(receipt.receipt.command_id.as_str()).unwrap(),
+            native_target: target.clone(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let observed = client.inspect_claimed_codex_turn(&selector, lease.writer_epoch(),
+                &receipt.receipt.request_digest, "thread.fixture").unwrap();
+            if matches!(observed.stage, LaterTurnControlStage::Settled {
+                terminal: LaterTurnTerminal::Completed, ..
+            }) { break; }
+            assert!(Instant::now() < deadline, "A later turn did not settle: {:?}", observed.stage);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        fs::write(fixture.directory.join("rebind.v22.original.later.id"),
+            &receipt.receipt.command_id).unwrap();
+    }
     fs::write(fixture.directory.join("rebind.v22.first.done"), first.receipt.command_id).unwrap();
     drop(host);
     std::mem::forget(fixture);
@@ -3699,6 +3745,49 @@ fn rebind_v22_second_later_manager_process_helper() {
     assert_eq!(completed_anchor.native_thread_id(), "thread.fixture");
     assert_eq!(completed_anchor.native_session_id(), "native.session.fixture");
     assert_eq!(completed_anchor.native_turn_id(), "turn.fixture");
+    if fixture.directory.join("rebind.v22.settled-readback").is_file() {
+        let original_id = fs::read_to_string(
+            fixture.directory.join("rebind.v22.original.later.id")).unwrap();
+        let original_selector = LaterCodexSendSelector {
+            scope_id: fixture.scope.clone(),
+            command_id: CommandId::try_from(original_id.as_str()).unwrap(),
+            native_target: target.clone(),
+        };
+        let original_proof = PodBayStore::open_existing_read_only(&fixture.database).unwrap()
+            .inspect_historical_claimed_later_codex_send(&original_selector).unwrap();
+        let diagnostic_client = PodClient::connect(&slot_manifest(&fixture).unwrap()).unwrap();
+        let observed = diagnostic_client.inspect_claimed_codex_turn(
+            &original_selector, original_proof.writer_epoch(),
+            &original_proof.receipt().request_digest, original_proof.native_thread_id(),
+        ).unwrap();
+        assert!(matches!(observed.stage, LaterTurnControlStage::Settled {
+            terminal: LaterTurnTerminal::Completed, ..
+        }));
+        for _ in 0..2 {
+            let (durable, native) = host.lookup_command_with_any_native_observation(
+                &transport, &fixture.scope,
+                &CommandLookupSelector::Id { command_id: original_id.clone() },
+            ).unwrap();
+            assert_eq!(durable.receipt.command_id, original_id);
+            assert!(matches!(native, Some(CommandNativeObservation::LaterTurn(value))
+                if matches!(value.stage(), LaterTurnNativeStage::Settled {
+                    terminal: podbay_host::LaterTurnNativeTerminal::Completed, ..
+                })), "B must read A's original settled journal command");
+        }
+        let manifest = slot_manifest(&fixture).unwrap();
+        let client = PodClient::connect(&manifest).unwrap();
+        let status = client.attested_status().unwrap();
+        assert_eq!(status.child_pid.to_string(), fs::read_to_string(
+            fixture.directory.join("rebind.v22.first.pid")).unwrap());
+        let frames = fs::read_to_string(
+            fixture_codex_slot(&fixture).join("home/codex/frames.log")).unwrap();
+        assert_eq!(frames.lines().filter(|line| line.contains("\"method\":\"turn/start\"")).count(), 2);
+        assert!(!client.stop().unwrap().child_running);
+        fs::write(fixture.directory.join("rebind.v22.second.done"), b"original_settled_readback").unwrap();
+        drop(host);
+        std::mem::forget(fixture);
+        return;
+    }
     let second = CommandEnvelope::new(
         "request.v22.rebind.second", "key.v22.rebind.second",
         WireTarget::Session { session_id: session.as_str().into() },
@@ -3770,6 +3859,22 @@ fn disposable_codex_v22_second_turn_after_a_to_b_rebind_uses_current_anchor() {
     assert!(fixture.directory.join("rebind.v22.first.done").is_file());
     run_rebind_manager_helper("rebind_v22_second_later_manager_process_helper", &fixture, &binary);
     assert!(fixture.directory.join("rebind.v22.second.done").is_file());
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY; fake app-server only"]
+fn disposable_codex_v22_settled_later_turn_readback_survives_a_to_b_rebind() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    fs::write(fixture.directory.join("rebind.v22.settled-readback"), b"1").unwrap();
+    install_fake_completed_then_second_turn(&fixture, false, 0);
+    run_rebind_manager_helper("rebind_v22_first_completed_manager_process_helper", &fixture, &binary);
+    let manifest = slot_manifest(&fixture).unwrap();
+    let _unit_guard = DisposableUnitGuard::for_manifest(&manifest);
+    assert!(fixture.directory.join("rebind.v22.original.later.id").is_file());
+    run_rebind_manager_helper("rebind_v22_second_later_manager_process_helper", &fixture, &binary);
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.v22.second.done")).unwrap(),
+        "original_settled_readback");
 }
 
 #[test]

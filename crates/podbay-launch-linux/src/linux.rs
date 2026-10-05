@@ -1759,15 +1759,12 @@ impl HostDispatchPort for LinuxLaunchPort {
             claimed.owner_epoch(), claimed.manager_credential_epoch(),
             claimed.authority_revision(), false,
         ).map_err(|_| HostError::StaleGuard)?;
-        let proof = context.store.inspect_claimed_later_codex_send(selector)
+        let proof = context.store.inspect_historical_claimed_later_codex_send(selector)
             .map_err(|_| HostError::StaleGuard)?;
         if proof.receipt().request_digest != claimed.expected_request_digest()
             || proof.native_thread_id() != claimed.native_thread_id()
             || proof.writer_epoch() != claimed.writer_epoch()
-            || context.lease.writer_epoch() != proof.writer_epoch()
             || context.lease.holder_actor_id() != proof.holder_actor_id()
-            || context.lease.holder_credential_generation() != proof.holder_credential_generation()
-            || context.lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
         { return Err(HostError::StaleGuard); }
         let response = context.client.inspect_claimed_codex_turn(
             selector, claimed.writer_epoch(), claimed.expected_request_digest(),
@@ -1795,8 +1792,10 @@ impl HostDispatchPort for LinuxLaunchPort {
                 .map_err(|_| HostError::StaleGuard)? != claimed.store_file_identity()
             || fs::symlink_metadata(&context.manifest_path).ok()
                 .map(|meta| (meta.dev(), meta.ino())) != Some(context.manifest_identity)
-            || context.store.inspect_claimed_later_codex_send(selector).ok().as_ref()
+            || context.store.inspect_historical_claimed_later_codex_send(selector).ok().as_ref()
                 != Some(&proof)
+            || context.store.inspect_native_writer_lease(target).ok().as_ref()
+                != Some(&context.lease)
         { return Err(HostError::StaleGuard); }
         let terminal = |value| match value {
             LaterTurnTerminal::Completed => LaterTurnNativeTerminal::Completed,

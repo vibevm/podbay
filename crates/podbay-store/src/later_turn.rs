@@ -300,6 +300,35 @@ fn binding_digest(
 }
 
 impl PodBayStore {
+    /// Historical claimed receipt for read-only native observation after a
+    /// manager/writer takeover. Callers must separately verify today's exact
+    /// Resource, manager, actor and live writer lease. Never use for send.
+    pub fn inspect_historical_claimed_later_codex_send(
+        &mut self,
+        selector: &LaterCodexSendSelector,
+    ) -> Result<LaterCodexSendRecord, StoreError> {
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: i64 = transaction.query_row(
+            "SELECT command_rowid FROM commands WHERE command_id=?1 AND scope_id=?2 AND namespace=?3",
+            params![selector.command_id.as_str(), selector.scope_id.as_str(), NAMESPACE],
+            |row| row.get(0),
+        ).optional()?.ok_or(StoreError::NotFound)?;
+        let record = read_later_record(&transaction, rowid)?;
+        if record.scope_id != selector.scope_id
+            || !same_resource_anchor(&record.native_target, &selector.native_target) {
+            return Err(StoreError::StaleEpoch);
+        }
+        if record.effect_state != EffectState::ClaimedUncertain
+            || record.claim_key.as_deref()
+                != Some(format!("claim.{}", record.receipt.command_id).as_str())
+            || record.claim_owner_epoch != Some(record.owner_epoch)
+        {
+            return Err(StoreError::Conflict("later turn has no claimed effect"));
+        }
+        transaction.commit()?;
+        Ok(record)
+    }
+
     /// Authenticated caller's exact claimed later-turn selector. This lookup
     /// reads durable history only; the host rechecks today's pod and lease.
     pub fn claimed_later_turn_selector_for_command(

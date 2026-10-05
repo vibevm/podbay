@@ -279,7 +279,7 @@ impl HostDispatchPort for FakePort {
         }
         let mut store = PodBayStore::open_existing_read_only(claimed.store_path())
             .map_err(|_| HostError::StaleGuard)?;
-        let proof = store.inspect_claimed_later_codex_send(claimed.selector())
+        let proof = store.inspect_historical_claimed_later_codex_send(claimed.selector())
             .map_err(|_| HostError::StaleGuard)?;
         if proof.receipt().request_digest != claimed.expected_request_digest()
             || proof.native_thread_id() != claimed.native_thread_id()
@@ -301,10 +301,18 @@ impl HostDispatchPort for FakePort {
                 native_session_id: "session.native.one".into(),
                 native_turn_id: "turn.native.two".into(),
             },
+            9 => LaterTurnNativeStage::Settled {
+                native_turn_id: "turn.native.two".into(),
+                terminal: LaterTurnNativeTerminal::Completed,
+            },
             _ => return Err(HostError::Unsupported),
         };
+        let mut selector = claimed.selector().clone();
+        if self.observe_stage.load(Ordering::SeqCst) == 9 {
+            selector.native_target.pod_incarnation += 1;
+        }
         LaterTurnNativeObservation::from_attested_pod(
-            "podbay.codex-turn.inspect/1", claimed.selector().clone(), claimed.writer_epoch(),
+            "podbay.codex-turn.inspect/1", selector, claimed.writer_epoch(),
             claimed.expected_request_digest().into(), stage,
         )
     }
@@ -1845,6 +1853,27 @@ fn claimed_later_turn_commands_get_is_read_only_and_keeps_uncertain_receipt() {
     assert_eq!(settled[0]["ok"]["state"], "uncertain");
     assert_eq!(settled[0]["ok"]["nativeObservation"]["stage"], "native_settled");
     assert_eq!(settled[0]["ok"]["nativeObservation"]["terminal"], "completed");
+    let mut store = PodBayStore::open(&fixture.database).unwrap();
+    let advanced = store.acquire_native_writer_lease_from_trusted_host(
+        &TrustedNativeWriterLeaseRequest {
+            target: target.clone(),
+            holder_actor_id: ActorId::try_from("actor.server.launch").unwrap(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: lease.owner_epoch(),
+            expected_manager_credential_epoch: lease.manager_credential_epoch(),
+            expected_authority_revision: authority.recorded_snapshot().revision,
+            expected_writer_epoch: Some(lease.writer_epoch()),
+            ttl_seconds: 120,
+        },
+    ).unwrap();
+    assert_eq!(advanced.writer_epoch(), lease.writer_epoch() + 1);
+    let after_takeover = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![read_by_key("request.later.after.takeover", "key.later.second").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert_eq!(after_takeover[0]["ok"]["nativeObservation"]["stage"], "native_settled");
+    assert_eq!(after_takeover[0]["ok"]["nativeObservation"]["terminal"], "completed");
     observe_stage.store(8, Ordering::SeqCst);
     let wrong_thread = serve_batch(
         &mut listener, &mut authority, &actor,
@@ -1852,6 +1881,13 @@ fn claimed_later_turn_commands_get_is_read_only_and_keeps_uncertain_receipt() {
         Some(&launch_template), Some(&send_template),
     );
     assert!(wrong_thread[0]["ok"].get("nativeObservation").is_none());
+    observe_stage.store(9, Ordering::SeqCst);
+    let wrong_pod = serve_batch(
+        &mut listener, &mut authority, &actor,
+        vec![read_by_key("request.later.wrong.pod", "key.later.second").encode_json().unwrap()],
+        Some(&launch_template), Some(&send_template),
+    );
+    assert!(wrong_pod[0]["ok"].get("nativeObservation").is_none());
     let retry = serve_batch(
         &mut listener, &mut authority, &actor,
         vec![send("request.later.retry", "key.later.second", "second turn")

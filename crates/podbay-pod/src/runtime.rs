@@ -3495,18 +3495,23 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                     }
                     let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
                         .map_err(|_| PodError::Refused("later-turn store unavailable"))?;
-                    let proof = store.inspect_claimed_later_codex_send(&selector)
-                        .map_err(|_| PodError::Refused("later-turn claimed proof is stale"))?;
+                    let proof = if inspection {
+                        store.inspect_historical_claimed_later_codex_send(&selector)
+                    } else {
+                        store.inspect_claimed_later_codex_send(&selector)
+                    }.map_err(|_| PodError::Refused("later-turn claimed proof is stale"))?;
                     let lease = store.inspect_native_writer_lease(&selector.native_target)
                         .map_err(|_| PodError::Refused("later-turn writer lease is stale"))?;
                     if proof.writer_epoch() != expected_writer_epoch
-                        || proof.owner_epoch() != binding.owner_epoch
-                        || proof.manager_credential_epoch() != binding.credential_epoch
-                        || !bootstrap_revision_matches(binding, proof.authority_revision())
-                        || lease.writer_epoch() != proof.writer_epoch()
+                        || (!inspection && (proof.owner_epoch() != binding.owner_epoch
+                            || proof.manager_credential_epoch() != binding.credential_epoch
+                            || !bootstrap_revision_matches(binding, proof.authority_revision())
+                            || lease.writer_epoch() != proof.writer_epoch()
+                            || lease.holder_credential_generation() != proof.holder_credential_generation()
+                            || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()))
+                        || lease.owner_epoch() != binding.owner_epoch
+                        || lease.manager_credential_epoch() != binding.credential_epoch
                         || lease.holder_actor_id() != proof.holder_actor_id()
-                        || lease.holder_credential_generation() != proof.holder_credential_generation()
-                        || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
                     { return Err(PodError::Refused("later-turn writer proof differs")); }
                     Ok((selector, proof, live_binding))
                 })();
@@ -3524,13 +3529,19 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                             current_codex_binding(binding, descriptor)?;
                             let mut store = PodBayStore::open_existing_read_only(&binding.store_path)
                                 .map_err(|_| PodError::Refused("later-turn store unavailable"))?;
-                            let current = store.inspect_claimed_later_codex_send(&selector)
-                                .map_err(|_| PodError::Refused("later-turn claim changed"))?;
+                            let current = if inspection {
+                                store.inspect_historical_claimed_later_codex_send(&selector)
+                            } else {
+                                store.inspect_claimed_later_codex_send(&selector)
+                            }.map_err(|_| PodError::Refused("later-turn claim changed"))?;
                             let lease = store.inspect_native_writer_lease(&selector.native_target)
                                 .map_err(|_| PodError::Refused("later-turn lease changed"))?;
                             if current != proof
-                                || lease.writer_epoch() != proof.writer_epoch()
-                                || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()
+                                || (!inspection && (lease.writer_epoch() != proof.writer_epoch()
+                                    || lease.expires_at_unix_seconds() != proof.lease_expires_at_unix_seconds()))
+                                || lease.owner_epoch() != binding.owner_epoch
+                                || lease.manager_credential_epoch() != binding.credential_epoch
+                                || lease.holder_actor_id() != proof.holder_actor_id()
                             { return Err(PodError::Refused("later-turn proof changed")); }
                             Ok(())
                         };

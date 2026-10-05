@@ -6622,13 +6622,23 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     actor.actor_id.as_str(),
                 ).ok()?;
                 let command_id = CommandId::try_from(inspected.receipt.command_id.as_str()).ok()?;
-                let (claimed_selector, writer_epoch) = self.store
+                let (mut claimed_selector, writer_epoch) = self.store
                     .claimed_later_turn_selector_for_command(&principal, scope, &command_id)
                     .ok()??;
-                let claimed = self.store.inspect_claimed_later_codex_send(&claimed_selector).ok()?;
+                let (current_target, _) = self.store.current_native_writer_target_for_session(
+                    scope, &claimed_selector.native_target.session_id,
+                ).ok()?;
+                let old_input_epoch = claimed_selector.native_target.resource_input_epoch;
+                claimed_selector.native_target.resource_input_epoch = current_target.resource_input_epoch;
+                if old_input_epoch > current_target.resource_input_epoch
+                    || claimed_selector.native_target != current_target
+                { return None; }
+                let claimed = self.store.inspect_historical_claimed_later_codex_send(&claimed_selector).ok()?;
+                let current_lease = self.store.inspect_native_writer_lease(&claimed_selector.native_target).ok()?;
                 if claimed.receipt() != &inspected.receipt
                     || claimed.holder_actor_id() != &actor.actor_id
-                    || claimed.holder_credential_generation() != actor.credential_generation.get()
+                    || current_lease.holder_actor_id() != &actor.actor_id
+                    || current_lease.holder_credential_generation() != actor.credential_generation.get()
                     || claimed.writer_epoch() != writer_epoch
                 { return None; }
                 self.recheck_actor_resolution_manager().ok()?;
@@ -6636,9 +6646,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     selector: claimed_selector.clone(), writer_epoch,
                     expected_request_digest: claimed.receipt().request_digest.clone(),
                     native_thread_id: claimed.native_thread_id().into(),
-                    owner_epoch: claimed.owner_epoch(),
-                    manager_credential_epoch: claimed.manager_credential_epoch(),
-                    authority_revision: claimed.authority_revision(),
+                    owner_epoch: current_lease.owner_epoch(),
+                    manager_credential_epoch: current_lease.manager_credential_epoch(),
+                    authority_revision: current_lease.authority_revision(),
                     store_path: self.canonical_database.clone(),
                     store_file_identity: self.database_identity,
                 };
@@ -6653,8 +6663,10 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 if fresh_actor.actor_id != actor.actor_id
                     || fresh_actor.scope_id != actor.scope_id
                     || fresh_actor.credential_generation != actor.credential_generation
-                    || self.store.inspect_claimed_later_codex_send(&claimed_selector).ok().as_ref()
+                    || self.store.inspect_historical_claimed_later_codex_send(&claimed_selector).ok().as_ref()
                         != Some(&claimed)
+                    || self.store.inspect_native_writer_lease(&claimed_selector.native_target).ok().as_ref()
+                        != Some(&current_lease)
                 { return None; }
                 self.recheck_actor_resolution_manager().ok()?;
                 Some(observed)
