@@ -82,6 +82,16 @@ and both Pod/Codex PIDs disappeared. This OS observation is **not** a signed
 PodBay stop receipt. The Lens session remains historically uncertain pending
 reconciliation after reboot.
 
+After reboot, manager startup recovered owner epochs 10 and 12 but refused
+readiness while preparing the same current V2 Pod for live rebind:
+`pod I/O failed: Connection refused (os error 111)` became
+`Host(StaleGuard)`. The exact unit was still inactive with `MainPID=0`.
+`current_codex_v2_rebind_page` still lists the Pod because no `pod.stop`
+outbox row exists. Repeating owner recovery changed epochs but did not settle
+the Pod. A new manager generation cannot infer a signed stop from this state;
+the old store must remain inspectable until an exact durable external-death
+reconciliation is implemented.
+
 **Priority investigation:** retain the underlying authenticated exchange
 error and timing in the typed guard-read result; determine whether manager
 load, socket backlog, peer authentication or the native checkpoint loop caused
@@ -90,3 +100,32 @@ reconcile a proved inactive unit without forging a successful PodBay stop or
 reissuing a possible native input. Test a live high-event Pod, manager restart,
 timeout before effect and terminal-only external stop. Do not automate an
 unchecked `systemctl stop` or weaken the current Pod/Run/epoch fence.
+
+## P1-006 — Operator Zap boot has no terminal-to-fresh-generation path
+
+After the signed terminal stop of outer Service `outer-v35` on 2026-10-06,
+`podbay operator zap launch --policy .../outer-v35/operator-zap-policy.json`
+returned exit 2, `existing Zap Pod rebind preparation failed:
+Host(StaleGuard)`. The stopped policy's original command key still resolves to
+`HostAccepted`/`PortSettled`, so `launch` enters the live-Pod rebind branch;
+that branch correctly refuses a stopped Pod. The operator had to copy the
+policy into a fresh `outer-v36` directory and manually mint eight `v36`
+identities. This is a boot orchestration gap, not evidence that the old Pod
+should be rebound or its command replayed.
+
+The fresh `outer-v36` launch then returned exit 0 and a `childPid`, although
+the child exited immediately because another Wayfinder owned the same state
+database. The PodBay supervisor remained active with a defunct child. Exit 0
+here proves host acceptance, not Zap readiness. The exact failed supervisor
+was stopped after identifying its unit and confirming the child had exited.
+
+**Required boot path:** provide an idempotent owner-level restart operation
+that reads the prior exact terminal receipt, allocates a fresh state directory
+and disjoint actor/scope/Pod/Run/attempt/resource/command identities, retains
+the same pinned artifact and verified configuration, then launches once. It
+must wait for authenticated child readiness or return a typed child-exit /
+configuration-conflict result with the exact accepted launch identity. On
+unknown prior effect or live child, stop before allocating a new generation.
+Test terminal restart, repeated request, crash between allocation and launch,
+foreign live owner, immediate child exit and old-command replay. Do not make
+the low-level same-key `launch` silently create a second Pod.
