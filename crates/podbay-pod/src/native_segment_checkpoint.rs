@@ -27,8 +27,10 @@ const MAX_SEGMENTS: usize = 4;
 const MAX_SEGMENT_BYTES: u64 = 1_048_576;
 const MAX_FRAME_PAYLOAD: usize = 65_536;
 pub(crate) const MAX_SEGMENT_FRAME_BYTES: u64 = (MAX_FRAME_PAYLOAD + 4 + 32) as u64;
-const MAX_OFFSETS: usize = 64;
-const MAX_CHECKPOINT_BYTES: usize = 65_536;
+// Codex's first bootstrap may burst well past one 64-event read page before
+// Zap can acknowledge it. Retain several pages in the durable index.
+const MAX_OFFSETS: usize = 512;
+const MAX_CHECKPOINT_BYTES: usize = 524_288;
 const FRAME_HEADER: usize = 4 + 32;
 const CHECKPOINT_HEADER: usize = 4 + 32;
 
@@ -1484,6 +1486,32 @@ mod tests {
         let (next, no_gap) = fixture.files.read_indexed_page(&checkpoint, 11, 4).unwrap();
         assert_eq!(no_gap, None);
         assert_eq!(next[0].source_sequence(), 12);
+    }
+
+    #[test]
+    fn long_bootstrap_replays_all_indexed_pages_without_gap() {
+        let mut fixture = Fixture::new();
+        for _ in 0..160 {
+            fixture.append(b"private bootstrap notification");
+        }
+        let checkpoint = fixture.files.read_checkpoint(&identity()).unwrap();
+        assert_eq!(checkpoint.redacted_snapshot.earliest_retained, 1);
+        let mut after = 0;
+        let mut count = 0;
+        loop {
+            let (page, gap) = fixture
+                .files
+                .read_indexed_page(&checkpoint, after, 64)
+                .unwrap();
+            assert_eq!(gap, None);
+            if page.is_empty() {
+                break;
+            }
+            count += page.len();
+            after = page.last().unwrap().source_sequence();
+        }
+        assert_eq!(count, 160);
+        assert_eq!(after, 160);
     }
 
     #[test]
