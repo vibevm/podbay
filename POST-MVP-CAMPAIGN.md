@@ -117,6 +117,17 @@ disjoint writers after their dependencies are proved.
 5. Decide which local CLI operations use the common command ledger, then
    expose read-only process inspection before mutating conveniences. Preserve
    stable IDs and receipt lookup across manager death.
+6. Separate provider protocol semantics from the reusable supervisor. The
+   current MVP has Codex-specific later-turn control and journals inside
+   `podbay-pod` and Codex-specific tables in `podbay-store`, as well as the
+   dedicated `podbay-adapter-codex` crate. Keep their exact intent, receipt,
+   idle-proof and single-input guarantees, but move provider-specific state
+   and transitions behind a driver-owned interface. The generic PodBay API
+   must be able to launch, inspect and stop an arbitrary process without a
+   concept of an agent turn. A Codex driver may report a native `failed` turn;
+   retry policy, including whether a model-capacity failure merits a new
+   continuation, belongs to its client such as Zap. Prove both a plain
+   process with no driver and a Codex process through the same Run/Pod API.
 
 **Gate:** one local manager restart with a live process; same Pod/Resource
 birth, same CommandId under lost reply, no second OS effect; snapshot and
