@@ -2199,6 +2199,105 @@ fn later_request<'a>(
 }
 
 #[test]
+fn later_turn_crosses_two_activated_manager_rebinds_only_with_contiguous_proof() {
+    let fixture = Fixture::new();
+    let (mut store, mut target, _, _, bootstrap_id) = later_ready(&fixture, false);
+    let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+    connection.execute_batch(
+        "INSERT INTO manager_peer_bindings
+           (store_lineage,owner_epoch,credential_epoch,peer_schema,os_identity,
+            process_identity,boot_identity,birth_identity,containment_identity)
+         SELECT lineage,epoch,epoch,'podbay.attested-peer/1','linux.uid.1000',
+                'pid.fixture','boot.fixture','birth.fixture','unit.fixture'
+           FROM store_identity CROSS JOIN (SELECT 2 AS epoch UNION ALL SELECT 3);
+         INSERT INTO manager_rebinds
+           (store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,
+            expected_owner_epoch,next_owner_epoch,expected_credential_epoch,
+            next_credential_epoch,manager_os_identity,manager_process_id,
+            manager_boot_identity,manager_birth_identity,manager_containment,
+            command_key,request_digest,resource_count,phase,pod_checkpoint_ref)
+         SELECT lineage,'scope.launch','pod.launch','attempt.codex.fixture',1,
+                epoch-1,epoch,epoch-1,epoch,'linux.uid.1000','pid.fixture',
+                'boot.fixture','birth.fixture','unit.fixture',
+                'rebind.fixture.'||epoch,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                1,'activated',
+                'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+           FROM store_identity CROSS JOIN (SELECT 2 AS epoch UNION ALL SELECT 3);
+         INSERT INTO manager_rebind_resources
+           (rebind_rowid,resource_id,expected_input_epoch,next_input_epoch)
+         SELECT rebind_rowid,'resource.codex.fixture',expected_owner_epoch,next_owner_epoch
+           FROM manager_rebinds;
+         INSERT INTO manager_rebind_prior_observations
+           (rebind_rowid,schema_version,checkpoint_digest,supervisor_pid,
+            supervisor_start_ticks,boot_id,unit_name,cgroup_path)
+         SELECT rebind_rowid,'podbay.prior-checkpoint/1',
+                'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                123,456,'boot.fixture','unit.fixture','/unit.fixture'
+           FROM manager_rebinds;
+         UPDATE metadata SET value=3 WHERE key='owner_epoch';
+         UPDATE manager_credential_claims SET owner_epoch=3,credential_epoch=3;
+         UPDATE authority_actors SET credential_generation=3
+           WHERE actor_id='actor.codex.fixture';
+         UPDATE authority_resources SET input_epoch=3
+           WHERE resource_id='resource.codex.fixture';
+         UPDATE native_writer_leases SET resource_input_epoch=3,
+           holder_credential_generation=3,owner_epoch=3,manager_credential_epoch=3,
+           writer_epoch=3 WHERE resource_id='resource.codex.fixture';"
+    ).unwrap();
+    target.resource_input_epoch = 3;
+    let (_, revision) = store.current_native_writer_target_for_session(
+        &target.scope_id, &target.session_id,
+    ).unwrap();
+    let envelope = CommandEnvelope::new(
+        "request.v22.turn.after.rebind", "key.v22.turn.after.rebind",
+        Target::Session { session_id: target.session_id.as_str().into() },
+        Some(Guard {
+            manager_epoch: Some(decimal(3)), pod_epoch: Some(decimal(1)),
+            resource_epoch: Some(decimal(1)), writer_epoch: Some(decimal(3)),
+            lease_epoch: None, target_revision: Some(decimal(revision)),
+        }),
+        None,
+        CommandBody::SessionSend(SessionSendBody {
+            content: vec![ContentBlock::Text { text: "After two rebinds".into() }],
+            policy: SendPolicy::WhenIdle,
+        }),
+    ).unwrap();
+    let request = TrustedLaterCodexSendRequest {
+        principal: VerifiedPrincipal::from_authenticated_boundary("actor.codex.fixture").unwrap(),
+        scope_id: target.scope_id.clone(), envelope: &envelope,
+        native_target: target.clone(), bootstrap_command_id: bootstrap_id,
+        native_thread_id: "0199a0c8-ced1-7df2-8d90-000000000001",
+        holder_actor_id: ActorId::try_from("actor.codex.fixture").unwrap(),
+        holder_credential_generation: 3, expected_owner_epoch: 3,
+        expected_manager_credential_epoch: 3,
+        expected_authority_revision: store.authority_snapshot().unwrap().revision,
+    };
+    connection.execute(
+        "UPDATE manager_rebind_resources SET expected_input_epoch=1
+         WHERE rebind_rowid=(SELECT rebind_rowid FROM manager_rebinds WHERE next_owner_epoch=3)",
+        [],
+    ).unwrap();
+    let broken = store.admit_later_codex_send(&request);
+    assert!(matches!(broken,
+        Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"))), "{broken:?}");
+    connection.execute(
+        "UPDATE manager_rebind_resources SET expected_input_epoch=2
+         WHERE rebind_rowid=(SELECT rebind_rowid FROM manager_rebinds WHERE next_owner_epoch=3)",
+        [],
+    ).unwrap();
+    let receipt = match store.admit_later_codex_send(&request).unwrap() {
+        Admission::Committed(receipt) => receipt,
+        other => panic!("expected one later turn admission: {other:?}"),
+    };
+    assert_eq!(store.admit_later_codex_send(&request).unwrap(), Admission::Duplicate(receipt));
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM codex_later_turns", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
 fn v22_later_turn_admits_exact_intent_and_reopens_without_provider_effect() {
     let fixture = Fixture::new();
     let (mut store, target, manager_credential, writer_epoch, bootstrap_id) =

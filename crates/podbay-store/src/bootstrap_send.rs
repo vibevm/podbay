@@ -391,42 +391,40 @@ pub(crate) fn check_host_accepted_launch(
     if claim_owner == Some(integer(owner_epoch)?) {
         return Ok(());
     }
-    // The original launch claim belongs to the old manager. It stays valid
-    // only through an exact proof-bearing Activated rebind for this same
-    // Pod/Attempt and the current manager/Resource vector. Pending, merely
-    // acknowledged, legacy, foreign and stale rows never bridge the claim.
+    // The original launch claim belongs to the old manager. Each activated
+    // rebind must bridge the preceding owner, credential and Resource input
+    // epochs. A recovered Pod can cross more than one manager incarnation;
+    // no single rebind then spans the original claim and current lease.
     let prior_owner = claim_owner
         .filter(|value| *value > 0)
         .ok_or(StoreError::Conflict("Codex V2 launch is not HostAccepted"))?;
     let activated: Option<i64> = transaction
         .query_row(
-            "SELECT r.rebind_rowid
-                 FROM manager_rebinds AS r
+            "WITH RECURSIVE activated_chain(owner_epoch,input_epoch,credential_epoch) AS (
+               SELECT ?6,1,0
+               UNION ALL
+               SELECT r.next_owner_epoch,rr.next_input_epoch,r.next_credential_epoch
+                 FROM activated_chain AS chain
+                 JOIN manager_rebinds AS r
+                   ON r.expected_owner_epoch=chain.owner_epoch
                  JOIN manager_rebind_prior_observations AS prior
                    ON prior.rebind_rowid=r.rebind_rowid
                  JOIN manager_rebind_resources AS rr
                    ON rr.rebind_rowid=r.rebind_rowid
-                 JOIN authority_resources AS resource
-                   ON resource.resource_id=rr.resource_id
-                 JOIN manager_credential_claims AS claim ON claim.singleton=1
+                    AND rr.expected_input_epoch=chain.input_epoch
                  JOIN manager_peer_bindings AS peer
                    ON peer.store_lineage=r.store_lineage
                     AND peer.owner_epoch=r.next_owner_epoch
                     AND peer.credential_epoch=r.next_credential_epoch
                  WHERE r.store_lineage=?1 AND r.scope_id=?2 AND r.pod_id=?3
                    AND r.attempt_id=?4 AND r.pod_incarnation=?5
-                   AND r.expected_owner_epoch=?6 AND r.next_owner_epoch=?7
-                   AND r.next_credential_epoch=?8 AND r.phase='activated'
+                   AND (chain.credential_epoch=0
+                        OR r.expected_credential_epoch=chain.credential_epoch)
+                   AND r.phase='activated'
                    AND r.resource_count=1
                    AND length(r.pod_checkpoint_ref)=64
                    AND prior.schema_version='podbay.prior-checkpoint/1'
-                   AND rr.resource_id=?9 AND rr.next_input_epoch=?10
-                   AND resource.scope_id=r.scope_id AND resource.pod_id=r.pod_id
-                   AND resource.pod_incarnation=r.pod_incarnation
-                   AND resource.resource_epoch=?11 AND resource.input_epoch=?10
-                   AND claim.store_lineage=r.store_lineage
-                   AND claim.owner_epoch=r.next_owner_epoch
-                   AND claim.credential_epoch=r.next_credential_epoch
+                   AND rr.resource_id=?9
                    AND peer.peer_schema='podbay.attested-peer/1'
                    AND peer.os_identity=r.manager_os_identity
                    AND peer.process_identity=r.manager_process_id
@@ -435,7 +433,18 @@ pub(crate) fn check_host_accepted_launch(
                    AND peer.containment_identity=r.manager_containment
                    AND (SELECT COUNT(*) FROM manager_rebind_resources
                         WHERE rebind_rowid=r.rebind_rowid)=1
-                 LIMIT 1",
+             )
+             SELECT chain.owner_epoch FROM activated_chain AS chain
+               JOIN authority_resources AS resource ON resource.resource_id=?9
+               JOIN manager_credential_claims AS claim ON claim.singleton=1
+              WHERE chain.owner_epoch=?7 AND chain.input_epoch=?10
+                AND chain.credential_epoch=?8
+                AND resource.scope_id=?2 AND resource.pod_id=?3
+                AND resource.pod_incarnation=?5
+                AND resource.resource_epoch=?11 AND resource.input_epoch=?10
+                AND claim.store_lineage=?1 AND claim.owner_epoch=?7
+                AND claim.credential_epoch=?8
+              LIMIT 1",
             params![
                 target.store_lineage.as_str(),
                 target.scope_id.as_str(),
