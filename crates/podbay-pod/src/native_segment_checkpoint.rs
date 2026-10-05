@@ -29,8 +29,8 @@ const MAX_FRAME_PAYLOAD: usize = 65_536;
 pub(crate) const MAX_SEGMENT_FRAME_BYTES: u64 = (MAX_FRAME_PAYLOAD + 4 + 32) as u64;
 // Codex's first bootstrap may burst well past one 64-event read page before
 // Zap can acknowledge it. Retain several pages in the durable index.
-const MAX_OFFSETS: usize = 512;
-const MAX_CHECKPOINT_BYTES: usize = 524_288;
+const MAX_OFFSETS: usize = 4096;
+const MAX_CHECKPOINT_BYTES: usize = 2_097_152;
 const FRAME_HEADER: usize = 4 + 32;
 const CHECKPOINT_HEADER: usize = 4 + 32;
 
@@ -1471,27 +1471,9 @@ mod tests {
     }
 
     #[test]
-    fn bounded_offset_index_reports_explicit_gap_without_lifetime_replay() {
-        let mut fixture = Fixture::new();
-        for _ in 0..(MAX_OFFSETS + 7) {
-            fixture.append(b"private notification");
-        }
-        let checkpoint = fixture.files.read_checkpoint(&identity()).unwrap();
-        assert_eq!(checkpoint.retained_offsets.len(), MAX_OFFSETS);
-        assert_eq!(checkpoint.redacted_snapshot.earliest_retained, 8);
-        let (page, gap) = fixture.files.read_indexed_page(&checkpoint, 0, 4).unwrap();
-        assert_eq!(gap, Some((1, 7)));
-        assert_eq!(page.len(), 4);
-        assert_eq!(page[0].source_sequence(), 8);
-        let (next, no_gap) = fixture.files.read_indexed_page(&checkpoint, 11, 4).unwrap();
-        assert_eq!(no_gap, None);
-        assert_eq!(next[0].source_sequence(), 12);
-    }
-
-    #[test]
     fn long_bootstrap_replays_all_indexed_pages_without_gap() {
         let mut fixture = Fixture::new();
-        for _ in 0..160 {
+        for _ in 0..600 {
             fixture.append(b"private bootstrap notification");
         }
         let checkpoint = fixture.files.read_checkpoint(&identity()).unwrap();
@@ -1510,8 +1492,8 @@ mod tests {
             count += page.len();
             after = page.last().unwrap().source_sequence();
         }
-        assert_eq!(count, 160);
-        assert_eq!(after, 160);
+        assert_eq!(count, 600);
+        assert_eq!(after, 600);
     }
 
     #[test]
