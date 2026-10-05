@@ -912,6 +912,21 @@ impl LinuxNativeSegmentDirectory {
         Ok(checkpoint)
     }
 
+    /// Manager reads may overlap the pod's next reservation/append. The
+    /// durable checkpoint remains the authority: verify every byte it names,
+    /// but ignore an in-progress temporary replacement and a pending frame
+    /// beyond the committed active segment length.
+    pub fn read_checkpoint_live(
+        &self,
+        expected: &NativeEventIdentity,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
+        self.recheck()?;
+        let checkpoint = self.read_checkpoint_payload(expected)?;
+        self.verify_retained_segments_live(&checkpoint)?;
+        self.verify_segment_inventory(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
     /// A retained reader first performs the bounded full attach above. Later
     /// checkpoints verify only newly appended frames and metadata for the
     /// unchanged prefix. Falling behind all retained segments performs one
@@ -920,9 +935,26 @@ impl LinuxNativeSegmentDirectory {
         &self,
         previous: &NativeSegmentCheckpoint,
     ) -> Result<NativeSegmentCheckpoint, PodError> {
+        self.read_checkpoint_incremental_inner(previous, false)
+    }
+
+    pub fn read_checkpoint_incremental_live(
+        &self,
+        previous: &NativeSegmentCheckpoint,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
+        self.read_checkpoint_incremental_inner(previous, true)
+    }
+
+    fn read_checkpoint_incremental_inner(
+        &self,
+        previous: &NativeSegmentCheckpoint,
+        live: bool,
+    ) -> Result<NativeSegmentCheckpoint, PodError> {
         self.recheck()?;
         previous.validate()?;
-        if fs::symlink_metadata(self.checkpoint_path().with_extension("checkpoint-new")).is_ok() {
+        if !live
+            && fs::symlink_metadata(self.checkpoint_path().with_extension("checkpoint-new")).is_ok()
+        {
             return Err(PodError::Uncertain(
                 "native checkpoint temporary file remains",
             ));
@@ -930,7 +962,9 @@ impl LinuxNativeSegmentDirectory {
         let current = self.read_checkpoint_payload(&previous.identity)?;
         if current == *previous {
             for segment in &current.segments {
-                self.checked_segment_length(segment)?;
+                let pending_tail = live && current.pending_source_sequence.is_some()
+                    && segment.id == current.active().id;
+                self.checked_segment_length(segment, pending_tail)?;
             }
             self.verify_segment_inventory(&current)?;
             return Ok(current);
@@ -946,7 +980,11 @@ impl LinuxNativeSegmentDirectory {
             .iter()
             .any(|segment| previous.segments.iter().any(|old| old.id == segment.id));
         if !overlap {
-            self.verify_retained_segments(&current)?;
+            if live {
+                self.verify_retained_segments_live(&current)?;
+            } else {
+                self.verify_retained_segments(&current)?;
+            }
         } else {
             for segment in &current.segments {
                 let old = previous.segments.iter().find(|old| old.id == segment.id);
@@ -961,7 +999,9 @@ impl LinuxNativeSegmentDirectory {
                         ));
                     }
                 }
-                self.verify_segment_suffix(segment, old)?;
+                let pending_tail = live && current.pending_source_sequence.is_some()
+                    && segment.id == current.active().id;
+                self.verify_segment_suffix(segment, old, pending_tail)?;
             }
         }
         self.verify_segment_inventory(&current)?;
@@ -969,10 +1009,17 @@ impl LinuxNativeSegmentDirectory {
         Ok(current)
     }
 
-    fn checked_segment_length(&self, segment: &NativeSegmentMeta) -> Result<(), PodError> {
+    fn checked_segment_length(
+        &self,
+        segment: &NativeSegmentMeta,
+        pending_tail: bool,
+    ) -> Result<(), PodError> {
         let path = self.segment_path(segment.id)?;
         let file = self.open_checked(&path, false)?;
-        if file.metadata()?.len() != segment.byte_len {
+        let len = file.metadata()?.len();
+        if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+            || len > MAX_SEGMENT_BYTES
+        {
             return Err(PodError::Uncertain("native segment length changed"));
         }
         Ok(())
@@ -982,10 +1029,14 @@ impl LinuxNativeSegmentDirectory {
         &self,
         segment: &NativeSegmentMeta,
         previous: Option<&NativeSegmentMeta>,
+        pending_tail: bool,
     ) -> Result<(), PodError> {
         let path = self.segment_path(segment.id)?;
         let mut file = self.open_checked(&path, false)?;
-        if file.metadata()?.len() != segment.byte_len {
+        let len = file.metadata()?.len();
+        if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+            || len > MAX_SEGMENT_BYTES
+        {
             return Err(PodError::Uncertain("native segment length changed"));
         }
         let from = previous.map_or(0, |old| old.byte_len);
@@ -1154,12 +1205,31 @@ impl LinuxNativeSegmentDirectory {
         &self,
         checkpoint: &NativeSegmentCheckpoint,
     ) -> Result<(), PodError> {
+        self.verify_retained_segments_inner(checkpoint, false)
+    }
+
+    fn verify_retained_segments_live(
+        &self,
+        checkpoint: &NativeSegmentCheckpoint,
+    ) -> Result<(), PodError> {
+        self.verify_retained_segments_inner(checkpoint, true)
+    }
+
+    fn verify_retained_segments_inner(
+        &self,
+        checkpoint: &NativeSegmentCheckpoint,
+        live: bool,
+    ) -> Result<(), PodError> {
         self.recheck()?;
         checkpoint.validate()?;
         for segment in &checkpoint.segments {
             let path = self.segment_path(segment.id)?;
             let mut file = self.open_checked(&path, false)?;
-            if file.metadata()?.len() != segment.byte_len {
+            let len = file.metadata()?.len();
+            let pending_tail = live && checkpoint.pending_source_sequence.is_some()
+                && segment.id == checkpoint.active().id;
+            if len < segment.byte_len || (!pending_tail && len != segment.byte_len)
+                || len > MAX_SEGMENT_BYTES {
                 return Err(PodError::Uncertain(
                     "segment tail differs from durable checkpoint",
                 ));
@@ -1168,9 +1238,12 @@ impl LinuxNativeSegmentDirectory {
             (&mut file)
                 .take(MAX_SEGMENT_BYTES + 1)
                 .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != segment.byte_len {
+            if (bytes.len() as u64) < segment.byte_len
+                || (!pending_tail && bytes.len() as u64 != segment.byte_len)
+            {
                 return Err(PodError::Uncertain("segment changed during read"));
             }
+            bytes.truncate(segment.byte_len as usize);
             let mut chain = initial_chain_digest(segment.id, &segment.prior_segment_digest);
             let mut at = 0usize;
             let mut frames = 0u64;
@@ -1463,6 +1536,54 @@ mod tests {
             fixture.rollover();
         }
         assert!(!fixture.checkpoint.contains_redacted_prefix(&old_reply, Some(&cursor), 64).unwrap());
+    }
+
+    #[test]
+    fn live_reader_keeps_committed_prefix_during_next_pending_append() {
+        let mut fixture = Fixture::new();
+        fixture.append(b"committed first frame");
+        let cursor = NativeEventCursor { identity: identity(), sequence: 0 };
+        let first = fixture.checkpoint.redacted_read_after(Some(&cursor), 64).unwrap();
+        let previous = fixture.files.read_checkpoint_live(&identity()).unwrap();
+
+        // The pod reserves the next sequence, then fsyncs its frame before
+        // replacing the checkpoint that indexes it. A concurrent manager
+        // must still serve the first committed frame, with no invented second.
+        fixture.checkpoint = fixture.checkpoint.reserve_native_take().unwrap();
+        fixture.files.commit_checkpoint(&fixture.checkpoint).unwrap();
+        let pending = fixture.files.append_frame_synced(
+            fixture.checkpoint.active(), b"not indexed yet",
+        ).unwrap();
+        assert!(fixture.files.read_checkpoint(&identity()).is_err());
+        let temporary = fixture.root.join("native-events.checkpoint-new");
+        OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(&temporary).unwrap();
+        assert_eq!(fixture.files.read_checkpoint_live(&identity()).unwrap().watermark, 1);
+        let live = fixture.files.read_checkpoint_incremental_live(&previous).unwrap();
+        assert_eq!(live.watermark, 1);
+        assert!(live.contains_redacted_prefix(&first, Some(&cursor), 64).unwrap());
+        let (frames, gap) = fixture.files.read_indexed_page(&live, 0, 1).unwrap();
+        assert_eq!(gap, None);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].private_payload(), b"committed first frame");
+        fs::remove_file(temporary).unwrap();
+
+        let event = PublicNativeEvent {
+            event_id: native_event_id(&identity(), 2), schema_version: 1,
+            identity: identity(), committed_cursor: 2, source_sequence: 2,
+            recorded_at_unix_millis: 2, occurred_at_unix_millis: None,
+            provenance: "codex.app-server.pod-observed/1".into(),
+            correlation_id: None, causation_id: None,
+            kind: crate::native_events::NativeEventKind::Output,
+            status: None, external_conflict: false,
+        };
+        fixture.checkpoint = fixture.checkpoint.after_synced_append(2, event, &pending).unwrap();
+        fixture.files.commit_checkpoint(&fixture.checkpoint).unwrap();
+        let current = fixture.files.read_checkpoint_incremental_live(&live).unwrap();
+        let next = current.redacted_read_after(Some(&first.next_cursor), 64).unwrap();
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].source_sequence, 2);
+        assert_eq!(next.gap, None);
     }
 
     #[test]

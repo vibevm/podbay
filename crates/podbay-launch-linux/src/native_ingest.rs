@@ -411,7 +411,7 @@ impl TrustedNativeEventDirectory {
             readers.remove(index)
         } else {
             let files = LinuxNativeSegmentDirectory::from_private_slot(private_slot.to_path_buf())?;
-            let checkpoint = files.read_checkpoint(expected)?;
+            let checkpoint = files.read_checkpoint_live(expected)?;
             CachedSegmentReader {
                 path: private_slot.to_path_buf(),
                 identity: expected.clone(),
@@ -421,7 +421,7 @@ impl TrustedNativeEventDirectory {
         };
         reader.checkpoint = reader
             .files
-            .read_checkpoint_incremental(&reader.checkpoint)?;
+            .read_checkpoint_incremental_live(&reader.checkpoint)?;
         if !reader
             .checkpoint
             .contains_redacted_prefix(redacted, cursor, limit)?
