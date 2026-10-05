@@ -6,6 +6,15 @@ Read [POST-MVP-CAMPAIGN.md](POST-MVP-CAMPAIGN.md) before expanding beyond the lo
 
 A real Codex turn produced 3,153 native events and a 1.1 MiB checkpoint. Each event reserves and commits by rewriting/fsyncing the bounded full index; the pod used roughly 74% CPU. [Evidence and benchmark design](NATIVE-CHECKPOINT-PERF.md) distinguish this writer cost from the now-fixed stale reader retry.
 
+The 2026-10-05 live Zap PodBay store was under `/home` on ext4 although the
+host's `/fast` NVMe mount is XFS. A disposable 1.4 MiB checkpoint-style
+write+fsync+rename+directory-fsync probe measured median 19.12 ms on ext4
+and 6.49 ms on XFS (20 timed iterations each). Zap 1.1.0 now supports an
+owner-pinned XFS `podDirectory` for a **fresh** manager state. The current
+running Pod cannot be repointed; use its signed stop and archive the complete
+old manager state/map before starting a new Pod there. This placement change
+reduces filesystem latency but does not remove the full-checkpoint rewrite.
+
 **Owner decision after the disposable benchmark:** adopt a versioned append-only native commit record with periodic compact snapshots and crash-point proof, or keep the bounded v2 checkpoint for the local campaign? This is a format/recovery redesign; it does not block current VibeVM work while the 4,096-event window and prefix-verified reads hold.
 
 ## P1-002 — Claimed later turn loses port disposition
