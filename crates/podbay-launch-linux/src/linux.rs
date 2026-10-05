@@ -1436,7 +1436,10 @@ impl HostDispatchPort for LinuxLaunchPort {
         launch: &ResolvedNativeCodexLaunch,
     ) -> Result<PortRebindObservation, podbay_host::HostError> {
         self.inspect_codex_v2_rebind(launch)
-            .map_err(|_| podbay_host::HostError::StaleGuard)
+            .map_err(|error| {
+                eprintln!("podbay V2 rebind inspection refused: {error}");
+                podbay_host::HostError::StaleGuard
+            })
     }
 
     fn attest_abandoned_codex_v2_manager_dead(

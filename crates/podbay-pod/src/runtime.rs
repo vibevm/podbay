@@ -171,7 +171,8 @@ fn inspect_allowed(
         || checkpoint != &fence.checkpoint()
         || checkpoint.phase() != RebindPhase::Active
         || observed_peer == checkpoint.manager_peer()
-        || observed_peer.containment_identity() != checkpoint.manager_containment()
+        || observed_peer.os_identity() != checkpoint.manager_peer().os_identity()
+        || observed_peer.boot_identity() != checkpoint.manager_peer().boot_identity()
         || request.owner_epoch <= checkpoint.owner_epoch().get()
         || request.credential_epoch <= checkpoint.credential_epoch().get()
     {
@@ -2992,6 +2993,9 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                                     &witness,
                                     &manager_witness,
                                 )
+                                && abandoned_manager_birth_absent(
+                                    checkpoint.checkpoint().manager_peer(), &boot_id,
+                                ).is_ok()
                                 && child_attested_running(
                                     &mut child,
                                     child_pid,
@@ -3057,6 +3061,7 @@ pub fn serve(manifest_path: impl AsRef<Path>) -> Result<(), PodError> {
                         &witness,
                         &manager_witness,
                     )
+                    || abandoned_manager_birth_absent(prior.manager_peer(), &boot_id).is_err()
                 {
                     respond(
                         &mut stream,
@@ -4489,6 +4494,16 @@ mod tests {
             &next,
             &owner,
             &manager
+        ));
+        let moved = AttestedPeer::from_port(
+            next.os_identity(), next.native_process_id(), next.boot_identity(),
+            next.birth_identity(), "new.outer.pod.unit",
+        ).unwrap();
+        let moved_claim = InspectManagerWitness {
+            peer: Some(moved.clone()), owner: 2, credential: 2,
+        };
+        assert!(inspect_allowed(
+            &request, &identity, &checkpoint, &fence, &moved, &owner, &moved_claim,
         ));
         let sibling = AttestedPeer::from_port(
             "uid.1000",

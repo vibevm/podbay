@@ -1463,6 +1463,8 @@ fn disposable_codex_v3_two_roots_hold_policy_until_revocation() {
 #[ignore = "helper for disposable two-process V2 rebind fixture"]
 fn rebind_first_manager_process_helper() {
     let fixture = Fixture::from_shared();
+    fs::write(fixture.directory.join("rebind.first.cgroup"),
+        fs::read_to_string("/proc/self/cgroup").unwrap()).unwrap();
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let mut port = port_for(&fixture, &binary);
     let reference =
@@ -1507,6 +1509,8 @@ fn rebind_first_manager_process_helper() {
 #[ignore = "helper for disposable two-process V2 rebind fixture"]
 fn rebind_second_manager_process_helper() {
     let fixture = Fixture::from_shared();
+    fs::write(fixture.directory.join("rebind.second.cgroup"),
+        fs::read_to_string("/proc/self/cgroup").unwrap()).unwrap();
     let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
     let mut port = port_for(&fixture, &binary);
     let reference =
@@ -2450,6 +2454,51 @@ fn run_rebind_manager_helper_with_owner(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn run_rebind_manager_helper_in_new_scope(name: &str, fixture: &Fixture, binary: &Path) {
+    let unit = format!("podbay-rebind-cross-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+    let mut process = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--unit", &unit])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", name, "--nocapture"])
+        .env("PODBAY_REBIND_FIXTURE_DIR", &fixture.directory)
+        .env("PODBAY_REBIND_FIXTURE_POD", fixture.pod.as_str())
+        .env("PODBAY_TEST_POD_BINARY", binary)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            assert!(status.success(), "{name} failed in a new cgroup with {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = process.kill();
+            let _ = process.wait();
+            panic!("{name} exceeded disposable cross-cgroup fixture deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires disposable user systemd and PODBAY_TEST_POD_BINARY"]
+fn disposable_v2_rebind_across_manager_cgroups_keeps_exact_pod_and_child() {
+    let binary = fs::canonicalize(std::env::var_os("PODBAY_TEST_POD_BINARY").unwrap()).unwrap();
+    let fixture = Fixture::new();
+    run_rebind_manager_helper("rebind_first_manager_process_helper", &fixture, &binary);
+    let before_pid = fs::read_to_string(fixture.directory.join("rebind.first.pid")).unwrap();
+    run_rebind_manager_helper_in_new_scope(
+        "rebind_second_manager_process_helper", &fixture, &binary,
+    );
+    assert_ne!(
+        fs::read_to_string(fixture.directory.join("rebind.first.cgroup")).unwrap(),
+        fs::read_to_string(fixture.directory.join("rebind.second.cgroup")).unwrap(),
+    );
+    assert_eq!(fs::read_to_string(fixture.directory.join("rebind.second.done")).unwrap(), before_pid);
 }
 
 #[test]

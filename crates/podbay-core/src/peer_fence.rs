@@ -472,7 +472,6 @@ impl PodFenceCheckpoint {
                                  exact_inputs: bool|
          -> Result<(), FenceError> {
             if proposal.identity != self.identity
-                || proposal.next_manager.containment_identity() != self.manager_containment.as_ref()
                 || proposal.expected_input_epochs.len() != self.input_epochs.len()
                 || proposal.next_input_epochs.len() != self.input_epochs.len()
             {
@@ -941,7 +940,11 @@ impl PodPeerFence {
         if proposal.next_manager != *new_peer {
             return Err(FenceError::WrongPeer);
         }
-        if proposal.next_manager.containment_identity != self.manager_containment {
+        // Recovery may move the manager to a new service cgroup. The exact
+        // successor is still pinned by the durable proposal and owner proof.
+        if proposal.next_manager.os_identity() != self.manager.peer.os_identity()
+            || proposal.next_manager.boot_identity() != self.manager.peer.boot_identity()
+        {
             return Err(FenceError::WrongContainment);
         }
         if self.repeat_phase(&proposal)?.is_some() {
@@ -1068,6 +1071,7 @@ impl PodPeerFence {
             credential_epoch: proposal.next_credential_epoch,
             lease_until_ms: 0,
         };
+        self.manager_containment = peer.containment_identity().into();
         self.pending = None;
         self.phase = RebindPhase::Active;
         Ok(self.phase)
@@ -2071,7 +2075,7 @@ mod tests {
                 &ledger,
                 180
             ),
-            Err(FenceError::WrongContainment)
+            Err(FenceError::NotAdmitted)
         );
         assert_eq!(
             fence.prepare_rebind(
@@ -2149,6 +2153,35 @@ mod tests {
             fence.activate_rebind(&proposed, &successor(), &advanced, &ledger),
             Ok(RebindPhase::Active)
         );
+    }
+
+    #[test]
+    fn recovered_manager_in_new_containment_updates_active_checkpoint() {
+        let mut fence = fence();
+        let mut proposal = proposal(input(1), input(1));
+        proposal.next_manager = sibling();
+        let witness = Witness::new(Some(owner(2)));
+        let pending = Ledger { proposal: proposal.clone(), pending: true, active: false };
+        let foreign_boot = peer("pid.300", "birth.300", "sibling.pod.unit");
+        let mut wrong = proposal.clone();
+        wrong.next_manager = AttestedPeer::from_port(
+            foreign_boot.os_identity(), foreign_boot.native_process_id(),
+            "boot.foreign", foreign_boot.birth_identity(), foreign_boot.containment_identity(),
+        ).unwrap();
+        assert_eq!(fence.prepare_rebind(wrong.clone(), &wrong.next_manager,
+            ManagerLiveness::DeadAttested, &witness,
+            &Ledger { proposal: wrong.clone(), pending: true, active: false }, 180),
+            Err(FenceError::WrongContainment));
+        fence.prepare_rebind(proposal.clone(), &sibling(), ManagerLiveness::DeadAttested,
+            &witness, &pending, 180).unwrap();
+        PodPeerFence::restore_after_crash(fence.checkpoint()).unwrap();
+        fence.confirm_pod_bound(&proposal, &sibling(), &witness, &pending).unwrap();
+        let active = Ledger { proposal: proposal.clone(), pending: false, active: true };
+        fence.activate_rebind(&proposal, &sibling(), &witness, &active).unwrap();
+        let checkpoint = fence.checkpoint();
+        assert_eq!(checkpoint.manager_containment(), sibling().containment_identity());
+        assert_eq!(checkpoint.manager_peer(), &sibling());
+        PodPeerFence::restore_after_crash(checkpoint).unwrap();
     }
 
     #[test]
