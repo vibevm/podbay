@@ -2620,6 +2620,45 @@ fn v23_native_evidence_is_exact_once_private_and_reopen_replays() {
 }
 
 #[test]
+fn native_evidence_reopens_a_full_32_event_page_without_skipping() {
+    let fixture = Fixture::new();
+    let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);
+    let actor = writer_actor("actor.codex.fixture");
+    let revision = store.authority_snapshot().unwrap().revision;
+    let bound = store.current_bound_pod_snapshot("scope.launch", "pod.launch").unwrap();
+    let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
+    let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
+    let mut page = native_fixture_page(&target, br#"{"method":"small"}"#);
+    let template = page.events[0].clone();
+    page.events = (1..=32).map(|sequence| {
+        let mut event = template.clone();
+        event.source_sequence = sequence;
+        event.event_id = format!("event.native.fixture.{sequence}");
+        event
+    }).collect();
+    page.snapshot.watermark = 32;
+    page.snapshot.output_events = 32;
+    page.next_source_sequence = 32;
+    let input = TrustedNativeEvidenceAdmission {
+        actor: &actor, expected_owner_epoch: 1,
+        expected_manager_credential_epoch: credential_epoch,
+        expected_authority_revision: revision,
+        effective_digest: effective.digest(), descriptor_digest: descriptor.digest(),
+        after: 0, limit: 32, page: &page,
+    };
+    assert_eq!(store.admit_native_evidence_page(input).unwrap(), page);
+    drop(store);
+    let mut reopened = fixture.open();
+    assert_eq!(reopened.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &page.snapshot.identity, effective.digest(), descriptor.digest(), 0, 32)
+        .unwrap(), Some(page.clone()));
+    assert_eq!(reopened.native_evidence_after(&actor, 1, credential_epoch, revision,
+        &page.snapshot.identity, effective.digest(), descriptor.digest(), 16, 32)
+        .unwrap().unwrap().events.iter().map(|event| event.source_sequence)
+        .collect::<Vec<_>>(), (17..=32).collect::<Vec<_>>());
+}
+
+#[test]
 fn v23_native_evidence_retains_observed_large_codex_output_but_bounds_one_frame() {
     let fixture = Fixture::new();
     let (mut store, target, credential_epoch) = admitted_writer_target(&fixture);

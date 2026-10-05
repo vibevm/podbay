@@ -9,7 +9,7 @@ use crate::current_snapshot::check_fence;
 use crate::model::{AuthorityActorRecord, StoreError};
 use crate::store::{PodBayStore, valid_id};
 
-const MAX_PAGE_EVENTS: usize = 4;
+const MAX_PAGE_EVENTS: usize = 32;
 const MAX_RAW_EVENT_BYTES: usize = 4 * 1_048_576;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

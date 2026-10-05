@@ -153,16 +153,7 @@ impl<P: HostDispatchPort> Handler for HostReadHandler<'_, P> {
                         body.limit.get() as usize,
                     )
                     .map_err(native_authority_error)?;
-                let value = native_events_json(page)?;
-                if serde_json::to_vec(&value).map_or(true, |bytes| {
-                    bytes.len() > podbay_wire::MAX_FRAME_BYTES - 4096
-                }) {
-                    return Err(refusal(
-                        RuntimeErrorCode::LimitExceeded,
-                        "native event page exceeds wire frame",
-                    ));
-                }
-                Ok(value)
+                bounded_native_events_json(page)
             }
             _ => Err(refusal(
                 RuntimeErrorCode::Unsupported,
@@ -232,6 +223,29 @@ fn native_events_json(page: NativeEvidencePage) -> Result<Value, RuntimeError> {
         })),
         "events": events,
     }))
+}
+
+/// Keep the full admitted suffix in the durable store, but return only the
+/// contiguous prefix that fits one authenticated local frame. The next read
+/// replays that suffix from its exact Resource cursor without another turn.
+fn bounded_native_events_json(page: NativeEvidencePage) -> Result<Value, RuntimeError> {
+    let mut value = native_events_json(page)?;
+    let maximum = podbay_wire::MAX_FRAME_BYTES - 4096;
+    loop {
+        if serde_json::to_vec(&value).map_or(false, |bytes| bytes.len() <= maximum) {
+            return Ok(value);
+        }
+        let events = value["events"].as_array_mut().expect("native page events");
+        if events.len() <= 1 {
+            return Err(refusal(
+                RuntimeErrorCode::LimitExceeded,
+                "native event exceeds wire frame",
+            ));
+        }
+        events.pop();
+        let last = events.last().expect("one native event remains");
+        value["nextCursor"]["sourceSequence"] = last["sourceSequence"].clone();
+    }
 }
 
 fn snapshot_json(snapshot: CurrentScopeSnapshot) -> Value {
@@ -686,6 +700,54 @@ mod tests {
                 .contains("private fixture output")
         );
         assert!(serde_json::to_vec(&value).unwrap().len() < podbay_wire::MAX_FRAME_BYTES - 4096);
+    }
+
+    #[test]
+    fn native_pages_advance_thousands_of_events_and_stop_before_a_large_frame() {
+        let identity = NativeEvidenceIdentity {
+            store_lineage: "lineage.fixture".into(), scope_id: "scope.fixture".into(),
+            session_id: "session.fixture".into(), run_id: "run.fixture".into(),
+            attempt_id: "attempt.fixture".into(), pod_id: "pod.fixture".into(),
+            pod_incarnation: 1, resource_id: "resource.fixture".into(), resource_epoch: 1,
+        };
+        let snapshot = NativeEvidenceSnapshot {
+            identity, watermark: 3000, earliest_retained: 1, last_status: None,
+            output_events: 3000, question_events: 0, permission_events: 0,
+            opaque_events: 0, external_conflict: false, fidelity: "exact".into(),
+            quarantined: false,
+        };
+        let mut cursor = 0;
+        let mut reads = 0;
+        while cursor < 3000 {
+            let events = ((cursor + 1)..=(cursor + 32).min(3000)).map(|sequence| {
+                let raw_jsonl = if sequence == 33 {
+                    format!("{{\"delta\":\"{}\"}}\n", "x".repeat(4 * 1_048_576 - 16)).into_bytes()
+                } else if (34..=64).contains(&sequence) {
+                    format!("{{\"delta\":\"{}\"}}\n", "x".repeat(512 * 1024)).into_bytes()
+                } else {
+                    b"{\"delta\":\"small\"}\n".to_vec()
+                };
+                NativeEvidenceEvent {
+                    event_id: format!("event.{sequence}"), source_sequence: sequence,
+                    kind: "output".into(), status: None, recorded_at_unix_millis: 1,
+                    provenance: "codex.app-server.pod-observed/1".into(),
+                    external_conflict: false, content_digest: "a".repeat(64), raw_jsonl,
+                }
+            }).collect();
+            let page = NativeEvidencePage {
+                snapshot: snapshot.clone(), events, next_source_sequence: (cursor + 32).min(3000), gap: None,
+            };
+            let value = bounded_native_events_json(page).unwrap();
+            assert!(serde_json::to_vec(&value).unwrap().len() <= podbay_wire::MAX_FRAME_BYTES - 4096);
+            let returned = value["events"].as_array().unwrap();
+            assert!(!returned.is_empty());
+            for (index, event) in returned.iter().enumerate() {
+                assert_eq!(event["sourceSequence"], (cursor + index as u64 + 1).to_string());
+            }
+            cursor = value["nextCursor"]["sourceSequence"].as_str().unwrap().parse().unwrap();
+            reads += 1;
+        }
+        assert!(reads < 120, "{reads} reads for 3000 events");
     }
 
     #[test]

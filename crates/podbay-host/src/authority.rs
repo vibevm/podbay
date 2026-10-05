@@ -6046,7 +6046,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         }
         #[cfg(target_os = "linux")]
         {
-            if !(1..=2).contains(&limit) {
+            if !(1..=32).contains(&limit) {
                 return Err(HostError::InvalidInput.into());
             }
             let snapshot = self.current_scope_snapshot(transport, scope)?;

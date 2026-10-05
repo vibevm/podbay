@@ -57,7 +57,7 @@ fn native_cursor_is_exact_scoped_and_bounded() {
         },
         {
             let mut value = request.clone();
-            value["body"]["limit"] = json!("3");
+            value["body"]["limit"] = json!("33");
             value
         },
         {

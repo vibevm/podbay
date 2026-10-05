@@ -600,7 +600,7 @@ function validateRead(value: unknown): ReadEnvelope {
     identity(body.sessionId, "native.sessionId");
     identity(body.resourceId, "native.resourceId");
     const limit = BigInt(decimal(body.limit, "native.limit", true));
-    if (limit > 2n) throw new RangeError("native page limit exceeds bound");
+    if (limit > 32n) throw new RangeError("native page limit exceeds bound");
     if (body.after !== undefined) {
       const cursor = record(body.after, "native.after");
       exact(cursor, ["identity", "sourceSequence"]);

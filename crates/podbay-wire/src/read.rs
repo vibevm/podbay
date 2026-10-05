@@ -332,7 +332,7 @@ impl ReadEnvelope {
                     .map_err(|_| WireError::InvalidField("body.sessionId"))?;
                 valid_identity(&body.resource_id)
                     .map_err(|_| WireError::InvalidField("body.resourceId"))?;
-                if !(1..=2).contains(&body.limit.get()) {
+                if !(1..=32).contains(&body.limit.get()) {
                     return Err(WireError::InvalidField("body.limit"));
                 }
                 if let Some(cursor) = &body.after {
