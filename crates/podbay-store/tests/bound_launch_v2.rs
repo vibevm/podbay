@@ -2568,8 +2568,8 @@ fn v23_native_evidence_retains_observed_large_codex_output_but_bounds_one_frame(
     let effective = EffectiveLaunchContractV2::decode(&bound.launch().effective_spec).unwrap();
     let descriptor = ImmutableLaunchDescriptorV2::decode_json(&bound.launch().descriptor).unwrap();
     let raw = format!("{{\"method\":\"item/completed\",\"params\":{{\"output\":\"{}\"}}}}",
-        "x".repeat(213_000)).into_bytes();
-    assert!(raw.len() > 65_536 && raw.len() <= 262_144);
+        "x".repeat(624_000)).into_bytes();
+    assert!(raw.len() > 262_144 && raw.len() <= 4_194_304);
     let page = native_fixture_page(&target, &raw);
     let input = native_input(&actor, 1, credential_epoch, revision,
         effective.digest(), descriptor.digest(), &page);
@@ -2578,8 +2578,8 @@ fn v23_native_evidence_retains_observed_large_codex_output_but_bounds_one_frame(
         &page.snapshot.identity, effective.digest(), descriptor.digest(), 0, 2)
         .unwrap(), Some(page.clone()));
     let oversized = format!("{{\"method\":\"item/completed\",\"params\":{{\"output\":\"{}\"}}}}",
-        "x".repeat(262_144)).into_bytes();
-    assert!(oversized.len() > 262_144);
+        "x".repeat(4_194_304)).into_bytes();
+    assert!(oversized.len() > 4_194_304);
     let too_large = native_fixture_page(&target, &oversized);
     assert!(matches!(store.admit_native_evidence_page(native_input(
         &actor, 1, credential_epoch, revision, effective.digest(), descriptor.digest(), &too_large,
