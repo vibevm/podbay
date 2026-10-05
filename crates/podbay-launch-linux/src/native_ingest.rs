@@ -397,7 +397,10 @@ impl TrustedNativeEventDirectory {
         reader.checkpoint = reader
             .files
             .read_checkpoint_incremental(&reader.checkpoint)?;
-        if reader.checkpoint.redacted_read_after(cursor, limit)? != *redacted {
+        if !reader
+            .checkpoint
+            .contains_redacted_prefix(redacted, cursor, limit)?
+        {
             readers.push(reader);
             if readers.len() > 64 {
                 readers.remove(0);
@@ -405,9 +408,14 @@ impl TrustedNativeEventDirectory {
             return Ok(None);
         }
         let after = cursor.map_or(reader.checkpoint.watermark, |cursor| cursor.sequence);
-        let (frames, _) = reader
-            .files
-            .read_indexed_page(&reader.checkpoint, after, limit)?;
+        let frames = if redacted.events.is_empty() {
+            Vec::new()
+        } else {
+            reader
+                .files
+                .read_indexed_page(&reader.checkpoint, after, redacted.events.len())?
+                .0
+        };
         if frames.len() != redacted.events.len() {
             return Err(PodError::Uncertain(
                 "indexed private page differs from pod reply",

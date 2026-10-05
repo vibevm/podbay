@@ -244,6 +244,58 @@ impl NativeSegmentCheckpoint {
         })
     }
 
+    /// A pod reply may describe an older committed checkpoint while this
+    /// reader verifies a newer one. Match the complete requested page against
+    /// the newer, chain-verified index; refuse if pruning hid any part of it.
+    /// The authenticated pod supplies the older snapshot's cumulative facts.
+    pub fn contains_redacted_prefix(
+        &self,
+        reply: &NativeEventRead,
+        cursor: Option<&NativeEventCursor>,
+        limit: usize,
+    ) -> Result<bool, PodError> {
+        self.validate()?;
+        if !(1..=MAX_OFFSETS).contains(&limit)
+            || reply.snapshot.identity != self.identity
+            || reply.snapshot.watermark > self.watermark
+            || reply.snapshot.earliest_retained > self.redacted_snapshot.earliest_retained
+            || reply.snapshot.quarantined != self.redacted_snapshot.quarantined
+            || reply.snapshot.fidelity != self.redacted_snapshot.fidelity
+        {
+            return Ok(false);
+        }
+        let after = match cursor {
+            Some(cursor) if cursor.identity == self.identity => cursor.sequence,
+            Some(_) => return Ok(false),
+            None => reply.snapshot.watermark,
+        };
+        if after > reply.snapshot.watermark
+            || after.saturating_add(1) < self.redacted_snapshot.earliest_retained
+        {
+            return Ok(false);
+        }
+        let expected_gap = (after.saturating_add(1) < reply.snapshot.earliest_retained)
+            .then(|| NativeEventGap {
+                missing_from: after + 1,
+                missing_through: reply.snapshot.earliest_retained - 1,
+                earliest_available: reply.snapshot.earliest_retained,
+            });
+        let expected: Vec<_> = self.redacted_events.iter()
+            .filter(|event| event.source_sequence > after
+                && event.source_sequence <= reply.snapshot.watermark)
+            .take(limit)
+            .map(|event| public_event(
+                &self.identity, event.source_sequence, event.recorded_at_unix_millis,
+                event.kind, event.status, event.external_conflict,
+            ))
+            .collect();
+        Ok(reply.gap == expected_gap
+            && reply.events == expected
+            && reply.next_cursor.identity == self.identity
+            && reply.next_cursor.sequence == expected.last()
+                .map_or(after, |event| event.source_sequence))
+    }
+
     pub fn reserve_native_take(&self) -> Result<Self, PodError> {
         self.validate()?;
         if self.pending_source_sequence.is_some() || self.redacted_snapshot.quarantined {
@@ -1387,6 +1439,30 @@ mod tests {
                 .unwrap_or_default()
                 .contains("prompt")
         );
+    }
+
+    #[test]
+    fn newer_checkpoint_proves_older_pod_page_without_restarting_read() {
+        let mut fixture = Fixture::new();
+        fixture.append(b"first private frame");
+        let cursor = NativeEventCursor { identity: identity(), sequence: 0 };
+        let old_reply = fixture.checkpoint.redacted_read_after(Some(&cursor), 64).unwrap();
+        fixture.append(b"second private frame");
+        let current = fixture.files.read_checkpoint(&identity()).unwrap();
+        assert!(current.contains_redacted_prefix(&old_reply, Some(&cursor), 64).unwrap());
+        let (frames, _) = fixture.files.read_indexed_page(&current, 0, old_reply.events.len()).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].source_sequence(), 1);
+
+        let mut altered = old_reply.clone();
+        altered.events[0].recorded_at_unix_millis += 1;
+        assert!(!current.contains_redacted_prefix(&altered, Some(&cursor), 64).unwrap());
+        fixture.rollover();
+        for _ in 0..3 {
+            fixture.append(b"later private frame");
+            fixture.rollover();
+        }
+        assert!(!fixture.checkpoint.contains_redacted_prefix(&old_reply, Some(&cursor), 64).unwrap());
     }
 
     #[test]
