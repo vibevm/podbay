@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod actor_credential;
+// Inert recovery calculus only; no production admission/acquisition hook.
+mod access_barrier_gate;
 mod authority;
 mod id_mint;
 mod launch_spec;
