@@ -1819,3 +1819,7 @@ fn digest_optional_u64(hash: &mut Sha256, value: Option<u64>) {
         None => hash.update([0]),
     }
 }
+
+// Isolated signing-time admission experiment; absent from production builds.
+#[cfg(all(test, target_os = "linux"))]
+mod signer_admission_fixture;

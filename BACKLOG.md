@@ -111,6 +111,12 @@ The passive evidence prototype can decode a strict signed envelope and read a
 schema24 historical verifier snapshot in a disposable fixture. Production
 origin acquisition returns `OriginUnavailable` before I/O; even a valid old
 signature remains `SigningTimeUnavailable` without independent time evidence.
+A separate Linux/test-only store fixture now shows that exact signed bytes can
+be admitted under the current nonrevoked key in the same `BEGIN IMMEDIATE`
+revision transaction used to serialize Owner rotation. Exact committed replay
+survives rotation; an old key first presented after rotation refuses. Process
+SIGKILL controls cover before/after commit, not power loss. This noncanonical
+fixture does not sign or authorize the production terminal envelope.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 
