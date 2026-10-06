@@ -4,6 +4,8 @@
 
 // Inert owner-level restart model; current launch/stop never call it.
 mod restart_model;
+// Pure signed-data verification only; no stop or restart acquisition path.
+mod terminal_attestation;
 
 use std::collections::BTreeSet;
 use std::env;
