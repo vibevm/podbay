@@ -342,6 +342,177 @@ fn operator_artifact_digest_refuses_symlink_outside_installed_tree() {
     assert!(TrustedOperatorArtifact::inspect_tree(&fixture.root).is_err());
 }
 
+// This fixture has no Pod/Store paths and its teardown never calls a service.
+struct ArtifactTreeFixture(PathBuf);
+impl ArtifactTreeFixture {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "podbay-artifact-vector-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(fs::canonicalize(path).unwrap())
+    }
+}
+impl Drop for ArtifactTreeFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+// Independent legacy stream oracle for these tiny stable fixtures only. Its
+// ordering/framing follows the pre-bounds implementation at base 70f0164;
+// it shares no walker, budget, metadata or framing helper with production.
+fn legacy_artifact_digest_for_fixture(root: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    fn directory(root: &Path, dir: &Path, out: &mut Vec<u8>) {
+        let mut children = fs::read_dir(dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            let path = entry.path();
+            field(out, path.strip_prefix(root).unwrap().as_os_str().as_bytes());
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                assert!(fs::canonicalize(&path).unwrap().starts_with(root));
+                out.push(b'L');
+                field(out, fs::read_link(&path).unwrap().as_os_str().as_bytes());
+            } else if meta.is_dir() {
+                out.push(b'D');
+                directory(root, &path, out);
+            } else {
+                assert!(meta.is_file());
+                out.push(b'F');
+                out.extend_from_slice(&meta.len().to_be_bytes());
+                out.extend_from_slice(&fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut bytes = b"podbay.operator-artifact-tree/1\0".to_vec();
+    directory(root, root, &mut bytes);
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn artifact_mixed_fixture(root: &Path) {
+    use std::os::unix::ffi::OsStringExt;
+    fs::create_dir(root.join("a")).unwrap();
+    fs::create_dir(root.join("d")).unwrap();
+    fs::write(root.join("a/z"), [0, 255, b'x']).unwrap();
+    fs::write(root.join("a-"), b"a").unwrap();
+    symlink("a/z", root.join("l")).unwrap();
+    fs::write(root.join(std::ffi::OsString::from_vec(vec![255])), b"raw\n").unwrap();
+}
+
+#[test]
+fn operator_artifact_v1_golden_bytes_and_legacy_compatibility() {
+    let tree = ArtifactTreeFixture::new();
+    let empty = TrustedOperatorArtifact::inspect_tree(&tree.0).unwrap();
+    assert_eq!(
+        empty.sha256,
+        "875b435a528c840cf06f06760c921b76a6d20d623ecb8e6ab3ce96b63c942163"
+    );
+    assert_eq!((empty.entries, empty.bytes), (0, 0));
+    assert_eq!(empty.sha256, legacy_artifact_digest_for_fixture(&tree.0));
+    artifact_mixed_fixture(&tree.0);
+    let mixed = TrustedOperatorArtifact::inspect_tree(&tree.0).unwrap();
+    // Frozen independently from the explicit 138-byte v1 stream: DFS visits
+    // a/z before a-; raw 0xff is the last filename; the literal link is a/z.
+    assert_eq!(
+        mixed.sha256,
+        "bafcc7fa340678219060888a9bdd9af95a6516df243b1f77737e8b6b5e06dd5d"
+    );
+    assert_eq!((mixed.entries, mixed.bytes), (6, 8));
+    assert_eq!(mixed.sha256, legacy_artifact_digest_for_fixture(&tree.0));
+    fs::set_permissions(tree.0.join("a-"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        TrustedOperatorArtifact::inspect_tree(&tree.0)
+            .unwrap()
+            .sha256,
+        mixed.sha256,
+        "mode is checked for changes during a scan but is not a v1 hash field"
+    );
+    fs::remove_file(tree.0.join("l")).unwrap();
+    symlink(tree.0.join("a/z"), tree.0.join("l")).unwrap();
+    let absolute = TrustedOperatorArtifact::inspect_tree(&tree.0).unwrap();
+    assert_ne!(absolute.sha256, mixed.sha256);
+    assert_eq!(absolute.sha256, legacy_artifact_digest_for_fixture(&tree.0));
+}
+
+#[test]
+fn operator_artifact_v1_names_types_content_and_literal_targets_are_committed() {
+    let tree = ArtifactTreeFixture::new();
+    artifact_mixed_fixture(&tree.0);
+    let original = TrustedOperatorArtifact::inspect_tree(&tree.0)
+        .unwrap()
+        .sha256;
+    fs::write(tree.0.join("a/z"), [0, 254, b'x']).unwrap();
+    assert_ne!(
+        TrustedOperatorArtifact::inspect_tree(&tree.0)
+            .unwrap()
+            .sha256,
+        original
+    );
+    fs::write(tree.0.join("a/z"), [0, 255, b'x']).unwrap();
+    fs::rename(tree.0.join("a-"), tree.0.join("b")).unwrap();
+    assert_ne!(
+        TrustedOperatorArtifact::inspect_tree(&tree.0)
+            .unwrap()
+            .sha256,
+        original
+    );
+    fs::rename(tree.0.join("b"), tree.0.join("a-")).unwrap();
+    fs::remove_dir(tree.0.join("d")).unwrap();
+    fs::write(tree.0.join("d"), b"").unwrap();
+    assert_ne!(
+        TrustedOperatorArtifact::inspect_tree(&tree.0)
+            .unwrap()
+            .sha256,
+        original
+    );
+    fs::remove_file(tree.0.join("d")).unwrap();
+    fs::create_dir(tree.0.join("d")).unwrap();
+    fs::remove_file(tree.0.join("l")).unwrap();
+    symlink("./a/z", tree.0.join("l")).unwrap();
+    let changed = TrustedOperatorArtifact::inspect_tree(&tree.0).unwrap();
+    assert_ne!(
+        changed.sha256, original,
+        "same resolved file, different literal link bytes"
+    );
+    assert_eq!(changed.sha256, legacy_artifact_digest_for_fixture(&tree.0));
+}
+
+#[test]
+fn operator_artifact_v1_refuses_dangling_cycles_and_special_files() {
+    let tree = ArtifactTreeFixture::new();
+    let link = tree.0.join("link");
+    symlink("missing", &link).unwrap();
+    assert!(TrustedOperatorArtifact::inspect_tree(&tree.0).is_err());
+    fs::remove_file(&link).unwrap();
+    symlink("link", &link).unwrap();
+    assert!(TrustedOperatorArtifact::inspect_tree(&tree.0).is_err());
+    fs::remove_file(&link).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(tree.0.join("socket")).unwrap();
+    assert!(TrustedOperatorArtifact::inspect_tree(&tree.0).is_err());
+    drop(socket);
+}
+
 #[test]
 #[ignore = "requires PODBAY_TEST_ZAP_ROOT; hashes the installed Zap import tree"]
 fn installed_zap_artifact_tree_fits_bounded_hash_budget() {

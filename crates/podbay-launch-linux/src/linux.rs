@@ -114,10 +114,145 @@ impl TrustedLinuxLaunchConfig {
 const OPERATOR_ARTIFACT_MAX_ENTRIES: u64 = 20_000;
 const OPERATOR_ARTIFACT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const OPERATOR_ARTIFACT_MAX_TIME: Duration = Duration::from_secs(8);
+const OPERATOR_ARTIFACT_MAX_DEPTH: usize = 128;
+const OPERATOR_ARTIFACT_MAX_PATH: usize = 4_096;
+const OPERATOR_ARTIFACT_MAX_PATH_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct OperatorArtifactLimits {
+    entries: u64,
+    bytes: u64,
+    depth: usize,
+    path: usize,
+    target: usize,
+    path_bytes: u64,
+    time: Duration,
+}
+
+impl OperatorArtifactLimits {
+    const PRODUCTION: Self = Self {
+        entries: OPERATOR_ARTIFACT_MAX_ENTRIES,
+        bytes: OPERATOR_ARTIFACT_MAX_BYTES,
+        depth: OPERATOR_ARTIFACT_MAX_DEPTH,
+        path: OPERATOR_ARTIFACT_MAX_PATH,
+        target: OPERATOR_ARTIFACT_MAX_PATH,
+        path_bytes: OPERATOR_ARTIFACT_MAX_PATH_BYTES,
+        time: OPERATOR_ARTIFACT_MAX_TIME,
+    };
+}
+
+struct OperatorArtifactBudget {
+    limits: OperatorArtifactLimits,
+    started: Instant,
+    entries: u64,
+    declared_bytes: u64,
+    read_bytes: u64,
+    path_bytes: u64,
+    #[cfg(test)]
+    test_elapsed: Option<std::rc::Rc<std::cell::Cell<Duration>>>,
+}
+
+impl OperatorArtifactBudget {
+    fn new(limits: OperatorArtifactLimits) -> Self {
+        Self {
+            limits,
+            started: Instant::now(),
+            entries: 0,
+            declared_bytes: 0,
+            read_bytes: 0,
+            path_bytes: 0,
+            #[cfg(test)]
+            test_elapsed: None,
+        }
+    }
+
+    // A polled elapsed budget, not cancellation of a blocked filesystem call.
+    fn check_time(&self) -> Result<(), PodError> {
+        let elapsed = self.started.elapsed();
+        #[cfg(test)]
+        let elapsed = self
+            .test_elapsed
+            .as_ref()
+            .map_or(elapsed, |clock| clock.get());
+        if elapsed > self.limits.time {
+            return Err(PodError::Refused(
+                "operator artifact hash exceeded time budget",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_path_bytes(&mut self, length: usize) -> Result<(), PodError> {
+        let length = u64::try_from(length)
+            .map_err(|_| PodError::Refused("operator artifact path byte count overflow"))?;
+        let next = self
+            .path_bytes
+            .checked_add(length)
+            .ok_or(PodError::Refused(
+                "operator artifact path byte count overflow",
+            ))?;
+        if next > self.limits.path_bytes {
+            return Err(PodError::Refused(
+                "operator artifact exceeds path byte budget",
+            ));
+        }
+        self.path_bytes = next;
+        Ok(())
+    }
+
+    fn discover(&mut self, relative: &Path, depth: usize) -> Result<(), PodError> {
+        self.check_time()?;
+        if depth > self.limits.depth || relative.as_os_str().len() > self.limits.path {
+            return Err(PodError::Refused(
+                "operator artifact path or depth exceeds budget",
+            ));
+        }
+        let next = self
+            .entries
+            .checked_add(1)
+            .ok_or(PodError::Refused("operator artifact entry count overflow"))?;
+        if next > self.limits.entries {
+            return Err(PodError::Refused("operator artifact has too many entries"));
+        }
+        self.reserve_path_bytes(relative.as_os_str().len())?;
+        self.entries = next;
+        Ok(())
+    }
+
+    fn reserve_file(&mut self, size: u64) -> Result<(), PodError> {
+        let next = self
+            .declared_bytes
+            .checked_add(size)
+            .ok_or(PodError::Refused("operator artifact byte count overflow"))?;
+        if next > self.limits.bytes {
+            return Err(PodError::Refused("operator artifact exceeds byte budget"));
+        }
+        self.declared_bytes = next;
+        Ok(())
+    }
+
+    fn read(&mut self, count: usize) -> Result<(), PodError> {
+        let next = self
+            .read_bytes
+            .checked_add(count as u64)
+            .ok_or(PodError::Refused(
+                "operator artifact read byte count overflow",
+            ))?;
+        if next > self.limits.bytes {
+            return Err(PodError::Refused(
+                "operator artifact exceeds read byte budget",
+            ));
+        }
+        self.read_bytes = next;
+        Ok(())
+    }
+}
 
 /// One bounded digest of the whole installed Zap code and import tree. A
 /// symlink is recorded by its literal target and may resolve only inside the
-/// root. Mutable Zap state must live outside this tree.
+/// root. Mutable Zap state must live outside this tree. Elapsed checks cannot
+/// interrupt a blocked filesystem call. This is cooperative observation, not
+/// an atomic filesystem snapshot or exclusion of hostile same-UID writers.
 #[derive(Clone, Debug)]
 pub struct OperatorArtifactDigest {
     pub sha256: String,
@@ -135,38 +270,7 @@ pub struct TrustedOperatorArtifact {
 
 impl TrustedOperatorArtifact {
     pub fn inspect_tree(root: &Path) -> Result<OperatorArtifactDigest, PodError> {
-        let metadata = fs::symlink_metadata(root)?;
-        let peer = LinuxPeerEvidence::for_current_process()
-            .map_err(|_| PodError::Refused("operator artifact inspector identity unavailable"))?;
-        if !root.is_absolute()
-            || fs::canonicalize(root)? != root
-            || !metadata.is_dir()
-            || metadata.uid() != peer.uid()
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(PodError::Refused("operator artifact root is not canonical and owned"));
-        }
-        let started = Instant::now();
-        let mut hash = Sha256::new();
-        hash.update(b"podbay.operator-artifact-tree/1\0");
-        let mut entries = 0u64;
-        let mut bytes = 0u64;
-        hash_operator_tree(root, root, &mut hash, &mut entries, &mut bytes, started)?;
-        if started.elapsed() > OPERATOR_ARTIFACT_MAX_TIME {
-            return Err(PodError::Refused("operator artifact hash exceeded time budget"));
-        }
-        let after = fs::symlink_metadata(root)?;
-        if (after.dev(), after.ino(), after.mtime(), after.mtime_nsec())
-            != (metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
-        {
-            return Err(PodError::Refused("operator artifact root changed during hash"));
-        }
-        Ok(OperatorArtifactDigest {
-            sha256: hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect(),
-            entries,
-            bytes,
-            elapsed: started.elapsed(),
-        })
+        inspect_operator_tree(root, OperatorArtifactLimits::PRODUCTION)
     }
 
     pub fn from_trusted_policy(root: PathBuf, sha256: String) -> Result<Self, PodError> {
@@ -177,13 +281,19 @@ impl TrustedOperatorArtifact {
         root: PathBuf,
         sha256: String,
     ) -> Result<(Self, OperatorArtifactDigest), PodError> {
-        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
             return Err(PodError::Refused("operator artifact digest is invalid"));
         }
         let metadata = fs::symlink_metadata(&root)?;
         let observed = Self::inspect_tree(&root)?;
         if observed.sha256 != sha256 {
-            return Err(PodError::Refused("operator artifact tree differs from trusted digest"));
+            return Err(PodError::Refused(
+                "operator artifact tree differs from trusted digest",
+            ));
         }
         let artifact = Self {
             root,
@@ -198,10 +308,58 @@ impl TrustedOperatorArtifact {
         if (metadata.dev(), metadata.ino()) != self.root_identity
             || Self::inspect_tree(&self.root)?.sha256 != self.sha256
         {
-            return Err(PodError::Refused("operator artifact tree differs from trusted digest"));
+            return Err(PodError::Refused(
+                "operator artifact tree differs from trusted digest",
+            ));
         }
         Ok(())
     }
+}
+
+fn inspect_operator_tree(
+    root: &Path,
+    limits: OperatorArtifactLimits,
+) -> Result<OperatorArtifactDigest, PodError> {
+    let mut budget = OperatorArtifactBudget::new(limits);
+    if root.as_os_str().len() > OPERATOR_ARTIFACT_MAX_PATH {
+        return Err(PodError::Refused(
+            "operator artifact root path exceeds budget",
+        ));
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    let peer = LinuxPeerEvidence::for_current_process()
+        .map_err(|_| PodError::Refused("operator artifact inspector identity unavailable"))?;
+    if !root.is_absolute()
+        || fs::canonicalize(root)? != root
+        || !metadata.is_dir()
+        || metadata.uid() != peer.uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(PodError::Refused(
+            "operator artifact root is not canonical and owned",
+        ));
+    }
+    budget.check_time()?;
+    let mut hash = Sha256::new();
+    hash.update(b"podbay.operator-artifact-tree/1\0");
+    hash_operator_tree(root, root, &mut hash, &mut budget, 0)?;
+    let after = fs::symlink_metadata(root)?;
+    budget.check_time()?;
+    if !operator_metadata_matches(&metadata, &after) || budget.read_bytes != budget.declared_bytes {
+        return Err(PodError::Refused(
+            "operator artifact root changed during hash",
+        ));
+    }
+    Ok(OperatorArtifactDigest {
+        sha256: hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        entries: budget.entries,
+        bytes: budget.read_bytes,
+        elapsed: budget.started.elapsed(),
+    })
 }
 
 fn operator_hash_field(hash: &mut Sha256, value: &[u8]) {
@@ -209,89 +367,544 @@ fn operator_hash_field(hash: &mut Sha256, value: &[u8]) {
     hash.update(value);
 }
 
+fn collect_operator_children(
+    root: &Path,
+    mut directory_entries: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
+    budget: &mut OperatorArtifactBudget,
+    child_depth: usize,
+) -> Result<Vec<std::ffi::OsString>, PodError> {
+    let mut children = Vec::new();
+    loop {
+        budget.check_time()?;
+        let Some(entry) = directory_entries.next() else {
+            break;
+        };
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| PodError::Refused("operator artifact path escaped root"))?;
+        // Reserve all discovered siblings before retaining/sorting any of them.
+        // Recursion therefore cannot reuse their outstanding entry/path budget.
+        budget.discover(relative, child_depth)?;
+        // Retain only the basename, not another copy of the absolute root.
+        children.push(entry.file_name());
+    }
+    budget.check_time()?;
+    children.sort_unstable();
+    budget.check_time()?;
+    Ok(children)
+}
+
 fn hash_operator_tree(
     root: &Path,
     directory: &Path,
     hash: &mut Sha256,
-    entries: &mut u64,
-    bytes: &mut u64,
-    started: Instant,
+    budget: &mut OperatorArtifactBudget,
+    depth: usize,
 ) -> Result<(), PodError> {
+    budget.check_time()?;
     let before = fs::symlink_metadata(directory)?;
     if !before.is_dir() {
         return Err(PodError::Refused("operator artifact directory changed"));
     }
-    let mut children = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for entry in children {
-        if started.elapsed() > OPERATOR_ARTIFACT_MAX_TIME {
-            return Err(PodError::Refused("operator artifact hash exceeded time budget"));
-        }
-        *entries += 1;
-        if *entries > OPERATOR_ARTIFACT_MAX_ENTRIES {
-            return Err(PodError::Refused("operator artifact has too many entries"));
-        }
-        let path = entry.path();
-        let relative = path.strip_prefix(root)
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or(PodError::Refused("operator artifact depth overflow"))?;
+    let children = collect_operator_children(root, fs::read_dir(directory)?, budget, child_depth)?;
+    for name in children {
+        budget.check_time()?;
+        let path = directory.join(name);
+        let relative = path
+            .strip_prefix(root)
             .map_err(|_| PodError::Refused("operator artifact path escaped root"))?;
         let metadata = fs::symlink_metadata(&path)?;
         operator_hash_field(hash, relative.as_os_str().as_bytes());
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)?;
+            if target.as_os_str().len() > budget.limits.target {
+                return Err(PodError::Refused(
+                    "operator artifact link target exceeds budget",
+                ));
+            }
+            budget.reserve_path_bytes(target.as_os_str().len())?;
+            budget.check_time()?;
             let resolved = fs::canonicalize(&path)?;
-            if !resolved.starts_with(root) {
+            budget.check_time()?;
+            if !resolved.starts_with(root)
+                || resolved.as_os_str().len() > OPERATOR_ARTIFACT_MAX_PATH
+            {
                 return Err(PodError::Refused("operator artifact symlink escaped root"));
+            }
+            let resolved_metadata = fs::symlink_metadata(&resolved)?;
+            if !resolved_metadata.is_file() && !resolved_metadata.is_dir() {
+                return Err(PodError::Refused(
+                    "operator artifact link targets a special file",
+                ));
+            }
+            if fs::read_link(&path)? != target
+                || !operator_metadata_matches(&metadata, &fs::symlink_metadata(&path)?)
+            {
+                return Err(PodError::Refused(
+                    "operator artifact link changed during hash",
+                ));
             }
             hash.update(b"L");
             operator_hash_field(hash, target.as_os_str().as_bytes());
         } else if metadata.is_dir() {
             hash.update(b"D");
-            hash_operator_tree(root, &path, hash, entries, bytes, started)?;
+            hash_operator_tree(root, &path, hash, budget, child_depth)?;
         } else if metadata.is_file() {
             hash.update(b"F");
             let size = metadata.len();
-            *bytes = bytes.checked_add(size)
-                .ok_or(PodError::Refused("operator artifact byte count overflow"))?;
-            if *bytes > OPERATOR_ARTIFACT_MAX_BYTES {
-                return Err(PodError::Refused("operator artifact exceeds byte budget"));
-            }
+            budget.reserve_file(size)?;
             hash.update(size.to_be_bytes());
-            let mut file = OpenOptions::new().read(true)
-                .custom_flags(libc::O_NOFOLLOW).open(&path)?;
-            let opened = file.metadata()?;
-            if (opened.dev(), opened.ino(), opened.len(), opened.mtime(), opened.mtime_nsec())
-                != (metadata.dev(), metadata.ino(), size, metadata.mtime(), metadata.mtime_nsec())
-            {
-                return Err(PodError::Refused("operator artifact file changed before hash"));
-            }
-            let mut chunk = [0u8; 16_384];
-            let mut read = 0u64;
-            loop {
-                let count = file.read(&mut chunk)?;
-                if count == 0 { break; }
-                read += count as u64;
-                hash.update(&chunk[..count]);
-            }
+            budget.check_time()?;
+            let mut file = open_operator_artifact_file(&path, &metadata)?;
+            hash_operator_file_bytes(&mut file, size, hash, budget)?;
             let after = file.metadata()?;
             let path_after = fs::symlink_metadata(&path)?;
-            if read != size
-                || (after.dev(), after.ino(), after.len(), after.mtime(), after.mtime_nsec())
-                    != (metadata.dev(), metadata.ino(), size, metadata.mtime(), metadata.mtime_nsec())
-                || (path_after.dev(), path_after.ino()) != (metadata.dev(), metadata.ino())
+            if !operator_metadata_matches(&metadata, &after)
+                || !operator_metadata_matches(&metadata, &path_after)
             {
-                return Err(PodError::Refused("operator artifact file changed during hash"));
+                return Err(PodError::Refused(
+                    "operator artifact file changed during hash",
+                ));
             }
         } else {
             return Err(PodError::Refused("operator artifact contains special file"));
         }
     }
     let after = fs::symlink_metadata(directory)?;
-    if (after.dev(), after.ino(), after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec())
-        != (before.dev(), before.ino(), before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec())
-    {
-        return Err(PodError::Refused("operator artifact directory changed during hash"));
+    budget.check_time()?;
+    if !operator_metadata_matches(&before, &after) {
+        return Err(PodError::Refused(
+            "operator artifact directory changed during hash",
+        ));
     }
     Ok(())
+}
+
+fn operator_metadata_matches(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mode(),
+        before.uid(),
+        before.gid(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) == (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mode(),
+        after.uid(),
+        after.gid(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    )
+}
+
+fn open_operator_artifact_file(path: &Path, expected: &fs::Metadata) -> Result<fs::File, PodError> {
+    // NONBLOCK prevents a regular-file-to-FIFO replacement from hanging open.
+    // It does not promise a hard deadline for arbitrary filesystem operations.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || !operator_metadata_matches(expected, &opened) {
+        return Err(PodError::Refused(
+            "operator artifact file changed before hash",
+        ));
+    }
+    Ok(file)
+}
+
+// The production file path and deterministic growth/deadline tests share this
+// exact loop. At most the declared bytes plus one un-hashed EOF probe are read.
+fn hash_operator_file_bytes(
+    file: &mut impl Read,
+    size: u64,
+    hash: &mut Sha256,
+    budget: &mut OperatorArtifactBudget,
+) -> Result<(), PodError> {
+    let mut remaining = size;
+    let mut chunk = [0u8; 16_384];
+    while remaining != 0 {
+        budget.check_time()?;
+        let capacity = remaining.min(chunk.len() as u64) as usize;
+        let count = file.read(&mut chunk[..capacity])?;
+        budget.check_time()?;
+        if count == 0 {
+            return Err(PodError::Refused(
+                "operator artifact file shrank during hash",
+            ));
+        }
+        remaining = remaining
+            .checked_sub(count as u64)
+            .ok_or(PodError::Refused(
+                "operator artifact read exceeded requested size",
+            ))?;
+        budget.read(count)?;
+        hash.update(&chunk[..count]);
+    }
+    budget.check_time()?;
+    let count = file.read(&mut chunk[..1])?;
+    budget.check_time()?;
+    if count != 0 {
+        return Err(PodError::Refused("operator artifact file grew during hash"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod artifact_bounds_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::Cursor;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Tree(PathBuf);
+    impl Tree {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "podbay-artifact-unit-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(fs::canonicalize(path).unwrap())
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn artifact_bounds_directory_stops_at_limit_plus_one_before_collecting() {
+        let tree = Tree::new();
+        for name in ["a", "b", "c"] {
+            fs::write(tree.0.join(name), b"").unwrap();
+        }
+        let yielded = Cell::new(0);
+        let entries = fs::read_dir(&tree.0)
+            .unwrap()
+            .inspect(|_| yielded.set(yielded.get() + 1));
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits {
+            entries: 1,
+            ..OperatorArtifactLimits::PRODUCTION
+        });
+        assert!(matches!(
+            collect_operator_children(&tree.0, entries, &mut budget, 1),
+            Err(PodError::Refused("operator artifact has too many entries"))
+        ));
+        assert_eq!(
+            yielded.get(),
+            2,
+            "must not exhaust/collect the directory first"
+        );
+        assert_eq!(budget.entries, 1);
+        for limit in [2, 3, 4] {
+            let result = inspect_operator_tree(
+                &tree.0,
+                OperatorArtifactLimits {
+                    entries: limit,
+                    ..OperatorArtifactLimits::PRODUCTION
+                },
+            );
+            assert_eq!(result.is_ok(), limit >= 3);
+        }
+    }
+
+    #[test]
+    fn artifact_bounds_directory_polls_deadline_after_iterator_io() {
+        let tree = Tree::new();
+        fs::write(tree.0.join("a"), b"").unwrap();
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits::PRODUCTION);
+        budget.test_elapsed = Some(clock.clone());
+        let entries = fs::read_dir(&tree.0).unwrap().inspect(|_| {
+            clock.set(OPERATOR_ARTIFACT_MAX_TIME + Duration::from_nanos(1));
+        });
+        assert!(matches!(
+            collect_operator_children(&tree.0, entries, &mut budget, 1),
+            Err(PodError::Refused(
+                "operator artifact hash exceeded time budget"
+            ))
+        ));
+        assert_eq!(budget.entries, 0);
+    }
+
+    #[test]
+    fn artifact_bounds_paths_depth_and_combined_targets_use_real_walker() {
+        let tree = Tree::new();
+        fs::create_dir(tree.0.join("a")).unwrap();
+        fs::write(tree.0.join("a/x"), b"123").unwrap();
+        // Relative paths are "a" and "a/x": four bytes in total, depth two.
+        for limit in [3, 4, 5] {
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        path_bytes: limit,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 4
+            );
+        }
+        for limit in [1, 2, 3] {
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        depth: limit,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 2
+            );
+        }
+        for limit in [2, 3, 4] {
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        path: limit,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 3
+            );
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        bytes: limit as u64,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 3
+            );
+        }
+        symlink("a/x", tree.0.join("l")).unwrap();
+        for limit in [2, 3, 4] {
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        target: limit,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 3
+            );
+        }
+        // Add "l" and its literal target: eight path/target bytes total.
+        for limit in [7, 8, 9] {
+            assert_eq!(
+                inspect_operator_tree(
+                    &tree.0,
+                    OperatorArtifactLimits {
+                        path_bytes: limit,
+                        ..OperatorArtifactLimits::PRODUCTION
+                    }
+                )
+                .is_ok(),
+                limit >= 8
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_bounds_pending_siblings_share_discovery_budget() {
+        let tree = Tree::new();
+        fs::create_dir(tree.0.join("a")).unwrap();
+        fs::write(tree.0.join("a/x"), b"").unwrap();
+        fs::write(tree.0.join("z"), b"").unwrap();
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits {
+            entries: 2,
+            ..OperatorArtifactLimits::PRODUCTION
+        });
+        let children =
+            collect_operator_children(&tree.0, fs::read_dir(&tree.0).unwrap(), &mut budget, 1)
+                .unwrap();
+        assert_eq!(
+            budget.entries, 2,
+            "the pending z sibling already consumes its slot"
+        );
+        assert_eq!(children.len(), 2);
+        assert!(matches!(
+            hash_operator_tree(
+                &tree.0,
+                &tree.0.join("a"),
+                &mut Sha256::new(),
+                &mut budget,
+                1
+            ),
+            Err(PodError::Refused("operator artifact has too many entries"))
+        ));
+    }
+
+    struct ObservedReader {
+        bytes: Cursor<Vec<u8>>,
+        calls: usize,
+        read: usize,
+        expire: Option<Rc<Cell<Duration>>>,
+    }
+    impl Read for ObservedReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            let count = self.bytes.read(output)?;
+            self.read += count;
+            if let Some(clock) = &self.expire {
+                clock.set(OPERATOR_ARTIFACT_MAX_TIME + Duration::from_nanos(1));
+            }
+            Ok(count)
+        }
+    }
+    fn observed(bytes: Vec<u8>) -> ObservedReader {
+        ObservedReader {
+            bytes: Cursor::new(bytes),
+            calls: 0,
+            read: 0,
+            expire: None,
+        }
+    }
+
+    #[test]
+    fn artifact_bounds_real_read_loop_refuses_growth_after_only_one_probe() {
+        let mut reader = observed(vec![7; 1_000_000]);
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits::PRODUCTION);
+        budget.reserve_file(3).unwrap();
+        assert!(matches!(
+            hash_operator_file_bytes(&mut reader, 3, &mut Sha256::new(), &mut budget),
+            Err(PodError::Refused("operator artifact file grew during hash"))
+        ));
+        assert_eq!(reader.read, 4, "growth must not be read through EOF");
+        assert_eq!(reader.calls, 2);
+        assert_eq!(budget.read_bytes, 3);
+    }
+
+    #[test]
+    fn artifact_bounds_real_read_loop_refuses_truncation_and_polls_deadline() {
+        let mut short = observed(vec![1, 2]);
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits::PRODUCTION);
+        assert!(matches!(
+            hash_operator_file_bytes(&mut short, 3, &mut Sha256::new(), &mut budget),
+            Err(PodError::Refused(
+                "operator artifact file shrank during hash"
+            ))
+        ));
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let mut reader = observed(vec![9; 32_768]);
+        reader.expire = Some(clock.clone());
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits::PRODUCTION);
+        budget.test_elapsed = Some(clock);
+        assert!(matches!(
+            hash_operator_file_bytes(&mut reader, 32_768, &mut Sha256::new(), &mut budget),
+            Err(PodError::Refused(
+                "operator artifact hash exceeded time budget"
+            ))
+        ));
+        assert_eq!(
+            reader.calls, 1,
+            "deadline must be checked before another read"
+        );
+        assert_eq!(reader.read, 16_384);
+    }
+
+    #[test]
+    fn artifact_bounds_real_read_loop_accounts_success_and_actual_limit() {
+        let mut reader = observed(b"abc".to_vec());
+        let mut budget = OperatorArtifactBudget::new(OperatorArtifactLimits {
+            bytes: 3,
+            ..OperatorArtifactLimits::PRODUCTION
+        });
+        budget.reserve_file(3).unwrap();
+        let mut hash = Sha256::new();
+        hash_operator_file_bytes(&mut reader, 3, &mut hash, &mut budget).unwrap();
+        assert_eq!(hash.finalize(), Sha256::digest(b"abc"));
+        assert_eq!(budget.read_bytes, 3);
+        assert_eq!(reader.calls, 2);
+        let mut extra = observed(vec![1]);
+        assert!(matches!(
+            hash_operator_file_bytes(&mut extra, 1, &mut Sha256::new(), &mut budget),
+            Err(PodError::Refused(
+                "operator artifact exceeds read byte budget"
+            ))
+        ));
+    }
+
+    #[test]
+    fn artifact_bounds_regular_to_fifo_replacement_refuses_without_blocking_open() {
+        let tree = Tree::new();
+        let path = tree.0.join("file");
+        fs::write(&path, b"x").unwrap();
+        let expected = fs::symlink_metadata(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        // Creates only a disposable pipe; no writer or service is started.
+        assert!(
+            Command::new("mkfifo")
+                .args(["-m", "600", "--"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(matches!(
+            open_operator_artifact_file(&path, &expected),
+            Err(PodError::Refused(
+                "operator artifact file changed before hash"
+            ))
+        ));
+        assert!(TrustedOperatorArtifact::inspect_tree(&tree.0).is_err());
+    }
+
+    #[test]
+    fn artifact_bounds_production_depth_accepts_boundary_and_refuses_next_entry() {
+        let tree = Tree::new();
+        let mut path = tree.0.clone();
+        for _ in 0..OPERATOR_ARTIFACT_MAX_DEPTH {
+            path.push("d");
+            fs::create_dir(&path).unwrap();
+        }
+        assert_eq!(
+            TrustedOperatorArtifact::inspect_tree(&tree.0)
+                .unwrap()
+                .entries,
+            OPERATOR_ARTIFACT_MAX_DEPTH as u64
+        );
+        fs::write(path.join("over"), b"").unwrap();
+        assert!(matches!(
+            TrustedOperatorArtifact::inspect_tree(&tree.0),
+            Err(PodError::Refused(
+                "operator artifact path or depth exceeds budget"
+            ))
+        ));
+    }
 }
 
 /// One operator-installed generic process profile. The public V1 descriptor

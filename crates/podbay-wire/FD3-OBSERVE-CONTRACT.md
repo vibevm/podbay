@@ -67,6 +67,49 @@ No future HostAccepted receipt, child PID/birth, secret key, nonce or allocated
 restart generation is synthesized. Those require later reviewed associations
 with a committed command/outbox and independently observed processes.
 
+## Artifact measurement implementation and limits
+
+The separate Linux launcher exposes `TrustedOperatorArtifact::inspect_tree`.
+It measures the existing `podbay.operator-artifact-tree/1` stream; the wire
+constructors above still only validate declared expectations. This helper adds
+no FD3 Host admission, grant, dispatch or readiness capability.
+
+The v1 hash input starts with `podbay.operator-artifact-tree/1` and one NUL.
+At each directory, children are sorted by their raw Linux filename order and
+visited depth first. Every entry starts with its root-relative raw pathname,
+framed by an eight-byte big-endian length. `D` marks a directory; `F` is followed
+by an eight-byte big-endian file size and the exact file bytes; `L` is followed
+by the length-framed literal link target. Internal symlinks must resolve inside
+the root; they are not traversed again through the alias. Empty directories are
+included. The root itself, timestamps, inode numbers, modes and ownership are
+not hash fields. Link targets are not normalized, so an absolute internal link
+can make the digest sensitive to installation location.
+
+The inspector limits discovery to 20,000 entries, regular-file content to
+512 MiB, entry depth to 128, root/relative/target paths to 4,096 bytes each, and
+cumulative relative-path plus target bytes to 16 MiB. Sibling entries consume
+the shared budget while being discovered, before collection/sorting or descent.
+Files are streamed only to their observed size plus one un-hashed growth probe.
+Errors, overflow, growth, truncation and unsupported file types refuse; no
+partial digest succeeds. Limits can refuse an installation previously accepted
+by the less strictly bounded inspector. Unchanged supported trees retain their
+exact v1 digests; a different framing or content algorithm needs a new domain.
+
+The eight-second elapsed budget is polled during enumeration, around sorting,
+and around each file read. It cannot interrupt a blocked filesystem syscall and
+is not a hard wall-clock guarantee. No-follow/nonblocking regular-file opens and
+before/after identity, size, mode, owner and change-time checks detect specified
+changes; symlink identity/target and directory metadata are also rechecked.
+Traversal remains cooperative pathname observation, not an atomic filesystem
+snapshot, exclusive ownership, hostile-writer exclusion or a pin on later
+execution. Dynamic dependencies, actual import closure and runtime composition
+are outside this digest. Mutable runtime state belongs outside the installation.
+
+`Configuration::Absent` carries no pathname and this measurement helper does
+not establish configuration absence or disabled discovery. A later Host
+admission must use a separately reviewed application configuration rule; neither
+that rule nor a successful configuration/Ready observation is added here.
+
 ## Compatibility and tests
 
 Legacy V1/V2 descriptor decoding explicitly rejects the reserved FD3 profile
