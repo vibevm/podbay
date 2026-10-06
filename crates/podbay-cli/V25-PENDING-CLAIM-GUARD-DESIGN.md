@@ -1,12 +1,15 @@
 # Disposable v25 pending claim guard
 
-Status: candidate integration design, 2026-10-06, following `bda9c88`. A
-private transaction-local disposition decoder is implemented for rebound V2
-recovery candidates; claim and current-inspection integration is not. The
-decoder's focused 5/5 and full store-library 29/29 tests passed, with
-independent review closing a pre-allocation TEXT byte-budget defect. No
-production v25 opener, authority or maintained effect-use gate exists. Anchors
-are relative to `crates/` and name
+Status: restricted disposable integration, 2026-10-06, following `333d282`.
+The private transaction-local disposition decoder and both bootstrap/later
+native-send claim/current-inspection bodies are implemented for rebound V2
+recovery candidates. The guard runs before fresh and `ExistingUncertain`
+classification; passive exact-key receipts remain separate. Parent full
+`podbay-store` suite passed 236/236 and independent review closed the
+latest-activated-rebind P2. A valid unrelated A subject remains Live while B
+is Pending/FinalRecorded in the private fixture. No production v25 opener,
+authority, finalizer or maintained effect-use gate exists. Anchors are relative
+to `crates/` and name
 the inspected source. This bounds the next atom from
 [the claim/use fence map](EXTERNAL-DEATH-CLAIM-FENCE-MAP.md).
 
@@ -45,13 +48,13 @@ private; disposable tests may use its existing private construction path.
 
 ## Claim and readback seams
 
-Extract shared transaction bodies for
+The implementation extracts shared transaction bodies for
 `podbay-store/src/bootstrap_send.rs:1249` and
 `podbay-store/src/later_turn.rs:1238`. Their order must be:
 
 `BEGIN IMMEDIATE -> resolve stored command/subject -> require_live_subject -> fresh/existing branch -> commit`
 
-Place the guard before `ExistingUncertain`, not only inside
+The private v25 guard is before `ExistingUncertain`, not only inside
 `check_current_record`: the existing returns at
 `podbay-store/src/bootstrap_send.rs:1262` and
 `podbay-store/src/later_turn.rs:1253` precede that helper. Guard the current
