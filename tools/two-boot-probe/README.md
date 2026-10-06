@@ -4,6 +4,11 @@ This directory has a read-only inventory, an offline CLOSED-stub assembler and a
 [QEMU runner](CLOSED-VM.md). The runner has passed dry-run, fake-child and one
 real CLOSED-stub VM boot. There is **no two-boot barrier proof, production
 admission or deployment capability**.
+
+The separate [CLOSED marker persistence fixture](PERSISTENCE-VM.md) has now
+completed two fresh QEMU boots against one new writable ext4 image. It verifies
+the same closed marker/inode across distinct guest boot IDs with exact child
+reap between boots. It does not execute v25 migration or release admission.
 `inventory.py` prints JSON and always exits 3 (`BLOCKED_NOT_BOOTED`). It opens
 only the explicit ISO and device metadata, never the KVM device itself. It does
 not execute discovered tools, extract files, download inputs or change services.
