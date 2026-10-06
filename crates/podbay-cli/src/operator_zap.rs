@@ -10,6 +10,8 @@ mod terminal_attestation;
 mod historical_signer;
 // Production restart is a typed, closed front door until its adapters exist.
 mod restart;
+// Fixture-only origin injection; production evidence acquisition stays closed.
+mod restart_evidence;
 
 use std::collections::BTreeSet;
 use std::env;

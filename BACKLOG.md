@@ -107,6 +107,10 @@ The `operator zap restart` CLI now has a strict, typed closed front door. A
 well-formed request returns `production_restart_closed` with exit 2 before
 policy loading, directory creation or owner-state I/O; repeated requests have
 the same refusal and no allocation. This is a preparatory contract only.
+The passive evidence prototype can decode a strict signed envelope and read a
+schema24 historical verifier snapshot in a disposable fixture. Production
+origin acquisition returns `OriginUnavailable` before I/O; even a valid old
+signature remains `SigningTimeUnavailable` without independent time evidence.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 

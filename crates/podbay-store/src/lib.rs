@@ -73,4 +73,4 @@ pub use rebind::{
 pub use supersession::{
     PriorPlannedRecovery, SqliteSupersessionLedger, SupersessionReceipt, SupersessionStage,
 };
-pub use store::PodBayStore;
+pub use store::{HistoricalOwnerReadbackV1, HistoricalRotationReadbackV1, PodBayStore};

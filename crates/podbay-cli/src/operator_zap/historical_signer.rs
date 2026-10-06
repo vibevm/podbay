@@ -64,7 +64,7 @@ struct TrustedSnapshotV1 {
     rotations: Vec<RotationV1>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Error {
+pub(super) enum Error {
     Malformed,
     Foreign,
     Bounds,
@@ -212,6 +212,71 @@ fn resolve(
         },
         public_key: key,
     })
+}
+
+/// Bridge passive captured rows into the existing pure resolver. The caller
+/// must separately establish origin; this function never does that itself.
+pub(super) fn resolve_readback(
+    expected_lineage: &str,
+    expected_actor: &str,
+    expected_scope: &str,
+    data: &podbay_store::HistoricalOwnerReadbackV1,
+    target: u64,
+) -> Result<TrustedSignerV1, Error> {
+    let actor = data.actor();
+    let expected = ExpectedOwnerV1 {
+        version: VERSION,
+        lineage: expected_lineage.into(),
+        actor: expected_actor.into(),
+        scope: expected_scope.into(),
+    };
+    let snapshot = TrustedSnapshotV1 {
+        version: data.version(),
+        current: CurrentVerifierV1 {
+            version: data.version(),
+            lineage: data.lineage().into(),
+            actor: actor.actor_id.clone(),
+            scope: actor.scope_id.clone(),
+            origin: if actor.origin == "owner_cli" {
+                Origin::OwnerCli
+            } else {
+                Origin::Other
+            },
+            role: if actor.role == "coordinator" {
+                Role::Coordinator
+            } else {
+                Role::Other
+            },
+            generation: actor.credential_generation,
+            key: data.public_key(),
+            binding: data.binding_digest(),
+            revoked: data.revoked(),
+            owner_epoch: data.owner_epoch(),
+            authority_revision: data.authority_revision(),
+        },
+        rotations: data
+            .rotations()
+            .iter()
+            .map(|row| RotationV1 {
+                version: VERSION,
+                lineage: data.lineage().into(),
+                actor: row.actor().into(),
+                scope: row.scope().into(),
+                rotation_key: row.rotation_key().into(),
+                intent_digest: row.intent_digest(),
+                prior_generation: row.prior_generation(),
+                next_generation: row.next_generation(),
+                prior_key: row.prior_key(),
+                next_key: row.next_key(),
+                prior_binding: row.prior_binding(),
+                next_binding: row.next_binding(),
+                prior_revoked: row.prior_revoked(),
+                owner_epoch: row.owner_epoch(),
+                authority_revision: row.authority_revision(),
+            })
+            .collect(),
+    };
+    resolve(&expected, &snapshot, target)
 }
 
 #[cfg(test)]

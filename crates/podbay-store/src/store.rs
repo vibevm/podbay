@@ -2800,3 +2800,153 @@ fn verify_owner_rotation_schema(transaction: &rusqlite::Transaction<'_>) -> Resu
     }
     Ok(())
 }
+
+/// Passive captured data only: no store-origin, signing-time or authority proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalRotationReadbackV1 {
+    scope: String,
+    actor: String,
+    rotation_key: String,
+    intent_digest: [u8; 32],
+    prior_generation: u64,
+    next_generation: u64,
+    prior_binding: [u8; 32],
+    prior_key: [u8; 32],
+    next_binding: [u8; 32],
+    next_key: [u8; 32],
+    owner_epoch: u64,
+    authority_revision: u64,
+    prior_revoked: bool,
+}
+impl HistoricalRotationReadbackV1 {
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+    pub fn rotation_key(&self) -> &str {
+        &self.rotation_key
+    }
+    pub fn intent_digest(&self) -> [u8; 32] {
+        self.intent_digest
+    }
+    pub fn prior_generation(&self) -> u64 {
+        self.prior_generation
+    }
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation
+    }
+    pub fn prior_binding(&self) -> [u8; 32] {
+        self.prior_binding
+    }
+    pub fn prior_key(&self) -> [u8; 32] {
+        self.prior_key
+    }
+    pub fn next_binding(&self) -> [u8; 32] {
+        self.next_binding
+    }
+    pub fn next_key(&self) -> [u8; 32] {
+        self.next_key
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn prior_revoked(&self) -> bool {
+        self.prior_revoked
+    }
+}
+
+/// Passive captured data only: no store-origin, signing-time or authority proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalOwnerReadbackV1 {
+    version: u8,
+    lineage: String,
+    owner_epoch: u64,
+    authority_revision: u64,
+    actor: crate::model::AuthorityActorRecord,
+    verifier_version: String,
+    public_key: [u8; 32],
+    binding_digest: [u8; 32],
+    revoked: bool,
+    rotations: Vec<HistoricalRotationReadbackV1>,
+}
+impl HistoricalOwnerReadbackV1 {
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn lineage(&self) -> &str {
+        &self.lineage
+    }
+    pub fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+    pub fn authority_revision(&self) -> u64 {
+        self.authority_revision
+    }
+    pub fn actor(&self) -> &crate::model::AuthorityActorRecord {
+        &self.actor
+    }
+    pub fn verifier_version(&self) -> &str {
+        &self.verifier_version
+    }
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+    pub fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+    pub fn revoked(&self) -> bool {
+        self.revoked
+    }
+    pub fn rotations(&self) -> &[HistoricalRotationReadbackV1] {
+        &self.rotations
+    }
+}
+
+impl PodBayStore {
+    /// Read the existing passive schema24 capture through immutable accessors.
+    /// The handle must already be read-only. This API does not acquire trusted
+    /// origin: any application making authority claims needs a separate provider.
+    pub fn historical_owner_readback_v1(
+        &mut self,
+        lineage: &str,
+        actor: &str,
+        scope: &str,
+    ) -> Result<HistoricalOwnerReadbackV1, StoreError> {
+        let captured = self.read_historical_owner_snapshot_v1(lineage, actor, scope)?;
+        Ok(HistoricalOwnerReadbackV1 {
+            version: captured.version,
+            lineage: captured.lineage,
+            owner_epoch: captured.owner_epoch,
+            authority_revision: captured.authority_revision,
+            actor: captured.actor,
+            verifier_version: captured.verifier_version,
+            public_key: captured.public_key,
+            binding_digest: captured.binding_digest,
+            revoked: captured.revoked,
+            rotations: captured
+                .rotations
+                .into_iter()
+                .map(|row| HistoricalRotationReadbackV1 {
+                    scope: row.scope,
+                    actor: row.actor,
+                    rotation_key: row.rotation_key,
+                    intent_digest: row.intent_digest,
+                    prior_generation: row.prior_generation,
+                    next_generation: row.next_generation,
+                    prior_binding: row.prior_binding,
+                    prior_key: row.prior_key,
+                    next_binding: row.next_binding,
+                    next_key: row.next_key,
+                    owner_epoch: row.owner_epoch,
+                    authority_revision: row.authority_revision,
+                    prior_revoked: row.prior_revoked,
+                })
+                .collect(),
+        })
+    }
+}

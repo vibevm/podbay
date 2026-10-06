@@ -2,12 +2,14 @@
 //! Trust-anchor acquisition, historical key provenance and OS proof are external.
 #![allow(dead_code)]
 use ed25519_compact::{PublicKey, Signature};
+use serde::{Deserialize, Serialize};
 
 const DOMAIN: &[u8] = b"podbay.operator-zap-terminal-attestation/1\0";
 const VERSION: u8 = 1;
 const MAX_BYTES: usize = 8192;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SignerBindingV1 {
     pub(super) lineage: String,
     pub(super) actor: String,
@@ -20,35 +22,36 @@ pub(super) struct TrustedSignerV1 {
     pub(super) binding: SignerBindingV1,
     pub(super) public_key: [u8; 32],
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SubjectV1 {
-    version: u8,
-    signer: SignerBindingV1,
-    policy_digest: [u8; 32],
-    launch_command: String,
-    launch_receipt_digest: [u8; 32],
-    stop_key: String,
-    stop_intent_digest: [u8; 32],
-    pod: String,
-    incarnation: u64,
-    session: String,
-    run: String,
-    attempt: String,
-    resource: String,
-    manifest_digest: [u8; 32],
-    unit: String,
-    boot: String,
-    supervisor_pid: u32,
-    supervisor_birth: u64,
-    child_pid: u32,
-    child_birth: u64,
-    socket_device: u64,
-    socket_inode: u64,
-    terminal_observation_digest: [u8; 32],
-    pod_artifact: [u8; 32],
-    node_artifact: [u8; 32],
-    zap_artifact: [u8; 32],
-    configuration_digest: [u8; 32],
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubjectV1 {
+    pub(super) version: u8,
+    pub(super) signer: SignerBindingV1,
+    pub(super) policy_digest: [u8; 32],
+    pub(super) launch_command: String,
+    pub(super) launch_receipt_digest: [u8; 32],
+    pub(super) stop_key: String,
+    pub(super) stop_intent_digest: [u8; 32],
+    pub(super) pod: String,
+    pub(super) incarnation: u64,
+    pub(super) session: String,
+    pub(super) run: String,
+    pub(super) attempt: String,
+    pub(super) resource: String,
+    pub(super) manifest_digest: [u8; 32],
+    pub(super) unit: String,
+    pub(super) boot: String,
+    pub(super) supervisor_pid: u32,
+    pub(super) supervisor_birth: u64,
+    pub(super) child_pid: u32,
+    pub(super) child_birth: u64,
+    pub(super) socket_device: u64,
+    pub(super) socket_inode: u64,
+    pub(super) terminal_observation_digest: [u8; 32],
+    pub(super) pod_artifact: [u8; 32],
+    pub(super) node_artifact: [u8; 32],
+    pub(super) zap_artifact: [u8; 32],
+    pub(super) configuration_digest: [u8; 32],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SignedAssertionV1 {
@@ -61,7 +64,7 @@ struct AuthenticatedAssertionV1 {
     subject: SubjectV1,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Error {
+pub(super) enum Error {
     InvalidSubject,
     ExpectedMismatch,
     SignerMismatch,
@@ -161,6 +164,102 @@ fn verify(
     Ok(AuthenticatedAssertionV1 {
         subject: receipt.subject.clone(),
     })
+}
+
+const ENVELOPE_SCHEMA: &str = "podbay.operator-zap-terminal-envelope/1";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireEnvelopeV1 {
+    schema: String,
+    subject: SubjectV1,
+    signature: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EnvelopeError {
+    TooLarge,
+    LegacyUnsigned,
+    Malformed,
+    Schema,
+    NonCanonical,
+    InvalidSubject,
+    SignatureEncoding,
+}
+
+/// Decoded signed data only. Its existence establishes no origin or authority.
+pub(super) struct DecodedEnvelopeV1(SignedAssertionV1);
+
+pub(super) fn decode_envelope(bytes: &[u8]) -> Result<DecodedEnvelopeV1, EnvelopeError> {
+    if bytes.is_empty() || bytes.len() > MAX_BYTES {
+        return Err(EnvelopeError::TooLarge);
+    }
+    if let Ok(legacy) = serde_json::from_slice::<super::StopTerminal>(bytes) {
+        if legacy.schema == super::STOP_TERMINAL_SCHEMA {
+            return Err(EnvelopeError::LegacyUnsigned);
+        }
+    }
+    let wire: WireEnvelopeV1 =
+        serde_json::from_slice(bytes).map_err(|_| EnvelopeError::Malformed)?;
+    if wire.schema != ENVELOPE_SCHEMA {
+        return Err(EnvelopeError::Schema);
+    }
+    if serde_json::to_vec(&wire).map_err(|_| EnvelopeError::Malformed)? != bytes {
+        return Err(EnvelopeError::NonCanonical);
+    }
+    transcript(&wire.subject).map_err(|_| EnvelopeError::InvalidSubject)?;
+    if wire.signature.len() != 128
+        || !wire
+            .signature
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(EnvelopeError::SignatureEncoding);
+    }
+    let mut signature = [0u8; 64];
+    for (out, pair) in signature
+        .iter_mut()
+        .zip(wire.signature.as_bytes().chunks_exact(2))
+    {
+        let digit = |b: u8| {
+            if b.is_ascii_digit() {
+                b - b'0'
+            } else {
+                b - b'a' + 10
+            }
+        };
+        *out = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    Ok(DecodedEnvelopeV1(SignedAssertionV1 {
+        subject: wire.subject,
+        signature,
+    }))
+}
+
+pub(super) fn authenticate_envelope(
+    receipt: &DecodedEnvelopeV1,
+    expected: &SubjectV1,
+    signer: &TrustedSignerV1,
+) -> Result<(), Error> {
+    verify(&receipt.0, expected, signer).map(|_| ())
+}
+
+#[cfg(test)]
+pub(super) fn sign_envelope_for_fixture(
+    subject: &SubjectV1,
+    key: &ed25519_compact::KeyPair,
+) -> Vec<u8> {
+    let signature = key.sk.sign(transcript(subject).unwrap(), None);
+    serde_json::to_vec(&WireEnvelopeV1 {
+        schema: ENVELOPE_SCHEMA.into(),
+        subject: subject.clone(),
+        signature: signature
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    })
+    .unwrap()
 }
 
 #[cfg(test)]
