@@ -3611,6 +3611,52 @@ impl LockedStorePreflight {
         &self.canonical_database
     }
 
+    /// New keyed disposable entry: a complete durable intent is published and
+    /// fsynced before exchange. This is not a terminal receipt or activation.
+    pub fn exchange_keyed_staged_v25(
+        &mut self,
+        staged: &podbay_store::V25StagingResult,
+        key: &str,
+        exclusion: &DisposableReaderExclusion<'_>,
+    ) -> Result<podbay_store::V25ExchangeOrientation, DisposableExchangeError> {
+        if staged.source_path != self.canonical_database
+            || exclusion.database != self.canonical_database
+        {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "intent is not bound to this lock and exclusion database",
+                ),
+            ));
+        }
+        self.verify_exchange_excludes_manager_lock(staged)?;
+        staged
+            .persist_exchange_intent(key)
+            .map_err(DisposableExchangeError::OrientationUnknown)?;
+        self.exchange_staged_v25(staged, exclusion)
+    }
+
+    /// Restart recovery only observes a durable exact pair. It never calls
+    /// exchange, interprets a phase flag, finalizes a receipt or opens v25.
+    pub fn recover_keyed_staged_v25(
+        &self,
+        staging_path: &Path,
+        key: &str,
+        exclusion: &DisposableReaderExclusion<'_>,
+    ) -> Result<podbay_store::V25RecoveredIntent, DisposableExchangeError> {
+        if exclusion.database != self.canonical_database {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "recovery is not bound to this lock and exclusion database",
+                ),
+            ));
+        }
+        let recovered =
+            podbay_store::recover_schema_v25_intent(&self.canonical_database, staging_path, key)
+                .map_err(DisposableExchangeError::OrientationUnknown)?;
+        self.verify_exchange_excludes_manager_lock(recovered.staged())?;
+        Ok(recovered)
+    }
+
     /// Disposable exchange only; successful verification is not a durable
     /// receipt or permission for production activation. The caller retains the
     /// lock and exclusion through the return, including any post-exchange error.
@@ -10364,6 +10410,82 @@ mod disposable_exchange_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn durable_intent_restart_recovers_published_pair_without_reexchange() {
+        let fixture = Fixture::new();
+        let key = "disposable.restart.intent";
+        let original_staging = fixture.staged.staging_path.clone();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        fixture.staged.persist_exchange_intent(key).unwrap();
+        let failure = lock
+            .exchange_staged_v25_inner(&fixture.staged, &exclusion, || {
+                Err(std::io::Error::other(
+                    "crash seam after exchange before directory fsync",
+                ))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            DisposableExchangeError::PossiblyPublished(_)
+        ));
+        drop(exclusion);
+        drop(lock);
+        let database = fixture.database.clone();
+        let barrier = RwLock::new(());
+        // Recovery accepts no in-memory attestation; the old fixture is not supplied.
+        let directory = fixture.directory.clone();
+        let lock = LockedStorePreflight::acquire(&database).unwrap();
+        let exclusion = DisposableReaderExclusion {
+            database: &database,
+            _barrier: barrier.write().unwrap(),
+        };
+        let recovered = lock
+            .recover_keyed_staged_v25(&original_staging, key, &exclusion)
+            .unwrap();
+        assert_eq!(recovered.orientation, V25ExchangeOrientation::Published);
+        let inode = std::fs::metadata(&database).unwrap().ino();
+        let again = lock
+            .recover_keyed_staged_v25(&original_staging, key, &exclusion)
+            .unwrap();
+        assert_eq!(again.orientation, V25ExchangeOrientation::Published);
+        assert_eq!(std::fs::metadata(&database).unwrap().ino(), inode);
+        assert!(matches!(
+            LockedStorePreflight::acquire(&database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        drop(exclusion);
+        drop(lock);
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn keyed_exchange_persists_intent_and_wrong_key_recovery_fails_closed() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        assert_eq!(
+            lock.exchange_keyed_staged_v25(&fixture.staged, "key.one", &exclusion)
+                .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        assert_eq!(
+            lock.recover_keyed_staged_v25(&fixture.staged.staging_path, "key.one", &exclusion)
+                .unwrap()
+                .orientation,
+            V25ExchangeOrientation::Published
+        );
+        assert!(matches!(
+            lock.recover_keyed_staged_v25(&fixture.staged.staging_path, "key.two", &exclusion),
+            Err(DisposableExchangeError::OrientationUnknown(_))
+        ));
+        assert_eq!(
+            lock.exchange_keyed_staged_v25(&fixture.staged, "key.one", &exclusion)
+                .unwrap(),
+            V25ExchangeOrientation::Published
+        );
     }
 
     #[test]

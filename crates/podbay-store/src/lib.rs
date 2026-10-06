@@ -36,6 +36,8 @@ pub use migration_v25::{
     V25ExchangeOrientation, V25PreservedTable, V25SequenceHighWater, V25StagingError, V25StagingResult,
     stage_schema_v25,
 };
+#[cfg(unix)]
+pub use migration_v25::{V25RecoveredIntent, recover_schema_v25_intent};
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,

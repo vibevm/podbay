@@ -425,6 +425,9 @@ dependencies = [
  "podbay-core",
  "podbay-wire",
  "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

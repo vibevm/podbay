@@ -9,8 +9,11 @@ podbay-core = { path = "../podbay-core" }
 podbay-wire = { path = "../podbay-wire" }
 rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 sha2 = "0.11.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 nix = { version = "=0.28.0", features = ["user"] }
 
 [lib]

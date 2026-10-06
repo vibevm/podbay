@@ -9,6 +9,7 @@ use std::time::Duration;
 use rusqlite::backup::Backup;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{PodBayStore, StoreError};
@@ -16,7 +17,8 @@ use crate::{PodBayStore, StoreError};
 const SOURCE_SCHEMA_VERSION: i64 = 24;
 const STAGING_SCHEMA_VERSION: i64 = 25;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V25PreservedTable {
     pub name: String,
     pub row_count: u64,
@@ -24,7 +26,8 @@ pub struct V25PreservedTable {
     pub content_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V25SequenceHighWater {
     pub table: String,
     pub sequence: i64,
@@ -51,10 +54,12 @@ pub enum V25ExchangeOrientation {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExchangeAttestation {
     source_path: PathBuf,
     staging_path: PathBuf,
+    parent_identity: FileIdentity,
     source_identity: FileIdentity,
     staging_identity: FileIdentity,
     source: StoreSnapshot,
@@ -73,6 +78,7 @@ impl V25StagingResult {
         #[cfg(unix)]
         {
             let proof = &self.exchange;
+            verify_parent_identity(&proof.source_path, proof.parent_identity)?;
             if self.source_path != proof.source_path || self.staging_path != proof.staging_path {
                 return Err(V25StagingError::Safety("staged pair paths were changed"));
             }
@@ -135,9 +141,328 @@ impl V25StagingResult {
                     "staged pair inode changed during verification",
                 ));
             }
+            verify_parent_identity(&proof.source_path, proof.parent_identity)?;
             Ok(orientation)
         }
     }
+}
+
+const INTENT_FORMAT: &str = "podbay.disposable-v25-exchange-intent/1";
+const INTENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A reopened intent proves pair orientation only. It is not a terminal receipt,
+/// a reader-exclusion capability, or permission to open schema 25 normally.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct V25RecoveredIntent {
+    pub intent_path: PathBuf,
+    pub orientation: V25ExchangeOrientation,
+    staged: V25StagingResult,
+}
+
+#[cfg(unix)]
+impl V25RecoveredIntent {
+    pub fn staged(&self) -> &V25StagingResult {
+        &self.staged
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableIntent {
+    format: String,
+    key: String,
+    attestation: ExchangeAttestation,
+    attestation_digest: String,
+}
+
+#[cfg(unix)]
+fn intent_paths(source: &Path, key: &str) -> Result<(PathBuf, PathBuf), V25StagingError> {
+    if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+        return Err(V25StagingError::InvalidInput(
+            "migration key is empty, oversized or contains control characters",
+        ));
+    }
+    let mut name = source
+        .file_name()
+        .ok_or(V25StagingError::InvalidInput("source filename missing"))?
+        .to_os_string();
+    name.push(".v25-intent.json");
+    let intent = source.with_file_name(name);
+    let mut writing = intent.as_os_str().to_os_string();
+    writing.push(".writing");
+    Ok((intent, PathBuf::from(writing)))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn attestation_digest(
+    key: &str,
+    attestation: &ExchangeAttestation,
+) -> Result<String, V25StagingError> {
+    // Bind the format, key, both exact paths/identities and complete snapshots.
+    let bytes = serde_json::to_vec(&(INTENT_FORMAT, key, attestation))?;
+    Ok(hex_digest(&bytes))
+}
+
+#[cfg(unix)]
+fn refuse_occupied(path: &Path) -> Result<(), V25StagingError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(V25StagingError::Safety(
+            "partial or foreign migration intent companion exists",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn private_parent_identity(path: &Path) -> Result<FileIdentity, V25StagingError> {
+    let parent = path
+        .parent()
+        .ok_or(V25StagingError::InvalidInput("private path has no parent"))?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o700
+        || fs::canonicalize(parent)? != parent
+    {
+        return Err(V25StagingError::Safety(
+            "migration parent is not private and canonical",
+        ));
+    }
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn verify_parent_identity(path: &Path, expected: FileIdentity) -> Result<(), V25StagingError> {
+    if private_parent_identity(path)? != expected {
+        return Err(V25StagingError::Safety("migration parent identity changed"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentSyncPoint {
+    WritingFile,
+    PublishedFile,
+    ParentDirectory,
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_parent_directory(path: &Path, expected: FileIdentity) -> Result<File, V25StagingError> {
+    verify_parent_identity(path, expected)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_no_follow() | nix::libc::O_DIRECTORY)
+        .open(path.parent().expect("verified source parent"))?;
+    let metadata = directory.metadata()?;
+    if (metadata.dev(), metadata.ino()) != (expected.device, expected.inode) {
+        return Err(V25StagingError::Safety(
+            "opened migration parent identity changed",
+        ));
+    }
+    Ok(directory)
+}
+
+impl V25StagingResult {
+    /// Persist a complete reviewed pair attestation before the caller's exchange.
+    /// Requires the same externally held manager lock and maintained exclusion
+    /// as orientation verification. Failed/partial writes are retained and refused;
+    /// this helper neither exchanges nor rebuilds staging.
+    #[cfg(target_os = "linux")]
+    pub fn persist_exchange_intent(&self, key: &str) -> Result<PathBuf, V25StagingError> {
+        self.persist_exchange_intent_with_sync(key, |file, _point| file.sync_all())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_exchange_intent_with_sync(
+        &self,
+        key: &str,
+        mut sync: impl FnMut(&File, IntentSyncPoint) -> std::io::Result<()>,
+    ) -> Result<PathBuf, V25StagingError> {
+        use std::io::Write;
+        let (intent_path, writing_path) = intent_paths(&self.source_path, key)?;
+        refuse_occupied(&writing_path)?;
+        if self.staging_path == intent_path || self.staging_path == writing_path {
+            return Err(V25StagingError::Safety(
+                "staging aliases a migration intent pathname",
+            ));
+        }
+        match fs::symlink_metadata(&intent_path) {
+            Ok(_) => {
+                let recovered =
+                    recover_schema_v25_intent(&self.source_path, &self.staging_path, key)?;
+                if recovered.staged.exchange != self.exchange {
+                    return Err(V25StagingError::Safety(
+                        "migration key already binds a different attestation",
+                    ));
+                }
+                // A visible rename may precede its directory fsync. Repair both
+                // durability barriers on exact-key retry before reporting success.
+                let identity = private_file_identity(&intent_path, false)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc_no_follow())
+                    .open(&intent_path)?;
+                let metadata = file.metadata()?;
+                if (metadata.dev(), metadata.ino()) != (identity.device, identity.inode) {
+                    return Err(V25StagingError::Safety(
+                        "opened migration intent identity changed",
+                    ));
+                }
+                let directory =
+                    pinned_parent_directory(&self.source_path, self.exchange.parent_identity)?;
+                sync(&file, IntentSyncPoint::PublishedFile)?;
+                sync(&directory, IntentSyncPoint::ParentDirectory)?;
+                let reverified =
+                    recover_schema_v25_intent(&self.source_path, &self.staging_path, key)?;
+                if reverified.staged.exchange != self.exchange
+                    || private_file_identity(&intent_path, false)? != identity
+                {
+                    return Err(V25StagingError::Safety(
+                        "migration intent changed during durability repair",
+                    ));
+                }
+                return Ok(intent_path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if self.verify_exchange_orientation()? != V25ExchangeOrientation::Unpublished {
+            return Err(V25StagingError::Safety(
+                "cannot originate an intent after publication",
+            ));
+        }
+        let record = DurableIntent {
+            format: INTENT_FORMAT.to_owned(),
+            key: key.to_owned(),
+            attestation: self.exchange.clone(),
+            attestation_digest: attestation_digest(key, &self.exchange)?,
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        if bytes.len() as u64 > INTENT_MAX_BYTES {
+            return Err(V25StagingError::Safety(
+                "migration intent exceeds bounded encoding",
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc_no_follow())
+            .open(&writing_path)?;
+        file.write_all(&bytes)?;
+        sync(&file, IntentSyncPoint::WritingFile)?;
+        drop(file);
+        private_file_identity(&writing_path, false)?;
+        verify_parent_identity(&self.source_path, self.exchange.parent_identity)?;
+        let directory = pinned_parent_directory(&self.source_path, self.exchange.parent_identity)?;
+        rustix::fs::renameat_with(
+            &directory,
+            writing_path.file_name().expect("writing filename"),
+            &directory,
+            intent_path.file_name().expect("intent filename"),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)?;
+        sync(&directory, IntentSyncPoint::ParentDirectory)?;
+        // Reopen exactly what was published; a successful return proves both
+        // the durable intent and a currently unchanged reviewed pair.
+        recover_schema_v25_intent(&self.source_path, &self.staging_path, key)?;
+        Ok(intent_path)
+    }
+}
+
+/// Fresh-open reconstruction, with no reliance on a caller's old in-memory
+/// staging result or last phase flag. The caller must hold the original manager
+/// lock and maintained reader/writer exclusion. This function never exchanges,
+/// writes SQLite, creates a terminal receipt or authorizes ordinary v25 open.
+#[cfg(unix)]
+pub fn recover_schema_v25_intent(
+    source_path: impl AsRef<Path>,
+    staging_path: impl AsRef<Path>,
+    key: &str,
+) -> Result<V25RecoveredIntent, V25StagingError> {
+    use std::io::Read;
+    let source_path = source_path.as_ref();
+    let staging_path = staging_path.as_ref();
+    let (intent_path, writing_path) = intent_paths(source_path, key)?;
+    refuse_occupied(&writing_path)?;
+    let identity = private_file_identity(&intent_path, false)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_no_follow())
+        .open(&intent_path)?;
+    let metadata = file.metadata()?;
+    if (metadata.dev(), metadata.ino()) != (identity.device, identity.inode)
+        || metadata.len() > INTENT_MAX_BYTES
+    {
+        return Err(V25StagingError::Safety(
+            "migration intent changed or exceeds bounded encoding",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(INTENT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > INTENT_MAX_BYTES {
+        return Err(V25StagingError::Safety(
+            "migration intent exceeds bounded encoding",
+        ));
+    }
+    let record: DurableIntent = serde_json::from_slice(&bytes)?;
+    let proof = record.attestation;
+    if record.format != INTENT_FORMAT
+        || record.key != key
+        || proof.source_path != source_path
+        || proof.staging_path != staging_path
+        || source_path == staging_path
+        || source_path.parent() != staging_path.parent()
+        || proof.source.version != SOURCE_SCHEMA_VERSION
+        || proof.staging.version != STAGING_SCHEMA_VERSION
+        || proof.source.schema != canonical_schema(false)?
+        || proof.staging.schema != canonical_schema(true)?
+        || record.attestation_digest != attestation_digest(key, &proof)?
+    {
+        return Err(V25StagingError::Safety(
+            "migration intent format, key, paths or attestation mismatch",
+        ));
+    }
+    verify_preserved_snapshot(&proof.source, &proof.staging)?;
+    verify_parent_identity(&intent_path, proof.parent_identity)?;
+    let staged = V25StagingResult {
+        source_path: proof.source_path.clone(),
+        staging_path: proof.staging_path.clone(),
+        store_lineage: proof.source.lineage.clone(),
+        source_schema_version: proof.source.version,
+        staging_schema_version: proof.staging.version,
+        preserved_tables: proof.source.tables.clone(),
+        sequence_high_water: proof.source.sequences.clone(),
+        exchange: proof,
+    };
+    let orientation = staged.verify_exchange_orientation()?;
+    if private_file_identity(&intent_path, false)? != identity {
+        return Err(V25StagingError::Safety(
+            "migration intent inode changed during recovery",
+        ));
+    }
+    Ok(V25RecoveredIntent {
+        intent_path,
+        orientation,
+        staged,
+    })
 }
 
 fn reject_exchange_sidecars(path: &Path) -> Result<(), V25StagingError> {
@@ -204,6 +529,7 @@ pub enum V25StagingError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     SourceStore(StoreError),
+    Encoding(serde_json::Error),
 }
 
 impl fmt::Display for V25StagingError {
@@ -215,6 +541,7 @@ impl fmt::Display for V25StagingError {
             }
             Self::Io(error) => write!(formatter, "staging I/O failed: {error}"),
             Self::Sqlite(error) => write!(formatter, "staging SQLite operation failed: {error}"),
+            Self::Encoding(error) => write!(formatter, "migration intent encoding failed: {error}"),
             Self::SourceStore(error) => {
                 write!(formatter, "source store validation failed: {error}")
             }
@@ -236,20 +563,28 @@ impl From<rusqlite::Error> for V25StagingError {
     }
 }
 
+impl From<serde_json::Error> for V25StagingError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encoding(error)
+    }
+}
+
 impl From<StoreError> for V25StagingError {
     fn from(error: StoreError) -> Self {
         Self::SourceStore(error)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SchemaObject {
     kind: String,
     name: String,
     sql: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoreSnapshot {
     version: i64,
     lineage: String,
@@ -259,7 +594,8 @@ struct StoreSnapshot {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -287,6 +623,8 @@ pub fn stage_schema_v25(
 
     #[cfg(unix)]
     let source_identity = private_file_identity(source_path, false)?;
+    #[cfg(unix)]
+    let parent_identity = private_parent_identity(source_path)?;
 
     let source_version = read_version(source_path)?;
     if source_version != SOURCE_SCHEMA_VERSION {
@@ -387,9 +725,12 @@ pub fn stage_schema_v25(
     drop(source_after_connection);
 
     #[cfg(unix)]
+    verify_parent_identity(source_path, parent_identity)?;
+    #[cfg(unix)]
     let exchange = ExchangeAttestation {
         source_path: source_path.to_path_buf(),
         staging_path: staging_path.to_path_buf(),
+        parent_identity,
         source_identity,
         staging_identity,
         source: source_before.clone(),
@@ -767,4 +1108,92 @@ fn verify_preserved_snapshot(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod durable_intent_sync_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn same_key_retry_repairs_post_rename_durability_and_refuses_sync_failures() {
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-intent-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = directory.join("podbay.sqlite");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source)
+            .unwrap();
+        drop(PodBayStore::open(&source).unwrap());
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let staged = stage_schema_v25(&source, directory.join("staged.sqlite")).unwrap();
+        let key = "key.post-rename";
+        let (intent, writing) = intent_paths(&source, key).unwrap();
+        let first = staged.persist_exchange_intent_with_sync(key, |file, point| {
+            if point == IntentSyncPoint::ParentDirectory {
+                assert!(intent.exists(), "injection must occur after atomic rename");
+                assert!(!writing.exists());
+                return Err(std::io::Error::other(
+                    "injected post-rename directory sync failure",
+                ));
+            }
+            file.sync_all()
+        });
+        assert!(matches!(first, Err(V25StagingError::Io(_))));
+        assert!(intent.exists());
+        for failing_point in [
+            IntentSyncPoint::PublishedFile,
+            IntentSyncPoint::ParentDirectory,
+        ] {
+            let mut observed = Vec::new();
+            let retry = staged.persist_exchange_intent_with_sync(key, |file, point| {
+                observed.push(point);
+                if point == failing_point {
+                    return Err(std::io::Error::other(
+                        "injected retry durability repair failure",
+                    ));
+                }
+                file.sync_all()
+            });
+            assert!(matches!(retry, Err(V25StagingError::Io(_))));
+            assert_eq!(observed.first(), Some(&IntentSyncPoint::PublishedFile));
+            assert_eq!(observed.last(), Some(&failing_point));
+        }
+        let mut repaired = Vec::new();
+        let path = staged
+            .persist_exchange_intent_with_sync(key, |file, point| {
+                repaired.push(point);
+                file.sync_all()
+            })
+            .unwrap();
+        assert_eq!(path, intent);
+        assert_eq!(
+            repaired,
+            [
+                IntentSyncPoint::PublishedFile,
+                IntentSyncPoint::ParentDirectory
+            ]
+        );
+        assert_eq!(
+            recover_schema_v25_intent(&source, &staged.staging_path, key)
+                .unwrap()
+                .orientation,
+            V25ExchangeOrientation::Unpublished
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
