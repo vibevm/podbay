@@ -695,6 +695,18 @@ fn valid_windows_part(part: &str) -> bool {
 }
 
 fn validate_body(body: &DescriptorBody) -> Result<(), LaunchDescriptorError> {
+    // This reserved capability requires its own mandatory policy and schema.
+    // Stripping that policy must not downgrade it to a generic V1/V2 body.
+    if body.profile_ref == crate::OPERATOR_FD3_OBSERVE_PROFILE_REF
+        || body.resources.iter().any(|resource| {
+            matches!(&resource.driver,
+                ResourceDriver::Auxiliary { driver_ref }
+                    | ResourceDriver::Structured { driver_ref, .. }
+                    if driver_ref == crate::OPERATOR_FD3_OBSERVE_DRIVER_REF)
+        })
+    {
+        return Err(LaunchDescriptorError::UnsupportedVersion);
+    }
     for value in [
         &body.scope_id,
         &body.actor_id,

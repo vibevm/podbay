@@ -127,6 +127,9 @@ impl EffectiveLaunchContract {
             _ => return Err(EffectiveLaunchError::InvalidField("parentRunId marker")),
         };
         let profile_ref = reader.label("profileRef")?;
+        if profile_ref == crate::OPERATOR_FD3_OBSERVE_PROFILE_REF {
+            return Err(EffectiveLaunchError::InvalidField("reserved FD3 profile"));
+        }
         let profile_generation = reader.u64()?;
         if profile_generation == 0 {
             return Err(EffectiveLaunchError::InvalidField("profileGeneration"));

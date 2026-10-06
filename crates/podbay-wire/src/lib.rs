@@ -10,6 +10,7 @@ mod error;
 mod frame;
 mod launch_descriptor;
 mod observation;
+mod operator_fd3_observe;
 mod read;
 mod schema;
 mod timestamp;
@@ -51,6 +52,17 @@ pub use observation::{
     Capability, CapabilityEnvelope, CapabilitySupport, CommandStage, ErrorEnvelope, EventEnvelope,
     ObservationKind, ProtocolVersion, Receipt, RuntimeError, RuntimeErrorCode, SnapshotEnvelope,
     SuccessEnvelope, decode_event_json,
+};
+pub use operator_fd3_observe::{
+    EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION, EffectiveOperatorFd3ObserveContractV1,
+    ImmutableOperatorFd3ObserveDescriptorV1, LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA,
+    OPERATOR_FD3_OBSERVE_CAPABILITY, OPERATOR_FD3_OBSERVE_CHILD_PROTOCOL,
+    OPERATOR_FD3_OBSERVE_DRIVER_REF, OPERATOR_FD3_OBSERVE_EXCHANGE_TIMEOUT_MS,
+    OPERATOR_FD3_OBSERVE_MAX_CONTRACT_BYTES, OPERATOR_FD3_OBSERVE_MAX_FRAME_BYTES,
+    OPERATOR_FD3_OBSERVE_MAX_POLICY_BYTES, OPERATOR_FD3_OBSERVE_POLICY_SCHEMA,
+    OPERATOR_FD3_OBSERVE_PROFILE_REF, OperatorArtifactTreePinV1, OperatorConfigurationPinV1,
+    OperatorFd3ContractError, OperatorFd3ObserveEffectiveInputV1, OperatorFd3ObservePolicyInputV1,
+    OperatorFd3ObservePolicyV1, OperatorFilePinV1, OperatorWorkspaceExpectationV1,
 };
 pub use read::{
     CommandSelector, CommandsGetBody, EmptyReadBody, EventsSubscribeBody, HistoryReadBody,

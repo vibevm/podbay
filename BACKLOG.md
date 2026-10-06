@@ -139,6 +139,10 @@ The standalone Linux `podbay-fd3-sys` boundary now tests a consumed supervisor
 spawn with FD3 custody, no inherited high descriptors and exact exec-error
 propagation. `podbay-pod` uses it only in cfg(test); production operator
 profiles, manager observation RPC and Lens Ready remain disconnected.
+A separate versioned FD3-observe wire contract now binds declared policy,
+planned root and effective launch bytes under new domains. Old operator V1
+formats reject the reserved FD3 profile/driver, while trusted registration,
+Store admission, dispatch and supervisor observation still have no new route.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 
