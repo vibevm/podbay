@@ -1,6 +1,9 @@
 //! PB05 Linux pod process boundary. No provider turns or PTY semantics are inferred here.
 #![forbid(unsafe_code)]
 
+#[cfg(all(test, target_os = "linux"))]
+mod fd3_fixture_tests;
+
 #[cfg(target_os = "linux")]
 mod codex_bootstrap;
 #[cfg(target_os = "linux")]

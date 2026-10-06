@@ -7,6 +7,7 @@ members = [
   "crates/podbay-host",
   "crates/podbay-launch-linux",
   "crates/podbay-pod",
+  "crates/podbay-fd3-sys",
   "crates/podbay-macos-sys",
   "crates/podbay-win32",
   "crates/podbay-client",

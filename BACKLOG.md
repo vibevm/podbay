@@ -135,6 +135,10 @@ Duplicates and reopened uncertain claims never resend; a separate noncanonical
 outcome journal stores reply/uncertainty without marking `pod.stopped`.
 Authority is injected and sends are emulated, so this is not production
 one-send custody or terminal settlement.
+The standalone Linux `podbay-fd3-sys` boundary now tests a consumed supervisor
+spawn with FD3 custody, no inherited high descriptors and exact exec-error
+propagation. `podbay-pod` uses it only in cfg(test); production operator
+profiles, manager observation RPC and Lens Ready remain disconnected.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 

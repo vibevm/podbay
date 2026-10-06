@@ -347,6 +347,13 @@ name = "podbay-core"
 version = "0.1.0"
 
 [[package]]
+name = "podbay-fd3-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "podbay-host"
 version = "0.1.0"
 dependencies = [
@@ -390,6 +397,7 @@ dependencies = [
  "nix",
  "podbay-adapter-codex",
  "podbay-core",
+ "podbay-fd3-sys",
  "podbay-store",
  "podbay-wire",
  "portable-pty",
