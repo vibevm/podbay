@@ -1,0 +1,12 @@
+[package]
+name = "podbay-readiness-private-fixture"
+version = "0.0.0"
+edition = "2024"
+license = "UPL-1.0"
+publish = false
+[dependencies]
+ed25519-compact = { version = "=2.6.0", default-features = false }
+[dev-dependencies]
+libc = "=0.2.190"
+
+[workspace]
