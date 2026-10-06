@@ -39,6 +39,16 @@ the preserved v24 file; the public handle exposes readback only and refuses
 new pending/final rows or other authority mutations. It is **not** a general
 v25 runtime open, Owner replay, production reader barrier or live activation.
 
+Checkpoint `1725228` adds a separate restricted pending-state decoder after
+the forward marker. Its disposable prepare transaction can write one typed
+`external_death_pending` row and authority revision together, then reopen and
+read the same key after an Owner epoch shift. This intentionally revises the
+**unreleased** schema-25 DDL with mandatory authenticated author and canonical
+request fields. Previously staged candidate v25 artifacts must be rebuilt;
+their old exact schema is refused. The pending decoder still excludes final
+records and ordinary runtime mutations, and it does not turn the publication
+receipt into a perpetual write grant.
+
 ## Decision and rejected alternative
 
 Use a staged **copy, verify, atomic exchange** from v24 to v25. The v25

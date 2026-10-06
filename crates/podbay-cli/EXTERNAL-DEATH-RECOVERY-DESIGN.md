@@ -75,6 +75,16 @@ separate exact-identity path; only an applicable class may request it.
    first implementation may expose only a restricted disposable v25 prepare
    handle and exact-key readback; it must not claim the runtime is fenced until
    all actual paths and direct adapters have the guard.
+
+   Checkpoint `1725228` implements that **restricted disposable** prepare and
+   historical readback. One IMMEDIATE transaction binds authenticated author,
+   canonical request, exact current V2 launch/Run/resources and latest applicable
+   Activated rebind, then inserts pending and advances authority revision once.
+   A separate versioned pending-state declaration permits fresh-process readback.
+   The unreleased candidate schema-25 now has mandatory author/request columns;
+   exact schema verification refuses older staged v25 variants. There is no
+   production author constructor, claim-path fence, OS death proof, final row,
+   manager readiness or live-store activation in this checkpoint.
 2. **Exclude reanimation for this slice:** require the saved activated
    rebind's boot ID to differ from the trusted current machine boot. The old
    manager and Pod processes cannot survive this boot. The exact launch
