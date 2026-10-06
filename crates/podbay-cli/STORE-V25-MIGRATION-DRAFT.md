@@ -66,6 +66,13 @@ enforced launch/access gate, verified over the whole interval. The strict
 same-UID raw-opener guarantee requires an OS access boundary; a narrower
 cooperating-process contract must explicitly name and close every trusted
 entry point. Neither contract is implemented by this draft or by `3d04cf0`.
+One disposable privileged mount-namespace fixture preserved the original
+database inode and owner UID while denying outside path, raw SQLite, symlink
+and `/proc` opens. Its inherited-descriptor oracle failed before the full
+descriptor/SCM/mmap boundary was established, so that probe is **not** a
+production isolation receipt. Any future broker must prevent preexisting or
+exported file descriptors as well as path opens, and prove its cleanup and
+cold-boot admission separately.
 
 The migration is bound to a stable Owner request key, old database lineage,
 source file identity, schema 24 content digest and expected v25 schema digest.
