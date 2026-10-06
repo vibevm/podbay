@@ -3594,6 +3594,48 @@ impl DisposableActivatedV25<'_, '_> {
     }
 }
 
+/// Restricted pending handle borrows the same manager lock and closed barrier.
+/// Its opaque authenticated-author argument has no production constructor.
+#[cfg(target_os = "linux")]
+pub struct DisposablePendingV25<'lock, 'barrier> {
+    store: podbay_store::DisposableV25PendingStore,
+    preflight: &'lock LockedStorePreflight,
+    _exclusion: &'lock DisposableReaderExclusion<'barrier>,
+}
+
+#[cfg(target_os = "linux")]
+impl DisposablePendingV25<'_, '_> {
+    pub fn metadata(&self) -> Result<podbay_store::V25ActivationMetadata, DisposableExchangeError> {
+        self.preflight
+            .verify_activation_lock_namespace(&self.store.attested_pair().staging_path)?;
+        self.store
+            .metadata()
+            .map_err(DisposableExchangeError::PossiblyPublishedVerification)
+    }
+    pub fn prepare(
+        &mut self,
+        author: &podbay_store::DisposablePendingAuthor,
+        request: &podbay_store::ExternalDeathPendingRequest,
+    ) -> Result<podbay_store::ExternalDeathPendingReceipt, DisposableExchangeError> {
+        self.preflight
+            .verify_activation_lock_namespace(&self.store.attested_pair().staging_path)?;
+        self.store
+            .prepare(author, request)
+            .map_err(DisposableExchangeError::PossiblyPublishedVerification)
+    }
+    pub fn lookup(
+        &self,
+        author: &podbay_store::DisposablePendingAuthor,
+        request: &podbay_store::ExternalDeathPendingRequest,
+    ) -> Result<Option<podbay_store::ExternalDeathPendingReceipt>, DisposableExchangeError> {
+        self.preflight
+            .verify_activation_lock_namespace(&self.store.attested_pair().staging_path)?;
+        self.store
+            .lookup(author, request)
+            .map_err(DisposableExchangeError::PossiblyPublishedVerification)
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub enum DisposableExchangeError {
@@ -3741,6 +3783,40 @@ impl LockedStorePreflight {
         .map_err(DisposableExchangeError::PossiblyPublishedVerification)?;
         self.verify_exchange_excludes_manager_lock(store.attested_pair())?;
         Ok(DisposableActivatedV25 {
+            store,
+            preflight: self,
+            _exclusion: exclusion,
+        })
+    }
+
+    /// Persist the separate pending-state decoder boundary before prepare can
+    /// be called. No production runtime or finalization path is enabled.
+    pub fn open_disposable_v25_pending<'lock, 'barrier>(
+        &'lock self,
+        staging_path: &Path,
+        migration_key: &str,
+        activation_key: &str,
+        state_key: &str,
+        exclusion: &'lock DisposableReaderExclusion<'barrier>,
+    ) -> Result<DisposablePendingV25<'lock, 'barrier>, DisposableExchangeError> {
+        if exclusion.database != self.canonical_database {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "pending state is not bound to this lock and exclusion database",
+                ),
+            ));
+        }
+        self.verify_activation_lock_namespace(staging_path)?;
+        let store = podbay_store::open_disposable_v25_pending(
+            &self.canonical_database,
+            staging_path,
+            migration_key,
+            activation_key,
+            state_key,
+        )
+        .map_err(DisposableExchangeError::PossiblyPublishedVerification)?;
+        self.verify_exchange_excludes_manager_lock(store.attested_pair())?;
+        Ok(DisposablePendingV25 {
             store,
             preflight: self,
             _exclusion: exclusion,
@@ -10716,6 +10792,48 @@ mod disposable_exchange_tests {
         drop(active);
         drop(exclusion);
         drop(lock);
+    }
+
+    #[test]
+    fn pending_entry_refuses_foreign_barrier_and_missing_manager_lock_before_declaration() {
+        let fixture = Fixture::new();
+        let foreign = Fixture::new();
+        let lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let foreign_barrier = foreign.exclusion();
+        let refused = lock.open_disposable_v25_pending(
+            &fixture.staged.staging_path,
+            "migration",
+            "activation",
+            "pending",
+            &foreign_barrier,
+        );
+        assert!(matches!(
+            refused,
+            Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "pending state is not bound to this lock and exclusion database"
+                )
+            ))
+        ));
+        drop(foreign_barrier);
+        let barrier = fixture.exclusion();
+        let named = manager_lock_path(&fixture.database).unwrap();
+        let old = fixture.directory.join("old.lock");
+        std::fs::rename(&named, &old).unwrap();
+        assert!(
+            lock.open_disposable_v25_pending(
+                &fixture.staged.staging_path,
+                "migration",
+                "activation",
+                "pending",
+                &barrier
+            )
+            .is_err()
+        );
+        std::fs::rename(&old, &named).unwrap();
+        let mut marker = fixture.database.as_os_str().to_os_string();
+        marker.push(".v25-pending-state.json");
+        assert!(!PathBuf::from(marker).exists());
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub use migration_v25::persist_schema_v25_receipt;
 pub use migration_v25::{DisposableV25ActivatedStore, V25ActivationMetadata, recover_disposable_v25_activation};
 #[cfg(target_os = "linux")]
 pub use migration_v25::activate_disposable_schema_v25;
+#[cfg(target_os = "linux")]
+pub use migration_v25::{DisposablePendingAuthor, DisposableV25PendingStore, ExternalDeathPendingRequest, ExternalDeathPendingReceipt, PendingResourceBinding, open_disposable_v25_pending};
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,

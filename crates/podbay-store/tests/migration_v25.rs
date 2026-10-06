@@ -382,8 +382,8 @@ fn v25_constraints_bind_exact_recovery_rows() {
             "INSERT INTO external_death_pending(
                recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,
                launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,
-               preparing_authority_revision,request_digest)
-             VALUES('recover.alpha',?1,'scope.alpha','pod.alpha',1,1,1,2,5,?2)",
+               preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest)
+             VALUES('recover.alpha',?1,'scope.alpha','pod.alpha',1,1,1,2,5,'fixture.owner','podbay.external-death-pending-request/1',X'01',?2)",
             params![fixture.lineage, "1".repeat(64)],
         )
         .unwrap();

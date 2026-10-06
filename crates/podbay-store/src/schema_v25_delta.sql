@@ -1,3 +1,5 @@
+-- Unreleased version-25 candidate DDL revision: author/canonical request binding.
+-- Earlier staged schema-25 variants are intentionally not accepted.
 -- Additive schema-25 recovery facts. Migration inserts no recovery record.
 CREATE TABLE external_death_pending (
   pending_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11,6 +13,9 @@ CREATE TABLE external_death_pending (
     REFERENCES manager_rebinds(rebind_rowid),
   preparing_owner_epoch INTEGER NOT NULL CHECK(preparing_owner_epoch>=1),
   preparing_authority_revision INTEGER NOT NULL CHECK(preparing_authority_revision>=1),
+  authenticated_author TEXT NOT NULL CHECK(length(authenticated_author) BETWEEN 1 AND 256),
+  request_version TEXT NOT NULL CHECK(request_version='podbay.external-death-pending-request/1'),
+  canonical_request BLOB NOT NULL CHECK(length(canonical_request) BETWEEN 1 AND 1048576),
   request_digest TEXT NOT NULL CHECK(length(request_digest)=64
     AND request_digest NOT GLOB '*[^0-9a-f]*'),
   FOREIGN KEY(scope_id,pod_id,pod_incarnation,launch_command_rowid)

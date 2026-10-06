@@ -1014,6 +1014,23 @@ fn read_activation(
     migration_key: &str,
     activation_key: &str,
 ) -> Result<(ActivationPayload, V25ActivationMetadata, FileIdentity), V25StagingError> {
+    read_activation_with_decoder(
+        source,
+        staging,
+        migration_key,
+        activation_key,
+        decode_activated_current_state,
+    )
+}
+
+#[cfg(unix)]
+fn read_activation_with_decoder(
+    source: &Path,
+    staging: &Path,
+    migration_key: &str,
+    activation_key: &str,
+    decoder: impl FnOnce(&ActivationPayload) -> Result<V25ActivationMetadata, V25StagingError>,
+) -> Result<(ActivationPayload, V25ActivationMetadata, FileIdentity), V25StagingError> {
     intent_paths(source, migration_key)?;
     intent_paths(source, activation_key)?;
     let (marker, writing) = activation_paths(source)?;
@@ -1072,7 +1089,7 @@ fn read_activation(
         ));
     }
     verify_preserved_snapshot(&p.attestation.source, &p.attestation.staging)?;
-    let metadata = decode_activated_current_state(&p)?;
+    let metadata = decoder(&p)?;
     if private_file_identity(&marker, false)? != marker_identity
         || hex_digest(&bounded_private_bytes(&receipt_path)?) != p.receipt_bytes_digest
         || hex_digest(&bounded_private_bytes(&intent_path)?) != p.intent_bytes_digest
@@ -1535,6 +1552,8 @@ fn reject_reserved_staging_path(
         ".v25-publication-receipt.json.writing",
         ".v25-activation.json",
         ".v25-activation.json.writing",
+        ".v25-pending-state.json",
+        ".v25-pending-state.json.writing",
         "-wal",
         "-shm",
         "-journal",
@@ -2681,7 +2700,7 @@ mod disposable_activation_tests {
                         "version"=>"PRAGMA user_version=24",
                         "lineage"=>"UPDATE store_identity SET lineage='foreign' WHERE singleton=1",
                         "owner"=>"UPDATE metadata SET value=value+1 WHERE key='owner_epoch'",
-                        "new_pending"=>"PRAGMA foreign_keys=OFF; INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,request_digest) SELECT 'new',lineage,'scope','pod',1,1,1,1,1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' FROM store_identity",
+                        "new_pending"=>"PRAGMA foreign_keys=OFF; INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest) SELECT 'new',lineage,'scope','pod',1,1,1,1,1,'fixture.owner','podbay.external-death-pending-request/1',X'01','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' FROM store_identity",
                         _=>unreachable!()
                     }).unwrap();
                 }
@@ -2747,3 +2766,12 @@ mod disposable_activation_tests {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "external_death_v25.rs"]
+mod external_death_v25;
+#[cfg(target_os = "linux")]
+pub use external_death_v25::{
+    DisposablePendingAuthor, DisposableV25PendingStore, ExternalDeathPendingReceipt,
+    ExternalDeathPendingRequest, PendingResourceBinding, open_disposable_v25_pending,
+};
