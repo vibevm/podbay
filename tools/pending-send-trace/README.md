@@ -1,4 +1,4 @@
-# Disposable bootstrap SQL trace producer
+# Disposable native-send SQL trace producer
 
 This is a test-only implementation of the first acceptance slice in
 `crates/podbay-cli/V25-PENDING-SEND-TRACE-DESIGN.md`. It creates private
@@ -137,12 +137,65 @@ the passing baseline's first three fixtures, so an earlier Pending rejection
 cannot mask a broken final fence. This composite is negative-control evidence
 only, not the positive producer trace.
 
+## Later-turn Pending extension profile
+
+```sh
+python3 tools/pending-send-trace/run.py --profile later-pending --scratch /fast/git/v/research/2026-10-06-podbay-pending-trace/a-fresh-later-run
+```
+
+Format `podbay.disposable-pending-send-sql-trace/later-pending/1` keeps the four
+earlier fixtures and appends one later turn preseeded ClaimedUncertain before
+staging. It runs the actual private later current-inspection body while Live,
+private Pending prepare, actual later retry and current-inspection Pending
+refusals, and passive original-key later receipt. Five fixtures emit nineteen
+operations. Live inspection changes no durable rows, so Pending prepare still
+uses its unchanged frozen baseline. Existing format grammars stay exact.
+
+The new fixture uses the already claimed bootstrap anchor and native thread
+from NativeHarness. Snapshot checks derive current Owner, exact manager claim
+lineage/Owner/credential, authority revision before/after Pending, exact stored
+Owner actor role/origin/generation, Pod/target incarnation and runtime state.
+They check latest activated rebind, admitted Owner/credential bounds, resource
+count/vector and prior checkpoint, with no restricted conflict or supersession.
+The selected later binding must match subject, original admission counters,
+holder/generation, Session revision and resource/input anchor. The checker
+decodes the bounded five-field immutable later payload and recomputes its
+binding digest, ties it to the claimed bootstrap command/resource anchor and
+requires the bootstrap outbox's command_rowid to link back to that exact
+bootstrap command. It verifies the original later outbox payload/digest/claim fields.
+
+Every earlier negative control reruns. Additional coherent all-snapshot
+mutants alter Owner/manager claim, Owner role/generation, rebind next counters,
+prior checkpoint/input vector, bootstrap/thread anchor, original admission
+counters or binding digest. They must reject their named row invariants.
+Two controls change the bootstrap outbox command_rowid in all ten later
+snapshots: one swaps the existing bootstrap and launch outbox command links,
+retaining valid and unique referenced IDs; the other points at nonexistent
+rowid 999. Both preserve claim
+state/key/Owner and snapshot continuity; both
+must reject the exact bootstrap outbox back-link invariant.
+A separately executed scratch later fence-after-retry mutant must reject
+the later fixture itself, using the passing earlier fixtures to isolate it.
+
+An additional real private probe increments authority revision in its caller
+transaction, confirms the rebound subject remains Live, requires the actual
+later inspector to return StaleEpoch, then rolls back and verifies no durable
+delta or receipt change. A scratch mutant omitting the later inspector's
+current check must fail this probe (Cargo exit 101, exact assertion marker).
+This probe emits test evidence, not an admitted trace operation or a recovery
+API. Its caller uses Immediate solely to make the reversible stale-state write.
+
 ## Explicit omissions
 
-Neither profile has a later-turn producer, successful committed Live claim,
+The profiles have no successful committed Live claim,
 lost-response retry, Owner advancement, unverified scenarios, unrelated A/B
 or competing-writer handshake. FinalRecorded fresh-Prepared denial is also
-outside the extension; only preseeded claimed retry/current/readback is covered.
+outside the final extension; only preseeded claimed retry/current/readback is covered.
+The later profile covers one claimed Pending path and no later fresh-Prepared
+claim, FinalRecorded, lost response or competing-writer order. Lease/current
+checks execute in the actual inspector, but the independent checker does not
+implement the complete writer-lease checker, clock/deadline or host/native
+evidence validator, nor the store-wide command identity/digest algorithm.
 The checker is a bounded fixture
 monitor, not a complete independent replacement for the private disposition
 decoder: it does not revalidate every launch descriptor, immutable send

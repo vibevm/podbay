@@ -2,12 +2,17 @@
 
 Status: staged test-only contract, 2026-10-06. This extends the evidence in
 [the pending claim guard design](V25-PENDING-CLAIM-GUARD-DESIGN.md). Checkpoint
-`7f04787` implements only the first bootstrap slice: three fixtures, nine
+`7f04787` introduced the first bootstrap slice: three fixtures, nine
 operations, actual private claim/current/passive bodies, committed SQLite
 snapshots and a strict checker. Parent baseline run passed; eight mutated
 checkers refused as intended, after independent review closed table-inventory,
-rowid-alias, sequence and rollback-state defects. Later-turn, Owner advancement,
-FinalRecorded, A/B and physical use remain unimplemented in this producer.
+rowid-alias, sequence and rollback-state defects. The separate FinalRecorded
+profile now adds a committed private final-row fixture (four fixtures,
+fourteen operations). The later-pending profile adds a preseeded claimed
+later turn with Live inspection, Pending prepare, retry/current refusal and
+passive receipt (five fixtures, nineteen operations); see the trace tools'
+README for profile gates and omissions. Owner advancement, later fresh claims,
+later FinalRecorded, A/B and physical use remain unimplemented in this producer.
 No production v25 support follows. The broader contract below still describes
 the remaining trace work.
 

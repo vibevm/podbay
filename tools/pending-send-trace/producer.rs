@@ -7,6 +7,7 @@ const ROW_CAP: i64 = 1024;
 const CELL_CAP: i64 = 1024 * 1024;
 const BASE_FORMAT: &str = "podbay.disposable-pending-send-sql-trace/1";
 const FINAL_FORMAT: &str = "podbay.disposable-pending-send-sql-trace/final-recorded/1";
+const LATER_FORMAT: &str = "podbay.disposable-pending-send-sql-trace/later-pending/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -157,11 +158,21 @@ fn op(h: &NativeHarness, sequence: usize, kind: &str) -> Operation {
                 require_live_native_send(t, target, owner, credential, revision)
             };
             let result = if inspect {
-                crate::bootstrap_send::inspect_claimed_bootstrap_send_in_transaction(
-                    &tx, &h.f.request.store_lineage, &h.bootstrap, policy).map(|_| "CurrentRecord".to_string())
+                if let Some(selector) = &h.later {
+                    crate::later_turn::inspect_claimed_later_codex_send_in_transaction(
+                        &tx, &h.f.request.store_lineage, selector, policy).map(|_| "CurrentRecord".to_string())
+                } else {
+                    crate::bootstrap_send::inspect_claimed_bootstrap_send_in_transaction(
+                        &tx, &h.f.request.store_lineage, &h.bootstrap, policy).map(|_| "CurrentRecord".to_string())
+                }
             } else {
-                crate::bootstrap_send::claim_bootstrap_send_in_transaction(
-                    &tx, &h.f.request.store_lineage, &h.bootstrap, policy).map(|r| format!("{r:?}"))
+                if let Some(selector) = &h.later {
+                    crate::later_turn::claim_later_codex_send_in_transaction(
+                        &tx, &h.f.request.store_lineage, selector, policy).map(|r| format!("{r:?}"))
+                } else {
+                    crate::bootstrap_send::claim_bootstrap_send_in_transaction(
+                        &tx, &h.f.request.store_lineage, &h.bootstrap, policy).map(|r| format!("{r:?}"))
+                }
             };
             let result = match result {
                 Ok(s) => s,
@@ -185,14 +196,17 @@ fn op(h: &NativeHarness, sequence: usize, kind: &str) -> Operation {
 #[test]
 fn produce_bootstrap_pending_trace() {
     let profile = std::env::var("PODBAY_PENDING_TRACE_PROFILE").unwrap_or_else(|_| "bootstrap".into());
-    assert!(matches!(profile.as_str(), "bootstrap" | "final-recorded"), "unknown trace profile");
+    assert!(matches!(profile.as_str(), "bootstrap" | "final-recorded" | "later-pending"), "unknown trace profile");
     let mut fixtures = Vec::new();
     let mut scenarios = vec![("PreparedPending", false), ("ClaimedPending", true), ("Rollback", false)];
-    if profile == "final-recorded" {
+    if profile != "bootstrap" {
         scenarios.push(("FinalRecorded", true));
     }
+    if profile == "later-pending" {
+        scenarios.push(("LaterClaimedPending", true));
+    }
     for (scenario, claimed) in scenarios {
-        let h = NativeHarness::new(false, claimed);
+        let h = NativeHarness::new(scenario == "LaterClaimedPending", claimed);
         let (original_receipt, original_effect_state) = receipt(&h);
         let mut operations = Vec::new();
         if scenario == "Rollback" {
@@ -200,6 +214,8 @@ fn produce_bootstrap_pending_trace() {
         } else {
             let kinds = if scenario == "FinalRecorded" {
                 vec!["PreparePending", "SeedFinalRecorded", "Claim", "CurrentInspect", "PassiveExactReceipt"]
+            } else if scenario == "LaterClaimedPending" {
+                vec!["CurrentInspect", "PreparePending", "Claim", "CurrentInspect", "PassiveExactReceipt"]
             } else {
                 vec!["PreparePending", "Claim", "CurrentInspect", "PassiveExactReceipt"]
             };
@@ -210,9 +226,10 @@ fn produce_bootstrap_pending_trace() {
         assert_eq!(receipt(&h), (original_receipt.clone(), original_effect_state.clone()));
         fixtures.push(FixtureTrace { scenario: scenario.into(),
             subject_request_hex: hex(&canonical(&h.f.author(), &h.f.request).unwrap()),
-            command_id: h.bootstrap.command_id.as_str().into(), original_receipt, original_effect_state, operations });
+            command_id: h.later.as_ref().map(|s| s.command_id.as_str()).unwrap_or(h.bootstrap.command_id.as_str()).into(), original_receipt, original_effect_state, operations });
     }
-    let trace = Trace { format: if profile == "final-recorded" { FINAL_FORMAT } else { BASE_FORMAT }.into(),
+    let format = match profile.as_str() { "later-pending" => LATER_FORMAT, "final-recorded" => FINAL_FORMAT, _ => BASE_FORMAT };
+    let trace = Trace { format: format.into(),
         pending_request_cap: MAX_PENDING_BYTES.to_string(), snapshot_cap: SNAPSHOT_CAP.to_string(),
         row_cap: ROW_CAP.to_string(), cell_cap: CELL_CAP.to_string(), fixtures };
     let bytes = serde_json::to_vec(&trace).unwrap();
@@ -220,4 +237,22 @@ fn produce_bootstrap_pending_trace() {
     let _: Trace = serde_json::from_slice(&bytes).unwrap();
     let output = std::env::var_os("PODBAY_PENDING_TRACE_OUTPUT").expect("private trace output path required");
     fs::write(output, bytes).unwrap();
+}
+
+#[test]
+fn later_current_authority_probe() {
+    let h = NativeHarness::new(true, true);
+    let before = capture(&h.f.source);
+    let history = receipt(&h);
+    let mut c = Connection::open(&h.f.source).unwrap();
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+    tx.execute("UPDATE metadata SET value=value+1 WHERE key='authority_revision'", []).unwrap();
+    assert_eq!(native_send_disposition(&tx, &h.bootstrap.native_target,
+        h.f.request.expected_owner_epoch, h.f.request.expected_manager_credential_epoch,
+        h.f.request.expected_authority_revision), SubjectDisposition::Live);
+    assert!(matches!(h.inspect(&tx), Err(StoreError::StaleEpoch)),
+        "current authority revision must be rechecked");
+    tx.rollback().unwrap();
+    assert_eq!(capture(&h.f.source), before);
+    assert_eq!(receipt(&h), history);
 }

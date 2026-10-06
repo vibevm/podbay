@@ -9,6 +9,7 @@ import sys
 
 FORMAT = 'podbay.disposable-pending-send-sql-trace/1'
 FINAL_FORMAT = 'podbay.disposable-pending-send-sql-trace/final-recorded/1'
+LATER_FORMAT = 'podbay.disposable-pending-send-sql-trace/later-pending/1'
 CAP = 8 * 1024 * 1024
 
 
@@ -193,15 +194,96 @@ def subject(t, r):
     require(run['session_id'] == r['session_id'] and run['current_attempt_id'] == r['attempt_id'], 'run/attempt binding')
 
 
+def later_authority(t, r):
+    owner, credential, revision = r['expected_owner_epoch'], r['expected_manager_credential_epoch'], r['expected_authority_revision']
+    require(metadata(t, 'owner_epoch') == owner, 'later current Owner')
+    require(metadata(t, 'authority_revision') == revision + bool(t['external_death_pending']), 'later current authority revision')
+    claim = only(t['manager_credential_claims'], lambda x: x['singleton'] == 1)
+    require(claim['store_lineage'] == r['store_lineage'] and claim['owner_epoch'] == owner and claim['credential_epoch'] == credential and credential >= owner, 'later manager claim authority')
+    actor = only(t['authority_actors'], lambda x: x['actor_id'] == 'owner.fixture')
+    require([actor[k] for k in ('scope_id','role','origin','parent_actor_id','pod_id','pod_incarnation','credential_generation')] == [r['scope_id'],'coordinator','owner_cli',None,None,None,1], 'later authenticated Owner row')
+    pod = only(t['authority_pods'], lambda x: x['pod_id'] == r['pod_id'])
+    epoch = only(t['target_epochs'], lambda x: x['scope_id'] == r['scope_id'] and x['target_id'] == r['pod_id'])
+    require(pod['scope_id'] == r['scope_id'] and pod['incarnation'] == r['pod_incarnation'] and epoch['epoch'] == r['pod_incarnation'], 'later Pod incarnation authority')
+    session = only(t['runtime_sessions'], lambda x: x['session_id'] == r['session_id'])
+    run = only(t['runtime_runs'], lambda x: x['run_id'] == r['run_id'])
+    require(session['state'] == 'open' and run['scope_id'] == r['scope_id'] and run['admission_state'] == 'admitted' and run['desired_mode'] == 'run' and run['execution_state'] in ('starting','running') and run['last_attempt_ordinal'] == 1, 'later runtime authority state')
+    resources = [x for x in t['authority_resources'] if x['pod_id'] == r['pod_id']]
+    require(all(x['scope_id'] == r['scope_id'] and x['pod_incarnation'] == r['pod_incarnation'] for x in resources), 'later resource association')
+    rebinds = [x for x in t['manager_rebinds'] if x['scope_id'] == r['scope_id'] and x['pod_id'] == r['pod_id'] and x['pod_incarnation'] == r['pod_incarnation']]
+    current = only(rebinds, lambda x: x['rebind_rowid'] == r['activated_rebind_rowid'])
+    require(type(current['next_owner_epoch']) is int and type(current['next_credential_epoch']) is int and 0 < current['next_owner_epoch'] <= owner and 0 < current['next_credential_epoch'] <= credential, 'later rebind ahead of admitted authority')
+    require(current['resource_count'] == len(r['resources']), 'later rebind resource count')
+    require(all(x['phase'] == 'activated' and x['rebind_rowid'] <= current['rebind_rowid'] and x['next_owner_epoch'] <= current['next_owner_epoch'] for x in rebinds), 'later latest activated rebind')
+    require(not any(x['scope_id'] == r['scope_id'] and x['pod_id'] == r['pod_id'] and x['pod_incarnation'] == r['pod_incarnation'] for x in t['rebind_supersession_attempts']), 'later rebind supersession')
+    prior = only(t['manager_rebind_prior_observations'], lambda x: x['rebind_rowid'] == r['activated_rebind_rowid'])
+    require(prior['checkpoint_digest'] == r['checkpoint_digest'], 'later prior checkpoint')
+    next_resources = sorted((x for x in t['manager_rebind_resources'] if x['rebind_rowid'] == r['activated_rebind_rowid']), key=lambda x: x['resource_id'])
+    require([(x['resource_id'],x['next_input_epoch']) for x in next_resources] == [(x['resource_id'],x['input_epoch']) for x in r['resources']], 'later rebind input vector')
+
+
+def later_anchor(t, r, cmd):
+    require(cmd['scope_id'] == r['scope_id'] and cmd['target_id'] == r['session_id'], 'later command scope/Session anchor')
+    binding = only(t['codex_later_turns'], lambda x: x['command_rowid'] == cmd['command_rowid'])
+    for k in ('store_lineage','scope_id','session_id','run_id','attempt_id','pod_id','pod_incarnation'):
+        require(binding[k] == r[k], 'later stored subject anchor')
+    require(any(binding['resource_id'] == x['resource_id'] and binding['resource_epoch'] == x['resource_epoch'] and binding['resource_input_epoch'] == x['input_epoch'] for x in r['resources']), 'later resource input anchor')
+    require(binding['owner_epoch'] == r['expected_owner_epoch'] and binding['manager_credential_epoch'] == r['expected_manager_credential_epoch'] and binding['authority_revision'] == r['expected_authority_revision'] and cmd['owner_epoch'] == binding['owner_epoch'], 'later admitted authority')
+    require(binding['holder_actor_id'] == cmd['principal'] == 'owner.fixture' and binding['holder_credential_generation'] == 1, 'later holder identity')
+    session = only(t['runtime_sessions'], lambda x: x['session_id'] == r['session_id'])
+    require(binding['session_revision'] == cmd['target_epoch'] == session['revision'], 'later Session revision anchor')
+    # Bounded independent decoder for the five-field immutable later payload.
+    payload = cmd['canonical_request']
+    domain = b'podbay.codex.later-send/1\0'
+    require(type(payload) is bytes and len(payload) <= 128000 and payload.startswith(domain), 'later payload domain/budget')
+    at, fields = len(domain), []
+    for _ in range(5):
+        require(at + 4 <= len(payload), 'later payload field length')
+        length = int.from_bytes(payload[at:at+4], 'big')
+        at += 4
+        require(at + length <= len(payload), 'later payload truncated')
+        fields.append(payload[at:at+length].decode('utf-8'))
+        at += length
+    require(at == len(payload), 'later payload trailing bytes')
+    wire, deadline, text, bootstrap_id, thread = fields
+    require(re.fullmatch('[0-9a-f]{64}', wire) and 0 < len(text.encode()) <= 64000, 'later payload digest/text')
+    require(thread == binding['native_thread_id'] == 'thread.native.fixture', 'later native thread anchor')
+    require(binding['wire_payload_digest'] == wire and binding['prompt_digest'] == hashlib.sha256(text.encode()).hexdigest(), 'later prompt digest anchor')
+    bootstrap = only(t['commands'], lambda x: x['command_rowid'] == binding['bootstrap_command_rowid'])
+    require(bootstrap['command_id'] == bootstrap_id and bootstrap['namespace'] == 'podbay.session.send.bootstrap' and bootstrap['command_key'] == 'key.native.bootstrap' and bootstrap['scope_id'] == cmd['scope_id'] and bootstrap['target_id'] == cmd['target_id'], 'later bootstrap command anchor')
+    bb = only(t['codex_bootstrap_sends'], lambda x: x['command_rowid'] == bootstrap['command_rowid'])
+    require(all(bb[k] == binding[k] for k in ('store_lineage','scope_id','session_id','run_id','attempt_id','pod_id','pod_incarnation','resource_id','resource_epoch','holder_actor_id','holder_credential_generation')) and bb['resource_input_epoch'] <= binding['resource_input_epoch'], 'later bootstrap resource anchor')
+    bo = only(t['outbox'], lambda x: x['outbox_id'] == bootstrap['outbox_id'])
+    require(bo['command_rowid'] == bootstrap['command_rowid'], 'later bootstrap outbox back-link')
+    require(bo['state'] == 'claimed_uncertain' and bo['claim_key'] == 'claim.' + bootstrap_id and bo['claim_owner_epoch'] == bootstrap['owner_epoch'], 'later claimed bootstrap anchor')
+    numbers = [binding[k] for k in ('session_revision','pod_incarnation','resource_epoch','resource_input_epoch','holder_credential_generation','owner_epoch','manager_credential_epoch','authority_revision','writer_epoch','lease_expires_at_unix_seconds')]
+    require(all(type(n) is int and 0 < n < 2**63 for n in numbers), 'later admitted integer bounds')
+    strings = [binding[k] for k in ('store_lineage','scope_id','session_id','run_id','attempt_id','pod_id','resource_id')] + [bootstrap_id,thread,binding['holder_actor_id'],wire,binding['prompt_digest']]
+    body = b'podbay.codex.later-binding/1\0'
+    for s in strings:
+        raw_field = s.encode()
+        body += len(raw_field).to_bytes(4, 'big') + raw_field
+    body += b''.join(n.to_bytes(8, 'big') for n in numbers)
+    require(binding['binding_digest'] == hashlib.sha256(body).hexdigest(), 'later immutable binding digest')
+    outbox = only(t['outbox'], lambda x: x['outbox_id'] == cmd['outbox_id'])
+    require(outbox['command_rowid'] == cmd['command_rowid'] and outbox['kind'] == 'codex.turn' and outbox['payload'] == payload and outbox['effect_digest'] == hashlib.sha256(payload).hexdigest() and outbox['claim_key'] == 'claim.' + cmd['command_id'] and outbox['claim_owner_epoch'] == cmd['owner_epoch'], 'later original outbox anchor')
+    require(outbox['scope_id'] == cmd['scope_id'] and outbox['target_id'] == cmd['target_id'] and outbox['owner_epoch'] == cmd['owner_epoch'] and outbox['target_epoch'] == cmd['target_epoch'] and all(outbox[k] is None for k in ('observation_key','observation_payload','observation_stage','observation_event_sequence')), 'later outbox scalar/observation anchor')
+    event = only(t['events'], lambda x: x['sequence'] == cmd['event_sequence'] and x['command_rowid'] == cmd['command_rowid'])
+    expected = {'kind': 'session.send.later.admitted', 'payload': binding['binding_digest'].encode(), 'scope_id': cmd['scope_id'], 'target_id': cmd['target_id'], 'owner_epoch': cmd['owner_epoch'], 'target_epoch': cmd['target_epoch'], 'source_id': cmd['command_id'], 'source_kind': 'manager.admission', 'source_digest': cmd['request_digest'], 'source_epoch': cmd['owner_epoch'], 'source_sequence': 1, 'provenance': 'authenticated.manager.admission'}
+    require(all(event[k] == v for k,v in expected.items()), 'later original event anchor')
+
+
 def check_file(path):
     require(path.stat().st_size <= 16 * 1024 * 1024, 'trace file cap')
     trace = json.loads(path.read_bytes(), object_pairs_hook=duplicate_guard)
     keys(trace, 'format pending_request_cap snapshot_cap row_cap cell_cap fixtures')
-    require(trace['format'] in (FORMAT, FINAL_FORMAT), 'trace format')
+    require(trace['format'] in (FORMAT, FINAL_FORMAT, LATER_FORMAT), 'trace format')
     require([trace[k] for k in ('pending_request_cap', 'snapshot_cap', 'row_cap', 'cell_cap')] == ['4194304', '8388608', '1024', '1048576'], 'pinned resource bounds')
     scenarios = ['PreparedPending', 'ClaimedPending', 'Rollback']
-    if trace['format'] == FINAL_FORMAT:
+    if trace['format'] in (FINAL_FORMAT, LATER_FORMAT):
         scenarios.append('FinalRecorded')
+    if trace['format'] == LATER_FORMAT:
+        scenarios.append('LaterClaimedPending')
     require(type(trace['fixtures']) is list and len(trace['fixtures']) == len(scenarios), 'profile fixture count')
     require([f['scenario'] for f in trace['fixtures']] == scenarios, 'scenario coverage/order')
     for f in trace['fixtures']:
@@ -210,6 +292,9 @@ def check_file(path):
         expected_ops = ['RollbackClaim'] if f['scenario'] == 'Rollback' else ['PreparePending', 'Claim', 'CurrentInspect', 'PassiveExactReceipt']
         if f['scenario'] == 'FinalRecorded':
             expected_ops.insert(1, 'SeedFinalRecorded')
+        later = f['scenario'] == 'LaterClaimedPending'
+        if later:
+            expected_ops.insert(0, 'CurrentInspect')
         require([o['kind'] for o in f['operations']] == expected_ops, 'operation coverage/order')
         previous = None
         for index, o in enumerate(f['operations'], 1):
@@ -223,12 +308,20 @@ def check_file(path):
             subject(a, r)
             subject(b, r)
             cmd = only(a['commands'], lambda x: x['command_id'] == f['command_id'])
-            require(cmd['principal'] == 'owner.fixture' and cmd['command_key'] == 'key.native.bootstrap' and cmd['namespace'] == 'podbay.session.send.bootstrap', 'original exact key')
+            require(cmd['principal'] == 'owner.fixture' and cmd['command_key'] == ('key.native.later' if later else 'key.native.bootstrap') and cmd['namespace'] == ('podbay.session.send.later' if later else 'podbay.session.send.bootstrap'), 'original exact key')
+            if later:
+                later_authority(a, r)
+                later_authority(b, r)
+                later_anchor(a, r, cmd)
+                later_anchor(b, r, only(b['commands'], lambda x: x['command_id'] == f['command_id']))
             require(f['original_receipt'] == [cmd['command_id'], str(cmd['event_sequence']), str(cmd['outbox_id']), cmd['digest_version'], cmd['request_digest']], 'original receipt')
             outbox = only(a['outbox'], lambda x: x['outbox_id'] == cmd['outbox_id'])
-            expected_state = 'ClaimedUncertain' if f['scenario'] in ('ClaimedPending', 'FinalRecorded') else 'Prepared'
+            expected_state = 'ClaimedUncertain' if f['scenario'] in ('ClaimedPending', 'FinalRecorded', 'LaterClaimedPending') else 'Prepared'
             require(f['original_effect_state'] == expected_state and outbox['state'] == ('claimed_uncertain' if expected_state == 'ClaimedUncertain' else 'prepared'), 'original uncertainty')
-            if o['kind'] == 'PreparePending':
+            if later and index == 1:
+                require((o['mode'],o['fence'],o['result'],o['finish']) == ('Deferred','Live','CurrentRecord','CommitSucceeded'), 'later initial Live current inspection')
+                require(not a['external_death_pending'] and not a['external_death_final'] and o['before'] == o['after'], 'later initial Live snapshot')
+            elif o['kind'] == 'PreparePending':
                 require((o['mode'], o['fence'], o['result'], o['finish']) == ('Immediate', 'NotReached', 'PendingCommitted', 'CommitSucceeded'), 'prepare outcome')
                 require(not a['external_death_pending'] and len(b['external_death_pending']) == 1, 'pending insertion')
                 pending = b['external_death_pending'][0]
@@ -299,4 +392,5 @@ if __name__ == '__main__':
         sys.exit(1)
     count = len(trace['fixtures'])
     operations = sum(len(f['operations']) for f in trace['fixtures'])
-    print(f'PASS: {count} bootstrap fixtures, {operations} operations; bounded SQL evidence only')
+    label = 'native-send' if trace['format'] == LATER_FORMAT else 'bootstrap'
+    print(f'PASS: {count} {label} fixtures, {operations} operations; bounded SQL evidence only')
