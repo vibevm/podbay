@@ -4,6 +4,11 @@
 
 const VERSION: u8 = 1;
 
+// Disposable persistence of modeled allocation only; no operator CLI hook.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "restart_model/disposable_files.rs"]
+mod disposable_files;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PinsV1 {
     pod_artifact: [u8; 32],
