@@ -7958,16 +7958,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         &mut self,
         profile: RegisteredLaunchProfile,
     ) -> Result<(), HostError> {
-        let key = profile.profile_ref().to_owned();
-        if let Some(existing) = self.launch_profiles.get(&key) {
-            if existing.generation() > profile.generation()
-                || (existing.generation() == profile.generation() && existing != &profile)
-            {
-                return Err(HostError::StaleGuard);
-            }
-        }
-        self.launch_profiles.insert(key, profile);
-        Ok(())
+        crate::launch_spec::register_launch_profile(&mut self.launch_profiles, profile)
     }
 
     pub fn register_native_host_from_trusted_policy(

@@ -143,6 +143,10 @@ A separate versioned FD3-observe wire contract now binds declared policy,
 planned root and effective launch bytes under new domains. Old operator V1
 formats reject the reserved FD3 profile/driver, while trusted registration,
 Store admission, dispatch and supervisor observation still have no new route.
+The Host now has a separate trusted FD3 policy constructor and immutable
+resolver that refuses generic V1/Codex selection, but this resolver returns
+declarations only. Current registry/actor/grant checks must still be performed
+at the future admission boundary; no file has been measured by this API.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 

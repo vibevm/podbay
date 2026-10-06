@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -13,6 +13,9 @@ use podbay_wire::{
 use sha2::{Digest, Sha256};
 
 use crate::authority::{CredentialRef, HostError};
+
+mod operator_fd3_profile;
+pub use operator_fd3_profile::ResolvedOperatorFd3ObserveData;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceAccess {
@@ -163,12 +166,20 @@ pub struct TrustedLaunchProfileInput {
 pub struct RegisteredLaunchProfile {
     input: TrustedLaunchProfileInput,
     codex_policy: Option<CodexAppServerPolicyV2>,
+    operator_fd3_observe: Option<operator_fd3_profile::Fd3Registration>,
     operator_until_stopped: bool,
     codex_until_stopped: bool,
 }
 
 impl RegisteredLaunchProfile {
     pub fn from_trusted_policy(input: TrustedLaunchProfileInput) -> Result<Self, HostError> {
+        if operator_fd3_profile::has_fd3_names(&input) {
+            return Err(HostError::Unsupported);
+        }
+        Self::from_common_input(input)
+    }
+
+    fn from_common_input(input: TrustedLaunchProfileInput) -> Result<Self, HostError> {
         if !valid_label(&input.profile_ref)
             || input.profile_generation == 0
             || input.executable.len() < 2
@@ -238,6 +249,7 @@ impl RegisteredLaunchProfile {
         Ok(Self {
             input,
             codex_policy: None,
+            operator_fd3_observe: None,
             operator_until_stopped: false,
             codex_until_stopped: false,
         })
@@ -245,7 +257,7 @@ impl RegisteredLaunchProfile {
 
     pub fn with_until_stopped_operator_service(mut self) -> Result<Self, HostError> {
         let input = &self.input;
-        if self.codex_policy.is_some()
+        if self.requires_fd3_observe() || self.codex_policy.is_some()
             || input.profile_ref != OPERATOR_PROCESS_PROFILE_REF
             || input.resource_layout.len() != 1
             || input.resource_layout[0].kind != ResourceKind::Auxiliary
@@ -268,7 +280,7 @@ impl RegisteredLaunchProfile {
     }
 
     pub fn with_until_stopped_codex_service(mut self) -> Result<Self, HostError> {
-        if self.codex_policy.is_none()
+        if self.requires_fd3_observe() || self.codex_policy.is_none()
             || self.operator_until_stopped
             || self.input.profile_ref == OPERATOR_PROCESS_PROFILE_REF
             || self.input.execution_mode != ExecutionMode::LinuxCooperative
@@ -294,7 +306,7 @@ impl RegisteredLaunchProfile {
         mut self,
         policy: CodexAppServerPolicyV2,
     ) -> Result<Self, HostError> {
-        if self.codex_policy.is_some() || self.operator_until_stopped {
+        if self.requires_fd3_observe() || self.codex_policy.is_some() || self.operator_until_stopped {
             return Err(HostError::InvalidInput);
         }
         let input = &self.input;
@@ -352,7 +364,7 @@ impl RegisteredLaunchProfile {
         binding: &LaunchBinding,
         effective_digest: &str,
     ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
-        if self.codex_policy.is_some() {
+        if self.requires_fd3_observe() || self.codex_policy.is_some() {
             return Err(HostError::Unsupported);
         }
         self.resolve_native_policy_for_review(host, spec, binding, effective_digest)
@@ -365,6 +377,9 @@ impl RegisteredLaunchProfile {
         binding: &LaunchBinding,
         effective_digest: &str,
     ) -> Result<(ReviewedNativePolicy, ResolvedNativePaths), HostError> {
+        if self.requires_fd3_observe() {
+            return Err(HostError::Unsupported);
+        }
         let policy = self.codex_policy.as_ref().ok_or(HostError::Unsupported)?;
         if binding.parent_run_id().is_some()
             || binding.resources().len() != 1
@@ -444,7 +459,7 @@ impl RegisteredLaunchProfile {
         effective: &EffectiveLaunchContract,
         descriptor: &ImmutableLaunchDescriptor,
     ) -> Result<ResolvedNativePaths, HostError> {
-        if self.codex_policy.is_some() {
+        if self.requires_fd3_observe() || self.codex_policy.is_some() {
             return Err(HostError::Unsupported);
         }
         if host.target_os != TargetOs::Linux
@@ -491,6 +506,9 @@ impl RegisteredLaunchProfile {
         effective: &EffectiveLaunchContractV2,
         descriptor: &ImmutableLaunchDescriptorV2,
     ) -> Result<ResolvedNativePaths, HostError> {
+        if self.requires_fd3_observe() {
+            return Err(HostError::Unsupported);
+        }
         let policy = self.codex_policy.as_ref().ok_or(HostError::StaleGuard)?;
         let base = effective.base();
         if effective.codex_policy() != policy
@@ -597,7 +615,7 @@ impl RegisteredLaunchProfile {
         selected_credential: Option<&CredentialRef>,
         selection: &LaunchSelection,
     ) -> Result<EffectiveLaunchSpec, HostError> {
-        if self.codex_policy.is_some() {
+        if self.requires_fd3_observe() || self.codex_policy.is_some() {
             return Err(HostError::Unsupported);
         }
         self.resolve_selection(pod_id, role, grant_id, selected_credential, selection)
@@ -611,6 +629,9 @@ impl RegisteredLaunchProfile {
         selected_credential: Option<&CredentialRef>,
         selection: &LaunchSelection,
     ) -> Result<EffectiveLaunchSpec, HostError> {
+        if self.requires_fd3_observe() {
+            return Err(HostError::Unsupported);
+        }
         let policy = self.codex_policy.as_ref().ok_or(HostError::Unsupported)?;
         let credential = selected_credential.ok_or(HostError::Unauthorised)?;
         if !matches!(role, Role::Coordinator | Role::Worker)
@@ -782,6 +803,9 @@ impl EffectiveLaunchSpec {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, HostError> {
+        if self.profile_ref == podbay_wire::OPERATOR_FD3_OBSERVE_PROFILE_REF {
+            return Err(HostError::Unsupported);
+        }
         let mut output = if self.until_stopped && self.profile_ref == OPERATOR_PROCESS_PROFILE_REF {
             b"podbay.effective-launch/operator-until-stopped/1\0".to_vec()
         } else if self.until_stopped {
@@ -838,6 +862,26 @@ fn append_string(output: &mut Vec<u8>, value: &str) -> Result<(), HostError> {
     let length = u32::try_from(value.len()).map_err(|_| HostError::InvalidInput)?;
     output.extend_from_slice(&length.to_be_bytes());
     output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+/// Pure registry update shared with DurableAuthority. No store or port effect.
+pub(crate) fn register_launch_profile(
+    profiles: &mut HashMap<String, RegisteredLaunchProfile>,
+    profile: RegisteredLaunchProfile,
+) -> Result<(), HostError> {
+    if profile.requires_fd3_observe() {
+        profile.validate_fd3_registration()?;
+    }
+    let key = profile.profile_ref().to_owned();
+    if let Some(existing) = profiles.get(&key) {
+        if existing.generation() > profile.generation()
+            || (existing.generation() == profile.generation() && existing != &profile)
+        {
+            return Err(HostError::StaleGuard);
+        }
+    }
+    profiles.insert(key, profile);
     Ok(())
 }
 
