@@ -31,6 +31,14 @@ the current v25 schema/lineage with its own authority and pending/final guards.
 The ordinary exact-v24 `PodBayStore::open` remains unchanged. No blind
 exchange-back is allowed after that activation boundary.
 
+Checkpoint `2290bd8` implements that boundary on disposable files: an exact
+receipt-bound forward marker is fsynced before any test authority mutation,
+and a fresh process can reopen a changed v25 metadata revision with a dedicated
+restricted decoder. The decoder checks its original metadata baseline against
+the preserved v24 file; the public handle exposes readback only and refuses
+new pending/final rows or other authority mutations. It is **not** a general
+v25 runtime open, Owner replay, production reader barrier or live activation.
+
 ## Decision and rejected alternative
 
 Use a staged **copy, verify, atomic exchange** from v24 to v25. The v25
