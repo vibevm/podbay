@@ -2,6 +2,9 @@
 //! The CLI is the trusted local manager. No caller supplies native launch
 //! fields after the private policy has been loaded and pinned.
 
+// Inert owner-level restart model; current launch/stop never call it.
+mod restart_model;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
