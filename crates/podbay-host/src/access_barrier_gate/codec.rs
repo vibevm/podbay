@@ -6,6 +6,10 @@ const MAGIC: &[u8; 8] = b"PBGATE01";
 const DOMAIN: &[u8] = b"podbay.inert-access-barrier-record/1\0";
 const MAX_BYTES: usize = 8192;
 
+// Disposable adapter is absent from ordinary production builds.
+#[cfg(all(test, target_os = "linux"))]
+mod disposable_files;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     InitialClosed,
@@ -375,7 +379,7 @@ fn check_next(previous: &RecordV1, next: &RecordV1) -> Result<(), CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn initial() -> RecordV1 {
+    pub(super) fn initial() -> RecordV1 {
         let (_, durable, _, _) = super::super::tests::fixture();
         RecordV1 {
             durable,
@@ -387,7 +391,7 @@ mod tests {
             previous_digest: [0; 32],
         }
     }
-    fn next(p: &RecordV1, kind: Kind) -> RecordV1 {
+    pub(super) fn next(p: &RecordV1, kind: Kind) -> RecordV1 {
         let mut r = p.clone();
         r.kind = kind;
         r.durable.subject.generation = p.durable.subject.generation.checked_add(1).unwrap();
