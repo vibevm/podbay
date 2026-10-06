@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+# TEST ONLY: no broker, owner child, admission transition, recovery or shell.
+PATH=/bin
+export PATH
+umask 077
+fail() {
+    printf '{"event":"fixture_stub","status":"BLOCKED_NOT_BOOTED_PROOF","gate":"CLOSED","reason":"%s"}\n' "$1"
+    /bin/busybox poweroff -f
+    # PID1 must never exit if poweroff fails. This delay is not a proof oracle.
+    while :; do /bin/busybox sleep 3600; done
+}
+[ "$$" = 1 ] || exit 2
+/bin/busybox mount -t proc -o nosuid,nodev,noexec proc /proc || fail proc_mount
+/bin/busybox mount -t sysfs -o nosuid,nodev,noexec sysfs /sys || fail sys_mount
+/bin/busybox mount -t devtmpfs -o nosuid devtmpfs /dev || fail dev_mount
+# Raw virtio fixture only. noload forbids journal replay; never remount writable.
+/bin/busybox mount -t ext4 -o ro,noload,nosuid,nodev,noexec /dev/vda /fixture || fail fixture_mount
+/bin/busybox sha256sum -c /etc/fixture.sha256 || fail fixture_digest
+[ "$(/bin/busybox cat /fixture/gate)" = 'schema=1
+policy=offline-closed-v1
+generation=1
+nonce=OFFLINE-DETERMINISTIC-NOT-A-RUNTIME-NONCE
+state=CLOSED
+admission=UNIMPLEMENTED' ] || fail gate_contract
+[ "$(/bin/busybox stat -c '%u:%g:%a' /fixture/gate)" = 0:0:600 ] || fail gate_identity
+[ "$(/bin/busybox stat -c '%u:%g:%a' /fixture/vault)" = 0:0:700 ] || fail vault_identity
+[ "$(/bin/busybox stat -c '%u:%g:%a' /fixture/vault/state)" = 1000:1000:700 ] || fail owner_directory_identity
+[ "$(/bin/busybox stat -c '%u:%g:%a' /fixture/vault/state/db.sqlite)" = 1000:1000:600 ] || fail database_identity
+# No owner execution is implemented. A valid fixture is still a blocked stub.
+fail persistent_broker_and_two_boot_protocol_unimplemented
