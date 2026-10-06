@@ -8,6 +8,7 @@ mod current_snapshot;
 mod launch;
 mod later_turn;
 mod manager_peer;
+mod migration_v25;
 mod model;
 mod native_evidence;
 mod peer_witness;
@@ -31,6 +32,10 @@ pub use bound_launch::{
 pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use later_turn::{LaterCodexSendRecord, LaterCodexSendSelector, TrustedLaterCodexSendRequest};
 pub use manager_peer::SqliteManagerPeerWitness;
+pub use migration_v25::{
+    V25PreservedTable, V25SequenceHighWater, V25StagingError, V25StagingResult,
+    stage_schema_v25,
+};
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,
