@@ -56,8 +56,12 @@ A disposable user-systemd 259 probe on 2026-10-06 ruled out `mask --runtime`
 as that maintained barrier. A previously accepted waiting job ran after the
 mask; a loaded transient unit restarted under the mask; after stop/collection,
 `systemd-run --unit=<same name>` created a fresh transient unit even while the
-mask symlink remained. Both probe units were removed and no product unit was
-touched. A production admission capability therefore needs a separately
+mask symlink remained. A follow-up held D-Bus `RefUnit` reference prevented
+collection of a loaded transient object, but did not cancel its waiting job;
+`systemctl start` still accepted a new job under the mask. A masked unit could
+not be acquired with `RefUnit` in that probe. All disposable units and D-Bus
+references were cleaned, and no product unit was touched. A production
+admission capability therefore needs a separately
 enforced launch/access gate, verified over the whole interval. The strict
 same-UID raw-opener guarantee requires an OS access boundary; a narrower
 cooperating-process contract must explicitly name and close every trusted
