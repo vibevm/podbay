@@ -476,16 +476,26 @@ impl PodBayStore {
         scope_id: &ScopeId,
         session_id: &SessionId,
     ) -> Result<BootstrapSendRecord, StoreError> {
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let rowid: Option<i64> = transaction.query_row(
-            "SELECT command_rowid FROM codex_bootstrap_sends
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let rowid: Option<i64> = transaction
+            .query_row(
+                "SELECT command_rowid FROM codex_bootstrap_sends
              WHERE scope_id=?1 AND session_id=?2",
-            params![scope_id.as_str(), session_id.as_str()], |row| row.get(0),
-        ).optional()?;
+                params![scope_id.as_str(), session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
         let record = read_bootstrap_record(&transaction, rowid.ok_or(StoreError::NotFound)?)?;
-        if record.scope_id() != scope_id || record.native_target().session_id != *session_id
+        if record.scope_id() != scope_id
+            || record.native_target().session_id != *session_id
             || record.effect_state() != EffectState::ClaimedUncertain
-        { return Err(StoreError::Conflict("bootstrap lineage is not claimed in this Session")); }
+        {
+            return Err(StoreError::Conflict(
+                "bootstrap lineage is not claimed in this Session",
+            ));
+        }
         transaction.commit()?;
         Ok(record)
     }
@@ -1242,6 +1252,73 @@ fn check_current_record(
     )
 }
 
+// Shared transaction bodies retain every immutable/current check. The policy
+// runs before fresh/retry classification and never receives a caller-only Pod.
+pub(crate) fn claim_bootstrap_send_in_transaction(
+    transaction: &Transaction<'_>,
+    lineage: &str,
+    selector: &BootstrapSendSelector,
+    fence: impl FnOnce(&Transaction<'_>, &NativeWriterTarget, u64, u64, u64) -> Result<(), StoreError>,
+) -> Result<EffectClaim, StoreError> {
+    let (_, record) = selected_record(transaction, selector)?;
+    fence(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+        record.authority_revision,
+    )?;
+    let claim_key = format!("claim.{}", record.receipt.command_id);
+    if record.effect_state != EffectState::Prepared {
+        if record.claim_key.as_deref() != Some(claim_key.as_str()) {
+            return Err(StoreError::Conflict("bootstrap claim identity differs"));
+        }
+        return Ok(EffectClaim::ExistingUncertain);
+    }
+    check_current_record(transaction, lineage, &record)?;
+    let changed = transaction.execute(
+        "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
+             WHERE outbox_id=?3 AND state='prepared' AND kind=?4",
+        params![
+            claim_key,
+            integer(record.owner_epoch)?,
+            record.receipt.outbox_id,
+            EFFECT_KIND
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(EffectClaim::NewClaim)
+}
+
+pub(crate) fn inspect_claimed_bootstrap_send_in_transaction(
+    transaction: &Transaction<'_>,
+    lineage: &str,
+    selector: &BootstrapSendSelector,
+    fence: impl FnOnce(&Transaction<'_>, &NativeWriterTarget, u64, u64, u64) -> Result<(), StoreError>,
+) -> Result<BootstrapSendRecord, StoreError> {
+    let (_, record) = selected_record(transaction, selector)?;
+    fence(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+        record.authority_revision,
+    )?;
+    if record.effect_state != EffectState::ClaimedUncertain
+        || record.claim_key.as_deref()
+            != Some(format!("claim.{}", record.receipt.command_id).as_str())
+        || record.claim_owner_epoch != Some(record.owner_epoch)
+    {
+        return Err(StoreError::Conflict(
+            "bootstrap has no current claimed effect",
+        ));
+    }
+    check_current_record(transaction, lineage, &record)?;
+    Ok(record)
+}
+
 impl PodBayStore {
     /// CAS-claim one Prepared bootstrap before any pod/native call. An
     /// existing claim is historical uncertainty, never permission to replay.
@@ -1253,32 +1330,15 @@ impl PodBayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, record) = selected_record(&transaction, selector)?;
-        let claim_key = format!("claim.{}", record.receipt.command_id);
-        if record.effect_state != EffectState::Prepared {
-            if record.claim_key.as_deref() != Some(claim_key.as_str()) {
-                return Err(StoreError::Conflict("bootstrap claim identity differs"));
-            }
-            return Ok(EffectClaim::ExistingUncertain);
-        }
-        check_current_record(&transaction, &self.store_lineage, &record)?;
-        let changed = transaction.execute(
-            "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
-             WHERE outbox_id=?3 AND state='prepared' AND kind=?4",
-            params![
-                claim_key,
-                integer(record.owner_epoch)?,
-                record.receipt.outbox_id,
-                EFFECT_KIND
-            ],
+        let result = claim_bootstrap_send_in_transaction(
+            &transaction,
+            &self.store_lineage,
+            selector,
+            crate::bootstrap_send::schema24_native_send_fence,
         )?;
-        if changed != 1 {
-            return Err(StoreError::StaleEpoch);
-        }
         transaction.commit()?;
-        Ok(EffectClaim::NewClaim)
+        Ok(result)
     }
-
     /// Read-only exact command and current-lease proof for a pod boundary.
     /// It supplies committed prompt bytes only after the typed outbox claim;
     /// it does not authenticate the connected manager or native child.
@@ -1289,18 +1349,29 @@ impl PodBayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let (_, record) = selected_record(&transaction, selector)?;
-        if record.effect_state != EffectState::ClaimedUncertain
-            || record.claim_key.as_deref()
-                != Some(format!("claim.{}", record.receipt.command_id).as_str())
-            || record.claim_owner_epoch != Some(record.owner_epoch)
-        {
-            return Err(StoreError::Conflict(
-                "bootstrap has no current claimed effect",
-            ));
-        }
-        check_current_record(&transaction, &self.store_lineage, &record)?;
+        let result = inspect_claimed_bootstrap_send_in_transaction(
+            &transaction,
+            &self.store_lineage,
+            selector,
+            crate::bootstrap_send::schema24_native_send_fence,
+        )?;
         transaction.commit()?;
-        Ok(record)
+        Ok(result)
     }
+}
+
+// A handle opened under v24 cannot acquire current send authority if its
+// database version changes. This does not add a production v25 opening path.
+pub(crate) fn schema24_native_send_fence(
+    transaction: &Transaction<'_>,
+    _target: &NativeWriterTarget,
+    _owner: u64,
+    _credential: u64,
+    _revision: u64,
+) -> Result<(), StoreError> {
+    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 24 {
+        return Err(StoreError::UnsupportedSchema(version));
+    }
+    Ok(())
 }

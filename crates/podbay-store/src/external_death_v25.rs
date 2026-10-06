@@ -487,10 +487,11 @@ fn read_rows(tx: &Transaction<'_>) -> Result<Vec<ExternalDeathPendingReceipt>, V
 }
 
 // Private disposable prototype only: no production claim/readback path calls
-// this decoder yet. A disposition is a store fact, never effect authority.
+// this decoder. Disposable claim integration is test-only; a disposition is a
+// store fact, never effect authority.
 // Restricted to rebound V2 recovery candidates: even Live requires an
 // activated rebind and its checkpoint/resource bindings. Ordinary fresh
-// native-send subject resolution remains deferred.
+// unrebound native-send subject resolution remains deferred.
 // The request supplies a candidate full binding checked against stored rows.
 // Future claim integration must resolve it from the selected stored send, not
 // take an independently caller-selected Pod subject.
@@ -633,6 +634,117 @@ fn decode_subject_disposition(
     } else {
         SubjectDisposition::Live
     })
+}
+
+// Only the private disposable claim harness selects this policy. Resolve from
+// the already decoded stored send in the caller's transaction; never accept an
+// independently selected pending request as the claim subject.
+#[cfg(test)]
+fn native_send_disposition(
+    tx: &Transaction<'_>,
+    target: &crate::NativeWriterTarget,
+    owner: u64,
+    credential: u64,
+    revision: u64,
+) -> SubjectDisposition {
+    resolve_native_send_subject(tx, target, owner, credential, revision)
+        .map(|subject| subject_disposition(tx, &subject))
+        .unwrap_or(SubjectDisposition::Unverified)
+}
+
+#[cfg(test)]
+fn resolve_native_send_subject(
+    tx: &Transaction<'_>,
+    target: &crate::NativeWriterTarget,
+    owner: u64,
+    credential: u64,
+    revision: u64,
+) -> Result<ExternalDeathPendingRequest, V25StagingError> {
+    let launch: i64 = tx.query_row(
+        "SELECT command_rowid FROM launch_slots WHERE scope_id=?1 AND pod_id=?2 AND pod_incarnation=?3",
+        params![target.scope_id.as_str(), target.pod_id.as_str(), positive(target.pod_incarnation)?],
+        |row| row.get(0),
+    )?;
+    let bound = crate::bound_launch::read_bound_record(tx, launch)?;
+    // Older activated history is harmless when the latest applicable row passes
+    // check_subject. That decoder still rejects later/nonactivated conflicts.
+    let mut statement = tx.prepare("SELECT rebind_rowid,CASE WHEN length(CAST(pod_checkpoint_ref AS BLOB))=64 THEN pod_checkpoint_ref END FROM manager_rebinds WHERE store_lineage=?1 AND scope_id=?2 AND pod_id=?3 AND pod_incarnation=?4 AND phase='activated' ORDER BY rebind_rowid DESC LIMIT 1")?;
+    let rebinds = statement
+        .query_map(
+            params![
+                target.store_lineage.as_str(),
+                target.scope_id.as_str(),
+                target.pod_id.as_str(),
+                positive(target.pod_incarnation)?
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rebinds.len() != 1 || rebinds[0].1.len() != 64 {
+        return Err(V25StagingError::Safety(
+            "native send requires a rebound V2 subject",
+        ));
+    }
+    let mut statement = tx.prepare("SELECT CASE WHEN length(CAST(resource_id AS BLOB)) BETWEEN 1 AND 256 THEN resource_id END,resource_epoch,input_epoch FROM authority_resources WHERE pod_id=?1 ORDER BY resource_id LIMIT 65")?;
+    let resources = statement
+        .query_map([target.pod_id.as_str()], |row| {
+            Ok(PendingResourceBinding {
+                resource_id: row.get(0)?,
+                resource_epoch: row.get::<_, i64>(1)? as u64,
+                input_epoch: row.get::<_, i64>(2)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if bound.session_id != target.session_id.as_str()
+        || bound.run_id != target.run_id.as_str()
+        || bound.attempt_id != target.attempt_id.as_str()
+        || !resources.iter().any(|resource| {
+            resource.resource_id == target.resource_id.as_str()
+                && resource.resource_epoch == target.resource_epoch
+                && resource.input_epoch == target.resource_input_epoch
+        })
+    {
+        return Err(V25StagingError::Safety(
+            "native send exact identity differs",
+        ));
+    }
+    Ok(ExternalDeathPendingRequest {
+        recovery_key: "disposable.native-send.subject".into(),
+        store_lineage: target.store_lineage.as_str().into(),
+        scope_id: target.scope_id.as_str().into(),
+        pod_id: target.pod_id.as_str().into(),
+        pod_incarnation: target.pod_incarnation,
+        session_id: bound.session_id,
+        run_id: bound.run_id,
+        attempt_id: bound.attempt_id,
+        launch_command_rowid: launch,
+        activated_rebind_rowid: rebinds[0].0,
+        checkpoint_digest: rebinds[0].1.clone(),
+        resources,
+        expected_owner_epoch: owner,
+        expected_manager_credential_epoch: credential,
+        expected_authority_revision: revision,
+    })
+}
+
+#[cfg(test)]
+fn require_live_native_send(
+    tx: &Transaction<'_>,
+    target: &crate::NativeWriterTarget,
+    owner: u64,
+    credential: u64,
+    revision: u64,
+) -> Result<(), StoreError> {
+    match native_send_disposition(tx, target, owner, credential, revision) {
+        SubjectDisposition::Live => Ok(()),
+        SubjectDisposition::Pending => Err(StoreError::Conflict("native send subject pending")),
+        SubjectDisposition::FinalRecorded => {
+            Err(StoreError::Conflict("native send subject final recorded"))
+        }
+        SubjectDisposition::Unverified => {
+            Err(StoreError::Conflict("native send subject unverified"))
+        }
+    }
 }
 
 fn decode_pending_state(p: &ActivationPayload) -> Result<V25ActivationMetadata, V25StagingError> {
@@ -1147,6 +1259,19 @@ mod tests {
             store.begin_authority_replay(1, 2).unwrap();
             // The private fixture models an authenticated original launch settlement.
             let revision = store.authority_snapshot().unwrap().revision;
+            let launch_claim = if variant.starts_with("native_") {
+                format!(
+                    "claim.{}",
+                    store
+                        .current_bound_pod_snapshot("scope.launch", "pod.launch")
+                        .unwrap()
+                        .launch()
+                        .receipt
+                        .command_id
+                )
+            } else {
+                "claim.launch".into()
+            };
             store
                 .claim_effect(
                     1,
@@ -1155,7 +1280,7 @@ mod tests {
                     2,
                     1,
                     revision,
-                    "claim.launch",
+                    &launch_claim,
                 )
                 .unwrap();
             let proof = crate::HostAcceptanceProof::from_authenticated_host_boundary(
@@ -1173,6 +1298,20 @@ mod tests {
                 store.begin_authority_replay(2, 3).unwrap();
             }
             let observing_owner = store.owner_epoch().unwrap();
+            if variant.starts_with("native_") {
+                store
+                    .record_launch_port_result(
+                        1,
+                        "scope.launch",
+                        "pod.launch",
+                        observing_owner,
+                        &launch_claim,
+                        crate::LaunchPortResult::HostAccepted {
+                            receipt_ref: Some("receipt.native.fixture".into()),
+                        },
+                    )
+                    .unwrap();
+            }
             store
                 .observe_effect(
                     1,
@@ -1180,7 +1319,7 @@ mod tests {
                     "pod.launch",
                     observing_owner,
                     1,
-                    "claim.launch",
+                    &launch_claim,
                     &proof,
                 )
                 .unwrap();
@@ -1321,7 +1460,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap() as u64;
-            let request = ExternalDeathPendingRequest {
+            let mut request = ExternalDeathPendingRequest {
                 recovery_key: "recover.one".into(),
                 store_lineage: lineage,
                 scope_id: "scope.launch".into(),
@@ -1343,6 +1482,23 @@ mod tests {
                 expected_authority_revision: 5,
             };
             drop(c);
+            if variant.starts_with("native_") {
+                if variant.contains("two_rebinds") {
+                    advance_native_rebind_fixture(&source, &mut request);
+                }
+                if variant.contains("unrelated") {
+                    seed_unrelated_bound_subject(&source);
+                    Connection::open(&source)
+                        .unwrap()
+                        .execute(
+                            "UPDATE metadata SET value=7 WHERE key='authority_revision'",
+                            [],
+                        )
+                        .unwrap();
+                    request.expected_authority_revision = 7;
+                }
+                seed_native_sends(&source, &request, variant);
+            }
             let staged = stage_schema_v25(&source, &staging).unwrap();
             staged.persist_exchange_intent("migration.one").unwrap();
             let dir = File::open(&directory).unwrap();
@@ -1401,6 +1557,367 @@ mod tests {
             let _ = fs::remove_dir_all(&self.directory);
         }
     }
+    fn advance_native_rebind_fixture(source: &Path, r: &mut ExternalDeathPendingRequest) {
+        let c = Connection::open(source).unwrap();
+        c.execute_batch("UPDATE metadata SET value=3 WHERE key='owner_epoch';
+            UPDATE manager_credential_claims SET owner_epoch=3,credential_epoch=3;
+            UPDATE authority_resources SET input_epoch=3 WHERE resource_id='resource.codex.fixture';
+            UPDATE outbox SET claim_owner_epoch=1 WHERE outbox_id=1;
+            INSERT INTO manager_peer_bindings(store_lineage,owner_epoch,credential_epoch,peer_schema,os_identity,process_identity,boot_identity,birth_identity,containment_identity)
+              SELECT lineage,epoch,epoch,'podbay.attested-peer/1','uid:1000','pid:100','boot.old','birth.100','unit.fixture'
+              FROM store_identity CROSS JOIN (SELECT 2 AS epoch UNION ALL SELECT 3);
+            INSERT INTO manager_rebinds(store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref)
+              SELECT store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,2,3,2,3,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,'rebind.second',request_digest,resource_count,'activated',pod_checkpoint_ref FROM manager_rebinds WHERE rebind_rowid=1;
+            INSERT INTO manager_rebind_resources VALUES(2,'resource.codex.fixture',2,3);
+            INSERT INTO manager_rebind_prior_observations SELECT 2,schema_version,checkpoint_digest,supervisor_pid,supervisor_start_ticks,boot_id,unit_name,cgroup_path FROM manager_rebind_prior_observations WHERE rebind_rowid=1;").unwrap();
+        r.expected_owner_epoch = 3;
+        r.expected_manager_credential_epoch = 3;
+        r.activated_rebind_rowid = 2;
+        r.resources[0].input_epoch = 3;
+    }
+    fn seed_unrelated_bound_subject(source: &Path) {
+        use podbay_wire::{
+            CodexAppServerPolicyV2, ResourceDriver, ReviewedNativePolicy, ReviewedResource,
+            TargetOs,
+        };
+        let mut store = PodBayStore::open(source).unwrap();
+        let scope = ScopeId::try_from("scope.launch").unwrap();
+        let mut session = Session::new(
+            SessionId::try_from("session.other.fixture").unwrap(),
+            ActorId::try_from("actor.codex.fixture").unwrap(),
+            scope.clone(),
+        );
+        let run = Run::new(
+            RunId::try_from("run.other.fixture").unwrap(),
+            &session,
+            Role::Coordinator,
+            WorkKind::Service,
+            None,
+        );
+        session.bind_run(session.revision(), &run).unwrap();
+        let mut attempt = Attempt::new(
+            AttemptId::try_from("attempt.other.fixture").unwrap(),
+            run.id().clone(),
+            1,
+            Epoch::new(1).unwrap(),
+        )
+        .unwrap();
+        let mut pod = Pod::new(
+            PodId::try_from("pod.otherx").unwrap(),
+            attempt.id().clone(),
+            Epoch::new(1).unwrap(),
+        );
+        attempt.attach_pod(attempt.revision(), &pod).unwrap();
+        let resource = Resource::new(
+            ResourceId::try_from("resource.other.fixture").unwrap(),
+            pod.id().clone(),
+            ResourceKind::StructuredProvider,
+            Epoch::new(1).unwrap(),
+        );
+        pod.attach_resource(pod.revision(), &resource).unwrap();
+        let planned =
+            LaunchBinding::plan_first_root(&session, &run, &attempt, &pod, &[resource]).unwrap();
+        let hex = include_str!("../../podbay-wire/tests/effective_launch_v2.hex")
+            .split_whitespace()
+            .collect::<String>();
+        let mut effective_bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        // Effective fixture identities follow B's planned binding. Keep each
+        // replacement the same byte length to preserve nested framing lengths.
+        for (old, new) in [
+            ("resource.codex.fixture", "resource.other.fixture"),
+            ("session.codex.fixture", "session.other.fixture"),
+            ("run.codex.fixture", "run.other.fixture"),
+            ("attempt.codex.fixture", "attempt.other.fixture"),
+            ("pod.launch", "pod.otherx"),
+        ] {
+            assert_eq!(old.len(), new.len());
+            let mut before = (old.len() as u32).to_be_bytes().to_vec();
+            before.extend_from_slice(old.as_bytes());
+            if let Some(at) = effective_bytes
+                .windows(before.len())
+                .position(|window| window == before)
+            {
+                let mut after = (new.len() as u32).to_be_bytes().to_vec();
+                after.extend_from_slice(new.as_bytes());
+                effective_bytes.splice(at..at + before.len(), after);
+            }
+        }
+        let effective = EffectiveLaunchContractV2::decode(&effective_bytes).unwrap();
+        let policy = ReviewedNativePolicy {
+            target_os: TargetOs::Linux,
+            host_id: "host.codex.fixture".into(),
+            profile_ref: "profile.fixture".into(),
+            profile_generation: 1,
+            model_id: "gpt-6-sol".into(),
+            reasoning_effort: "medium".into(),
+            executable_generation: "sha256.fakegeneration1".into(),
+            effective_spec_digest: effective.digest().into(),
+            workspace_basis_ref: "basis.commit.one".into(),
+            executable: "/opt/podbay/bin/fake-agent".into(),
+            cwd: "/work/src".into(),
+            arguments: vec!["--managed".into(), "--safe".into()],
+            environment_refs: vec!["env.clean".into()],
+            credential_refs: vec!["vault.allowed.one".into()],
+            wall_seconds: 60,
+            max_children: 2,
+            resources: planned
+                .identity()
+                .resources()
+                .iter()
+                .map(|resource| ReviewedResource {
+                    resource_id: resource.id().clone(),
+                    kind: resource.kind(),
+                    epoch: resource.epoch(),
+                    driver: ResourceDriver::Structured {
+                        driver_ref: "driver.codex.app-server".into(),
+                        protocol_ref: "protocol.codex.app-server".into(),
+                    },
+                })
+                .collect(),
+        };
+        let descriptor = ImmutableLaunchDescriptorV2::from_planned_root(
+            &planned,
+            policy,
+            CodexAppServerPolicyV2::new(
+                &scope,
+                "vault.allowed.one".into(),
+                "driver.codex.app-server".into(),
+                "protocol.codex.app-server".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let admission = store
+            .admit_bound_root_launch_v2(crate::BoundRootLaunchRequestV2 {
+                principal: crate::VerifiedPrincipal::from_authenticated_boundary("owner.fixture")
+                    .unwrap(),
+                command_key: "launch.other",
+                canonical_intent: b"unrelated fixture launch",
+                scope_id: "scope.launch",
+                pod_id: "pod.otherx",
+                proposal: Some(crate::BoundRootLaunchProposalV2 {
+                    session: &session,
+                    run: &run,
+                    binding: &planned,
+                    effective_spec: &effective,
+                    descriptor: &descriptor,
+                    expected_owner_epoch: 2,
+                    expected_authority_revision: 5,
+                }),
+            })
+            .unwrap();
+        let crate::BoundLaunchAdmission::Committed(bound) = admission else {
+            panic!("fresh unrelated bound subject")
+        };
+        let launch_claim = format!("claim.{}", bound.receipt.command_id);
+        store
+            .claim_effect(
+                bound.receipt.outbox_id,
+                "scope.launch",
+                "pod.otherx",
+                2,
+                1,
+                6,
+                &launch_claim,
+            )
+            .unwrap();
+        store
+            .record_launch_port_result(
+                bound.receipt.outbox_id,
+                "scope.launch",
+                "pod.otherx",
+                2,
+                &launch_claim,
+                crate::LaunchPortResult::HostAccepted {
+                    receipt_ref: Some("receipt.other".into()),
+                },
+            )
+            .unwrap();
+        let proof = crate::HostAcceptanceProof::from_authenticated_host_boundary(
+            "host.other",
+            2,
+            1,
+            "receipt.other",
+            b"disposable unrelated trusted host",
+            None,
+            "correlation.other",
+            None,
+        )
+        .unwrap();
+        store
+            .observe_effect(
+                bound.receipt.outbox_id,
+                "scope.launch",
+                "pod.otherx",
+                2,
+                1,
+                &launch_claim,
+                &proof,
+            )
+            .unwrap();
+        let c = &store.connection;
+        c.execute("INSERT INTO manager_rebinds(store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,command_key,request_digest,resource_count,phase,pod_checkpoint_ref) SELECT store_lineage,scope_id,'pod.otherx','attempt.other.fixture',1,1,2,1,2,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,'rebind.other',request_digest,resource_count,'activated',pod_checkpoint_ref FROM manager_rebinds WHERE rebind_rowid=1",[]).unwrap();
+        let rebind = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO manager_rebind_resources VALUES(?1,'resource.other.fixture',1,2)",
+            [rebind],
+        )
+        .unwrap();
+        c.execute("INSERT INTO manager_rebind_prior_observations SELECT ?1,schema_version,checkpoint_digest,supervisor_pid,supervisor_start_ticks,boot_id,unit_name,cgroup_path FROM manager_rebind_prior_observations WHERE rebind_rowid=1",[rebind]).unwrap();
+        c.execute(
+            "UPDATE authority_resources SET input_epoch=2 WHERE resource_id='resource.other.fixture'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(bound.pod_id, "pod.otherx");
+        drop(store);
+        Connection::open(source)
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+    }
+
+    fn native_target(r: &ExternalDeathPendingRequest) -> crate::NativeWriterTarget {
+        crate::NativeWriterTarget {
+            store_lineage: r.store_lineage.as_str().try_into().unwrap(),
+            scope_id: r.scope_id.as_str().try_into().unwrap(),
+            session_id: r.session_id.as_str().try_into().unwrap(),
+            run_id: r.run_id.as_str().try_into().unwrap(),
+            attempt_id: r.attempt_id.as_str().try_into().unwrap(),
+            pod_id: r.pod_id.as_str().try_into().unwrap(),
+            pod_incarnation: r.pod_incarnation,
+            resource_id: r.resources[0].resource_id.as_str().try_into().unwrap(),
+            resource_epoch: r.resources[0].resource_epoch,
+            resource_input_epoch: r.resources[0].input_epoch,
+        }
+    }
+    fn send_envelope_at_owner(
+        key: &str,
+        revision: u64,
+        owner: u64,
+    ) -> podbay_wire::CommandEnvelope {
+        use podbay_wire::{
+            CommandBody, CommandEnvelope, ContentBlock, DecimalString, Guard, SendPolicy,
+            SessionSendBody, Target,
+        };
+        CommandEnvelope::new(
+            "request.native",
+            key,
+            Target::Session {
+                session_id: "session.codex.fixture".into(),
+            },
+            Some(Guard {
+                manager_epoch: Some(DecimalString::new(owner)),
+                pod_epoch: Some(DecimalString::new(1)),
+                resource_epoch: Some(DecimalString::new(1)),
+                writer_epoch: Some(DecimalString::new(1)),
+                lease_epoch: None,
+                target_revision: Some(DecimalString::new(revision)),
+            }),
+            None,
+            CommandBody::SessionSend(SessionSendBody {
+                content: vec![ContentBlock::Text {
+                    text: "native fixture prompt".into(),
+                }],
+                policy: SendPolicy::WhenIdle,
+            }),
+        )
+        .unwrap()
+    }
+    fn seed_native_sends(source: &Path, r: &ExternalDeathPendingRequest, variant: &str) {
+        let mut store = PodBayStore::open(source).unwrap();
+        let target = native_target(r);
+        let holder = ActorId::try_from("owner.fixture").unwrap();
+        store
+            .acquire_native_writer_lease_from_trusted_host(
+                &crate::TrustedNativeWriterLeaseRequest {
+                    target: target.clone(),
+                    holder_actor_id: holder.clone(),
+                    holder_credential_generation: 1,
+                    expected_owner_epoch: r.expected_owner_epoch,
+                    expected_manager_credential_epoch: r.expected_manager_credential_epoch,
+                    expected_authority_revision: r.expected_authority_revision,
+                    expected_writer_epoch: None,
+                    ttl_seconds: 3600,
+                },
+            )
+            .unwrap();
+        let (_, revision) = store
+            .current_native_writer_target_for_session(&target.scope_id, &target.session_id)
+            .unwrap();
+        let envelope =
+            send_envelope_at_owner("key.native.bootstrap", revision, r.expected_owner_epoch);
+        let request = crate::TrustedBootstrapSendRequest {
+            principal: crate::VerifiedPrincipal::from_authenticated_boundary("owner.fixture")
+                .unwrap(),
+            scope_id: target.scope_id.clone(),
+            envelope: &envelope,
+            native_target: target.clone(),
+            holder_actor_id: holder.clone(),
+            holder_credential_generation: 1,
+            expected_owner_epoch: r.expected_owner_epoch,
+            expected_manager_credential_epoch: r.expected_manager_credential_epoch,
+            expected_authority_revision: r.expected_authority_revision,
+        };
+        let crate::Admission::Committed(receipt) = store.admit_bootstrap_send(&request).unwrap()
+        else {
+            panic!("fresh bootstrap expected")
+        };
+        let selector = crate::BootstrapSendSelector {
+            scope_id: target.scope_id.clone(),
+            command_id: receipt.command_id.as_str().try_into().unwrap(),
+            native_target: target.clone(),
+        };
+        if variant.contains("claimed") || variant.contains("later") {
+            assert_eq!(
+                store.claim_bootstrap_send(&selector).unwrap(),
+                crate::EffectClaim::NewClaim
+            );
+        }
+        if variant.contains("later") {
+            let envelope =
+                send_envelope_at_owner("key.native.later", revision, r.expected_owner_epoch);
+            let request = crate::TrustedLaterCodexSendRequest {
+                principal: crate::VerifiedPrincipal::from_authenticated_boundary("owner.fixture")
+                    .unwrap(),
+                scope_id: target.scope_id.clone(),
+                envelope: &envelope,
+                native_target: target.clone(),
+                holder_actor_id: holder,
+                holder_credential_generation: 1,
+                expected_owner_epoch: r.expected_owner_epoch,
+                expected_manager_credential_epoch: r.expected_manager_credential_epoch,
+                expected_authority_revision: r.expected_authority_revision,
+                bootstrap_command_id: selector.command_id,
+                native_thread_id: "thread.native.fixture".into(),
+            };
+            let crate::Admission::Committed(receipt) =
+                store.admit_later_codex_send(&request).unwrap()
+            else {
+                panic!("fresh later expected")
+            };
+            if variant.contains("claimed") {
+                let selector = crate::LaterCodexSendSelector {
+                    scope_id: target.scope_id.clone(),
+                    command_id: receipt.command_id.as_str().try_into().unwrap(),
+                    native_target: target,
+                };
+                assert_eq!(
+                    store.claim_later_codex_send(&selector).unwrap(),
+                    crate::EffectClaim::NewClaim
+                );
+            }
+        }
+        drop(store);
+        Connection::open(source)
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+    }
+
     fn raw_witness_peer() -> podbay_core::AttestedPeer {
         podbay_core::AttestedPeer::from_port(
             "uid:1000",
@@ -1410,6 +1927,634 @@ mod tests {
             "unit.fixture",
         )
         .unwrap()
+    }
+
+    struct NativeHarness {
+        f: Fixture,
+        bootstrap: crate::BootstrapSendSelector,
+        later: Option<crate::LaterCodexSendSelector>,
+        revision: u64,
+    }
+    impl NativeHarness {
+        fn new(later: bool, claimed: bool) -> Self {
+            let variant = match (later, claimed) {
+                (false, false) => "native_fresh",
+                (false, true) => "native_claimed",
+                (true, false) => "native_later_fresh",
+                (true, true) => "native_later_claimed",
+            };
+            Self::from_variant(variant, later)
+        }
+        fn from_variant(variant: &str, later: bool) -> Self {
+            let f = Fixture::new(variant);
+            let c = Connection::open(&f.source).unwrap();
+            let command = |namespace| {
+                c.query_row(
+                    "SELECT command_id FROM commands WHERE namespace=?1",
+                    [namespace],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            };
+            let target = native_target(&f.request);
+            let bootstrap = crate::BootstrapSendSelector {
+                scope_id: target.scope_id.clone(),
+                command_id: command("podbay.session.send.bootstrap").try_into().unwrap(),
+                native_target: target.clone(),
+            };
+            let later = later.then(|| crate::LaterCodexSendSelector {
+                scope_id: target.scope_id.clone(),
+                command_id: command("podbay.session.send.later").try_into().unwrap(),
+                native_target: target,
+            });
+            let revision = c
+                .query_row(
+                    "SELECT revision FROM runtime_sessions WHERE session_id=?1",
+                    [&f.request.session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as u64;
+            Self {
+                f,
+                bootstrap,
+                later,
+                revision,
+            }
+        }
+        fn claim(&self, tx: &Transaction<'_>) -> Result<crate::EffectClaim, StoreError> {
+            if let Some(selector) = &self.later {
+                crate::later_turn::claim_later_codex_send_in_transaction(
+                    tx,
+                    &self.f.request.store_lineage,
+                    selector,
+                    require_live_native_send,
+                )
+            } else {
+                crate::bootstrap_send::claim_bootstrap_send_in_transaction(
+                    tx,
+                    &self.f.request.store_lineage,
+                    &self.bootstrap,
+                    require_live_native_send,
+                )
+            }
+        }
+        fn inspect(&self, tx: &Transaction<'_>) -> Result<(), StoreError> {
+            if let Some(selector) = &self.later {
+                let record = crate::later_turn::inspect_claimed_later_codex_send_in_transaction(
+                    tx,
+                    &self.f.request.store_lineage,
+                    selector,
+                    require_live_native_send,
+                )?;
+                assert_eq!(record.native_target(), &selector.native_target);
+                assert_eq!(record.prompt_text(), "native fixture prompt");
+            } else {
+                let record = crate::bootstrap_send::inspect_claimed_bootstrap_send_in_transaction(
+                    tx,
+                    &self.f.request.store_lineage,
+                    &self.bootstrap,
+                    require_live_native_send,
+                )?;
+                assert_eq!(record.native_target(), &self.bootstrap.native_target);
+                assert_eq!(record.prompt_text(), "native fixture prompt");
+            }
+            Ok(())
+        }
+        fn history(&self) -> (crate::Receipt, crate::EffectState) {
+            // Private disposable fixture only: no public v25 opening route.
+            let mut store = PodBayStore {
+                connection: Connection::open(&self.f.source).unwrap(),
+                store_lineage: self.f.request.store_lineage.clone(),
+            };
+            let principal =
+                crate::VerifiedPrincipal::from_authenticated_boundary("owner.fixture").unwrap();
+            let wrong =
+                crate::VerifiedPrincipal::from_authenticated_boundary("owner.foreign").unwrap();
+            let (receipt, state) = if let Some(selector) = &self.later {
+                let envelope = send_envelope_at_owner(
+                    "key.native.later",
+                    self.revision,
+                    self.f.request.expected_owner_epoch,
+                );
+                assert!(
+                    store
+                        .lookup_later_codex_send_by_key(
+                            &wrong,
+                            &selector.scope_id,
+                            &envelope,
+                            &self.bootstrap.command_id,
+                            "thread.native.fixture"
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                let record = store
+                    .lookup_later_codex_send_by_key(
+                        &principal,
+                        &selector.scope_id,
+                        &envelope,
+                        &self.bootstrap.command_id,
+                        "thread.native.fixture",
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mut changed = envelope.clone();
+                changed.key = "foreign.key".into();
+                assert!(
+                    store
+                        .lookup_later_codex_send_by_key(
+                            &principal,
+                            &selector.scope_id,
+                            &changed,
+                            &self.bootstrap.command_id,
+                            "thread.native.fixture"
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    store
+                        .lookup_later_codex_send_by_key(
+                            &principal,
+                            &selector.scope_id,
+                            &envelope,
+                            &self.bootstrap.command_id,
+                            "thread.changed"
+                        )
+                        .is_err()
+                );
+                (record.receipt().clone(), record.effect_state())
+            } else {
+                let envelope = send_envelope_at_owner(
+                    "key.native.bootstrap",
+                    self.revision,
+                    self.f.request.expected_owner_epoch,
+                );
+                assert!(
+                    store
+                        .lookup_bootstrap_send_by_key(&wrong, &self.bootstrap.scope_id, &envelope)
+                        .unwrap()
+                        .is_none()
+                );
+                let record = store
+                    .lookup_bootstrap_send_by_key(&principal, &self.bootstrap.scope_id, &envelope)
+                    .unwrap()
+                    .unwrap();
+                let mut changed = envelope.clone();
+                changed.key = "foreign.key".into();
+                assert!(
+                    store
+                        .lookup_bootstrap_send_by_key(
+                            &principal,
+                            &self.bootstrap.scope_id,
+                            &changed
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                changed = envelope.clone();
+                changed.payload_digest = "0".repeat(64);
+                assert!(
+                    store
+                        .lookup_bootstrap_send_by_key(
+                            &principal,
+                            &self.bootstrap.scope_id,
+                            &changed
+                        )
+                        .is_err()
+                );
+                (record.receipt().clone(), record.effect_state())
+            };
+            (receipt, state)
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_latest_activated_rebind_preserves_older_history_both_paths() {
+        for later in [false, true] {
+            let variant = if later {
+                "native_two_rebinds_later_fresh"
+            } else {
+                "native_two_rebinds_fresh"
+            };
+            let h = NativeHarness::from_variant(variant, later);
+            assert_eq!(h.f.request.expected_owner_epoch, 3);
+            assert_eq!(h.f.request.expected_manager_credential_epoch, 3);
+            assert_eq!(h.bootstrap.native_target.resource_input_epoch, 3);
+            let mut c = Connection::open(&h.f.source).unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM manager_rebinds WHERE phase='activated'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let subject =
+                resolve_native_send_subject(&tx, &h.bootstrap.native_target, 3, 3, 5).unwrap();
+            assert_eq!(
+                subject.activated_rebind_rowid, 2,
+                "latest applicable activated row"
+            );
+            assert_eq!(
+                native_send_disposition(&tx, &h.bootstrap.native_target, 3, 3, 5),
+                SubjectDisposition::Live
+            );
+            assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::NewClaim);
+            h.inspect(&tx).unwrap();
+            assert_eq!(tx.total_changes(), 1);
+            tx.commit().unwrap();
+            let before = snapshot(&c).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::ExistingUncertain);
+            h.inspect(&tx).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(snapshot(&c).unwrap(), before);
+            // A later nonactivated candidate still conflicts; selecting latest
+            // activated history must not conceal unresolved recovery.
+            c.execute("INSERT INTO manager_rebinds(store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,expected_owner_epoch,next_owner_epoch,expected_credential_epoch,next_credential_epoch,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,command_key,request_digest,resource_count,phase) SELECT store_lineage,scope_id,pod_id,attempt_id,pod_incarnation,3,4,3,4,manager_os_identity,manager_process_id,manager_boot_identity,manager_birth_identity,manager_containment,'rebind.unresolved',request_digest,resource_count,'pending' FROM manager_rebinds WHERE rebind_rowid=2",[]).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(matches!(
+                h.claim(&tx),
+                Err(StoreError::Conflict("native send subject unverified"))
+            ));
+            assert!(matches!(
+                h.inspect(&tx),
+                Err(StoreError::Conflict("native send subject unverified"))
+            ));
+            tx.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_unrelated_pending_and_final_do_not_fence_live_subject_both_paths() {
+        for later in [false, true] {
+            for final_record in [false, true] {
+                let variant = if later {
+                    "native_unrelated_later_fresh"
+                } else {
+                    "native_unrelated_fresh"
+                };
+                let h = NativeHarness::from_variant(variant, later);
+                let mut c = Connection::open(&h.f.source).unwrap();
+                assert_eq!(h.f.request.expected_authority_revision, 7);
+                let mut other = h.f.request.clone();
+                other.recovery_key = "recover.other".into();
+                other.pod_id = "pod.otherx".into();
+                other.session_id = "session.other.fixture".into();
+                other.run_id = "run.other.fixture".into();
+                other.attempt_id = "attempt.other.fixture".into();
+                other.resources[0].resource_id = "resource.other.fixture".into();
+                other.expected_authority_revision = 6;
+                other.launch_command_rowid = c
+                    .query_row(
+                        "SELECT command_rowid FROM launch_bindings WHERE pod_id='pod.otherx'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                other.activated_rebind_rowid = c
+                    .query_row(
+                        "SELECT rebind_rowid FROM manager_rebinds WHERE pod_id='pod.otherx'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                // Private historical row seed models B's pending committing at
+                // revision7 before A's native admission at that same current revision.
+                // It does not invoke a v25 admission path or relax frozen-baseline decoding.
+                let bytes = canonical(&h.f.author(), &other).unwrap();
+                c.execute("INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest) VALUES(?1,?2,?3,?4,1,?5,?6,2,7,'owner.fixture',?7,?8,?9)",params![other.recovery_key,other.store_lineage,other.scope_id,other.pod_id,other.launch_command_rowid,other.activated_rebind_rowid,REQUEST_VERSION,bytes,hex_digest(&bytes)]).unwrap();
+                if final_record {
+                    c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(?1,?2,'uncertain')",params![c.last_insert_rowid(),"a".repeat(64)]).unwrap();
+                }
+                let tx = c
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                assert_eq!(
+                    subject_disposition(&tx, &other),
+                    if final_record {
+                        SubjectDisposition::FinalRecorded
+                    } else {
+                        SubjectDisposition::Pending
+                    }
+                );
+                assert_eq!(
+                    native_send_disposition(&tx, &h.bootstrap.native_target, 2, 2, 7),
+                    SubjectDisposition::Live
+                );
+                let changes = tx.total_changes();
+                assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::NewClaim);
+                h.inspect(&tx).unwrap();
+                assert_eq!(
+                    tx.total_changes(),
+                    changes + 1,
+                    "unrelated fence permits exactly A's claim mutation"
+                );
+                tx.commit().unwrap();
+                let before = snapshot(&c).unwrap();
+                let tx = c
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::ExistingUncertain);
+                h.inspect(&tx).unwrap();
+                tx.commit().unwrap();
+                assert_eq!(snapshot(&c).unwrap(), before);
+                assert_eq!(h.history().1, crate::EffectState::ClaimedUncertain);
+            }
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_live_fresh_retry_inspection_and_rollback_both_paths() {
+        for later in [false, true] {
+            let h = NativeHarness::new(later, false);
+            let mut c = Connection::open(&h.f.source).unwrap();
+            let before = snapshot(&c).unwrap();
+            {
+                let tx = c
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::NewClaim);
+                assert_eq!(tx.total_changes(), 1, "only exact outbox claim mutates");
+                h.inspect(&tx).unwrap();
+                // Lost work before COMMIT cannot leak a claim.
+            }
+            assert_eq!(snapshot(&c).unwrap(), before);
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::NewClaim);
+            assert_eq!(
+                tx.total_changes(),
+                2,
+                "SQLite total_changes counts rolled-back writes too"
+            );
+            tx.commit().unwrap();
+            drop(c);
+            let history = h.history();
+            assert_eq!(history.1, crate::EffectState::ClaimedUncertain);
+            // New connection models committed claim with lost response.
+            let mut c = Connection::open(&h.f.source).unwrap();
+            let before = snapshot(&c).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::ExistingUncertain);
+            h.inspect(&tx).unwrap();
+            assert_eq!(tx.total_changes(), 0);
+            tx.commit().unwrap();
+            assert_eq!(snapshot(&c).unwrap(), before);
+            assert_eq!(h.history(), history);
+            assert!(matches!(
+                PodBayStore::open(&h.f.source),
+                Err(StoreError::UnsupportedSchema(25))
+            ));
+            assert!(matches!(
+                PodBayStore::open_existing_read_only(&h.f.source),
+                Err(StoreError::UnsupportedSchema(25))
+            ));
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_fence_precedes_fresh_retry_and_current_inspection_both_paths() {
+        for later in [false, true] {
+            for claimed in [false, true] {
+                for disposition in ["pending", "final", "missing", "digest", "ddl"] {
+                    let h = NativeHarness::new(later, claimed);
+                    let original = h.history();
+                    let expected = match disposition {
+                        "pending" | "final" => {
+                            let receipt = h.f.open().prepare(&h.f.author(), &h.f.request).unwrap();
+                            if disposition == "final" {
+                                Connection::open(&h.f.source).unwrap().execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(?1,?2,'uncertain')",params![receipt.pending_rowid,"a".repeat(64)]).unwrap();
+                                "native send subject final recorded"
+                            } else {
+                                "native send subject pending"
+                            }
+                        }
+                        "missing" => {
+                            Connection::open(&h.f.source)
+                                .unwrap()
+                                .execute_batch(
+                                    "PRAGMA foreign_keys=OFF; DROP TABLE external_death_final",
+                                )
+                                .unwrap();
+                            "native send subject unverified"
+                        }
+                        "digest" => {
+                            h.f.open().prepare(&h.f.author(), &h.f.request).unwrap();
+                            Connection::open(&h.f.source)
+                                .unwrap()
+                                .execute(
+                                    "UPDATE external_death_pending SET request_digest=?1",
+                                    ["0".repeat(64)],
+                                )
+                                .unwrap();
+                            "native send subject unverified"
+                        }
+                        "ddl" => {
+                            Connection::open(&h.f.source)
+                                .unwrap()
+                                .execute_batch(
+                                    "CREATE INDEX arbitrary_outbox_index ON outbox(state)",
+                                )
+                                .unwrap();
+                            "native send subject unverified"
+                        }
+                        _ => unreachable!(),
+                    };
+                    let mut c = Connection::open(&h.f.source).unwrap();
+                    let before = snapshot(&c).unwrap();
+                    let tx = c
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .unwrap();
+                    assert!(
+                        matches!(h.claim(&tx),Err(StoreError::Conflict(message)) if message==expected),
+                        "{later}/{claimed}/{disposition}"
+                    );
+                    assert!(
+                        matches!(h.inspect(&tx),Err(StoreError::Conflict(message)) if message==expected),
+                        "current inspection must expose specific fence before revision or claim-state failures"
+                    );
+                    assert_eq!(tx.total_changes(), 0);
+                    tx.commit().unwrap();
+                    assert_eq!(snapshot(&c).unwrap(), before);
+                    assert_eq!(
+                        h.history(),
+                        original,
+                        "fence preserves passive receipt and uncertainty"
+                    );
+                    let uncertainty:(String,String,i64)=c.query_row("SELECT state,claim_key,claim_owner_epoch FROM outbox WHERE outbox_id=2",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+                    assert_eq!(
+                        uncertainty,
+                        ("claimed_uncertain".into(), "native.claim".into(), 2)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_pending_survives_owner_advance_with_passive_exact_history() {
+        for later in [false, true] {
+            let h = NativeHarness::new(later, true);
+            let history = h.history();
+            h.f.open().prepare(&h.f.author(), &h.f.request).unwrap();
+            let mut c = Connection::open(&h.f.source).unwrap();
+            c.execute_batch("UPDATE metadata SET value=3 WHERE key='owner_epoch'; UPDATE metadata SET value=7 WHERE key='authority_revision'; UPDATE manager_credential_claims SET owner_epoch=3,credential_epoch=3").unwrap();
+            let before = snapshot(&c).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(matches!(
+                h.claim(&tx),
+                Err(StoreError::Conflict("native send subject pending"))
+            ));
+            assert!(matches!(
+                h.inspect(&tx),
+                Err(StoreError::Conflict("native send subject pending"))
+            ));
+            assert_eq!(
+                tx.total_changes(),
+                3,
+                "only the explicit prior counter updates changed this connection"
+            );
+            tx.commit().unwrap();
+            assert_eq!(snapshot(&c).unwrap(), before);
+            assert_eq!(h.history(), history);
+            if let Some(selector) = &h.later {
+                let mut store = PodBayStore {
+                    connection: Connection::open(&h.f.source).unwrap(),
+                    store_lineage: h.f.request.store_lineage.clone(),
+                };
+                let historic = store
+                    .inspect_historical_claimed_later_codex_send(selector)
+                    .unwrap();
+                assert_eq!(historic.receipt(), &history.0);
+                assert_eq!(
+                    historic.effect_state(),
+                    crate::EffectState::ClaimedUncertain
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_transaction_excludes_competing_writer_then_pending_denies() {
+        for later in [false, true] {
+            let h = NativeHarness::new(later, false);
+            let history = h.history();
+            let mut c = Connection::open(&h.f.source).unwrap();
+            let before = snapshot(&c).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(h.claim(&tx).unwrap(), crate::EffectClaim::NewClaim);
+            let path = h.f.source.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let contender = std::thread::spawn(move || {
+                let mut c = Connection::open(path).unwrap();
+                c.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let result = c.transaction_with_behavior(TransactionBehavior::Immediate);
+                let busy = matches!(result,Err(rusqlite::Error::SqliteFailure(ref error,_)) if error.code==rusqlite::ErrorCode::DatabaseBusy);
+                send.send(busy).unwrap();
+            });
+            assert!(
+                receive
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                "held claim transaction must exclude another writer"
+            );
+            contender.join().unwrap();
+            tx.rollback().unwrap();
+            assert_eq!(snapshot(&c).unwrap(), before);
+            assert_eq!(h.history(), history);
+            // Frozen pending baseline remains valid only because claim rolled back.
+            h.f.open().prepare(&h.f.author(), &h.f.request).unwrap();
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(matches!(
+                h.claim(&tx),
+                Err(StoreError::Conflict("native send subject pending"))
+            ));
+            tx.commit().unwrap();
+            assert_eq!(h.history(), history);
+        }
+    }
+
+    #[test]
+    fn native_claim_v25_exact_target_and_unrebound_are_not_live() {
+        let h = NativeHarness::new(false, true);
+        let mut c = Connection::open(&h.f.source).unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for field in [
+            "lineage",
+            "scope",
+            "session",
+            "run",
+            "attempt",
+            "pod",
+            "incarnation",
+            "resource",
+            "resource_epoch",
+            "input",
+        ] {
+            let mut target = h.bootstrap.native_target.clone();
+            match field {
+                "lineage" => target.store_lineage = "foreign".try_into().unwrap(),
+                "scope" => target.scope_id = "foreign".try_into().unwrap(),
+                "session" => target.session_id = "foreign".try_into().unwrap(),
+                "run" => target.run_id = "foreign".try_into().unwrap(),
+                "attempt" => target.attempt_id = "foreign".try_into().unwrap(),
+                "pod" => target.pod_id = "foreign".try_into().unwrap(),
+                "incarnation" => target.pod_incarnation += 1,
+                "resource" => target.resource_id = "foreign".try_into().unwrap(),
+                "resource_epoch" => target.resource_epoch += 1,
+                "input" => target.resource_input_epoch += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                native_send_disposition(&tx, &target, 2, 2, 5),
+                SubjectDisposition::Unverified,
+                "{field}"
+            );
+            let selector = crate::BootstrapSendSelector {
+                native_target: target,
+                ..h.bootstrap.clone()
+            };
+            assert!(
+                crate::bootstrap_send::claim_bootstrap_send_in_transaction(
+                    &tx,
+                    &h.f.request.store_lineage,
+                    &selector,
+                    require_live_native_send
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(tx.total_changes(), 0);
+        tx.commit().unwrap();
+        c.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM manager_rebind_prior_observations; DELETE FROM manager_rebind_resources; DELETE FROM manager_rebinds").unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(matches!(
+            h.claim(&tx),
+            Err(StoreError::Conflict("native send subject unverified"))
+        ));
     }
 
     fn assert_disposition_unchanged(

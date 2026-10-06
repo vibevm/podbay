@@ -6,17 +6,17 @@ use podbay_core::{
     ActorId, AttemptId, CommandId, PodId, ResourceId, RunId, ScopeId, SessionId, StoreLineageId,
 };
 use podbay_wire::{CommandEnvelope, Target};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::bootstrap_send::{
     check_deadline, check_host_accepted_launch, first_text, read_bootstrap_record, session_revision,
 };
 use crate::model::{
-    Admission, CommandRequest, EffectClaim, EffectState, NativeWriterTarget, Receipt, StoreError,
-    VerifiedPrincipal, DIGEST_VERSION,
+    Admission, CommandRequest, DIGEST_VERSION, EffectClaim, EffectState, NativeWriterTarget,
+    Receipt, StoreError, VerifiedPrincipal,
 };
 use crate::store::{
-    digest_request, integer, sha256_hex, stable_command_id, valid_id, validate_request, PodBayStore,
+    PodBayStore, digest_request, integer, sha256_hex, stable_command_id, valid_id, validate_request,
 };
 use crate::writer_lease::checked_native_writer_lease;
 
@@ -307,7 +307,9 @@ impl PodBayStore {
         &mut self,
         selector: &LaterCodexSendSelector,
     ) -> Result<LaterCodexSendRecord, StoreError> {
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let rowid: i64 = transaction.query_row(
             "SELECT command_rowid FROM commands WHERE command_id=?1 AND scope_id=?2 AND namespace=?3",
             params![selector.command_id.as_str(), selector.scope_id.as_str(), NAMESPACE],
@@ -315,7 +317,8 @@ impl PodBayStore {
         ).optional()?.ok_or(StoreError::NotFound)?;
         let record = read_later_record(&transaction, rowid)?;
         if record.scope_id != selector.scope_id
-            || !same_resource_anchor(&record.native_target, &selector.native_target) {
+            || !same_resource_anchor(&record.native_target, &selector.native_target)
+        {
             return Err(StoreError::StaleEpoch);
         }
         if record.effect_state != EffectState::ClaimedUncertain
@@ -1231,6 +1234,75 @@ fn check_current_record(
     )
 }
 
+// Shared transaction bodies retain every immutable/current check. The policy
+// runs before fresh/retry classification and never receives a caller-only Pod.
+pub(crate) fn claim_later_codex_send_in_transaction(
+    transaction: &Transaction<'_>,
+    lineage: &str,
+    selector: &LaterCodexSendSelector,
+    fence: impl FnOnce(&Transaction<'_>, &NativeWriterTarget, u64, u64, u64) -> Result<(), StoreError>,
+) -> Result<EffectClaim, StoreError> {
+    let (_, record) = selected_record(transaction, selector)?;
+    fence(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+        record.authority_revision,
+    )?;
+    let claim_key = format!("claim.{}", record.receipt.command_id);
+    if record.effect_state != EffectState::Prepared {
+        if record.claim_key.as_deref() != Some(claim_key.as_str())
+            || record.claim_owner_epoch != Some(record.owner_epoch)
+        {
+            return Err(StoreError::Conflict("later turn claim identity differs"));
+        }
+        return Ok(EffectClaim::ExistingUncertain);
+    }
+    check_current_record(transaction, lineage, &record)?;
+    let changed = transaction.execute(
+        "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
+             WHERE outbox_id=?3 AND state='prepared' AND kind=?4",
+        params![
+            claim_key,
+            integer(record.owner_epoch)?,
+            record.receipt.outbox_id,
+            EFFECT_KIND
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::StaleEpoch);
+    }
+    Ok(EffectClaim::NewClaim)
+}
+
+pub(crate) fn inspect_claimed_later_codex_send_in_transaction(
+    transaction: &Transaction<'_>,
+    lineage: &str,
+    selector: &LaterCodexSendSelector,
+    fence: impl FnOnce(&Transaction<'_>, &NativeWriterTarget, u64, u64, u64) -> Result<(), StoreError>,
+) -> Result<LaterCodexSendRecord, StoreError> {
+    let (_, record) = selected_record(transaction, selector)?;
+    fence(
+        transaction,
+        &record.native_target,
+        record.owner_epoch,
+        record.manager_credential_epoch,
+        record.authority_revision,
+    )?;
+    if record.effect_state != EffectState::ClaimedUncertain
+        || record.claim_key.as_deref()
+            != Some(format!("claim.{}", record.receipt.command_id).as_str())
+        || record.claim_owner_epoch != Some(record.owner_epoch)
+    {
+        return Err(StoreError::Conflict(
+            "later turn has no current claimed effect",
+        ));
+    }
+    check_current_record(transaction, lineage, &record)?;
+    Ok(record)
+}
+
 impl PodBayStore {
     /// CAS-claim before any pod/native call. A prior claim is uncertainty,
     /// never permission to replay. The host must separately reauthenticate
@@ -1242,34 +1314,15 @@ impl PodBayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, record) = selected_record(&transaction, selector)?;
-        let claim_key = format!("claim.{}", record.receipt.command_id);
-        if record.effect_state != EffectState::Prepared {
-            if record.claim_key.as_deref() != Some(claim_key.as_str())
-                || record.claim_owner_epoch != Some(record.owner_epoch)
-            {
-                return Err(StoreError::Conflict("later turn claim identity differs"));
-            }
-            return Ok(EffectClaim::ExistingUncertain);
-        }
-        check_current_record(&transaction, &self.store_lineage, &record)?;
-        let changed = transaction.execute(
-            "UPDATE outbox SET state='claimed_uncertain',claim_key=?1,claim_owner_epoch=?2
-             WHERE outbox_id=?3 AND state='prepared' AND kind=?4",
-            params![
-                claim_key,
-                integer(record.owner_epoch)?,
-                record.receipt.outbox_id,
-                EFFECT_KIND
-            ],
+        let result = claim_later_codex_send_in_transaction(
+            &transaction,
+            &self.store_lineage,
+            selector,
+            crate::bootstrap_send::schema24_native_send_fence,
         )?;
-        if changed != 1 {
-            return Err(StoreError::StaleEpoch);
-        }
         transaction.commit()?;
-        Ok(EffectClaim::NewClaim)
+        Ok(result)
     }
-
     /// Exact same-snapshot claimed input for an authenticated pod boundary.
     /// This exposes protected prompt bytes only after a typed claim and fresh
     /// durable fences; it cannot prove the connected manager or native child.
@@ -1280,18 +1333,13 @@ impl PodBayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let (_, record) = selected_record(&transaction, selector)?;
-        if record.effect_state != EffectState::ClaimedUncertain
-            || record.claim_key.as_deref()
-                != Some(format!("claim.{}", record.receipt.command_id).as_str())
-            || record.claim_owner_epoch != Some(record.owner_epoch)
-        {
-            return Err(StoreError::Conflict(
-                "later turn has no current claimed effect",
-            ));
-        }
-        check_current_record(&transaction, &self.store_lineage, &record)?;
+        let result = inspect_claimed_later_codex_send_in_transaction(
+            &transaction,
+            &self.store_lineage,
+            selector,
+            crate::bootstrap_send::schema24_native_send_fence,
+        )?;
         transaction.commit()?;
-        Ok(record)
+        Ok(result)
     }
 }
