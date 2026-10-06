@@ -40,13 +40,73 @@ pub struct CurrentV2RebindCursor {
     authority_revision: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentV2RebindDisposition {
+    NeedsLiveRebind,
+    StopClaimedUncertain { command_id: CommandId },
+    StopObservedUnverified { command_id: CommandId },
+}
+
+impl CurrentV2RebindDisposition {
+    pub fn needs_live_rebind(&self) -> bool {
+        matches!(self, Self::NeedsLiveRebind)
+    }
+
+    pub fn stop_command_id(&self) -> Option<&CommandId> {
+        match self {
+            Self::NeedsLiveRebind => None,
+            Self::StopClaimedUncertain { command_id }
+            | Self::StopObservedUnverified { command_id } => Some(command_id),
+        }
+    }
+
+    pub fn diagnostic_label(&self) -> &'static str {
+        match self {
+            Self::NeedsLiveRebind => "needs_live_rebind",
+            Self::StopClaimedUncertain { .. } => "stop_claimed_uncertain",
+            Self::StopObservedUnverified { .. } => "stop_observed_unverified",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentV2RebindCandidate {
+    scope_id: ScopeId,
+    pod_id: PodId,
+    pod_incarnation: Epoch,
+    source_command_id: CommandId,
+    disposition: CurrentV2RebindDisposition,
+}
+
+impl CurrentV2RebindCandidate {
+    pub fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+
+    pub fn pod_id(&self) -> &PodId {
+        &self.pod_id
+    }
+
+    pub fn pod_incarnation(&self) -> Epoch {
+        self.pod_incarnation
+    }
+
+    pub fn source_command_id(&self) -> &CommandId {
+        &self.source_command_id
+    }
+
+    pub fn disposition(&self) -> &CurrentV2RebindDisposition {
+        &self.disposition
+    }
+}
+
 pub struct CurrentV2RebindPage {
-    candidates: Vec<(ScopeId, PodId)>,
+    candidates: Vec<CurrentV2RebindCandidate>,
     next_cursor: Option<CurrentV2RebindCursor>,
 }
 
 impl CurrentV2RebindPage {
-    pub fn candidates(&self) -> &[(ScopeId, PodId)] {
+    pub fn candidates(&self) -> &[CurrentV2RebindCandidate] {
         &self.candidates
     }
     pub fn next_cursor(&self) -> Option<&CurrentV2RebindCursor> {
@@ -667,9 +727,10 @@ pub enum BoundLaunchAdmission {
 
 impl PodBayStore {
     /// One indexed page of current V2 selectors in `(scope_id,pod_id)` order.
-    /// The target-epoch key drives indexed Pod/binding lookups; no command or
-    /// event log is scanned. Host revalidates each complete binding and live
-    /// OS pod before any rebind effect. Mixed-version bindings fail closed.
+    /// The target-epoch key drives indexed Pod/binding lookups; unresolved stop
+    /// effects are read by that same exact target epoch and no event log is
+    /// scanned. Host revalidates each complete binding and live OS pod before
+    /// any rebind effect. Mixed-version bindings fail closed.
     pub fn current_codex_v2_rebind_page(
         &mut self,
         cursor: Option<&CurrentV2RebindCursor>,
@@ -704,22 +765,19 @@ impl PodBayStore {
             None => ("", ""),
         };
         let mut statement = transaction.prepare(
-            "SELECT t.scope_id,t.target_id,b.effective_spec_version,b.descriptor_version
+            "SELECT t.scope_id,t.target_id,p.incarnation,source_command.command_id,
+                    source_command.scope_id,source_command.target_id,source_command.target_epoch,
+                    b.effective_spec_version,b.descriptor_version
              FROM target_epochs AS t
              CROSS JOIN authority_pods AS p
              CROSS JOIN launch_bindings AS b
+             LEFT JOIN commands AS source_command ON source_command.command_rowid=b.command_rowid
              WHERE (t.scope_id,t.target_id)>(?1,?2)
                AND t.scope_id=p.scope_id AND t.target_id=p.pod_id
                AND t.epoch=p.incarnation
                AND b.scope_id=p.scope_id AND b.pod_id=p.pod_id
                AND b.pod_incarnation=p.incarnation
                AND (b.effective_spec_version=?3 OR b.descriptor_version=?4)
-               AND NOT EXISTS (
-                 SELECT 1 FROM commands AS stop_command
-                 JOIN outbox AS stop_effect ON stop_effect.command_rowid=stop_command.command_rowid
-                 WHERE stop_command.scope_id=p.scope_id AND stop_command.target_id=p.pod_id
-                   AND stop_command.target_epoch=p.incarnation AND stop_effect.kind='pod.stop'
-                   AND stop_effect.state IN ('claimed_uncertain','observed'))
              ORDER BY t.scope_id,t.target_id LIMIT ?5",
         )?;
         let rows = statement.query_map(
@@ -734,36 +792,183 @@ impl PodBayStore {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )?;
         let mut candidates = Vec::new();
         for row in rows {
-            let (scope, pod, effective, descriptor) = row?;
+            let (
+                scope,
+                pod,
+                incarnation,
+                source_command,
+                source_scope,
+                source_pod,
+                source_incarnation,
+                effective,
+                descriptor,
+            ) = row?;
+            let (source_command, source_scope, source_pod, source_incarnation) = match (
+                source_command,
+                source_scope,
+                source_pod,
+                source_incarnation,
+            ) {
+                (Some(command), Some(scope), Some(pod), Some(incarnation)) => {
+                    (command, scope, pod, incarnation)
+                }
+                (None, None, None, None) => {
+                    return Err(StoreError::Conflict(
+                        "current V2 source command is missing",
+                    ));
+                }
+                _ => {
+                    return Err(StoreError::Conflict(
+                        "current V2 source command identity is incomplete",
+                    ));
+                }
+            };
             if effective != EFFECTIVE_LAUNCH_V2_VERSION || descriptor != LAUNCH_DESCRIPTOR_V2_SCHEMA
             {
                 return Err(StoreError::Conflict(
                     "current V2 launch version pair differs",
                 ));
             }
-            candidates.push((
-                ScopeId::try_from(scope.as_str())
+            if source_scope != scope
+                || source_pod != pod
+                || source_incarnation != incarnation
+            {
+                return Err(StoreError::Conflict(
+                    "current V2 source command crosses launch binding",
+                ));
+            }
+            let mut stop_statement = transaction.prepare_cached(
+                "SELECT stop_command.command_id,stop_effect.state,
+                        stop_command.scope_id,stop_command.target_id,stop_command.target_epoch,
+                        stop_effect.scope_id,stop_effect.target_id,stop_effect.target_epoch
+                 FROM outbox AS stop_effect
+                 LEFT JOIN commands AS stop_command
+                   ON stop_command.command_rowid=stop_effect.command_rowid
+                 WHERE stop_effect.kind='pod.stop'
+                   AND stop_effect.state IN ('claimed_uncertain','observed')
+                   AND ((stop_command.scope_id=?1 AND stop_command.target_id=?2
+                         AND stop_command.target_epoch=?3)
+                     OR (stop_effect.scope_id=?1 AND stop_effect.target_id=?2
+                         AND stop_effect.target_epoch=?3))
+                 ORDER BY stop_effect.outbox_id LIMIT 2",
+            )?;
+            let stop_rows = stop_statement.query_map(params![scope, pod, incarnation], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?;
+            let mut stops = stop_rows.collect::<Result<Vec<_>, _>>()?;
+            let disposition = match stops.len() {
+                0 => CurrentV2RebindDisposition::NeedsLiveRebind,
+                1 => {
+                    let (
+                        command,
+                        state,
+                        command_scope,
+                        command_pod,
+                        command_incarnation,
+                        effect_scope,
+                        effect_pod,
+                        effect_incarnation,
+                    ) = stops.pop().expect("one stop row exists");
+                    let (command, command_scope, command_pod, command_incarnation) = match (
+                        command,
+                        command_scope,
+                        command_pod,
+                        command_incarnation,
+                    ) {
+                        (Some(command), Some(scope), Some(pod), Some(incarnation)) => {
+                            (command, scope, pod, incarnation)
+                        }
+                        (None, None, None, None) => {
+                            return Err(StoreError::Conflict(
+                                "current V2 stop command is missing",
+                            ));
+                        }
+                        _ => {
+                            return Err(StoreError::Conflict(
+                                "current V2 stop command identity is incomplete",
+                            ));
+                        }
+                    };
+                    if command_scope != scope
+                        || command_pod != pod
+                        || command_incarnation != incarnation
+                        || effect_scope != scope
+                        || effect_pod != pod
+                        || effect_incarnation != incarnation
+                    {
+                        return Err(StoreError::Conflict(
+                            "current V2 stop command or outbox crosses launch binding",
+                        ));
+                    }
+                    let command_id = CommandId::try_from(command.as_str()).map_err(|_| {
+                        StoreError::Conflict("current V2 stop command ID is malformed")
+                    })?;
+                    match state.as_str() {
+                        "claimed_uncertain" => {
+                            CurrentV2RebindDisposition::StopClaimedUncertain { command_id }
+                        }
+                        "observed" => {
+                            CurrentV2RebindDisposition::StopObservedUnverified { command_id }
+                        }
+                        _ => {
+                            return Err(StoreError::Conflict(
+                                "current V2 stop disposition is invalid",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(StoreError::Conflict(
+                        "current V2 Pod has multiple unresolved stop commands",
+                    ));
+                }
+            };
+            candidates.push(CurrentV2RebindCandidate {
+                scope_id: ScopeId::try_from(scope.as_str())
                     .map_err(|_| StoreError::Conflict("current V2 scope ID is malformed"))?,
-                PodId::try_from(pod.as_str())
+                pod_id: PodId::try_from(pod.as_str())
                     .map_err(|_| StoreError::Conflict("current V2 Pod ID is malformed"))?,
-            ));
+                pod_incarnation: Epoch::new(positive_stored_epoch(
+                    incarnation,
+                    "current V2 Pod incarnation is invalid",
+                )?)
+                .map_err(|_| StoreError::Conflict("current V2 Pod incarnation is invalid"))?,
+                source_command_id: CommandId::try_from(source_command.as_str()).map_err(|_| {
+                    StoreError::Conflict("current V2 source command ID is malformed")
+                })?,
+                disposition,
+            });
         }
         let has_more = candidates.len() > CURRENT_V2_REBIND_PAGE_SIZE;
         candidates.truncate(CURRENT_V2_REBIND_PAGE_SIZE);
         let next_cursor = if has_more {
-            let (scope_id, pod_id) = candidates
+            let candidate = candidates
                 .last()
                 .ok_or(StoreError::Conflict("current V2 page cursor is empty"))?;
             Some(CurrentV2RebindCursor {
-                scope_id: scope_id.clone(),
-                pod_id: pod_id.clone(),
+                scope_id: candidate.scope_id.clone(),
+                pod_id: candidate.pod_id.clone(),
                 store_lineage: StoreLineageId::try_from(lineage.as_str())
                     .map_err(|_| StoreError::Conflict("current V2 lineage is malformed"))?,
                 owner_epoch: expected_owner_epoch,

@@ -275,11 +275,45 @@ mod linux {
                 }
             }
         }
-        let first_v2_page = authority
+        let mut inventory_page = authority
             .current_codex_v2_rebind_page(None)
             .map_err(|error| format!("current V2 Pod inventory unavailable: {error:?}"))?;
         check_owner()?;
-        if !first_v2_page.candidates().is_empty() && prepared.is_none() {
+        let mut inventory_page_number = 1usize;
+        let mut inventory_candidates = 0usize;
+        loop {
+            let next = inventory_page.next_cursor().cloned();
+            for candidate in inventory_page.candidates() {
+                inventory_candidates += 1;
+                if !candidate.disposition().needs_live_rebind() {
+                    let stop_command =
+                        candidate.disposition().stop_command_id().ok_or_else(|| {
+                            "unresolved stop disposition lacks a command ID".to_owned()
+                        })?;
+                    return Err(format!(
+                        "current V2 Pod {} in {} incarnation={} sourceCommand={} has unresolved {} stopCommand={} on inventory page {}; manager not ready",
+                        candidate.pod_id(),
+                        candidate.scope_id(),
+                        candidate.pod_incarnation().get(),
+                        candidate.source_command_id(),
+                        candidate.disposition().diagnostic_label(),
+                        stop_command,
+                        inventory_page_number,
+                    ));
+                }
+            }
+            let Some(cursor) = next else { break };
+            inventory_page_number += 1;
+            inventory_page = authority
+                .current_codex_v2_rebind_page(Some(&cursor))
+                .map_err(|error| {
+                    format!(
+                        "current V2 Pod inventory page {inventory_page_number} unavailable before recovery: {error:?}"
+                    )
+                })?;
+            check_owner()?;
+        }
+        if inventory_candidates != 0 && prepared.is_none() {
             return Err("current V2 Pods require the original trusted policy for recovery".into());
         }
         let templates = if let Some(policy) = prepared {
@@ -293,12 +327,33 @@ mod linux {
                 .map_err(|error| {
                     format!("trusted launch profile registration refused: {error:?}")
                 })?;
-            let mut page = first_v2_page;
+            let mut page = authority
+                .current_codex_v2_rebind_page(None)
+                .map_err(|error| {
+                    format!("current V2 Pod recovery inventory unavailable: {error:?}")
+                })?;
             let mut page_number = 1usize;
             let mut settled = 0usize;
             loop {
                 let next = page.next_cursor().cloned();
-                for (scope, pod) in page.candidates() {
+                for candidate in page.candidates() {
+                    if !candidate.disposition().needs_live_rebind() {
+                        let stop_command =
+                            candidate.disposition().stop_command_id().ok_or_else(|| {
+                                "unresolved stop disposition lacks a command ID".to_owned()
+                            })?;
+                        return Err(format!(
+                            "current V2 Pod {} in {} incarnation={} sourceCommand={} changed to unresolved {} stopCommand={} after {settled} settled Pods on page {page_number}; manager not ready",
+                            candidate.pod_id(),
+                            candidate.scope_id(),
+                            candidate.pod_incarnation().get(),
+                            candidate.source_command_id(),
+                            candidate.disposition().diagnostic_label(),
+                            stop_command,
+                        ));
+                    }
+                    let scope = candidate.scope_id();
+                    let pod = candidate.pod_id();
                     check_owner()?;
                     let key = auto_rebind_key(
                         authority.owner_epoch().get(),

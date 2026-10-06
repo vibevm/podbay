@@ -24,6 +24,7 @@ ed25519-compact = { version = "2", default-features = false }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 podbay-client = { path = "../podbay-client" }
 podbay-store = { path = "../podbay-store" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [[bin]]
 name = "podbay"

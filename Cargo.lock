@@ -322,6 +322,7 @@ dependencies = [
  "podbay-server",
  "podbay-store",
  "podbay-wire",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

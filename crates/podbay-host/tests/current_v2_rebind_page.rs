@@ -7,7 +7,7 @@ use podbay_host::{
     AuthorisedBoundLaunch, AuthorisedDispatch, DurableAuthority, HostDispatchPort,
     PortDispatchError, PortDispatchOutcome,
 };
-use podbay_store::{PodBayStore, StoreError};
+use podbay_store::{CurrentV2RebindDisposition, PodBayStore, StoreError};
 use podbay_wire::{EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA};
 use rusqlite::{Connection, params};
 
@@ -33,6 +33,14 @@ struct Fixture {
     database: PathBuf,
 }
 impl Fixture {
+    fn source_command_id(index: usize) -> String {
+        format!("command.pb04.{:064x}", index + 1)
+    }
+
+    fn stop_command_id(index: usize) -> String {
+        format!("command.pb04.{:064x}", 10_000 + index)
+    }
+
     fn new() -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -54,6 +62,23 @@ impl Fixture {
                 "scope.beta"
             };
             let pod = format!("pod.{index:04}");
+            connection
+                .execute(
+                    "INSERT INTO commands(command_rowid,command_id,principal,namespace,command_key,
+                       scope_id,target_id,digest_version,request_digest,canonical_request,
+                       owner_epoch,target_epoch)
+                     VALUES(?1,?2,'fixture.principal','fixture.launch',?3,?4,?5,
+                            'sha256-v1',?6,X'',0,1)",
+                    params![
+                        index as i64 + 1,
+                        Self::source_command_id(index),
+                        format!("launch.key.{index:04}"),
+                        scope,
+                        pod,
+                        "a".repeat(64)
+                    ],
+                )
+                .unwrap();
             connection
                 .execute(
                     "INSERT INTO authority_pods(pod_id,scope_id,incarnation) VALUES(?1,?2,1)",
@@ -87,6 +112,39 @@ impl Fixture {
                 )
                 .unwrap();
         }
+        for (index, state) in [(0usize, "claimed_uncertain"), (1usize, "observed")] {
+            let scope = if index % 2 == 0 {
+                "scope.alpha"
+            } else {
+                "scope.beta"
+            };
+            let pod = format!("pod.{index:04}");
+            connection
+                .execute(
+                    "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,
+                       target_id,digest_version,request_digest,canonical_request,owner_epoch,
+                       target_epoch)
+                     VALUES(?1,'fixture.principal','fixture.stop',?2,?3,?4,
+                            'sha256-v1',?5,X'',0,1)",
+                    params![
+                        Self::stop_command_id(index),
+                        format!("stop.key.{index:04}"),
+                        scope,
+                        pod,
+                        "b".repeat(64)
+                    ],
+                )
+                .unwrap();
+            let command_rowid = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO outbox(command_rowid,scope_id,target_id,owner_epoch,target_epoch,
+                       kind,payload,effect_digest,state)
+                     VALUES(?1,?2,?3,0,1,'pod.stop',X'',?4,?5)",
+                    params![command_rowid, scope, pod, "c".repeat(64), state],
+                )
+                .unwrap();
+        }
         connection.execute_batch("COMMIT;").unwrap();
         Self {
             directory,
@@ -114,17 +172,78 @@ fn manager_fenced_host_pages_more_than_128_current_pods_without_duplicates() {
         .candidates()
         .iter()
         .chain(second.candidates())
-        .map(|(scope, pod)| (scope.as_str().to_owned(), pod.as_str().to_owned()))
+        .map(|candidate| {
+            (
+                candidate.scope_id().as_str().to_owned(),
+                candidate.pod_id().as_str().to_owned(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(selectors.len(), 130);
     selectors.sort();
     selectors.dedup();
     assert_eq!(selectors.len(), 130);
 
+    let claimed = first
+        .candidates()
+        .iter()
+        .chain(second.candidates())
+        .find(|candidate| candidate.pod_id().as_str() == "pod.0000")
+        .unwrap();
+    assert_eq!(claimed.pod_incarnation().get(), 1);
+    assert_eq!(
+        claimed.source_command_id().as_str(),
+        Fixture::source_command_id(0)
+    );
+    assert_eq!(
+        claimed.disposition(),
+        &CurrentV2RebindDisposition::StopClaimedUncertain {
+            command_id: Fixture::stop_command_id(0).as_str().try_into().unwrap(),
+        }
+    );
+    let observed = first
+        .candidates()
+        .iter()
+        .chain(second.candidates())
+        .find(|candidate| candidate.pod_id().as_str() == "pod.0001")
+        .unwrap();
+    assert_eq!(observed.pod_incarnation().get(), 1);
+    assert_eq!(
+        observed.source_command_id().as_str(),
+        Fixture::source_command_id(1)
+    );
+    assert_eq!(
+        observed.disposition(),
+        &CurrentV2RebindDisposition::StopObservedUnverified {
+            command_id: Fixture::stop_command_id(1).as_str().try_into().unwrap(),
+        }
+    );
+
     Connection::open(&fixture.database)
         .unwrap()
         .execute(
             "UPDATE metadata SET value=value+1 WHERE key='authority_revision'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        host.current_codex_v2_rebind_page(Some(&cursor)),
+        Err(podbay_host::RebindContextError::Store(
+            StoreError::StaleEpoch
+        ))
+    ));
+}
+
+#[test]
+fn manager_fenced_host_refuses_owner_epoch_drift() {
+    let fixture = Fixture::new();
+    let mut host = DurableAuthority::open(&fixture.database, NoopPort).unwrap();
+    let first = host.current_codex_v2_rebind_page(None).unwrap();
+    let cursor = first.next_cursor().unwrap().clone();
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE metadata SET value=value+1 WHERE key='owner_epoch'",
             [],
         )
         .unwrap();

@@ -25,7 +25,8 @@ pub use bound_launch::{
     BoundLaunchRequest, BoundLaunchResource, BoundOperatorRootLaunchProposal,
     BoundOperatorRootLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
     CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot,
-    CurrentLaunchPolicyFence, CurrentV2RebindCursor, CurrentV2RebindPage, RunChildBudget,
+    CurrentLaunchPolicyFence, CurrentV2RebindCandidate, CurrentV2RebindCursor,
+    CurrentV2RebindDisposition, CurrentV2RebindPage, RunChildBudget,
 };
 pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use later_turn::{LaterCodexSendRecord, LaterCodexSendSelector, TrustedLaterCodexSendRequest};

@@ -13,7 +13,11 @@ use ed25519_compact::{KeyPair, Seed};
 use podbay_client::authenticate_existing_linux_stream;
 use podbay_pod::LinuxPeerEvidence;
 use podbay_store::PodBayStore;
-use podbay_wire::{CommandEnvelope, MutationOperation, ReadEnvelope, ReadOperation, Target};
+use podbay_wire::{
+    CommandEnvelope, EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA, MutationOperation,
+    ReadEnvelope, ReadOperation, Target,
+};
+use rusqlite::{Connection, params};
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use serde_json::{Value, json};
@@ -159,6 +163,77 @@ impl Fixture {
             .owner_epoch()
             .unwrap()
     }
+
+    fn insert_current_v2_claimed_stop(&self) {
+        let owner_epoch = self.owner_epoch() as i64;
+        let connection = Connection::open(&self.database).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")
+            .unwrap();
+        let source_command = format!("command.pb04.{}", "1".repeat(64));
+        connection
+            .execute(
+                "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
+                   digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
+                 VALUES(?1,'fixture.principal','fixture.launch','launch.key.current',
+                        'scope.current','pod.current','sha256-v1',?2,X'',?3,1)",
+                params![source_command, "a".repeat(64), owner_epoch],
+            )
+            .unwrap();
+        let source_rowid = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO authority_pods(pod_id,scope_id,incarnation)
+                 VALUES('pod.current','scope.current',1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO target_epochs(scope_id,target_id,epoch)
+                 VALUES('scope.current','pod.current',1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO launch_bindings(command_rowid,scope_id,session_id,run_id,
+                   attempt_id,attempt_ordinal,attempt_epoch,pod_id,pod_incarnation,
+                   resource_count,effective_spec_version,effective_spec_digest,effective_spec,
+                   descriptor_version,descriptor_digest,descriptor)
+                 VALUES(?1,'scope.current','session.current','run.current','attempt.current',
+                        1,1,'pod.current',1,1,?2,?3,X'01',?4,?3,X'01')",
+                params![
+                    source_rowid,
+                    EFFECTIVE_LAUNCH_V2_VERSION,
+                    "a".repeat(64),
+                    LAUNCH_DESCRIPTOR_V2_SCHEMA,
+                ],
+            )
+            .unwrap();
+        let stop_command = format!("command.pb04.{}", "2".repeat(64));
+        connection
+            .execute(
+                "INSERT INTO commands(command_id,principal,namespace,command_key,scope_id,target_id,
+                   digest_version,request_digest,canonical_request,owner_epoch,target_epoch)
+                 VALUES(?1,'fixture.principal','fixture.stop','stop.key.current',
+                        'scope.current','pod.current','sha256-v1',?2,X'',?3,1)",
+                params![stop_command, "b".repeat(64), owner_epoch],
+            )
+            .unwrap();
+        let stop_rowid = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO outbox(command_rowid,scope_id,target_id,owner_epoch,target_epoch,
+                   kind,payload,effect_digest,state)
+                 VALUES(?1,'scope.current','pod.current',?2,1,'pod.stop',X'',?3,
+                        'claimed_uncertain')",
+                params![stop_rowid, owner_epoch, "c".repeat(64)],
+            )
+            .unwrap();
+        connection.execute_batch("COMMIT;").unwrap();
+    }
+
 }
 
 impl Drop for Fixture {
@@ -491,6 +566,36 @@ fn sigkill_leaves_manager_socket_and_next_process_reconciles_it_under_lock() {
     second.wait_ready(&fixture);
     assert_eq!(fixture.owner_epoch(), epoch + 1);
     assert!(second.stop_with("TERM").success());
+}
+
+#[test]
+fn claimed_uncertain_current_v2_stop_refuses_before_manager_socket() {
+    let ordinary = Fixture::new();
+    let mut ordinary_manager = Running::spawn(&ordinary);
+    ordinary_manager.wait_ready(&ordinary);
+    assert!(ordinary_manager.stop_with("TERM").success());
+
+    let stopped = Fixture::new();
+    let mut seed_manager = Running::spawn(&stopped);
+    seed_manager.wait_ready(&stopped);
+    assert!(seed_manager.stop_with("TERM").success());
+    stopped.insert_current_v2_claimed_stop();
+
+    let (status, error) = run_short(&stopped);
+    assert!(!status.success());
+    assert!(error.contains("manager not ready"), "{error}");
+    assert!(error.contains("stop_claimed_uncertain"), "{error}");
+    assert!(error.contains("scope.current"), "{error}");
+    assert!(error.contains("pod.current"), "{error}");
+    assert!(
+        error.contains(&format!("command.pb04.{}", "1".repeat(64))),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("command.pb04.{}", "2".repeat(64))),
+        "{error}"
+    );
+    assert!(!stopped.socket().exists());
 }
 
 #[test]
