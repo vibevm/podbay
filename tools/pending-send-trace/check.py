@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Strict checker for the first three bootstrap scenarios, not a general SQL decoder."""
 import hashlib
+import copy
 import json
 from pathlib import Path
 import re
 import sys
 
 FORMAT = 'podbay.disposable-pending-send-sql-trace/1'
+FINAL_FORMAT = 'podbay.disposable-pending-send-sql-trace/final-recorded/1'
 CAP = 8 * 1024 * 1024
 
 
@@ -95,6 +97,42 @@ def integer_cell(n):
     return {'type': 'Integer', 'decimal': str(n)}
 
 
+def final_seed(a, b, pa, pb):
+    require(len(a['external_death_pending']) == 1 and not a['external_death_final'] and len(b['external_death_final']) == 1, 'final seed row count/linkage')
+    pending = a['external_death_pending'][0]
+    final = b['external_death_final'][0]
+    require(final['pending_rowid'] == pending['pending_rowid'], 'final pending linkage')
+    require(type(final['proof_digest']) is str and re.fullmatch('[0-9a-f]{64}', final['proof_digest']), 'final digest shape')
+    require(final['proof_digest'] == 'a' * 64 and final['native_outcome'] == 'uncertain', 'final placeholder/outcome')
+    before_seq = [x for x in a['sqlite_sequence'] if x['name'] == 'external_death_final']
+    require(len(before_seq) <= 1, 'duplicate final sequence')
+    prior = before_seq[0]['seq'] if before_seq else 0
+    require(type(prior) is int and 0 <= prior < 2**63 - 1 and final['final_rowid'] == prior + 1, 'final next rowid')
+    columns = pa['external_death_final']['columns']
+    require(columns[0] in ('rowid', 'final_rowid') and columns[1:] == ['final_rowid', 'pending_rowid', 'proof_digest', 'native_outcome'], 'final column identity')
+    fields = {'rowid': integer_cell(prior + 1), 'final_rowid': integer_cell(prior + 1),
+              'pending_rowid': integer_cell(pending['pending_rowid']),
+              'proof_digest': {'type': 'Text', 'hex': ('a' * 64).encode().hex()},
+              'native_outcome': {'type': 'Text', 'hex': b'uncertain'.hex()}}
+    expected_final = copy.deepcopy(pa['external_death_final'])
+    expected_final['rows'] = [[fields[c] for c in columns]]
+    require(expected_final == pb['external_death_final'], 'exact typed final insertion')
+    for name in pa:
+        if name not in ('external_death_final', 'sqlite_sequence'):
+            require(pa[name] == pb[name], 'final seed changed unrelated typed table ' + name)
+    expected_sequence = copy.deepcopy(pa['sqlite_sequence'])
+    columns = expected_sequence['columns']
+    if before_seq:
+        row = only(expected_sequence['rows'], lambda x: cell(x[columns.index('name')]) == 'external_death_final')
+        row[columns.index('seq')] = integer_cell(prior + 1)
+    else:
+        rowid = max((x['__implicit_rowid'] for x in a['sqlite_sequence']), default=0) + 1
+        fields = {'rowid': integer_cell(rowid), 'name': {'type': 'Text', 'hex': b'external_death_final'.hex()}, 'seq': integer_cell(prior + 1)}
+        require(set(columns) == set(fields), 'sequence column identity')
+        expected_sequence['rows'].append([fields[c] for c in columns])
+    require(expected_sequence == pb['sqlite_sequence'], 'exact final sequence transition')
+
+
 def only(rows, predicate):
     chosen = [r for r in rows if predicate(r)]
     require(len(chosen) == 1, 'missing/ambiguous exact row')
@@ -159,14 +197,19 @@ def check_file(path):
     require(path.stat().st_size <= 16 * 1024 * 1024, 'trace file cap')
     trace = json.loads(path.read_bytes(), object_pairs_hook=duplicate_guard)
     keys(trace, 'format pending_request_cap snapshot_cap row_cap cell_cap fixtures')
-    require(trace['format'] == FORMAT, 'trace format')
+    require(trace['format'] in (FORMAT, FINAL_FORMAT), 'trace format')
     require([trace[k] for k in ('pending_request_cap', 'snapshot_cap', 'row_cap', 'cell_cap')] == ['4194304', '8388608', '1024', '1048576'], 'pinned resource bounds')
-    require(type(trace['fixtures']) is list and len(trace['fixtures']) == 3, 'first-scope fixture count')
-    require([f['scenario'] for f in trace['fixtures']] == ['PreparedPending', 'ClaimedPending', 'Rollback'], 'scenario coverage/order')
+    scenarios = ['PreparedPending', 'ClaimedPending', 'Rollback']
+    if trace['format'] == FINAL_FORMAT:
+        scenarios.append('FinalRecorded')
+    require(type(trace['fixtures']) is list and len(trace['fixtures']) == len(scenarios), 'profile fixture count')
+    require([f['scenario'] for f in trace['fixtures']] == scenarios, 'scenario coverage/order')
     for f in trace['fixtures']:
         keys(f, 'scenario subject_request_hex command_id original_receipt original_effect_state operations')
         canonical, r = canonical_request(f['subject_request_hex'])
         expected_ops = ['RollbackClaim'] if f['scenario'] == 'Rollback' else ['PreparePending', 'Claim', 'CurrentInspect', 'PassiveExactReceipt']
+        if f['scenario'] == 'FinalRecorded':
+            expected_ops.insert(1, 'SeedFinalRecorded')
         require([o['kind'] for o in f['operations']] == expected_ops, 'operation coverage/order')
         previous = None
         for index, o in enumerate(f['operations'], 1):
@@ -183,7 +226,7 @@ def check_file(path):
             require(cmd['principal'] == 'owner.fixture' and cmd['command_key'] == 'key.native.bootstrap' and cmd['namespace'] == 'podbay.session.send.bootstrap', 'original exact key')
             require(f['original_receipt'] == [cmd['command_id'], str(cmd['event_sequence']), str(cmd['outbox_id']), cmd['digest_version'], cmd['request_digest']], 'original receipt')
             outbox = only(a['outbox'], lambda x: x['outbox_id'] == cmd['outbox_id'])
-            expected_state = 'ClaimedUncertain' if f['scenario'] == 'ClaimedPending' else 'Prepared'
+            expected_state = 'ClaimedUncertain' if f['scenario'] in ('ClaimedPending', 'FinalRecorded') else 'Prepared'
             require(f['original_effect_state'] == expected_state and outbox['state'] == ('claimed_uncertain' if expected_state == 'ClaimedUncertain' else 'prepared'), 'original uncertainty')
             if o['kind'] == 'PreparePending':
                 require((o['mode'], o['fence'], o['result'], o['finish']) == ('Immediate', 'NotReached', 'PendingCommitted', 'CommitSucceeded'), 'prepare outcome')
@@ -200,7 +243,6 @@ def check_file(path):
                         require(pa[name] == pb[name], 'prepare changed unrelated typed table ' + name)
                 require(pa['external_death_pending']['columns'] == pb['external_death_pending']['columns'], 'pending columns drift')
                 # Only the exact authority_revision value cell may change in metadata.
-                import copy
                 expected_metadata = copy.deepcopy(pa['metadata'])
                 columns = expected_metadata['columns']
                 row = only(expected_metadata['rows'], lambda x: cell(x[columns.index('key')]) == 'authority_revision')
@@ -222,17 +264,28 @@ def check_file(path):
                     require(set(columns) == set(values), 'sequence column identity')
                     expected_sequence['rows'].append([values[k] for k in columns])
                 require(expected_sequence == pb['sqlite_sequence'], 'exact pending sequence transition')
+            elif o['kind'] == 'SeedFinalRecorded':
+                require(f['scenario'] == 'FinalRecorded' and (o['mode'], o['fence'], o['result'], o['finish']) == ('Immediate', 'NotReached', 'FinalRecordedSeeded', 'CommitSucceeded'), 'private final seed outcome')
+                final_seed(a, b, pa, pb)
             elif o['kind'] == 'RollbackClaim':
                 require((o['mode'], o['fence'], o['result'], o['finish']) == ('Immediate','Live','NewClaim','RollbackSucceeded'), 'transaction-local NewClaim requires rollback, not claimed commit')
                 require(not a['external_death_pending'] and not a['external_death_final'] and not b['external_death_pending'] and not b['external_death_final'], 'rollback Live contradicted by committed Pending/Final rows')
                 require(o['before'] == o['after'], 'rollback durable delta')
             else:
                 require(o['before'] == o['after'], 'read/refusal durable delta')
-                require(len(a['external_death_pending']) == 1 and not a['external_death_final'], 'pending snapshot')
+                require(len(a['external_death_pending']) == 1, 'pending snapshot')
+                final_recorded = f['scenario'] == 'FinalRecorded'
+                if final_recorded:
+                    require(len(a['external_death_final']) == 1, 'final snapshot')
+                    final = a['external_death_final'][0]
+                    require(final['pending_rowid'] == a['external_death_pending'][0]['pending_rowid'] and final['proof_digest'] == 'a' * 64 and final['native_outcome'] == 'uncertain', 'final snapshot linkage/placeholder')
+                else:
+                    require(not a['external_death_final'], 'pending snapshot')
                 if o['kind'] == 'PassiveExactReceipt':
                     require((o['mode'],o['fence'],o['result'],o['finish']) == ('Deferred','NotReached','ExactReceipt','CommitSucceeded'), 'passive receipt outcome')
                 else:
-                    require((o['fence'],o['result'],o['finish']) == ('Pending','DeniedPending','CommitSucceeded'), 'fence must deny Pending before retry/current checks')
+                    expected = ('FinalRecorded', 'DeniedFinalRecorded', 'CommitSucceeded') if final_recorded else ('Pending','DeniedPending','CommitSucceeded')
+                    require((o['fence'],o['result'],o['finish']) == expected, 'fence must deny FinalRecorded before retry/current checks' if final_recorded else 'fence must deny Pending before retry/current checks')
                     require(o['mode'] == ('Deferred' if o['kind'] == 'CurrentInspect' else 'Immediate'), 'transaction mode')
             previous = o['after']
     return trace
@@ -240,8 +293,10 @@ def check_file(path):
 
 if __name__ == '__main__':
     try:
-        check_file(Path(sys.argv[1]))
+        trace = check_file(Path(sys.argv[1]))
     except (ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as e:
         print(f'REJECT: {e}', file=sys.stderr)
         sys.exit(1)
-    print('PASS: 3 bootstrap fixtures, 9 operations; bounded SQL evidence only')
+    count = len(trace['fixtures'])
+    operations = sum(len(f['operations']) for f in trace['fixtures'])
+    print(f'PASS: {count} bootstrap fixtures, {operations} operations; bounded SQL evidence only')

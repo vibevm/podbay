@@ -5,6 +5,8 @@ use rusqlite::types::ValueRef;
 const SNAPSHOT_CAP: usize = 8 * 1024 * 1024;
 const ROW_CAP: i64 = 1024;
 const CELL_CAP: i64 = 1024 * 1024;
+const BASE_FORMAT: &str = "podbay.disposable-pending-send-sql-trace/1";
+const FINAL_FORMAT: &str = "podbay.disposable-pending-send-sql-trace/final-recorded/1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
@@ -129,6 +131,19 @@ fn op(h: &NativeHarness, sequence: usize, kind: &str) -> Operation {
             h.f.open().prepare(&h.f.author(), &h.f.request).unwrap();
             ("Immediate", "PendingCommitted".to_string(), "CommitSucceeded")
         }
+        "SeedFinalRecorded" => {
+            // Explicit private fixture seed only: no authenticated finalization.
+            let mut c = Connection::open(&h.f.source).unwrap();
+            c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;").unwrap();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            let pending: i64 = tx.query_row(
+                "SELECT pending_rowid FROM external_death_pending WHERE recovery_key=?1 AND store_lineage=?2",
+                params![h.f.request.recovery_key, h.f.request.store_lineage], |r| r.get(0)).unwrap();
+            tx.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(?1,?2,'uncertain')",
+                params![pending, "a".repeat(64)]).unwrap();
+            tx.commit().unwrap();
+            ("Immediate", "FinalRecordedSeeded".to_string(), "CommitSucceeded")
+        }
         "PassiveExactReceipt" => {
             let _ = receipt(h);
             ("Deferred", "ExactReceipt".to_string(), "CommitSucceeded")
@@ -151,6 +166,7 @@ fn op(h: &NativeHarness, sequence: usize, kind: &str) -> Operation {
             let result = match result {
                 Ok(s) => s,
                 Err(StoreError::Conflict("native send subject pending")) => "DeniedPending".into(),
+                Err(StoreError::Conflict("native send subject final recorded")) => "DeniedFinalRecorded".into(),
                 Err(e) => panic!("unexpected store outcome: {e:?}"),
             };
             if kind == "RollbackClaim" {
@@ -168,15 +184,26 @@ fn op(h: &NativeHarness, sequence: usize, kind: &str) -> Operation {
 }
 #[test]
 fn produce_bootstrap_pending_trace() {
+    let profile = std::env::var("PODBAY_PENDING_TRACE_PROFILE").unwrap_or_else(|_| "bootstrap".into());
+    assert!(matches!(profile.as_str(), "bootstrap" | "final-recorded"), "unknown trace profile");
     let mut fixtures = Vec::new();
-    for (scenario, claimed) in [("PreparedPending", false), ("ClaimedPending", true), ("Rollback", false)] {
+    let mut scenarios = vec![("PreparedPending", false), ("ClaimedPending", true), ("Rollback", false)];
+    if profile == "final-recorded" {
+        scenarios.push(("FinalRecorded", true));
+    }
+    for (scenario, claimed) in scenarios {
         let h = NativeHarness::new(false, claimed);
         let (original_receipt, original_effect_state) = receipt(&h);
         let mut operations = Vec::new();
         if scenario == "Rollback" {
             operations.push(op(&h, 1, "RollbackClaim"));
         } else {
-            for (i, kind) in ["PreparePending", "Claim", "CurrentInspect", "PassiveExactReceipt"].iter().enumerate() {
+            let kinds = if scenario == "FinalRecorded" {
+                vec!["PreparePending", "SeedFinalRecorded", "Claim", "CurrentInspect", "PassiveExactReceipt"]
+            } else {
+                vec!["PreparePending", "Claim", "CurrentInspect", "PassiveExactReceipt"]
+            };
+            for (i, kind) in kinds.iter().enumerate() {
                 operations.push(op(&h, i + 1, kind));
             }
         }
@@ -185,7 +212,7 @@ fn produce_bootstrap_pending_trace() {
             subject_request_hex: hex(&canonical(&h.f.author(), &h.f.request).unwrap()),
             command_id: h.bootstrap.command_id.as_str().into(), original_receipt, original_effect_state, operations });
     }
-    let trace = Trace { format: "podbay.disposable-pending-send-sql-trace/1".into(),
+    let trace = Trace { format: if profile == "final-recorded" { FINAL_FORMAT } else { BASE_FORMAT }.into(),
         pending_request_cap: MAX_PENDING_BYTES.to_string(), snapshot_cap: SNAPSHOT_CAP.to_string(),
         row_cap: ROW_CAP.to_string(), cell_cap: CELL_CAP.to_string(), fixtures };
     let bytes = serde_json::to_vec(&trace).unwrap();

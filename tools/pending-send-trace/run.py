@@ -22,6 +22,7 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scratch', type=Path, default=BASE / 'bootstrap-first')
+    parser.add_argument('--profile', choices=('bootstrap', 'final-recorded'), default='bootstrap')
     args = parser.parse_args()
     scratch = args.scratch.resolve()
     if BASE.resolve() not in scratch.parents:
@@ -48,6 +49,7 @@ def main():
     env = os.environ.copy()
     env['CARGO_TARGET_DIR'] = str(scratch / 'target')
     env['PODBAY_PENDING_TRACE_OUTPUT'] = str(scratch / 'trace.json')
+    env['PODBAY_PENDING_TRACE_PROFILE'] = args.profile
     command = ['cargo', 'test', '--offline', '--locked', '-p', 'podbay-store', '--lib',
                'pending_trace::produce_bootstrap_pending_trace', '--', '--nocapture']
     results = {}
@@ -92,6 +94,15 @@ def main():
     checker('fence_after_retry_checker', scratch / 'fence-after-retry.json', 1)
     (source / bootstrap).write_text(b)
     baseline = json.loads((scratch / 'trace.json').read_text())
+    if args.profile == 'final-recorded':
+        # Isolate the actual code mutant's final fixture: keep original fixtures
+        # from the passing baseline so an earlier Pending failure cannot mask it.
+        observed = json.loads((scratch / 'fence-after-retry.json').read_text())
+        observed['fixtures'][:3] = copy.deepcopy(baseline['fixtures'][:3])
+        isolated = scratch / 'fence-after-retry-final-isolated.json'
+        isolated.write_text(json.dumps(observed, separators=(',', ':')))
+        checker('fence_after_retry_final_checker', isolated, 1,
+                'fence must deny FinalRecorded before retry/current checks')
 
     def table(snapshot, name):
         return next(t for t in snapshot['tables'] if t['name'] == name)
@@ -187,9 +198,67 @@ def main():
 
     negative('rollback-pending-rows', blocked_rollback)
     negative('rollback-final-rows', lambda t: blocked_rollback(t, final=True))
+    if args.profile == 'final-recorded':
+        def after_final(trace):
+            ops = trace['fixtures'][3]['operations']
+            yield ops[1]['after']
+            for op in ops[2:]:
+                yield op['before']
+                yield op['after']
+
+        def final_field(trace, column, value):
+            for s in after_final(trace):
+                t = table(s, 'external_death_final')
+                set_cell(t, t['rows'][0], column, value)
+
+        negative('final-orphan-link', lambda t: final_field(t, 'pending_rowid', int_cell(999)), 'final pending linkage')
+        negative('final-wrong-outcome', lambda t: final_field(t, 'native_outcome', text_cell('dead')), 'final placeholder/outcome')
+        negative('final-malformed-digest', lambda t: final_field(t, 'proof_digest', text_cell('g' * 64)), 'final digest shape')
+
+        def final_alias(trace):
+            for s in after_final(trace):
+                table(s, 'external_death_final')['rows'][0][0] = int_cell(101)
+
+        negative('final-rowid-alias', final_alias, 'typed implicit rowid alias mismatch')
+
+        def final_sequence(trace):
+            for s in after_final(trace):
+                t = table(s, 'sqlite_sequence')
+                row = next(row for row in t['rows'] if row[t['columns'].index('name')] == text_cell('external_death_final'))
+                set_cell(t, row, 'seq', int_cell(999))
+
+        negative('final-sequence-999', final_sequence, 'exact final sequence transition')
+
+        def final_unrelated(trace):
+            for s in after_final(trace):
+                t = table(s, 'outbox')
+                row = next(row for row in t['rows'] if row[t['columns'].index('outbox_id')] == int_cell(2))
+                set_cell(t, row, 'claim_key', text_cell('native.changed'))
+
+        negative('final-unrelated-outbox', final_unrelated, 'final seed changed unrelated typed table outbox')
+
+        def final_pending_label(trace):
+            trace['fixtures'][3]['operations'][2].update(fence='Pending', result='DeniedPending')
+
+        negative('final-as-pending-label', final_pending_label, 'fence must deny FinalRecorded before retry/current checks')
+
+        def final_current_label(trace):
+            trace['fixtures'][3]['operations'][3].update(result='CurrentRecord')
+
+        negative('final-as-current-proof', final_current_label, 'fence must deny FinalRecorded before retry/current checks')
+
+        def final_receipt(trace):
+            trace['fixtures'][3]['original_receipt'][1] = '999'
+
+        negative('final-changed-original-receipt', final_receipt, 'original receipt')
+
+        def final_uncertainty(trace):
+            trace['fixtures'][3]['original_effect_state'] = 'Prepared'
+
+        negative('final-changed-original-uncertainty', final_uncertainty, 'original uncertainty')
     assert hashes == {str(p): digest(ROOT / p) for p in inputs}, 'accepted sources changed'
     artifacts = {p.name: digest(p) for p in scratch.iterdir() if p.is_file()}
-    evidence = {'source_hashes': hashes,
+    evidence = {'profile': args.profile, 'source_hashes': hashes,
                 'tool_hashes': {name: digest(HERE / name) for name in ('producer.rs', 'run.py', 'check.py')},
                 'artifacts': artifacts, 'command': command,
                 'private_target': env['CARGO_TARGET_DIR'], 'results': results}
