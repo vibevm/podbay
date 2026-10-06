@@ -7,6 +7,11 @@ const STATE_FORMAT: &str = "podbay.disposable-v25-pending-state/1";
 const MAX_PENDING_ROWS: i64 = 128;
 const MAX_PENDING_BYTES: i64 = INTENT_MAX_BYTES as i64;
 const REQUEST_VERSION: &str = "podbay.external-death-pending-request/1";
+// Bound every fetched byte, including TEXT that SQLite character length would
+// undercount. Retain the existing aggregate canonical-request budget.
+const MAX_PENDING_ROW_BYTES: i64 =
+    MAX_PENDING_BYTES + MAX_PENDING_ROWS * (5 * 256 + REQUEST_VERSION.len() as i64 + 64);
+const MAX_FINAL_ROW_BYTES: i64 = MAX_PENDING_ROWS * (64 + 9);
 
 /// Only private tests construct this authenticated Owner boundary in this atom.
 /// A serialized actor string or caller digest is not this value.
@@ -330,7 +335,7 @@ fn check_subject(
     if prior.as_deref() != Some(&r.checkpoint_digest) {
         return Err(V25StagingError::Safety("pending prior observation differs"));
     }
-    let mut statement=tx.prepare("SELECT resource_id,next_input_epoch FROM manager_rebind_resources WHERE rebind_rowid=?1 ORDER BY resource_id")?;
+    let mut statement=tx.prepare("SELECT resource_id,next_input_epoch FROM manager_rebind_resources WHERE rebind_rowid=?1 ORDER BY resource_id LIMIT 65")?;
     let next = statement
         .query_map([r.activated_rebind_rowid], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -382,13 +387,31 @@ fn check_owner_author(
     Ok(())
 }
 
-fn read_rows(tx: &Transaction<'_>) -> Result<Vec<ExternalDeathPendingReceipt>, V25StagingError> {
-    let (count, size): (i64, i64) = tx.query_row(
-        "SELECT count(*),coalesce(sum(length(canonical_request)),0) FROM external_death_pending",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+fn read_validated_rows(
+    tx: &Transaction<'_>,
+) -> Result<Vec<(ExternalDeathPendingReceipt, ExternalDeathPendingRequest)>, V25StagingError> {
+    // Fetch only numeric lengths before materializing any pending String/Vec.
+    let (count, request_bytes, row_bytes, oversized): (i64, i64, i64, i64) = tx.query_row(
+        "SELECT count(*),coalesce(sum(length(CAST(canonical_request AS BLOB))),0),
+         coalesce(sum(length(CAST(canonical_request AS BLOB))+
+           length(CAST(recovery_key AS BLOB))+length(CAST(store_lineage AS BLOB))+
+           length(CAST(scope_id AS BLOB))+length(CAST(pod_id AS BLOB))+
+           length(CAST(authenticated_author AS BLOB))+length(CAST(request_version AS BLOB))+
+           length(CAST(request_digest AS BLOB))),0),
+         coalesce(max(length(CAST(canonical_request AS BLOB))>1048576 OR
+           length(CAST(recovery_key AS BLOB))>256 OR length(CAST(store_lineage AS BLOB))>256 OR
+           length(CAST(scope_id AS BLOB))>256 OR length(CAST(pod_id AS BLOB))>256 OR
+           length(CAST(authenticated_author AS BLOB))>256 OR
+           length(CAST(request_version AS BLOB))>?1 OR length(CAST(request_digest AS BLOB))>64),0)
+         FROM external_death_pending",
+        [REQUEST_VERSION.len() as i64],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    if count > MAX_PENDING_ROWS || size > MAX_PENDING_BYTES {
+    if count > MAX_PENDING_ROWS
+        || request_bytes > MAX_PENDING_BYTES
+        || row_bytes > MAX_PENDING_ROW_BYTES
+        || oversized != 0
+    {
         return Err(V25StagingError::Safety("pending decoder row/byte budget"));
     }
     let mut statement=tx.prepare("SELECT pending_rowid,recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest FROM external_death_pending ORDER BY pending_rowid")?;
@@ -441,16 +464,175 @@ fn read_rows(tx: &Transaction<'_>) -> Result<Vec<ExternalDeathPendingReceipt>, V
         }
         check_owner_author(tx, &canonical.author, &canonical.author_scope)?;
         check_subject(tx, r)?;
-        receipts.push(ExternalDeathPendingReceipt {
-            pending_rowid: row.0,
-            recovery_key: row.1,
-            authenticated_author: row.10,
-            request_digest: row.13,
-            preparing_owner_epoch: row.8 as u64,
-            preparing_authority_revision: row.9 as u64,
-        });
+        receipts.push((
+            ExternalDeathPendingReceipt {
+                pending_rowid: row.0,
+                recovery_key: row.1,
+                authenticated_author: row.10,
+                request_digest: row.13,
+                preparing_owner_epoch: row.8 as u64,
+                preparing_authority_revision: row.9 as u64,
+            },
+            canonical.request,
+        ));
     }
     Ok(receipts)
+}
+
+fn read_rows(tx: &Transaction<'_>) -> Result<Vec<ExternalDeathPendingReceipt>, V25StagingError> {
+    Ok(read_validated_rows(tx)?
+        .into_iter()
+        .map(|(receipt, _)| receipt)
+        .collect())
+}
+
+// Private disposable prototype only: no production claim/readback path calls
+// this decoder yet. A disposition is a store fact, never effect authority.
+// Restricted to rebound V2 recovery candidates: even Live requires an
+// activated rebind and its checkpoint/resource bindings. Ordinary fresh
+// native-send subject resolution remains deferred.
+// The request supplies a candidate full binding checked against stored rows.
+// Future claim integration must resolve it from the selected stored send, not
+// take an independently caller-selected Pod subject.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectDisposition {
+    Live,
+    Pending,
+    /// A well-shaped blocking record, without any verified death semantics.
+    FinalRecorded,
+    Unverified,
+}
+
+#[allow(dead_code)]
+fn subject_disposition(
+    tx: &Transaction<'_>,
+    subject: &ExternalDeathPendingRequest,
+) -> SubjectDisposition {
+    decode_subject_disposition(tx, subject).unwrap_or(SubjectDisposition::Unverified)
+}
+
+#[allow(dead_code)]
+fn decode_subject_disposition(
+    tx: &Transaction<'_>,
+    subject: &ExternalDeathPendingRequest,
+) -> Result<SubjectDisposition, V25StagingError> {
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let (schema_count, schema_bytes): (i64, i64) = tx.query_row(
+        "SELECT count(*),coalesce(sum(length(CAST(sql AS BLOB))),0) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let expected_schema = canonical_schema(true)?;
+    if version != 25
+        || schema_count != expected_schema.len() as i64
+        || schema_bytes > MAX_PENDING_BYTES
+        || schema_objects(tx)? != expected_schema
+    {
+        return Err(V25StagingError::Safety(
+            "subject decoder unsupported schema",
+        ));
+    }
+    validate_request(subject)?;
+    let (lineage, owner, revision, claim_lineage, claim_owner, credential): (String, i64, i64, String, i64, i64) = tx.query_row(
+        "SELECT (SELECT lineage FROM store_identity WHERE singleton=1),(SELECT value FROM metadata WHERE key='owner_epoch'),(SELECT value FROM metadata WHERE key='authority_revision'),(SELECT store_lineage FROM manager_credential_claims WHERE singleton=1),(SELECT owner_epoch FROM manager_credential_claims WHERE singleton=1),(SELECT credential_epoch FROM manager_credential_claims WHERE singleton=1)",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    )?;
+    if lineage != subject.store_lineage
+        || claim_lineage != lineage
+        || owner < 1
+        || revision < 0
+        || claim_owner != owner
+        || credential < owner
+        || positive(subject.expected_owner_epoch)? > owner
+        || positive(subject.expected_authority_revision)? > revision
+        || positive(subject.expected_manager_credential_epoch)? > credential
+    {
+        return Err(V25StagingError::Safety(
+            "subject decoder counter/lineage mismatch",
+        ));
+    }
+    // Resolve the full candidate against stored launch/runtime/rebind/resources
+    // in this transaction; matching caller Pod fields alone is insufficient.
+    check_subject(tx, subject)?;
+    let rows = read_validated_rows(tx)?;
+    let mut subjects = std::collections::BTreeSet::new();
+    let mut selected = None;
+    for (receipt, request) in &rows {
+        if request.store_lineage != lineage
+            || positive(receipt.preparing_owner_epoch)? > owner
+            || positive(receipt.preparing_authority_revision)? > revision
+            || positive(request.expected_manager_credential_epoch)? > credential
+            || !subjects.insert((
+                &request.store_lineage,
+                &request.scope_id,
+                &request.pod_id,
+                request.pod_incarnation,
+            ))
+        {
+            return Err(V25StagingError::Safety(
+                "subject decoder pending inconsistency",
+            ));
+        }
+        if request.scope_id == subject.scope_id
+            && request.pod_id == subject.pod_id
+            && request.pod_incarnation == subject.pod_incarnation
+        {
+            selected = Some(receipt.pending_rowid);
+        }
+    }
+    // Never materialize final TEXT until individual and aggregate byte limits
+    // pass; length(TEXT) would miss NUL tails and multibyte characters.
+    let (final_count, final_bytes, oversized): (i64, i64, i64) = tx.query_row(
+        "SELECT count(*),coalesce(sum(length(CAST(proof_digest AS BLOB))+
+          length(CAST(native_outcome AS BLOB))),0),
+         coalesce(max(length(CAST(proof_digest AS BLOB))>64 OR
+           length(CAST(native_outcome AS BLOB))>9),0) FROM external_death_final",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if final_count > MAX_PENDING_ROWS || final_bytes > MAX_FINAL_ROW_BYTES || oversized != 0 {
+        return Err(V25StagingError::Safety(
+            "subject decoder final row/byte budget",
+        ));
+    }
+    let mut statement = tx.prepare("SELECT final_rowid,pending_rowid,proof_digest,native_outcome FROM external_death_final ORDER BY final_rowid")?;
+    let finals = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut final_subjects = std::collections::BTreeSet::new();
+    let mut selected_final = false;
+    for (id, pending, digest, outcome) in finals {
+        if id <= 0
+            || !rows
+                .iter()
+                .any(|(receipt, _)| receipt.pending_rowid == pending)
+            || !final_subjects.insert(pending)
+            || outcome != "uncertain"
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(V25StagingError::Safety(
+                "subject decoder malformed final linkage",
+            ));
+        }
+        selected_final |= selected == Some(pending);
+    }
+    Ok(if selected_final {
+        SubjectDisposition::FinalRecorded
+    } else if selected.is_some() {
+        SubjectDisposition::Pending
+    } else {
+        SubjectDisposition::Live
+    })
 }
 
 fn decode_pending_state(p: &ActivationPayload) -> Result<V25ActivationMetadata, V25StagingError> {
@@ -833,6 +1015,9 @@ fn lookup(
     author: &str,
     bytes: &[u8],
 ) -> Result<Option<ExternalDeathPendingReceipt>, V25StagingError> {
+    // Validate numeric byte budgets in this snapshot before the exact-key
+    // lookup materializes its pending TEXT/BLOB fields.
+    let receipts = read_rows(tx)?;
     let raw:Option<(String,Vec<u8>,String)>=tx.query_row("SELECT authenticated_author,canonical_request,request_digest FROM external_death_pending WHERE recovery_key=?1",[&r.recovery_key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -842,7 +1027,7 @@ fn lookup(
             "pending historical key changed author/request",
         ));
     }
-    Ok(read_rows(tx)?
+    Ok(receipts
         .into_iter()
         .find(|row| row.recovery_key == r.recovery_key))
 }
@@ -1225,6 +1410,384 @@ mod tests {
             "unit.fixture",
         )
         .unwrap()
+    }
+
+    fn assert_disposition_unchanged(
+        f: &Fixture,
+        subject: &ExternalDeathPendingRequest,
+        expected: SubjectDisposition,
+    ) {
+        let mut c = Connection::open(&f.source).unwrap();
+        let before = snapshot(&c).unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(subject_disposition(&tx, subject), expected);
+        assert_eq!(tx.total_changes(), 0, "decoder must execute no mutations");
+        tx.commit().unwrap();
+        assert_eq!(snapshot(&c).unwrap(), before);
+        let uncertainty: (String, String, i64) = c
+            .query_row(
+                "SELECT state,claim_key,claim_owner_epoch FROM outbox WHERE outbox_id=2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            uncertainty,
+            ("claimed_uncertain".into(), "native.claim".into(), 2)
+        );
+    }
+
+    #[test]
+    fn subject_decoder_live_pending_and_final_are_read_only_store_facts() {
+        let f = Fixture::new("");
+        assert_disposition_unchanged(&f, &f.request, SubjectDisposition::Live);
+        let receipt = f.open().prepare(&f.author(), &f.request).unwrap();
+        assert_disposition_unchanged(&f, &f.request, SubjectDisposition::Pending);
+        // Passive exact history survives counters advancing; this is no claim.
+        let c = Connection::open(&f.source).unwrap();
+        c.execute_batch("UPDATE metadata SET value=3 WHERE key='owner_epoch'; UPDATE metadata SET value=7 WHERE key='authority_revision'; UPDATE manager_credential_claims SET owner_epoch=3,credential_epoch=3;").unwrap();
+        drop(c);
+        assert_eq!(
+            f.open().lookup(&f.author(), &f.request).unwrap(),
+            Some(receipt.clone())
+        );
+        assert_disposition_unchanged(&f, &f.request, SubjectDisposition::Pending);
+        let c = Connection::open(&f.source).unwrap();
+        c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(?1,?2,'uncertain')", params![receipt.pending_rowid, "a".repeat(64)]).unwrap();
+        drop(c);
+        // This arbitrary shaped digest is deliberately NOT authenticated death.
+        assert_disposition_unchanged(&f, &f.request, SubjectDisposition::FinalRecorded);
+    }
+
+    #[test]
+    fn subject_decoder_exact_stored_binding_never_accepts_caller_fields_alone() {
+        let f = Fixture::new("");
+        for change in [
+            "lineage",
+            "scope",
+            "pod",
+            "incarnation",
+            "session",
+            "run",
+            "attempt",
+            "launch",
+            "rebind",
+            "checkpoint",
+            "resource",
+            "input",
+            "owner",
+            "revision",
+            "credential",
+        ] {
+            let mut subject = f.request.clone();
+            match change {
+                "lineage" => subject.store_lineage = "foreign".into(),
+                "scope" => subject.scope_id = "foreign".into(),
+                "pod" => subject.pod_id = "foreign".into(),
+                "incarnation" => subject.pod_incarnation += 1,
+                "session" => subject.session_id = "foreign".into(),
+                "run" => subject.run_id = "foreign".into(),
+                "attempt" => subject.attempt_id = "foreign".into(),
+                "launch" => subject.launch_command_rowid = 2,
+                "rebind" => subject.activated_rebind_rowid = 2,
+                "checkpoint" => subject.checkpoint_digest = "c".repeat(64),
+                "resource" => subject.resources[0].resource_epoch += 1,
+                "input" => subject.resources[0].input_epoch += 1,
+                "owner" => subject.expected_owner_epoch = 99,
+                "revision" => subject.expected_authority_revision = 99,
+                "credential" => subject.expected_manager_credential_epoch = 99,
+                _ => unreachable!(),
+            }
+            assert_disposition_unchanged(&f, &subject, SubjectDisposition::Unverified);
+        }
+    }
+
+    #[test]
+    fn subject_decoder_malformed_pending_final_and_schema_default_closed() {
+        for change in [
+            "author",
+            "digest",
+            "version",
+            "bytes",
+            "pending_lineage",
+            "pending_counter",
+            "resource_binding",
+            "ddl",
+            "missing_pending",
+            "missing_final",
+            "user_version",
+            "orphan_final",
+            "final_digest",
+            "final_outcome",
+            "pending_rows",
+            "pending_bytes",
+            "final_rows",
+            "final_bytes",
+            "author_role",
+            "duplicate_subject",
+        ] {
+            let f = Fixture::new("");
+            f.open().prepare(&f.author(), &f.request).unwrap();
+            let c = Connection::open(&f.source).unwrap();
+            c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            match change {
+                "author_role" => {
+                    c.execute(
+                        "UPDATE authority_actors SET role='worker' WHERE actor_id='owner.fixture'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "final_bytes" => {
+                    c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(1,?1,'uncertain')", ["a".repeat(MAX_PENDING_BYTES as usize + 1)]).unwrap();
+                }
+                "author" => {
+                    c.execute(
+                        "UPDATE external_death_pending SET authenticated_author='foreign'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "digest" => {
+                    c.execute(
+                        "UPDATE external_death_pending SET request_digest=?1",
+                        ["0".repeat(64)],
+                    )
+                    .unwrap();
+                }
+                "version" => {
+                    c.execute(
+                        "UPDATE external_death_pending SET request_version='future/2'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "bytes" => {
+                    c.execute("UPDATE external_death_pending SET canonical_request=CAST(canonical_request||' ' AS BLOB)", []).unwrap();
+                }
+                "pending_lineage" => {
+                    c.execute(
+                        "UPDATE external_death_pending SET store_lineage='foreign'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "pending_counter" => {
+                    c.execute(
+                        "UPDATE metadata SET value=5 WHERE key='authority_revision'",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "resource_binding" => {
+                    c.execute(
+                        "UPDATE authority_resources SET input_epoch=input_epoch+1",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "ddl" => c
+                    .execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT")
+                    .unwrap(),
+                "missing_pending" => c
+                    .execute_batch("DROP TABLE external_death_pending")
+                    .unwrap(),
+                "missing_final" => c.execute_batch("DROP TABLE external_death_final").unwrap(),
+                "user_version" => c.execute_batch("PRAGMA user_version=24").unwrap(),
+                "orphan_final" => {
+                    c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(99,?1,'uncertain')", ["a".repeat(64)]).unwrap();
+                }
+                "final_digest" => {
+                    c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(1,'malformed','uncertain')", []).unwrap();
+                }
+                "final_outcome" => {
+                    c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(1,?1,'settled')", ["a".repeat(64)]).unwrap();
+                }
+                "pending_rows" | "duplicate_subject" => {
+                    let count = if change == "pending_rows" {
+                        MAX_PENDING_ROWS
+                    } else {
+                        1
+                    };
+                    for n in 0..count {
+                        c.execute("INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest) SELECT ?1,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,?2,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest FROM external_death_pending WHERE pending_rowid=1", params![format!("copy.{n}"), n+2]).unwrap();
+                    }
+                }
+                "pending_bytes" => {
+                    c.execute(
+                        "UPDATE external_death_pending SET canonical_request=zeroblob(?1)",
+                        [MAX_PENDING_BYTES + 1],
+                    )
+                    .unwrap();
+                }
+                "final_rows" => {
+                    for n in 0..=MAX_PENDING_ROWS {
+                        c.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(?1,?2,'uncertain')", params![n+1, "a".repeat(64)]).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            drop(c);
+            assert_disposition_unchanged(&f, &f.request, SubjectDisposition::Unverified);
+        }
+    }
+
+    #[test]
+    fn subject_decoder_text_byte_budgets_refuse_before_materialization() {
+        let f = Fixture::new("");
+        f.open().prepare(&f.author(), &f.request).unwrap();
+        let mut c = Connection::open(&f.source).unwrap();
+        c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        let before = snapshot(&c).unwrap();
+        for (column, maximum) in [
+            ("recovery_key", 256),
+            ("store_lineage", 256),
+            ("scope_id", 256),
+            ("pod_id", 256),
+            ("authenticated_author", 256),
+            ("request_version", REQUEST_VERSION.len()),
+            ("request_digest", 64),
+        ] {
+            for nul_tail in [true, false] {
+                let value = if nul_tail {
+                    format!("a\0{}", "a".repeat(maximum))
+                } else {
+                    "é".repeat(maximum)
+                };
+                let tx = c.transaction().unwrap();
+                tx.execute(
+                    &format!("UPDATE external_death_pending SET {column}=?1"),
+                    [&value],
+                )
+                .unwrap();
+                // Demonstrate the old character check would admit this value.
+                let (characters, bytes): (i64, i64) = tx.query_row(
+                    &format!("SELECT length({column}),length(CAST({column} AS BLOB)) FROM external_death_pending"),
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert!(characters <= maximum as i64 && bytes > maximum as i64);
+                let changes = tx.total_changes();
+                assert!(
+                    matches!(
+                        decode_subject_disposition(&tx, &f.request),
+                        Err(V25StagingError::Safety("pending decoder row/byte budget"))
+                    ),
+                    "{column}, NUL tail={nul_tail}: must refuse at numeric preflight before String decoding"
+                );
+                assert!(
+                    matches!(
+                        lookup(
+                            &tx,
+                            &f.request,
+                            "owner.fixture",
+                            &canonical(&f.author(), &f.request).unwrap()
+                        ),
+                        Err(V25StagingError::Safety("pending decoder row/byte budget"))
+                    ),
+                    "exact-key lookup must also preflight before materialization"
+                );
+                assert_eq!(
+                    subject_disposition(&tx, &f.request),
+                    SubjectDisposition::Unverified
+                );
+                assert_eq!(tx.total_changes(), changes);
+                tx.rollback().unwrap();
+            }
+        }
+        for (column, maximum) in [("proof_digest", 64), ("native_outcome", 9)] {
+            for nul_tail in [true, false] {
+                let value = if nul_tail {
+                    format!("a\0{}", "a".repeat(maximum))
+                } else {
+                    "é".repeat(maximum)
+                };
+                let tx = c.transaction().unwrap();
+                tx.execute("INSERT INTO external_death_final(pending_rowid,proof_digest,native_outcome) VALUES(1,?1,'uncertain')", ["a".repeat(64)]).unwrap();
+                tx.execute(
+                    &format!("UPDATE external_death_final SET {column}=?1"),
+                    [&value],
+                )
+                .unwrap();
+                let (characters, bytes): (i64, i64) = tx.query_row(
+                    &format!("SELECT length({column}),length(CAST({column} AS BLOB)) FROM external_death_final"),
+                    [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert!(characters <= maximum as i64 && bytes > maximum as i64);
+                let changes = tx.total_changes();
+                assert!(
+                    matches!(
+                        decode_subject_disposition(&tx, &f.request),
+                        Err(V25StagingError::Safety(
+                            "subject decoder final row/byte budget"
+                        ))
+                    ),
+                    "{column}, NUL tail={nul_tail}: must refuse at numeric preflight before String decoding"
+                );
+                assert_eq!(
+                    subject_disposition(&tx, &f.request),
+                    SubjectDisposition::Unverified
+                );
+                assert_eq!(tx.total_changes(), changes);
+                tx.rollback().unwrap();
+            }
+        }
+        assert_eq!(snapshot(&c).unwrap(), before);
+    }
+
+    #[test]
+    fn subject_decoder_reads_callers_transaction_and_rollback_preserves_history() {
+        let f = Fixture::new("");
+        let mut c = Connection::open(&f.source).unwrap();
+        let before = snapshot(&c).unwrap();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            subject_disposition(&tx, &f.request),
+            SubjectDisposition::Live
+        );
+        let bytes = canonical(&f.author(), &f.request).unwrap();
+        tx.execute("INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,authenticated_author,request_version,canonical_request,request_digest) VALUES('recover.one',?1,'scope.launch','pod.launch',1,1,1,2,6,'owner.fixture',?2,?3,?4)", params![f.request.store_lineage, REQUEST_VERSION, &bytes, hex_digest(&bytes)]).unwrap();
+        tx.execute(
+            "UPDATE metadata SET value=6 WHERE key='authority_revision'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            subject_disposition(&tx, &f.request),
+            SubjectDisposition::Pending,
+            "must see uncommitted caller snapshot, not a filesystem reopen"
+        );
+        let (started, start_rx) = std::sync::mpsc::channel();
+        let (finished, finish_rx) = std::sync::mpsc::channel();
+        let source = f.source.clone();
+        let writer = std::thread::spawn(move || {
+            let c = Connection::open(source).unwrap();
+            c.busy_timeout(std::time::Duration::ZERO).unwrap();
+            started.send(()).unwrap();
+            finished
+                .send(
+                    c.execute(
+                        "UPDATE metadata SET value=99 WHERE key='authority_revision'",
+                        [],
+                    )
+                    .unwrap_err(),
+                )
+                .unwrap();
+        });
+        start_rx.recv().unwrap();
+        let error = finish_rx.recv().unwrap();
+        assert!(
+            matches!(error, rusqlite::Error::SqliteFailure(ref failure, _) if failure.code == rusqlite::ErrorCode::DatabaseBusy)
+        );
+        writer.join().unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(snapshot(&c).unwrap(), before);
+        assert_disposition_unchanged(&f, &f.request, SubjectDisposition::Live);
     }
 
     #[test]
