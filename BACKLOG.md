@@ -103,6 +103,13 @@ unchecked `systemctl stop` or weaken the current Pod/Run/epoch fence.
 
 ## P1-006 — Operator Zap boot has no terminal-to-fresh-generation path
 
+The `operator zap restart` CLI now has a strict, typed closed front door. A
+well-formed request returns `production_restart_closed` with exit 2 before
+policy loading, directory creation or owner-state I/O; repeated requests have
+the same refusal and no allocation. This is a preparatory contract only.
+P1-006 remains open until trusted signed-terminal acquisition, durable fresh
+generation publication, and authenticated child readiness are implemented.
+
 After the signed terminal stop of outer Service `outer-v35` on 2026-10-06,
 `podbay operator zap launch --policy .../outer-v35/operator-zap-policy.json`
 returned exit 2, `existing Zap Pod rebind preparation failed:

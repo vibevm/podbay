@@ -8,6 +8,8 @@ mod restart_model;
 mod terminal_attestation;
 // Trusted snapshot assertions only; no database/key acquisition path.
 mod historical_signer;
+// Production restart is a typed, closed front door until its adapters exist.
+mod restart;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -156,9 +158,23 @@ impl AuthenticatedTransport for SelfTransport {
     }
 }
 
+enum OperatorOutcome {
+    Completed,
+    RestartClosed(restart::ClosedRestartResult),
+}
+
 pub(crate) fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(OperatorOutcome::Completed) => ExitCode::SUCCESS,
+        Ok(OperatorOutcome::RestartClosed(result)) => {
+            match serde_json::to_string(&result) {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("podbay operator zap: restart result encoding failed: {error}");
+                }
+            }
+            ExitCode::from(2)
+        }
         Err(error) => {
             eprintln!("podbay operator zap: {error}");
             ExitCode::from(2)
@@ -166,8 +182,13 @@ pub(crate) fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<OperatorOutcome, String> {
     let args = env::args_os().collect::<Vec<_>>();
+    // Refuse before Policy::load can create pods/ or open_operator can change
+    // authority state. This branch performs lexical argument validation only.
+    if args.get(3).is_some_and(|argument| argument == "restart") {
+        return restart::parse_closed_request(&args).map(OperatorOutcome::RestartClosed);
+    }
     if args.len() == 6
         && args[1] == "operator"
         && args[2] == "zap"
@@ -188,7 +209,7 @@ fn run() -> Result<(), String> {
                 "hashMillis": proof.elapsed.as_millis(),
             })
         );
-        return Ok(());
+        return Ok(OperatorOutcome::Completed);
     }
     if args.len() != 6
         || args[1] != "operator"
@@ -196,15 +217,16 @@ fn run() -> Result<(), String> {
         || (args[3] != "launch" && args[3] != "stop")
         || args[4] != "--policy"
     {
-        return Err("usage: podbay operator zap hash --root ABSOLUTE_PRIVATE_DIRECTORY | podbay operator zap launch|stop --policy ABSOLUTE_PRIVATE_JSON".into());
+        return Err(format!("usage: podbay operator zap hash --root ABSOLUTE_PRIVATE_DIRECTORY | podbay operator zap launch|stop --policy ABSOLUTE_PRIVATE_JSON | {}", restart::SYNTAX));
     }
     let policy_path = PathBuf::from(&args[5]);
     let policy = Policy::load(&policy_path)?;
     if args[3] == "stop" {
-        stop(policy)
+        stop(policy)?;
     } else {
-        launch(policy)
+        launch(policy)?;
     }
+    Ok(OperatorOutcome::Completed)
 }
 
 impl Policy {
