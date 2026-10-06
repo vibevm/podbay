@@ -10,10 +10,14 @@ verified Linux atomic exchange pass disposable tests under the identical
 manager lock. The exchange verifies exact v24/v25 inode orientation, private
 files, schema/content/lineage, absent SQLite sidecars and the manager lock
 namespace. A retry with the in-memory staging attestation does not exchange a
-published pair back. This is test-scoped: its reader-exclusion token has no
-production constructor. There is no durable migration intent or receipt,
-process-death recovery, ordinary v25 activation, or live-store cutover yet.
-The old schema-24 store remains untouched.
+published pair back. Checkpoint `5cf8dd8` adds a versioned durable keyed intent
+before the disposable exchange. A fresh process can recover and verify the
+exact Unpublished or Published inode orientation without re-exchanging; same-key
+retry repairs an interrupted pre-directory-fsync intent publication. These
+paths remain test-scoped: their reader-exclusion token has no production
+constructor. There is no terminal migration receipt, incomplete-staging
+rebuild, rollback, ordinary v25 activation, or live-store cutover yet. The old
+schema-24 store remains untouched.
 
 ## Decision and rejected alternative
 
