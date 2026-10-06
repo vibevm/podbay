@@ -109,7 +109,7 @@ def parse_serial(raw):
         r'clocksource: Switched to clocksource tsc',
         r'ACPI: PM: Preparing to enter system sleep state S5',
     )
-    chatter_index = 0
+    chatter_seen = set()
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -120,15 +120,13 @@ def parse_serial(raw):
             if not shutdown_seen and re.fullmatch(r'(?:\[\s*\d+\.\d+\]\s*)?reboot: Power down', line):
                 shutdown_seen = True
                 continue
-            if not shutdown_seen:
-                for index in range(chatter_index, len(shutdown_chatter)):
-                    if re.fullmatch(r'\[\s*\d+\.\d+\]\s*' + shutdown_chatter[index], line):
-                        chatter_index = index + 1
-                        break
-                else:
-                    raise ValueError('unexpected serial suffix after CLOSED-stub event')
-                continue
-            raise ValueError('unexpected serial suffix after CLOSED-stub event')
+            for index, pattern in enumerate(shutdown_chatter):
+                if index not in chatter_seen and re.fullmatch(r'\[\s*\d+\.\d+\]\s*' + pattern, line):
+                    chatter_seen.add(index)
+                    break
+            else:
+                raise ValueError('unexpected serial suffix after CLOSED-stub event')
+            continue
         if line.startswith('{'):
             if len(line) > 4096:
                 raise ValueError('oversized serial JSON line')

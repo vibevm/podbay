@@ -41,8 +41,13 @@ static _Noreturn void halt(void) {
     sync(); reboot(RB_POWER_OFF);
     for (;;) pause(); /* Never return PID1 or start an issuer if poweroff fails. */
 }
+static char subject_nonce[33], subject_boot[37], subject_phase;
+static int subject_bound;
 static _Noreturn void fail(const char *why) {
-    printf("{\"event\":\"persistence_refused\",\"gate\":\"CLOSED\",\"admission\":\"UNIMPLEMENTED\",\"reason\":\"%s\"}\n", why);
+    if (subject_bound)
+        printf("{\"event\":\"persistence_refused\",\"gate\":\"CLOSED\",\"admission\":\"UNIMPLEMENTED\",\"reason\":\"%s\",\"phase\":\"%c\",\"nonce\":\"%s\",\"boot_id\":\"%s\"}\n", why,subject_phase,subject_nonce,subject_boot);
+    else
+        printf("{\"event\":\"persistence_refused\",\"gate\":\"CLOSED\",\"admission\":\"UNIMPLEMENTED\",\"reason\":\"%s\"}\n", why);
     fflush(stdout); halt();
 }
 static ssize_t exact_read(int fd, char *buffer, size_t capacity) {
@@ -70,7 +75,8 @@ static void write_all(int fd, const char *bytes, size_t n) {
 }
 static void absent(int directory, const char *name) {
     struct stat st;
-    if (!fstatat(directory,name,&st,AT_SYMLINK_NOFOLLOW) || errno != ENOENT) fail("existing_or_partial_gate");
+    if (!fstatat(directory,name,&st,AT_SYMLINK_NOFOLLOW)) fail("existing_or_partial_gate");
+    if (errno != ENOENT) fail("gate_absence_unobserved");
 }
 int main(void) {
     if (getpid()!=1 || getuid()!=0 || geteuid()!=0) return 3;
@@ -89,6 +95,7 @@ int main(void) {
     if (strlen(boot)!=37 || boot[36]!='\n') fail("boot_id_length");
     boot[36]=0; if (!uuid_valid(boot)) fail("boot_id_format");
     if (mount("/dev/vda","/fixture","ext4",MS_NODEV|MS_NOSUID|MS_NOEXEC,NULL)) fail("fixture_mount");
+    memcpy(subject_nonce,nonce,33); memcpy(subject_boot,boot,37); subject_phase=(char)phase; subject_bound=1;
     if (phase=='A') {
         if (mkdir("/fixture/closed",0700)) fail("fresh_directory");
         int parent=open("/fixture",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);

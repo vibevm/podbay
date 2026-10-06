@@ -73,5 +73,31 @@ runner `33899e9a04fb4a700396c99cfed4694f12889fb36030709725b31e1862261fb9`.
 The seven offline tests passed before this run and again after copying the
 sources; the parent log is
 `/fast/git/v/research/2026-10-06-podbay-two-boot-persistence/parent-offline-after-copy.log`.
-This receipt does not include a malformed
-guest disk or power-loss negative run.
+This receipt does not include a power-loss negative run.
+
+## Actual partial gate Boot-B refusal, 2026-10-06
+
+The opt-in `--negative partial-writing` case creates a separate fresh image.
+After a validated Boot A exit/reap and image fsync, pinned debugfs reads back
+the original `gate.record` bytes/inode, proves `gate.writing` absent and creates
+one bounded partial `gate.writing` without overwriting the original. Boot B
+must emit one exact CLOSED/UNIMPLEMENTED `existing_or_partial_gate` refusal
+bound to the run nonce, phase B and a distinct kernel boot ID. Post-B readback
+requires the original and partial file bytes/inodes to remain unchanged.
+
+The parent run `persist-partial-retry` exited 0 with
+`BOOT_B_PARTIAL_GATE_REFUSED_NO_ADMISSION`. Both QEMU children exited 0,
+reported pidfd exit/reap and were subsequently absent. The injection and
+post-B identity records match, and the retained image SHA-256 matches its
+receipt. Exact artifacts are under
+`/home/olegchir/podbay-two-boot-persistence-build/persist-partial-retry/`.
+Twelve offline tests passed before the VM run; the first parent VM attempt
+`persist-partial-parent` failed closed after Boot A because the host parser
+rejected valid kernel clocksource messages printed after `reboot: Power down`.
+It did not start Boot B. The parser now accepts each bounded expected shutdown
+line at most once in either observed order; malformed, duplicate, fatal or
+arbitrary lines still reject. The failed image and logs remain retained.
+
+This is a deliberately malformed disposable marker control. It is not a v25
+activation, production barrier, holder exclusion or hypervisor power-loss
+recovery proof.

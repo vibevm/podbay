@@ -136,6 +136,96 @@ class Persistence(unittest.TestCase):
                 self.assertEqual(reap.call_args.kwargs.get('kill',False),failure)
                 self.assertEqual(result['status'],'FAILED_OR_LIFECYCLE_UNVERIFIED' if failure else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION')
 
+    def test_bound_partial_refusal_is_exact_and_never_accepts_success(self):
+        expected={'event':'persistence_refused','gate':'CLOSED','admission':'UNIMPLEMENTED',
+                  'reason':'existing_or_partial_gate','phase':'B','nonce':NONCE,'boot_id':B}
+        self.assertEqual(runner.parse_partial_refusal(raw(expected),NONCE,event('A')),expected)
+        for bad in (dict(expected,nonce='b'*32),dict(expected,boot_id=A),dict(expected,phase='A'),
+                    dict(expected,reason='gate_absence_unobserved'),dict(expected,extra=True),
+                    dict(expected,gate='OPEN'),event('B'),
+                    {'event':'persistence_refused','gate':'CLOSED','admission':'UNIMPLEMENTED','reason':'existing_or_partial_gate'}):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):
+                runner.parse_partial_refusal(raw(bad),NONCE,event('A'))
+        for bad in (raw(expected)+raw(expected),raw(expected)+raw(event('B')),raw(expected)+b'foreign\n'):
+            with self.assertRaises(ValueError):runner.parse_partial_refusal(bad,NONCE,event('A'))
+
+    def test_real_offline_ext4_partial_injection_is_exclusive_and_preserves_original(self):
+        report=self.prepare('persist-partial-image');path=TEST_ROOT/'persist-partial-image'
+        with offline.TrustedOutput(path) as output:
+            output.out=path;closed.attach(output,'fixture.raw')
+            data=runner.marker(report['nonce'],A);output.write('seed-marker.bin',data)
+            seedfd=output.pins[path/'seed-marker.bin']
+            runner.debugfs_command(output,'mkdir /closed','seed-directory',True)
+            runner.debugfs_command(output,'set_inode_field /closed mode 040700','seed-directory-mode',True)
+            runner.debugfs_command(output,f'write /proc/self/fd/{seedfd} /closed/gate.record','seed-record',True,(seedfd,))
+            for field,value in (('mode','0100600'),('uid','0'),('gid','0')):
+                runner.debugfs_command(output,f'set_inode_field /closed/gate.record {field} {value}','seed-record-'+field,True)
+            record,record_bytes=runner.disk_file(output,'/closed/gate.record','seed-readback')
+            prior=event('A');prior.update(nonce=report['nonce'],inode=record['inode'],marker_hex=data.hex())
+            boot={'status':'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION','boot_executed':True,'exact_child_reaped':True,
+                  'pidfd_exit_verified':True,'exit_code':0,'event':prior}
+            for field in ('boot_executed','exact_child_reaped','pidfd_exit_verified'):
+                with self.assertRaises(ValueError):runner.inject_partial(output,dict(boot,**{field:False}))
+            injected=runner.inject_partial(output,boot)
+            self.assertEqual(injected['record'],record);self.assertEqual(record_bytes,data)
+            self.assertEqual(injected['injected_hex'],runner.PARTIAL.hex())
+            before=offline.fd_hash(output.pins[path/'fixture.raw'])
+            with self.assertRaises((ValueError,FileExistsError)):runner.inject_partial(output,boot)
+            self.assertEqual(offline.fd_hash(output.pins[path/'fixture.raw']),before)
+            self.assertEqual(runner.verify_partial(output,prior,injected,'offline-after'),
+                             {'record':injected['record'],'partial':injected['partial']})
+            # Exercise the pinned tool itself: its write refuses an existing guest path.
+            with self.assertRaises(ValueError):runner.debugfs_command(output,f'write /proc/self/fd/{seedfd} /closed/gate.writing','direct-exclusive-retry',True,(seedfd,))
+            self.assertEqual(offline.fd_hash(output.pins[path/'fixture.raw']),before)
+
+    def test_injection_failure_prevents_boot_b_and_unexpected_success_fails_negative(self):
+        first={'phase':'A','boot_executed':True,'exact_child_reaped':True,'pidfd_exit_verified':True,
+               'exit_code':0,'status':'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION','event':event('A')}
+        with patch.object(runner,'BASE',TEST_ROOT),patch.object(runner,'run_boot',return_value=first) as boot, \
+             patch.object(runner,'inject_partial',side_effect=ValueError('injected failure')):
+            report=runner.prepare('persist-inject-fail',True,QEMU_HASH,'partial-writing')
+        self.assertEqual(boot.call_count,1);self.assertEqual(report['status'],'FAILED_NO_ADMISSION')
+        with patch.object(runner,'BASE',TEST_ROOT),patch.object(runner,'run_boot',side_effect=[first,dict(first,phase='B')]) as boot, \
+             patch.object(runner,'inject_partial',return_value={'case':'partial-writing'}), \
+             patch.object(runner,'verify_partial') as verify:
+            report=runner.prepare('persist-neg-success-fail',True,QEMU_HASH,'partial-writing')
+        self.assertEqual(boot.call_count,2);self.assertTrue(boot.call_args.kwargs['partial_refusal'])
+        self.assertEqual(report['status'],'FAILED_NO_ADMISSION');verify.assert_not_called()
+
+    def test_negative_success_requires_refusal_and_post_boot_preservation(self):
+        first={'phase':'A','boot_executed':True,'exact_child_reaped':True,'pidfd_exit_verified':True,
+               'exit_code':0,'status':'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION','event':event('A')}
+        second={'phase':'B','boot_executed':True,'exact_child_reaped':True,'pidfd_exit_verified':True,
+                'exit_code':0,'status':'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION',
+                'event':{'event':'persistence_refused','reason':'existing_or_partial_gate','gate':'CLOSED','admission':'UNIMPLEMENTED','phase':'B','nonce':NONCE,'boot_id':B}}
+        for fail in (False,True):
+            name='persist-neg-post-fail' if fail else 'persist-neg-mock-ok'
+            with patch.object(runner,'BASE',TEST_ROOT),patch.object(runner,'run_boot',side_effect=[first,second]), \
+                 patch.object(runner,'inject_partial',return_value={'case':'partial-writing'}), \
+                 patch.object(runner,'verify_partial',side_effect=ValueError('changed original') if fail else None,return_value={'preserved':True}):
+                report=runner.prepare(name,True,QEMU_HASH,'partial-writing')
+            self.assertEqual(report['status'],'FAILED_NO_ADMISSION' if fail else runner.NEGATIVE_SUCCESS)
+            self.assertTrue((TEST_ROOT/name/'fixture.raw').exists())
+
+    def test_fake_child_refusal_flows_through_real_run_boot_parser_and_teardown(self):
+        report=self.prepare('persist-refusal-child');path=TEST_ROOT/'persist-refusal-child'
+        with offline.TrustedOutput(runner.INPUT) as inputs,offline.TrustedOutput(path) as output:
+            output.out=path
+            for file in ('vmlinuz','initramfs.cpio.gz','fixture.raw'):closed.attach(output,file)
+            child=type('Child',(),{'pid':424243,'stdout':io.BytesIO(),'stderr':io.BytesIO()})()
+            def capture(child,pidfd,serialfd,stderrfd,logs,latch):
+                refusal={'event':'persistence_refused','gate':'CLOSED','admission':'UNIMPLEMENTED',
+                         'reason':'existing_or_partial_gate','phase':'B','nonce':report['nonce'],'boot_id':B}
+                closed.write_all(serialfd,raw(refusal))
+            with patch.object(runner.subprocess,'Popen',return_value=child), \
+                 patch.object(os,'pidfd_open',side_effect=lambda *_:os.dup(output.pins[path])), \
+                 patch.object(closed,'process_birth',return_value=101), \
+                 patch.object(closed,'capture',side_effect=capture),patch.object(closed,'reap_exact',return_value=0):
+                result=runner.run_boot(inputs,output,'B',report['nonce'],QEMU_HASH,closed.SignalLatch(),event('A'),partial_refusal=True)
+            self.assertEqual(result['status'],'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION')
+            self.assertTrue(result['exact_child_reaped']);self.assertTrue(result['pidfd_exit_verified'])
+            self.assertEqual(result['event']['reason'],'existing_or_partial_gate')
+
 
 if __name__=='__main__':
     print('retained offline test root: '+str(TEST_ROOT),flush=True)

@@ -59,8 +59,9 @@ Only one exact `fixture_stub` CLOSED/unimplemented JSON event, normal QEMU exit
 and verified pidfd exit/reap can produce `CLOSED_STUB_OBSERVED_UNIMPLEMENTED`.
 Malformed, repeated, missing or failed events are failure. Invalid UTF-8, NUL,
 JSON arrays and fatal kernel diagnostics fail closed. After the exact event, only
-blank lines, an ordered optional subset of the observed clocksource/ACPI
-shutdown messages, and at most one exact `reboot: Power down` line are allowed;
+blank lines, a non-repeating optional subset of the observed clocksource/ACPI
+shutdown messages, and at most one exact `reboot: Power down` line are allowed
+in either observed order;
 arbitrary trailing output is rejected. Kernel/BusyBox text
 is retained in `serial.raw`; JSON records are separately validated. The launch/report transaction never automatically deletes the disk. A separate
 internal cleanup helper refuses unless exact reap/pidfd exit and a durable

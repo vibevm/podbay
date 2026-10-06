@@ -21,6 +21,9 @@ INPUT = offline.BASE / 'final-a'
 GCC = Path('/usr/bin/x86_64-linux-gnu-gcc-15')
 GCC_SHA256 = 'b5f1b773a7c733738352000c92a077dc5852a1a2fc6d836b1e411be1e9ec5f88'
 SUCCESS = 'TWO_BOOT_CLOSED_MARKER_PERSISTED_NO_ADMISSION'
+NEGATIVE_SUCCESS = 'BOOT_B_PARTIAL_GATE_REFUSED_NO_ADMISSION'
+PARTIAL = b'PODBAY-PERSISTENCE/1\nstate=CLO'
+DEBUGFS = Path(offline.PINS['debugfs'][0])
 PREFIX = b'PODBAY-PERSISTENCE/1\nstate=CLOSED\nadmission=UNIMPLEMENTED\nnonce='
 SUFFIX = b'\npayload=DISPOSABLE-CLOSED-MARKER-NOT-V25-AUTHORITY\n'
 BOOT_ID = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}')
@@ -72,7 +75,101 @@ def parse_event(raw, phase, nonce, prior=None):
     return event
 
 
-def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None):
+def parse_partial_refusal(raw, nonce, prior):
+    if not raw.endswith(b'\n') or b'\0' in raw or len(raw) > closed.MAX_SERIAL:
+        raise ValueError('incomplete/NUL/oversized refusal capture')
+    lines = [line for line in raw.decode('utf-8', errors='strict').splitlines() if line.startswith('{')]
+    if len(lines) != 1 or len(lines[0]) > 4096:
+        raise ValueError('one bounded refusal event required')
+    event = json.loads(lines[0], object_pairs_hook=closed.strict_object)
+    expected = {'event':'persistence_refused', 'gate':'CLOSED', 'admission':'UNIMPLEMENTED',
+                'reason':'existing_or_partial_gate', 'phase':'B', 'nonce':nonce,
+                'boot_id':event.get('boot_id')}
+    if event != expected or not isinstance(event['boot_id'],str) or not BOOT_ID.fullmatch(event['boot_id']) or event['boot_id'] == prior['boot_id']:
+        raise ValueError('not the exact fresh-B partial-gate refusal')
+    normalized = raw.replace(lines[0].encode(),json.dumps(closed.EXPECTED_EVENT).encode(),1)
+    closed.parse_serial(normalized)
+    return event
+
+
+def debugfs_command(output, command, tag, writable=False, extra_fds=(), missing=False):
+    output.check(); offline.trusted_tool(DEBUGFS); offline.read_pinned(*offline.PINS['debugfs'])
+    disk = output.pins[output.out/'fixture.raw']
+    args=[str(DEBUGFS)] + (['-w'] if writable else []) + ['-R',command,f'/proc/self/fd/{disk}']
+    result=subprocess.run(args,pass_fds=(disk,*extra_fds),capture_output=True,timeout=30,
+                          env={'PATH':'/usr/bin:/bin','LC_ALL':'C','TZ':'UTC'})
+    output.check()
+    output.write('negative-'+tag+'.log',result.stdout+result.stderr)
+    os.fsync(output.pins[output.out/('negative-'+tag+'.log')])
+    text=(result.stdout+result.stderr).decode('utf-8',errors='strict')
+    if len(text)>65536 or result.returncode:
+        raise ValueError('debugfs failed/oversized output: '+tag)
+    if missing:
+        if not re.search(r'File not found by ext2_lookup',text) or re.search(r'Inode:',text):
+            raise ValueError('partial gate is not proved absent')
+    elif re.search(r'File not found|already exists|Filesystem not open|Usage:|while |Command not found|Could not|Error|not a directory',text,re.I):
+        raise ValueError('debugfs command failed: '+tag)
+    return text
+
+
+def disk_file(output,path,tag):
+    text=debugfs_command(output,'stat '+path,tag+'-stat')
+    patterns={'inode':r'Inode:\s*(\d+)', 'mode':r'Mode:\s*0*([0-7]+)',
+              'uid':r'User:\s*(\d+)', 'gid':r'Group:\s*(\d+)',
+              'links':r'Links:\s*(\d+)', 'size':r'Size:\s*(\d+)'}
+    values={}
+    for key,pattern in patterns.items():
+        found=re.search(pattern,text)
+        if found is None: raise ValueError('missing debugfs identity '+key)
+        values[key]=int(found[1],8 if key=='mode' else 10)
+    if not re.search(r'Type:\s*regular',text) or values['uid'] or values['gid'] or values['mode']!=0o600 or values['links']!=1 or not 0<values['size']<=512:
+        raise ValueError('foreign disk file identity')
+    name='negative-'+tag+'.bin'; output.write(name,b''); fd=output.pins[output.out/name]
+    debugfs_command(output,f'dump {path} /proc/self/fd/{fd}',tag+'-dump',extra_fds=(fd,))
+    os.fsync(fd)
+    data=output.read(name)
+    if len(data)!=values['size']: raise ValueError('disk readback length mismatch')
+    values['sha256']=offline.sha(data)
+    return values,data
+
+
+def verify_partial(output, prior, expected, tag):
+    record,record_bytes=disk_file(output,'/closed/gate.record',tag+'-record')
+    partial,partial_bytes=disk_file(output,'/closed/gate.writing',tag+'-partial')
+    if record != expected['record'] or record_bytes.hex()!=prior['marker_hex'] or partial != expected['partial'] or partial_bytes != PARTIAL:
+        raise ValueError('original record or injected partial identity/bytes changed')
+    return {'record':record,'partial':partial}
+
+
+def inject_partial(output, boot_a):
+    if (boot_a.get('status')!='CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION' or
+        boot_a.get('boot_executed') is not True or boot_a.get('exact_child_reaped') is not True or
+        boot_a.get('pidfd_exit_verified') is not True or type(boot_a.get('exit_code')) is not int or boot_a['exit_code']!=0):
+        raise ValueError('injection requires validated exact Boot-A exit/reap/fsync')
+    prior=boot_a['event']
+    parse_event((json.dumps(prior)+'\n').encode(),'A',prior['nonce'])
+    disk=output.pins[output.out/'fixture.raw']; os.fsync(disk); output.check()
+    debugfs_command(output,'stat /closed/gate.writing','before-partial-absence',missing=True)
+    record,record_bytes=disk_file(output,'/closed/gate.record','before-record')
+    if record['inode']!=prior['inode'] or record_bytes.hex()!=prior['marker_hex']:
+        raise ValueError('Boot-A record identity/bytes not preserved before injection')
+    output.write('partial-gate.bin',PARTIAL); fd=output.pins[output.out/'partial-gate.bin']; os.fsync(fd)
+    debugfs_command(output,f'write /proc/self/fd/{fd} /closed/gate.writing','create-partial',True,(fd,))
+    for field,value in (('uid','0'),('gid','0'),('mode','0100600')):
+        debugfs_command(output,f'set_inode_field /closed/gate.writing {field} {value}','partial-'+field,True)
+    os.fsync(disk); output.check()
+    after,after_bytes=disk_file(output,'/closed/gate.record','after-record')
+    partial,partial_bytes=disk_file(output,'/closed/gate.writing','after-partial')
+    if after!=record or after_bytes!=record_bytes or partial_bytes!=PARTIAL or partial['inode']==record['inode']:
+        raise ValueError('injection changed original record or failed exact exclusive partial readback')
+    receipt={'case':'partial-writing','debugfs_sha256':offline.PINS['debugfs'][1],
+             'record':record,'partial':partial,'original_marker_hex':record_bytes.hex(),
+             'injected_hex':PARTIAL.hex(),'disk_device':os.fstat(disk).st_dev,'disk_inode':os.fstat(disk).st_ino}
+    closed.durable_receipt(output,'negative-injection.json',receipt)
+    return receipt
+
+
+def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None, partial_refusal=False):
     report = {'phase': phase, 'boot_executed': False, 'exact_child_reaped': False,
               'pidfd_exit_verified': False, 'status': 'NOT_STARTED'}
     with offline.TrustedOutput(output.out) as logs:
@@ -98,10 +195,11 @@ def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None):
             latch.check(); inputs.check(); output.check()
             if report['exit_code'] != 0:
                 raise ValueError('QEMU nonzero exit')
-            report['event'] = parse_event(logs.read('serial.raw'), phase, nonce, prior)
+            if partial_refusal and phase != 'B': raise ValueError('refusal oracle only for Boot B')
+            report['event'] = parse_partial_refusal(logs.read('serial.raw'),nonce,prior) if partial_refusal else parse_event(logs.read('serial.raw'), phase, nonce, prior)
             closed.write_all(logs.pins[logs.out / 'guest-events.jsonl'],
                              (json.dumps(report['event'], sort_keys=True) + '\n').encode())
-            report['status'] = 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
+            report['status'] = 'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if partial_refusal else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
         except BaseException as error:
             report.update(status='FAILED_OR_LIFECYCLE_UNVERIFIED', error=str(error))
             if child is not None:
@@ -126,7 +224,8 @@ def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None):
     return report
 
 
-def prepare(name, execute=False, qemu_hash=None):
+def prepare(name, execute=False, qemu_hash=None, negative=None):
+    if negative not in (None, 'partial-writing'): raise ValueError('closed negative case set')
     if os.getuid() == 0 or os.geteuid() == 0:
         raise ValueError('ordinary host UID required')
     if not re.fullmatch(r'persist-[a-z0-9][a-z0-9-]{0,22}', name):
@@ -181,7 +280,7 @@ def prepare(name, execute=False, qemu_hash=None):
             if stat.S_ISREG(os.fstat(fd).st_mode): os.fsync(fd)
         os.fsync(output.pins[output.out])
         report = {'schema': 1, 'status': 'DRY_RUN_UNBOOTED_NO_ADMISSION', 'admission': 'UNIMPLEMENTED', 'gate': 'CLOSED',
-                  'nonce': nonce, 'fs_uuid': fs_uuid, 'disk_inode': os.fstat(diskfd).st_ino,
+                  'nonce': nonce, 'fs_uuid': fs_uuid, 'negative_case':negative, 'disk_inode': os.fstat(diskfd).st_ino,
                   'disk_device': os.fstat(diskfd).st_dev, 'disk_retained': True, 'boots': [],
                   'source_sha256': offline.sha(Path(__file__).read_bytes()), 'pid1_source_sha256': offline.sha(source),
                   'compiler_sha256': offline.sha(GCC.read_bytes()), 'compile_argv': command, 'mkfs_argv': mkfs,
@@ -195,12 +294,29 @@ def prepare(name, execute=False, qemu_hash=None):
                 for phase in ('A', 'B'):
                     latch.check()
                     prior = report['boots'][0]['event'] if phase == 'B' else None
-                    boot = run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior)
+                    if phase == 'B' and negative:
+                        try:
+                            report['negative_injection']=inject_partial(output,report['boots'][0])
+                            latch.check()
+                        except BaseException as error:
+                            report.update(status='FAILED_NO_ADMISSION',negative_error=str(error)); break
+                    if phase == 'B' and negative:
+                        boot = run_boot(inputs,output,phase,nonce,qemu_hash,latch,prior,partial_refusal=True)
+                    else:
+                        boot = run_boot(inputs,output,phase,nonce,qemu_hash,latch,prior)
                     report['boots'].append(boot)
-                    if boot['status'] != 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION' or not boot['exact_child_reaped'] or not boot['pidfd_exit_verified']:
+                    expected_status='CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if phase=='B' and negative else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
+                    if boot['status'] != expected_status or not boot['exact_child_reaped'] or not boot['pidfd_exit_verified']:
                         report['status'] = 'FAILED_NO_ADMISSION'; break
                     os.fsync(diskfd)
-                    if phase == 'B': report['status'] = SUCCESS
+                    if phase == 'B':
+                        if negative:
+                            try:
+                                report['negative_post_boot']=verify_partial(output,prior,report['negative_injection'],'post-b')
+                                report['status']=NEGATIVE_SUCCESS
+                            except BaseException as error:
+                                report.update(status='FAILED_NO_ADMISSION',negative_error=str(error))
+                        else: report['status'] = SUCCESS
                 report['final_disk_sha256'] = offline.fd_hash(diskfd)
         closed.durable_receipt(output, 'result.json', report)
         return report
@@ -211,15 +327,16 @@ def main():
     parser.add_argument('--name', required=True)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--qemu-sha256')
+    parser.add_argument('--negative',choices=['partial-writing'])
     args = parser.parse_args()
     try:
-        report = prepare(args.name, args.run, args.qemu_sha256)
+        report = prepare(args.name, args.run, args.qemu_sha256,args.negative)
     except BaseException as error:
         # Never label uncertain postlaunch receipt failures as 'not started'. Artifacts remain.
         print(json.dumps({'status':'REFUSED_OR_FAILED_LAUNCH_STATE_MUST_BE_INSPECTED', 'error':str(error), 'admission':'UNIMPLEMENTED'}), file=sys.stderr)
         return 2
     print(json.dumps(report, sort_keys=True))
-    return 0 if report['status'] in (SUCCESS, 'DRY_RUN_UNBOOTED_NO_ADMISSION') else 2
+    return 0 if report['status'] in (SUCCESS, NEGATIVE_SUCCESS, 'DRY_RUN_UNBOOTED_NO_ADMISSION') else 2
 
 
 if __name__ == '__main__': sys.exit(main())
