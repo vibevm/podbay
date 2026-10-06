@@ -9,8 +9,9 @@ The separate [CLOSED marker persistence fixture](PERSISTENCE-VM.md) has now
 completed two fresh QEMU boots against one new writable ext4 image. It verifies
 the same closed marker/inode across distinct guest boot IDs with exact child
 reap between boots. It does not execute v25 migration or release admission.
-The [disposable v25 guest example](V25-GUEST.md) is built and host-tested but
-has not yet been run in those two guest boots.
+The [disposable v25 guest example](V25-GUEST.md) has now completed its own two
+fresh guest boots with actual v25 activation/recovery and refusal checks. This
+remains fixture evidence, not a production barrier.
 `inventory.py` prints JSON and always exits 3 (`BLOCKED_NOT_BOOTED`). It opens
 only the explicit ISO and device metadata, never the KVM device itself. It does
 not execute discovered tools, extract files, download inputs or change services.

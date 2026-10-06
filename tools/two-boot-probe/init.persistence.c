@@ -12,6 +12,8 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PREFIX "PODBAY-PERSISTENCE/1\nstate=CLOSED\nadmission=UNIMPLEMENTED\nnonce="
@@ -78,6 +80,45 @@ static void absent(int directory, const char *name) {
     if (!fstatat(directory,name,&st,AT_SYMLINK_NOFOLLOW)) fail("existing_or_partial_gate");
     if (errno != ENOENT) fail("gate_absence_unobserved");
 }
+static pid_t fixture_child;
+static unsigned long long fixture_birth;
+static unsigned long long birth_of(pid_t pid) {
+    char path[64], text[4096]; snprintf(path,sizeof(path),"/proc/%ld/stat",(long)pid);
+    int fd=open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW); if(fd<0) return 0;
+    ssize_t n=exact_read(fd,text,sizeof(text)-1);close(fd);if(n<0)return 0;text[n]=0;
+    char *start=strrchr(text,')');if(!start)return 0;start+=2;
+    for(int field=3;field<22;field++){start=strchr(start,' ');if(!start)return 0;start++;}
+    char *end; unsigned long long value=strtoull(start,&end,10);
+    return end!=start && (*end==' ' || *end=='\n' || *end==0) ? value : 0;
+}
+static void run_v25(int phase,const char *nonce) {
+    char root[128]; snprintf(root,sizeof(root),"/fixture/podbay-v25-fixture-%s",nonce);
+    struct stat st;
+    if(lstat("/bin/v25_two_boot_fixture",&st) || !S_ISREG(st.st_mode) || st.st_uid || st.st_gid || (st.st_mode&07777)!=0700 || st.st_nlink!=1)fail("v25_binary_identity");
+    pid_t pid=fork();if(pid<0)fail("v25_fork");
+    if(!pid){
+        if(chdir("/") || syscall(SYS_close_range,3u,~0u,0u))_exit(126);
+        int input=open("/dev/null",O_RDONLY);if(input<0 || dup2(input,0)<0)_exit(126);if(input>2)close(input);
+        char *args[]={"/bin/v25_two_boot_fixture",phase=='A'?"boot-a":"boot-b",root,(char*)nonce,"guest",NULL};
+        char *env[]={"LC_ALL=C","TZ=UTC",NULL};execve(args[0],args,env);_exit(127);
+    }
+    fixture_child=pid;fixture_birth=birth_of(pid);
+    if(!fixture_birth){kill(pid,SIGKILL);while(waitpid(pid,NULL,0)<0 && errno==EINTR){}fail("v25_child_birth");}
+    struct timespec began,now,delay={.tv_sec=0,.tv_nsec=20000000};
+    if(clock_gettime(CLOCK_MONOTONIC,&began)){kill(pid,SIGKILL);waitpid(pid,NULL,0);fail("v25_clock");}
+    int status;
+    for(;;){
+        pid_t got=waitpid(pid,&status,WNOHANG);
+        if(got==pid)break;
+        if(got<0 && errno!=EINTR)fail("v25_wait");
+        if(clock_gettime(CLOCK_MONOTONIC,&now) || now.tv_sec-began.tv_sec>=60){
+            kill(pid,SIGKILL);while(waitpid(pid,NULL,0)<0 && errno==EINTR){}fail("v25_child_deadline");
+        }
+        nanosleep(&delay,NULL);
+    }
+    if(!WIFEXITED(status) || WEXITSTATUS(status)!=0)fail("v25_child_failed");
+}
+
 int main(void) {
     if (getpid()!=1 || getuid()!=0 || geteuid()!=0) return 3;
     setvbuf(stdout,NULL,_IONBF,0); umask(077);
@@ -126,8 +167,17 @@ int main(void) {
     if (fstatat(directory,"gate.record",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_nlink!=1 || st.st_uid || st.st_gid || (st.st_mode&07777)!=0600 || (size_t)st.st_size!=n) fail("final_marker_identity");
     if (fsync(directory)) fail("directory_flush");
     close(directory);
+    int v25=0,workload=open("/etc/v25-workload",O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if(workload>=0){char tag[32];ssize_t got=exact_read(workload,tag,sizeof(tag));close(workload);
+        if(got!=13 || memcmp(tag,"v25-fixture/1",13))fail("workload_tag");
+        v25=1;}
+    else if(errno!=ENOENT)fail("workload_unobserved");
+    if(v25){if(!strcmp(nonce,"00000000000000000000000000000000"))fail("v25_zero_nonce");run_v25(phase,nonce);}
     if (umount("/fixture")) fail("fixture_unmount");
     printf("{\"event\":\"closed_marker_persistence\",\"phase\":\"%c\",\"gate\":\"CLOSED\",\"admission\":\"UNIMPLEMENTED\",\"nonce\":\"%s\",\"boot_id\":\"%s\",\"boot_a\":\"%s\",\"inode\":%llu,\"marker_hex\":\"", phase,nonce,boot,phase=='A'?boot:prior,(unsigned long long)st.st_ino);
     for (size_t i=0;i<n;i++) printf("%02x",(unsigned char)data[i]);
-    puts("\"}"); halt();
+    if(v25)printf("\",\"workload\":\"v25-fixture/1\",\"child_pid\":%ld,\"child_birth_ticks\":%llu,\"child_exit_code\":0,\"child_reaped\":true}\n",(long)fixture_child,fixture_birth);
+    else puts("\"}");
+    if(v25 && phase=='A')for(;;)pause();
+    halt();
 }

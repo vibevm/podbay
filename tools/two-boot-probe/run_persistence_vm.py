@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Disposable CLOSED marker across two fresh VMs; never v25 migration/admission."""
+"""Disposable CLOSED marker or opt-in v25 migration across two fresh VMs; no production admission."""
 import argparse
+import selectors
+import time
 import gzip
 import json
 import os
@@ -15,6 +17,7 @@ import uuid
 sys.dont_write_bytecode = True
 import offline
 import run_closed_vm as closed
+import v25_oracle
 
 BASE = Path('/home/olegchir/podbay-two-boot-persistence-build')
 INPUT = offline.BASE / 'final-a'
@@ -24,6 +27,9 @@ SUCCESS = 'TWO_BOOT_CLOSED_MARKER_PERSISTED_NO_ADMISSION'
 NEGATIVE_SUCCESS = 'BOOT_B_PARTIAL_GATE_REFUSED_NO_ADMISSION'
 PARTIAL = b'PODBAY-PERSISTENCE/1\nstate=CLO'
 DEBUGFS = Path(offline.PINS['debugfs'][0])
+V25_ELF = Path('/fast/git/v/research/2026-10-06-podbay-v25-guest-fixture/target/x86_64-unknown-linux-musl/release/examples/v25_two_boot_fixture')
+V25_SIZE = 3680464
+V25_SUCCESS = 'DISPOSABLE_V25_TWO_BOOT_OBSERVED_NO_PRODUCTION_ADMISSION'
 PREFIX = b'PODBAY-PERSISTENCE/1\nstate=CLOSED\nadmission=UNIMPLEMENTED\nnonce='
 SUFFIX = b'\npayload=DISPOSABLE-CLOSED-MARKER-NOT-V25-AUTHORITY\n'
 BOOT_ID = re.compile(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}')
@@ -169,7 +175,42 @@ def inject_partial(output, boot_a):
     return receipt
 
 
-def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None, partial_refusal=False):
+def capture_v25_a(child,pidfd,serialfd,stderrfd,logs,latch,nonce):
+    deadline=time.monotonic()+closed.TIMEOUT
+    sizes={'serial':0,'stderr':0};accepted=None
+    with selectors.DefaultSelector() as selector:
+        for stream,kind,fd,limit in ((child.stdout,'serial',serialfd,closed.MAX_SERIAL),(child.stderr,'stderr',stderrfd,closed.MAX_STDERR)):
+            os.set_blocking(stream.fileno(),False);selector.register(stream,selectors.EVENT_READ,(kind,fd,limit))
+        while accepted is None:
+            latch.check()
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('v25 Boot-A acknowledgement deadline')
+            if not selector.get_map():raise ValueError('QEMU streams ended before v25 acknowledgement')
+            for key,_ in selector.select(min(remaining,1)):
+                data=os.read(key.fileobj.fileno(),65536)
+                if not data:selector.unregister(key.fileobj);continue
+                kind,fd,limit=key.data;sizes[kind]+=len(data)
+                if sizes[kind]>limit:raise ValueError('v25 '+kind+' capture bound')
+                logs.check();closed.write_all(fd,data);logs.check()
+                if kind=='serial':
+                    raw=logs.read('serial.raw')
+                    complete=raw[:raw.rfind(b'\n')+1]
+                    if any(line.startswith(b'{') or b'"event":"FIXTURE_FAILED"' in line for line in complete.splitlines()):
+                        accepted=v25_oracle.parse_phase(complete,'A',nonce,sys.modules[__name__])
+                        break
+    # Validation precedes termination. PID1 has acknowledged exact child reap and clean disk unmount.
+    latch.check()
+    signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+    code=closed.reap_exact(child,pidfd)
+    if code!=-signal.SIGKILL:raise ValueError('unexpected Boot-A termination status')
+    # Drain bounded remaining pipe bytes after exact reap; retain any trailing corruption for final parse.
+    closed.capture(child,pidfd,serialfd,stderrfd,logs,latch)
+    if os.fstat(serialfd).st_size>closed.MAX_SERIAL or os.fstat(stderrfd).st_size>closed.MAX_STDERR:
+        raise ValueError('aggregate v25 capture bound after termination')
+    return accepted
+
+
+def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None, partial_refusal=False, v25=False):
     report = {'phase': phase, 'boot_executed': False, 'exact_child_reaped': False,
               'pidfd_exit_verified': False, 'status': 'NOT_STARTED'}
     with offline.TrustedOutput(output.out) as logs:
@@ -188,18 +229,30 @@ def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None, partial
             report.update(boot_executed=True, pid=child.pid, executed_argv=command)
             pidfd = os.pidfd_open(child.pid, 0)
             report['process_birth_ticks'] = closed.process_birth(child.pid)
-            closed.capture(child, pidfd, logs.pins[logs.out / 'serial.raw'],
-                           logs.pins[logs.out / 'qemu.stderr'], logs, latch)
-            report['exit_code'] = closed.reap_exact(child, pidfd)
+            if v25 and phase=='A':
+                capture_v25_a(child,pidfd,logs.pins[logs.out/'serial.raw'],logs.pins[logs.out/'qemu.stderr'],logs,latch,nonce)
+                report['exit_code']=-signal.SIGKILL
+                report['termination']='EXACT_PIDFD_SIGKILL_AFTER_HELPER_REAP_AND_CLEAN_UNMOUNT'
+            else:
+                closed.capture(child, pidfd, logs.pins[logs.out / 'serial.raw'],
+                               logs.pins[logs.out / 'qemu.stderr'], logs, latch)
+                report['exit_code'] = closed.reap_exact(child, pidfd)
             report.update(exact_child_reaped=True, pidfd_exit_verified=True)
             latch.check(); inputs.check(); output.check()
-            if report['exit_code'] != 0:
+            if report['exit_code'] != (-signal.SIGKILL if v25 and phase=='A' else 0):
                 raise ValueError('QEMU nonzero exit')
-            if partial_refusal and phase != 'B': raise ValueError('refusal oracle only for Boot B')
-            report['event'] = parse_partial_refusal(logs.read('serial.raw'),nonce,prior) if partial_refusal else parse_event(logs.read('serial.raw'), phase, nonce, prior)
-            closed.write_all(logs.pins[logs.out / 'guest-events.jsonl'],
-                             (json.dumps(report['event'], sort_keys=True) + '\n').encode())
-            report['status'] = 'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if partial_refusal else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
+            if v25:
+                if partial_refusal:raise ValueError('workload/negative case conflict')
+                report['v25']=v25_oracle.parse_phase(logs.read('serial.raw'),phase,nonce,sys.modules[__name__],prior)
+                report['event']=report['v25']['marker']
+                report['status']='DISPOSABLE_V25_PHASE_OBSERVED_NO_PRODUCTION_ADMISSION'
+                records=report['v25']['events']+[report['v25']['ack']]
+            else:
+                if partial_refusal and phase != 'B': raise ValueError('refusal oracle only for Boot B')
+                report['event'] = parse_partial_refusal(logs.read('serial.raw'),nonce,prior) if partial_refusal else parse_event(logs.read('serial.raw'), phase, nonce, prior)
+                report['status'] = 'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if partial_refusal else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
+                records=[report['event']]
+            closed.write_all(logs.pins[logs.out/'guest-events.jsonl'],b''.join((json.dumps(record,sort_keys=True)+'\n').encode() for record in records))
         except BaseException as error:
             report.update(status='FAILED_OR_LIFECYCLE_UNVERIFIED', error=str(error))
             if child is not None:
@@ -224,7 +277,13 @@ def run_boot(inputs, output, phase, nonce, qemu_hash, latch, prior=None, partial
     return report
 
 
-def prepare(name, execute=False, qemu_hash=None, negative=None):
+def prepare(name, execute=False, qemu_hash=None, negative=None, v25=False):
+    if type(v25) is not bool or (v25 and negative):raise ValueError('closed opt-in workload/negative set')
+    payload=None
+    if v25:
+        payload=offline.read_pinned(V25_ELF,v25_oracle.ELF_SHA256)
+        if len(payload)!=V25_SIZE:raise ValueError('v25 ELF size mismatch')
+        offline.static_elf(payload)
     if negative not in (None, 'partial-writing'): raise ValueError('closed negative case set')
     if os.getuid() == 0 or os.geteuid() == 0:
         raise ValueError('ordinary host UID required')
@@ -248,6 +307,7 @@ def prepare(name, execute=False, qemu_hash=None, negative=None):
         offline.read_pinned(GCC, GCC_SHA256)
         offline.read_pinned(*offline.PINS['mke2fs'])
         nonce = secrets.token_hex(16)
+        if v25 and nonce=='0'*32:raise ValueError('zero v25 nonce')
         output.create_dir(name)
         output.write('vmlinuz', os.pread(kernel, os.fstat(kernel).st_size, 0))
         source = Path(__file__).with_name('init.persistence.c').read_bytes()
@@ -264,6 +324,11 @@ def prepare(name, execute=False, qemu_hash=None, negative=None):
         entries += [('dev/console', stat.S_IFCHR | 0o600, b'', 5, 1),
                     ('etc/nonce', stat.S_IFREG | 0o600, nonce.encode(), 0, 0),
                     ('init', stat.S_IFREG | 0o700, init, 0, 0)]
+        if payload is not None:
+            entries += [('bin',stat.S_IFDIR|0o755,b'',0,0),
+                        ('bin/v25_two_boot_fixture',stat.S_IFREG|0o700,payload,0,0),
+                        ('etc/v25-workload',stat.S_IFREG|0o600,b'v25-fixture/1',0,0)]
+            output.write('v25_two_boot_fixture',payload)
         output.write('initramfs.cpio.gz', gzip.compress(offline.newc(sorted(entries)), mtime=0))
         output.write('fixture.raw', b''); diskfd = output.pins[output.out / 'fixture.raw']
         os.ftruncate(diskfd, offline.SIZE)
@@ -280,12 +345,13 @@ def prepare(name, execute=False, qemu_hash=None, negative=None):
             if stat.S_ISREG(os.fstat(fd).st_mode): os.fsync(fd)
         os.fsync(output.pins[output.out])
         report = {'schema': 1, 'status': 'DRY_RUN_UNBOOTED_NO_ADMISSION', 'admission': 'UNIMPLEMENTED', 'gate': 'CLOSED',
-                  'nonce': nonce, 'fs_uuid': fs_uuid, 'negative_case':negative, 'disk_inode': os.fstat(diskfd).st_ino,
+                  'nonce': nonce, 'fs_uuid': fs_uuid, 'negative_case':negative, 'v25_workload':v25, 'v25_elf_sha256':v25_oracle.ELF_SHA256 if v25 else None, 'disk_inode': os.fstat(diskfd).st_ino,
                   'disk_device': os.fstat(diskfd).st_dev, 'disk_retained': True, 'boots': [],
                   'source_sha256': offline.sha(Path(__file__).read_bytes()), 'pid1_source_sha256': offline.sha(source),
+                  'v25_oracle_source_sha256':offline.sha(Path(v25_oracle.__file__).read_bytes()),
                   'compiler_sha256': offline.sha(GCC.read_bytes()), 'compile_argv': command, 'mkfs_argv': mkfs,
                   'artifacts': {n: offline.sha(output.read(n)) for n in ('vmlinuz', 'initramfs.cpio.gz', 'init.bin', 'fixture.raw')},
-                  'limitations': ['No actual v25 migration/admission', 'No broker/sealing/Owner issuer',
+                  'limitations': ['No production v25 admission; disposable migration APIs only' if v25 else 'No actual v25 migration/admission', 'No broker/sealing/Owner issuer',
                                   'Orderly two-boot marker persistence only; no crash durability matrix',
                                   'Trusted host root/invoking UID/toolchain/firmware; no execution-inode attestation']}
         closed.durable_receipt(output, 'plan.json', report)
@@ -293,19 +359,21 @@ def prepare(name, execute=False, qemu_hash=None, negative=None):
             with closed.SignalLatch() as latch:
                 for phase in ('A', 'B'):
                     latch.check()
-                    prior = report['boots'][0]['event'] if phase == 'B' else None
+                    prior = (report['boots'][0]['v25'] if v25 else report['boots'][0]['event']) if phase == 'B' else None
                     if phase == 'B' and negative:
                         try:
                             report['negative_injection']=inject_partial(output,report['boots'][0])
                             latch.check()
                         except BaseException as error:
                             report.update(status='FAILED_NO_ADMISSION',negative_error=str(error)); break
-                    if phase == 'B' and negative:
+                    if v25:
+                        boot=run_boot(inputs,output,phase,nonce,qemu_hash,latch,prior,v25=True)
+                    elif phase == 'B' and negative:
                         boot = run_boot(inputs,output,phase,nonce,qemu_hash,latch,prior,partial_refusal=True)
                     else:
                         boot = run_boot(inputs,output,phase,nonce,qemu_hash,latch,prior)
                     report['boots'].append(boot)
-                    expected_status='CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if phase=='B' and negative else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
+                    expected_status='DISPOSABLE_V25_PHASE_OBSERVED_NO_PRODUCTION_ADMISSION' if v25 else 'CLOSED_PARTIAL_GATE_REFUSAL_OBSERVED_NO_ADMISSION' if phase=='B' and negative else 'CLOSED_MARKER_BOOT_OBSERVED_NO_ADMISSION'
                     if boot['status'] != expected_status or not boot['exact_child_reaped'] or not boot['pidfd_exit_verified']:
                         report['status'] = 'FAILED_NO_ADMISSION'; break
                     os.fsync(diskfd)
@@ -316,7 +384,7 @@ def prepare(name, execute=False, qemu_hash=None, negative=None):
                                 report['status']=NEGATIVE_SUCCESS
                             except BaseException as error:
                                 report.update(status='FAILED_NO_ADMISSION',negative_error=str(error))
-                        else: report['status'] = SUCCESS
+                        else: report['status'] = V25_SUCCESS if v25 else SUCCESS
                 report['final_disk_sha256'] = offline.fd_hash(diskfd)
         closed.durable_receipt(output, 'result.json', report)
         return report
@@ -328,15 +396,16 @@ def main():
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--qemu-sha256')
     parser.add_argument('--negative',choices=['partial-writing'])
+    parser.add_argument('--v25',action='store_true',help='exact reviewed disposable static ELF only; no production admission')
     args = parser.parse_args()
     try:
-        report = prepare(args.name, args.run, args.qemu_sha256,args.negative)
+        report = prepare(args.name, args.run, args.qemu_sha256,args.negative,args.v25)
     except BaseException as error:
         # Never label uncertain postlaunch receipt failures as 'not started'. Artifacts remain.
         print(json.dumps({'status':'REFUSED_OR_FAILED_LAUNCH_STATE_MUST_BE_INSPECTED', 'error':str(error), 'admission':'UNIMPLEMENTED'}), file=sys.stderr)
         return 2
     print(json.dumps(report, sort_keys=True))
-    return 0 if report['status'] in (SUCCESS, NEGATIVE_SUCCESS, 'DRY_RUN_UNBOOTED_NO_ADMISSION') else 2
+    return 0 if report['status'] in (SUCCESS, NEGATIVE_SUCCESS, V25_SUCCESS, 'DRY_RUN_UNBOOTED_NO_ADMISSION') else 2
 
 
 if __name__ == '__main__': sys.exit(main())
