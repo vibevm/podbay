@@ -22,6 +22,15 @@ process readback and interrupted-fsync repair. Its disposition is explicitly
 rebuild, rollback, production exclusion, ordinary v25 activation and live-store
 cutover remain open. The old schema-24 store remains untouched.
 
+The publication receipt verifies the original migrated snapshot with empty
+recovery tables. It becomes **historical acceptance evidence** after the first
+v25 authority mutation; re-running its unchanged-snapshot verifier then must
+fail. A separate versioned first-activation boundary must durably record that
+direction under the same manager lock and maintained reader barrier, then open
+the current v25 schema/lineage with its own authority and pending/final guards.
+The ordinary exact-v24 `PodBayStore::open` remains unchanged. No blind
+exchange-back is allowed after that activation boundary.
+
 ## Decision and rejected alternative
 
 Use a staged **copy, verify, atomic exchange** from v24 to v25. The v25

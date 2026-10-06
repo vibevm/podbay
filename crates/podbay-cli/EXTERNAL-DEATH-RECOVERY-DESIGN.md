@@ -65,6 +65,16 @@ separate exact-identity path; only an applicable class may request it.
    `external_death_pending` and fence all new launch, rebind and dispatch
    claims for that incarnation. A previously claimed effect must first be
    reconciled by its original key; pending does not assume it had no effect.
+
+   The schema-25 pending table is additive and has no trigger that fences old
+   writers. Before production v25 activation, every launch, stop, native send,
+   writer lease/use, rebind and effect-claim path must query pending/final for
+   the exact lineage/scope/Pod/incarnation in its own transaction. A global
+   authority-revision increment alone is insufficient: some rebind paths do
+   not advance that revision, and a later caller can carry a fresh one. The
+   first implementation may expose only a restricted disposable v25 prepare
+   handle and exact-key readback; it must not claim the runtime is fenced until
+   all actual paths and direct adapters have the guard.
 2. **Exclude reanimation for this slice:** require the saved activated
    rebind's boot ID to differ from the trusted current machine boot. The old
    manager and Pod processes cannot survive this boot. The exact launch
