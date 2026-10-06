@@ -14,6 +14,9 @@ use crate::store::PodBayStore;
 
 const ACTOR_VERIFIER_VERSION: &str = "podbay.ed25519/1";
 
+// Passive internal DTO capture only; no CLI or authority replay entry point.
+mod historical_snapshot;
+
 /// Fresh SQLite evidence that one trusted actor binding still names the same
 /// public verifier. This is not a peer identity or a signature proof. The
 /// caller must derive the actor/process birth from trusted policy and kernel
