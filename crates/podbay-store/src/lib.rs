@@ -38,6 +38,10 @@ pub use migration_v25::{
 };
 #[cfg(unix)]
 pub use migration_v25::{V25RecoveredIntent, recover_schema_v25_intent};
+#[cfg(unix)]
+pub use migration_v25::{V25PublicationReceipt, recover_schema_v25_receipt};
+#[cfg(target_os = "linux")]
+pub use migration_v25::persist_schema_v25_receipt;
 pub use model::{
     Admission, AdmittedLaunchInspection, AuthorityActorRecord, AuthorityGrantRecord,
     AuthorityMutation, AuthorityPodRecord, AuthorityResourceRecord, AuthorityRightRecord,

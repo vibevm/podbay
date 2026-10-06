@@ -3657,6 +3657,44 @@ impl LockedStorePreflight {
         Ok(recovered)
     }
 
+    /// Terminal publication receipt only. Maintains the existing lock and
+    /// disposable barrier; it neither activates schema 25 nor settles Pod effects.
+    pub fn finalize_keyed_v25_publication(
+        &self,
+        staging_path: &Path,
+        key: &str,
+        exclusion: &DisposableReaderExclusion<'_>,
+    ) -> Result<podbay_store::V25PublicationReceipt, DisposableExchangeError> {
+        let recovered = self.recover_keyed_staged_v25(staging_path, key, exclusion)?;
+        if recovered.orientation != podbay_store::V25ExchangeOrientation::Published {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "terminal publication receipt requires Published pair",
+                ),
+            ));
+        }
+        let receipt =
+            podbay_store::persist_schema_v25_receipt(&self.canonical_database, staging_path, key)
+                .map_err(DisposableExchangeError::PossiblyPublishedVerification)?;
+        self.verify_exchange_excludes_manager_lock(receipt.intent().staged())?;
+        Ok(receipt)
+    }
+
+    /// Reopen the terminal receipt, intent and exact Published pair without exchange.
+    pub fn recover_keyed_v25_publication(
+        &self,
+        staging_path: &Path,
+        key: &str,
+        exclusion: &DisposableReaderExclusion<'_>,
+    ) -> Result<podbay_store::V25PublicationReceipt, DisposableExchangeError> {
+        self.recover_keyed_staged_v25(staging_path, key, exclusion)?;
+        let receipt =
+            podbay_store::recover_schema_v25_receipt(&self.canonical_database, staging_path, key)
+                .map_err(DisposableExchangeError::OrientationUnknown)?;
+        self.verify_exchange_excludes_manager_lock(receipt.intent().staged())?;
+        Ok(receipt)
+    }
+
     /// Disposable exchange only; successful verification is not a durable
     /// receipt or permission for production activation. The caller retains the
     /// lock and exclusion through the return, including any post-exchange error.
@@ -3785,6 +3823,9 @@ impl LockedStorePreflight {
         let unknown_io = |error| {
             DisposableExchangeError::OrientationUnknown(podbay_store::V25StagingError::Io(error))
         };
+        staged
+            .verify_exchange_namespace()
+            .map_err(DisposableExchangeError::OrientationUnknown)?;
         let lock_path = manager_lock_path(&self.canonical_database).map_err(unknown_io)?;
         let staging_parent = staged
             .staging_path
@@ -10486,6 +10527,109 @@ mod disposable_exchange_tests {
                 .unwrap(),
             V25ExchangeOrientation::Published
         );
+    }
+
+    #[test]
+    fn exchange_refuses_all_canonical_metadata_and_sqlite_companion_staging_names() {
+        for suffix in [
+            ".v25-intent.json",
+            ".v25-intent.json.writing",
+            ".v25-publication-receipt.json",
+            ".v25-publication-receipt.json.writing",
+            "-wal",
+            "-shm",
+            "-journal",
+        ] {
+            let mut fixture = Fixture::new();
+            let before = std::fs::read(&fixture.database).unwrap();
+            let inode = std::fs::metadata(&fixture.database).unwrap().ino();
+            let mut name = fixture.database.as_os_str().to_os_string();
+            name.push(suffix);
+            let reserved = PathBuf::from(name);
+            // Model a candidate produced by an older creator, before namespace rejection.
+            std::fs::rename(&fixture.staged.staging_path, &reserved).unwrap();
+            fixture.staged.staging_path = reserved.clone();
+            let foreign_before = std::fs::read(&reserved).unwrap();
+            let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+            let exclusion = fixture.exclusion();
+            let refused = lock.exchange_staged_v25_using(
+                &fixture.staged,
+                &exclusion,
+                || panic!("reserved namespace must never reach post-exchange hook"),
+                |_, _, _| panic!("reserved namespace must never issue rename"),
+            );
+            assert!(
+                matches!(
+                    refused,
+                    Err(DisposableExchangeError::OrientationUnknown(
+                        podbay_store::V25StagingError::Safety(
+                            "staging path is reserved for canonical migration metadata or SQLite companions"
+                        )
+                    ))
+                ),
+                "{suffix}: {refused:?}"
+            );
+            let after = std::fs::read(&fixture.database).unwrap();
+            assert_eq!(after, before);
+            assert_eq!(u32::from_be_bytes(after[60..64].try_into().unwrap()), 24);
+            assert_eq!(std::fs::metadata(&fixture.database).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&reserved).unwrap(), foreign_before);
+        }
+    }
+
+    #[test]
+    fn terminal_receipt_stays_under_manager_lock_and_disposable_barrier() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        fixture
+            .staged
+            .persist_exchange_intent("key.receipt")
+            .unwrap();
+        assert!(
+            lock.finalize_keyed_v25_publication(
+                &fixture.staged.staging_path,
+                "key.receipt",
+                &exclusion
+            )
+            .is_err()
+        );
+        lock.exchange_keyed_staged_v25(&fixture.staged, "key.receipt", &exclusion)
+            .unwrap();
+        let inode = std::fs::metadata(&fixture.database).unwrap().ino();
+        let terminal = lock
+            .finalize_keyed_v25_publication(&fixture.staged.staging_path, "key.receipt", &exclusion)
+            .unwrap();
+        assert_eq!(
+            terminal.intent().orientation,
+            V25ExchangeOrientation::Published
+        );
+        assert!(fixture.barrier.try_read().is_err());
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        let repeated = lock
+            .finalize_keyed_v25_publication(&fixture.staged.staging_path, "key.receipt", &exclusion)
+            .unwrap();
+        assert_eq!(repeated.intent_digest, terminal.intent_digest);
+        assert!(
+            lock.recover_keyed_v25_publication(
+                &fixture.staged.staging_path,
+                "key.foreign",
+                &exclusion
+            )
+            .is_err()
+        );
+        drop(exclusion);
+        drop(lock);
+        let lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        let reopened = lock
+            .recover_keyed_v25_publication(&fixture.staged.staging_path, "key.receipt", &exclusion)
+            .unwrap();
+        assert_eq!(reopened.intent_digest, terminal.intent_digest);
+        assert_eq!(std::fs::metadata(&fixture.database).unwrap().ino(), inode);
     }
 
     #[test]

@@ -67,6 +67,12 @@ struct ExchangeAttestation {
 }
 
 impl V25StagingResult {
+    /// Reject staging at canonical-source metadata or SQLite companion entries.
+    /// This read-only namespace check also applies to older/recovered attestations.
+    pub fn verify_exchange_namespace(&self) -> Result<(), V25StagingError> {
+        reject_reserved_staging_path(&self.source_path, &self.staging_path)
+    }
+
     /// Revalidate a sidecar-free, non-WAL pair under an externally maintained
     /// manager lock and reader/writer exclusion. This method only reads files;
     /// it does not acquire exclusion or authorize publication.
@@ -77,6 +83,7 @@ impl V25StagingResult {
         ));
         #[cfg(unix)]
         {
+            self.verify_exchange_namespace()?;
             let proof = &self.exchange;
             verify_parent_identity(&proof.source_path, proof.parent_identity)?;
             if self.source_path != proof.source_path || self.staging_path != proof.staging_path {
@@ -465,6 +472,294 @@ pub fn recover_schema_v25_intent(
     })
 }
 
+const RECEIPT_FORMAT: &str = "podbay.disposable-v25-publication-receipt/1";
+const RECEIPT_DISPOSITION: &str = "published_unactivated";
+
+/// A verified publication receipt for a disposable unchanged pair. It certifies
+/// neither ordinary v25 activation nor settlement of any historical Pod effect.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct V25PublicationReceipt {
+    pub receipt_path: PathBuf,
+    pub intent_digest: String,
+    recovered: V25RecoveredIntent,
+}
+
+#[cfg(unix)]
+impl V25PublicationReceipt {
+    pub fn intent(&self) -> &V25RecoveredIntent {
+        &self.recovered
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublicationReceiptPayload {
+    key: String,
+    disposition: String,
+    intent_digest: String,
+    attestation: ExchangeAttestation,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurablePublicationReceipt {
+    format: String,
+    payload: PublicationReceiptPayload,
+    receipt_digest: String,
+}
+
+#[cfg(unix)]
+fn receipt_paths(source: &Path, key: &str) -> Result<(PathBuf, PathBuf), V25StagingError> {
+    // Reuse the checked key contract, with one receipt slot per canonical source.
+    intent_paths(source, key)?;
+    let mut name = source
+        .file_name()
+        .ok_or(V25StagingError::InvalidInput("source filename missing"))?
+        .to_os_string();
+    name.push(".v25-publication-receipt.json");
+    let receipt = source.with_file_name(name);
+    let mut writing = receipt.as_os_str().to_os_string();
+    writing.push(".writing");
+    Ok((receipt, PathBuf::from(writing)))
+}
+
+#[cfg(unix)]
+fn receipt_digest(payload: &PublicationReceiptPayload) -> Result<String, V25StagingError> {
+    Ok(hex_digest(&serde_json::to_vec(&(RECEIPT_FORMAT, payload))?))
+}
+
+#[cfg(unix)]
+fn open_exact_private_file(path: &Path, identity: FileIdentity) -> Result<File, V25StagingError> {
+    if private_file_identity(path, false)? != identity {
+        return Err(V25StagingError::Safety(
+            "private migration file identity changed",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_no_follow())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if (metadata.dev(), metadata.ino()) != (identity.device, identity.inode) {
+        return Err(V25StagingError::Safety(
+            "opened private migration file identity changed",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn bounded_private_bytes(path: &Path) -> Result<Vec<u8>, V25StagingError> {
+    use std::io::Read;
+    let identity = private_file_identity(path, false)?;
+    let file = open_exact_private_file(path, identity)?;
+    if file.metadata()?.len() > INTENT_MAX_BYTES {
+        return Err(V25StagingError::Safety(
+            "migration record exceeds bounded encoding",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(INTENT_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > INTENT_MAX_BYTES || private_file_identity(path, false)? != identity {
+        return Err(V25StagingError::Safety(
+            "migration record changed or exceeds bounded encoding",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Fresh-process verification of receipt, exact intent bytes and current
+/// Published pair. The same manager lock and exclusion must be maintained.
+/// This function never exchanges, writes, activates v25 or resolves old effects.
+#[cfg(unix)]
+pub fn recover_schema_v25_receipt(
+    source_path: impl AsRef<Path>,
+    staging_path: impl AsRef<Path>,
+    key: &str,
+) -> Result<V25PublicationReceipt, V25StagingError> {
+    let source_path = source_path.as_ref();
+    let staging_path = staging_path.as_ref();
+    let recovered = recover_schema_v25_intent(source_path, staging_path, key)?;
+    if recovered.orientation != V25ExchangeOrientation::Published {
+        return Err(V25StagingError::Safety(
+            "publication receipt requires exact Published orientation",
+        ));
+    }
+    let (receipt_path, writing_path) = receipt_paths(source_path, key)?;
+    refuse_occupied(&writing_path)?;
+    if staging_path == receipt_path || staging_path == writing_path {
+        return Err(V25StagingError::Safety(
+            "staging aliases a publication receipt pathname",
+        ));
+    }
+    let identity = private_file_identity(&receipt_path, false)?;
+    let bytes = bounded_private_bytes(&receipt_path)?;
+    let record: DurablePublicationReceipt = serde_json::from_slice(&bytes)?;
+    let intent_digest = hex_digest(&bounded_private_bytes(&recovered.intent_path)?);
+    if record.format != RECEIPT_FORMAT
+        || record.payload.key != key
+        || record.payload.disposition != RECEIPT_DISPOSITION
+        || record.payload.intent_digest != intent_digest
+        || record.payload.attestation != recovered.staged.exchange
+        || record.receipt_digest != receipt_digest(&record.payload)?
+    {
+        return Err(V25StagingError::Safety(
+            "publication receipt format, key, intent or payload mismatch",
+        ));
+    }
+    let reverified = recover_schema_v25_intent(source_path, staging_path, key)?;
+    if reverified.orientation != V25ExchangeOrientation::Published
+        || reverified.staged.exchange != recovered.staged.exchange
+        || hex_digest(&bounded_private_bytes(&reverified.intent_path)?) != intent_digest
+        || private_file_identity(&receipt_path, false)? != identity
+    {
+        return Err(V25StagingError::Safety(
+            "publication receipt pair or intent changed during verification",
+        ));
+    }
+    Ok(V25PublicationReceipt {
+        receipt_path,
+        intent_digest,
+        recovered: reverified,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptSyncPoint {
+    CanonicalFile,
+    StagedOldFile,
+    PairDirectory,
+    WritingReceipt,
+    PublishedReceipt,
+    ReceiptDirectory,
+}
+
+/// Persist a terminal *publication-only* receipt after repairing intent/pair
+/// durability. Requires the exact manager lock and maintained reader exclusion.
+/// A failure may leave a visible receipt, so only verified fsynced retry succeeds.
+#[cfg(target_os = "linux")]
+pub fn persist_schema_v25_receipt(
+    source_path: impl AsRef<Path>,
+    staging_path: impl AsRef<Path>,
+    key: &str,
+) -> Result<V25PublicationReceipt, V25StagingError> {
+    persist_schema_v25_receipt_with_sync(
+        source_path.as_ref(),
+        staging_path.as_ref(),
+        key,
+        |file, _| file.sync_all(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn persist_schema_v25_receipt_with_sync(
+    source_path: &Path,
+    staging_path: &Path,
+    key: &str,
+    mut sync: impl FnMut(&File, ReceiptSyncPoint) -> std::io::Result<()>,
+) -> Result<V25PublicationReceipt, V25StagingError> {
+    use std::io::Write;
+    let recovered = recover_schema_v25_intent(source_path, staging_path, key)?;
+    if recovered.orientation != V25ExchangeOrientation::Published {
+        return Err(V25StagingError::Safety(
+            "publication receipt requires exact Published orientation",
+        ));
+    }
+    let (receipt_path, writing_path) = receipt_paths(source_path, key)?;
+    refuse_occupied(&writing_path)?;
+    if staging_path == receipt_path || staging_path == writing_path {
+        return Err(V25StagingError::Safety(
+            "staging aliases a publication receipt pathname",
+        ));
+    }
+    // Repair even a visible intent whose publication directory fsync was lost.
+    recovered.staged.persist_exchange_intent(key)?;
+    let proof = &recovered.staged.exchange;
+    let directory = pinned_parent_directory(source_path, proof.parent_identity)?;
+    let canonical = open_exact_private_file(source_path, proof.staging_identity)?;
+    let old = open_exact_private_file(staging_path, proof.source_identity)?;
+    sync(&canonical, ReceiptSyncPoint::CanonicalFile)?;
+    sync(&old, ReceiptSyncPoint::StagedOldFile)?;
+    sync(&directory, ReceiptSyncPoint::PairDirectory)?;
+    let reverified = recover_schema_v25_intent(source_path, staging_path, key)?;
+    if reverified.orientation != V25ExchangeOrientation::Published
+        || reverified.staged.exchange != *proof
+    {
+        return Err(V25StagingError::Safety(
+            "Published pair changed during receipt preparation",
+        ));
+    }
+    let payload = PublicationReceiptPayload {
+        key: key.to_owned(),
+        disposition: RECEIPT_DISPOSITION.to_owned(),
+        intent_digest: hex_digest(&bounded_private_bytes(&reverified.intent_path)?),
+        attestation: proof.clone(),
+    };
+    match fs::symlink_metadata(&receipt_path) {
+        Ok(_) => {
+            let prior = recover_schema_v25_receipt(source_path, staging_path, key)?;
+            if prior.intent_digest != payload.intent_digest
+                || prior.recovered.staged.exchange != payload.attestation
+            {
+                return Err(V25StagingError::Safety(
+                    "publication receipt already binds different payload",
+                ));
+            }
+            let identity = private_file_identity(&receipt_path, false)?;
+            let file = open_exact_private_file(&receipt_path, identity)?;
+            sync(&file, ReceiptSyncPoint::PublishedReceipt)?;
+            sync(&directory, ReceiptSyncPoint::ReceiptDirectory)?;
+            let result = recover_schema_v25_receipt(source_path, staging_path, key)?;
+            if result.intent_digest != payload.intent_digest
+                || private_file_identity(&receipt_path, false)? != identity
+            {
+                return Err(V25StagingError::Safety(
+                    "publication receipt changed during durability repair",
+                ));
+            }
+            return Ok(result);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let record = DurablePublicationReceipt {
+        format: RECEIPT_FORMAT.to_owned(),
+        receipt_digest: receipt_digest(&payload)?,
+        payload,
+    };
+    let bytes = serde_json::to_vec(&record)?;
+    if bytes.len() as u64 > INTENT_MAX_BYTES {
+        return Err(V25StagingError::Safety(
+            "publication receipt exceeds bounded encoding",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc_no_follow())
+        .open(&writing_path)?;
+    file.write_all(&bytes)?;
+    sync(&file, ReceiptSyncPoint::WritingReceipt)?;
+    drop(file);
+    private_file_identity(&writing_path, false)?;
+    verify_parent_identity(source_path, proof.parent_identity)?;
+    rustix::fs::renameat_with(
+        &directory,
+        writing_path.file_name().expect("writing filename"),
+        &directory,
+        receipt_path.file_name().expect("receipt filename"),
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)?;
+    sync(&directory, ReceiptSyncPoint::ReceiptDirectory)?;
+    recover_schema_v25_receipt(source_path, staging_path, key)
+}
+
 fn reject_exchange_sidecars(path: &Path) -> Result<(), V25StagingError> {
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut name = OsString::from(path.as_os_str());
@@ -750,6 +1045,43 @@ pub fn stage_schema_v25(
     })
 }
 
+fn reject_reserved_staging_path(
+    source_path: &Path,
+    staging_path: &Path,
+) -> Result<(), V25StagingError> {
+    let canonical_source = fs::canonicalize(source_path)?;
+    let parent = staging_path
+        .parent()
+        .ok_or(V25StagingError::InvalidInput("staging path has no parent"))?;
+    let normalized_staging = fs::canonicalize(parent)?.join(
+        staging_path
+            .file_name()
+            .ok_or(V25StagingError::InvalidInput("staging filename is missing"))?,
+    );
+    // Reserve only these exact canonical-source names, not arbitrary suffixes.
+    for suffix in [
+        ".v25-intent.json",
+        ".v25-intent.json.writing",
+        ".v25-publication-receipt.json",
+        ".v25-publication-receipt.json.writing",
+        "-wal",
+        "-shm",
+        "-journal",
+    ] {
+        let mut name = canonical_source
+            .file_name()
+            .ok_or(V25StagingError::InvalidInput("source filename is missing"))?
+            .to_os_string();
+        name.push(suffix);
+        if normalized_staging == canonical_source.with_file_name(name) {
+            return Err(V25StagingError::Safety(
+                "staging path is reserved for canonical migration metadata or SQLite companions",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_path_pair(source_path: &Path, staging_path: &Path) -> Result<(), V25StagingError> {
     if !source_path.is_absolute() || !staging_path.is_absolute() {
         return Err(V25StagingError::InvalidInput(
@@ -799,6 +1131,7 @@ fn validate_path_pair(source_path: &Path, staging_path: &Path) -> Result<(), V25
             "staging path is the reserved manager lock pathname",
         ));
     }
+    reject_reserved_staging_path(source_path, staging_path)?;
     match fs::symlink_metadata(staging_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(V25StagingError::Safety("staging path is already occupied")),
@@ -1193,6 +1526,177 @@ mod durable_intent_sync_tests {
                 .unwrap()
                 .orientation,
             V25ExchangeOrientation::Unpublished
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod durable_receipt_sync_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn recovered_older_intent_refuses_reserved_receipt_and_sqlite_staging_names() {
+        for suffix in [
+            ".v25-publication-receipt.json",
+            ".v25-publication-receipt.json.writing",
+            "-wal",
+            "-shm",
+            "-journal",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "podbay-reserved-recovery-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let source = directory.join("podbay.sqlite");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&source)
+                .unwrap();
+            drop(PodBayStore::open(&source).unwrap());
+            let connection = Connection::open(&source).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode=DELETE;")
+                .unwrap();
+            drop(connection);
+            let staged = stage_schema_v25(&source, directory.join("staged.sqlite")).unwrap();
+            let intent = staged.persist_exchange_intent("key.older").unwrap();
+            let mut name = source.as_os_str().to_os_string();
+            name.push(suffix);
+            let reserved = PathBuf::from(name);
+            fs::rename(&staged.staging_path, &reserved).unwrap();
+            // Reconstruct a checksum-valid legacy intent with exact unchanged inodes/content.
+            let mut record: DurableIntent =
+                serde_json::from_slice(&fs::read(&intent).unwrap()).unwrap();
+            record.attestation.staging_path = reserved.clone();
+            record.attestation_digest =
+                attestation_digest("key.older", &record.attestation).unwrap();
+            fs::write(&intent, serde_json::to_vec(&record).unwrap()).unwrap();
+            drop(staged);
+            let source_before = fs::read(&source).unwrap();
+            let foreign_before = fs::read(&reserved).unwrap();
+            let refused = recover_schema_v25_intent(&source, &reserved, "key.older");
+            assert!(
+                matches!(
+                    refused,
+                    Err(V25StagingError::Safety(
+                        "staging path is reserved for canonical migration metadata or SQLite companions"
+                    ))
+                ),
+                "{suffix}: {refused:?}"
+            );
+            assert_eq!(fs::read(&source).unwrap(), source_before);
+            assert_eq!(fs::read(&reserved).unwrap(), foreign_before);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn receipt_post_rename_retry_repairs_fsync_and_refuses_every_repair_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "podbay-receipt-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = directory.join("podbay.sqlite");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source)
+            .unwrap();
+        drop(PodBayStore::open(&source).unwrap());
+        let c = Connection::open(&source).unwrap();
+        c.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        drop(c);
+        let stage = directory.join("staged.sqlite");
+        let staged = stage_schema_v25(&source, &stage).unwrap();
+        staged.persist_exchange_intent("key.receipt").unwrap();
+        let dir = File::open(&directory).unwrap();
+        rustix::fs::renameat_with(
+            &dir,
+            source.file_name().unwrap(),
+            &dir,
+            stage.file_name().unwrap(),
+            rustix::fs::RenameFlags::EXCHANGE,
+        )
+        .unwrap();
+        drop(staged);
+        let (receipt, writing) = receipt_paths(&source, "key.receipt").unwrap();
+        let first =
+            persist_schema_v25_receipt_with_sync(&source, &stage, "key.receipt", |file, point| {
+                if point == ReceiptSyncPoint::ReceiptDirectory {
+                    assert!(receipt.exists());
+                    assert!(!writing.exists());
+                    return Err(std::io::Error::other(
+                        "injected after receipt rename before dir fsync",
+                    ));
+                }
+                file.sync_all()
+            });
+        assert!(matches!(first, Err(V25StagingError::Io(_))));
+        assert!(receipt.exists());
+        for fail in [
+            ReceiptSyncPoint::CanonicalFile,
+            ReceiptSyncPoint::StagedOldFile,
+            ReceiptSyncPoint::PairDirectory,
+            ReceiptSyncPoint::PublishedReceipt,
+            ReceiptSyncPoint::ReceiptDirectory,
+        ] {
+            let mut calls = Vec::new();
+            let retry = persist_schema_v25_receipt_with_sync(
+                &source,
+                &stage,
+                "key.receipt",
+                |file, point| {
+                    calls.push(point);
+                    if point == fail {
+                        return Err(std::io::Error::other("injected receipt retry sync failure"));
+                    }
+                    file.sync_all()
+                },
+            );
+            assert!(matches!(retry, Err(V25StagingError::Io(_))));
+            assert_eq!(calls.last(), Some(&fail));
+        }
+        let mut repaired = Vec::new();
+        let terminal =
+            persist_schema_v25_receipt_with_sync(&source, &stage, "key.receipt", |file, point| {
+                repaired.push(point);
+                file.sync_all()
+            })
+            .unwrap();
+        assert_eq!(terminal.receipt_path, receipt);
+        assert_eq!(
+            repaired,
+            [
+                ReceiptSyncPoint::CanonicalFile,
+                ReceiptSyncPoint::StagedOldFile,
+                ReceiptSyncPoint::PairDirectory,
+                ReceiptSyncPoint::PublishedReceipt,
+                ReceiptSyncPoint::ReceiptDirectory
+            ]
+        );
+        assert_eq!(
+            recover_schema_v25_receipt(&source, &stage, "key.receipt")
+                .unwrap()
+                .intent()
+                .orientation,
+            V25ExchangeOrientation::Published
         );
         fs::remove_dir_all(directory).unwrap();
     }
