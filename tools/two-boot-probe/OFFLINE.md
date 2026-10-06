@@ -2,9 +2,11 @@
 
 `offline.py` assembles local direct-kernel inputs. Its exit 0 means assembly
 succeeded. **It does not mean a boot happened or a two-boot proof passed.** There
-is no VM runner, persistent broker, sealed worker, admission transition, recovery
-implementation or production interface. `init.closed` is a reviewed source
-candidate with offline checks only; guest execution is unverified.
+is a separate [CLOSED-stub QEMU runner preparation](CLOSED-VM.md), but its live
+branch has not been executed. There is no persistent broker, sealed worker,
+admission transition, recovery implementation or production interface.
+`init.closed` is a reviewed source candidate with offline checks only; guest
+execution is unverified.
 
 Inputs are fixed: the explicit local ISO, its complete SHA-256 and kernel extent,
 exact config and `modules.builtin` from its minimal squashfs, static x86_64

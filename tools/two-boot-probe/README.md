@@ -1,7 +1,9 @@
-# Two-boot fixture preparation — design only
+# Two-boot fixture preparation
 
-This directory has a read-only offline inventory and an implementation contract.
-There is **no VM runner, boot result, production admission or deployment capability**.
+This directory has a read-only inventory, an offline CLOSED-stub assembler and a
+[QEMU runner preparation](CLOSED-VM.md). Its runner has passed dry-run and fake
+child tests only. There is **no observed VM boot, production admission or
+deployment capability**; QEMU was absent when these checks ran.
 `inventory.py` prints JSON and always exits 3 (`BLOCKED_NOT_BOOTED`). It opens
 only the explicit ISO and device metadata, never the KVM device itself. It does
 not execute discovered tools, extract files, download inputs or change services.
