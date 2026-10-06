@@ -575,3 +575,29 @@ fn source_and_parent_privacy_are_required() {
         Err(V25StagingError::Safety(_))
     ));
 }
+
+#[test]
+fn refuses_manager_lock_names_before_creating_staging() {
+    let fixture = Fixture::new();
+    let before = fixture.source_summary();
+    let alias_parent = fixture.directory.join("alias-parent");
+    std::os::unix::fs::symlink(&fixture.directory, &alias_parent).unwrap();
+    for path in [
+        fixture.directory.join("podbay.sqlite.manager.lock"),
+        fixture.directory.join("other.sqlite.manager.lock"),
+        fixture.directory.join("./podbay.sqlite.manager.lock"),
+        alias_parent.join("podbay.sqlite.manager.lock"),
+    ] {
+        assert!(matches!(
+            stage_schema_v25(&fixture.source, &path),
+            Err(V25StagingError::Safety(
+                "staging basename uses the reserved manager lock suffix"
+            ))
+        ));
+        assert!(
+            !path.exists(),
+            "reserved entry must not be created before manager acquisition"
+        );
+        assert_eq!(fixture.source_summary(), before);
+    }
+}

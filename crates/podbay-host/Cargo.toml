@@ -17,6 +17,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [lib]
 path = "src/lib.rs"

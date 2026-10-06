@@ -33,7 +33,7 @@ pub use current_snapshot::CURRENT_SCOPE_ENTITY_LIMIT;
 pub use later_turn::{LaterCodexSendRecord, LaterCodexSendSelector, TrustedLaterCodexSendRequest};
 pub use manager_peer::SqliteManagerPeerWitness;
 pub use migration_v25::{
-    V25PreservedTable, V25SequenceHighWater, V25StagingError, V25StagingResult,
+    V25ExchangeOrientation, V25PreservedTable, V25SequenceHighWater, V25StagingError, V25StagingResult,
     stage_schema_v25,
 };
 pub use model::{

@@ -39,6 +39,161 @@ pub struct V25StagingResult {
     pub staging_schema_version: i64,
     pub preserved_tables: Vec<V25PreservedTable>,
     pub sequence_high_water: Vec<V25SequenceHighWater>,
+    #[cfg(unix)]
+    exchange: ExchangeAttestation,
+}
+
+/// Verified orientation of the exact staged pair, not a durable migration receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V25ExchangeOrientation {
+    Unpublished,
+    Published,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExchangeAttestation {
+    source_path: PathBuf,
+    staging_path: PathBuf,
+    source_identity: FileIdentity,
+    staging_identity: FileIdentity,
+    source: StoreSnapshot,
+    staging: StoreSnapshot,
+}
+
+impl V25StagingResult {
+    /// Revalidate a sidecar-free, non-WAL pair under an externally maintained
+    /// manager lock and reader/writer exclusion. This method only reads files;
+    /// it does not acquire exclusion or authorize publication.
+    pub fn verify_exchange_orientation(&self) -> Result<V25ExchangeOrientation, V25StagingError> {
+        #[cfg(not(unix))]
+        return Err(V25StagingError::Safety(
+            "exchange verification requires Unix",
+        ));
+        #[cfg(unix)]
+        {
+            let proof = &self.exchange;
+            if self.source_path != proof.source_path || self.staging_path != proof.staging_path {
+                return Err(V25StagingError::Safety("staged pair paths were changed"));
+            }
+            reject_exchange_sidecars(&proof.source_path)?;
+            reject_exchange_sidecars(&proof.staging_path)?;
+            let source_identity = private_file_identity(&proof.source_path, false)?;
+            let staging_identity = private_file_identity(&proof.staging_path, false)?;
+            let (orientation, expected_source, expected_staging) = if source_identity
+                == proof.source_identity
+                && staging_identity == proof.staging_identity
+            {
+                (
+                    V25ExchangeOrientation::Unpublished,
+                    &proof.source,
+                    &proof.staging,
+                )
+            } else if source_identity == proof.staging_identity
+                && staging_identity == proof.source_identity
+            {
+                (
+                    V25ExchangeOrientation::Published,
+                    &proof.staging,
+                    &proof.source,
+                )
+            } else {
+                return Err(V25StagingError::Safety(
+                    "staged pair inode orientation changed",
+                ));
+            };
+            for (path, expected) in [
+                (&proof.source_path, expected_source),
+                (&proof.staging_path, expected_staging),
+            ] {
+                let connection = open_exchange_read_only(path)?;
+                let journal_mode: String =
+                    connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                if journal_mode != "delete" {
+                    return Err(V25StagingError::Safety(
+                        "exchange requires DELETE journal mode",
+                    ));
+                }
+                verify_integrity(&connection)?;
+                verify_foreign_keys(&connection)?;
+                verify_current_v2_bindings(&connection)?;
+                if expected.version == STAGING_SCHEMA_VERSION {
+                    verify_recovery_tables_empty(&connection)?;
+                }
+                if &snapshot(&connection)? != expected {
+                    return Err(V25StagingError::Safety(
+                        "staged pair exact snapshot changed",
+                    ));
+                }
+            }
+            reject_exchange_sidecars(&proof.source_path)?;
+            reject_exchange_sidecars(&proof.staging_path)?;
+            if private_file_identity(&proof.source_path, false)? != source_identity
+                || private_file_identity(&proof.staging_path, false)? != staging_identity
+            {
+                return Err(V25StagingError::Safety(
+                    "staged pair inode changed during verification",
+                ));
+            }
+            Ok(orientation)
+        }
+    }
+}
+
+fn reject_exchange_sidecars(path: &Path) -> Result<(), V25StagingError> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut name = OsString::from(path.as_os_str());
+        name.push(suffix);
+        match fs::symlink_metadata(Path::new(&name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(V25StagingError::Safety(
+                    "exchange refuses every SQLite sidecar",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_exchange_read_only(path: &Path) -> Result<Connection, V25StagingError> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    // immutable=1 prevents SQLite from creating WAL/SHM or recovering journals.
+    // It is sound here only with the maintained exclusion and sidecar refusal.
+    let mut header = [0u8; 20];
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_no_follow())
+        .open(path)?
+        .read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" || header[18] != 1 || header[19] != 1 {
+        return Err(V25StagingError::Safety(
+            "exchange refuses WAL-format main files",
+        ));
+    }
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.".contains(byte) {
+            uri.push(char::from(*byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )?)
+}
+
+#[cfg(unix)]
+fn libc_no_follow() -> i32 {
+    nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC
 }
 
 #[derive(Debug)]
@@ -229,6 +384,17 @@ pub fn stage_schema_v25(
             "source logical content changed while staging",
         ));
     }
+    drop(source_after_connection);
+
+    #[cfg(unix)]
+    let exchange = ExchangeAttestation {
+        source_path: source_path.to_path_buf(),
+        staging_path: staging_path.to_path_buf(),
+        source_identity,
+        staging_identity,
+        source: source_before.clone(),
+        staging: staged_v25.clone(),
+    };
 
     Ok(V25StagingResult {
         source_path: source_path.to_path_buf(),
@@ -238,6 +404,8 @@ pub fn stage_schema_v25(
         staging_schema_version: staged_v25.version,
         preserved_tables: source_before.tables,
         sequence_high_water: source_before.sequences,
+        #[cfg(unix)]
+        exchange,
     })
 }
 
@@ -252,6 +420,14 @@ fn validate_path_pair(source_path: &Path, staging_path: &Path) -> Result<(), V25
             "staging path must be distinct from source",
         ));
     }
+    if staging_path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(".manager.lock"))
+    {
+        return Err(V25StagingError::Safety(
+            "staging basename uses the reserved manager lock suffix",
+        ));
+    }
     let source_parent = source_path
         .parent()
         .ok_or(V25StagingError::InvalidInput("source path has no parent"))?;
@@ -261,6 +437,25 @@ fn validate_path_pair(source_path: &Path, staging_path: &Path) -> Result<(), V25
     if fs::canonicalize(source_parent)? != fs::canonicalize(staging_parent)? {
         return Err(V25StagingError::Safety(
             "staging path must be in the source directory",
+        ));
+    }
+    // The manager lock belongs to the canonical database filename, independent
+    // of whether it exists yet. Never create staging at that reserved entry.
+    let canonical_source = fs::canonicalize(source_path)?;
+    let mut lock_name = canonical_source
+        .file_name()
+        .ok_or(V25StagingError::InvalidInput("source filename is missing"))?
+        .to_os_string();
+    lock_name.push(".manager.lock");
+    let reserved_lock = canonical_source.with_file_name(lock_name);
+    let normalized_staging = fs::canonicalize(staging_parent)?.join(
+        staging_path
+            .file_name()
+            .ok_or(V25StagingError::InvalidInput("staging filename is missing"))?,
+    );
+    if normalized_staging == reserved_lock {
+        return Err(V25StagingError::Safety(
+            "staging path is the reserved manager lock pathname",
         ));
     }
     match fs::symlink_metadata(staging_path) {

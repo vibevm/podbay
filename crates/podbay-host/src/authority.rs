@@ -3557,6 +3557,233 @@ fn recheck_current_manager(
     Ok(peer.peer().clone())
 }
 
+/// Lock-only preflight: neither ordinary SQLite open nor Owner replay occurs.
+/// The lock key and acquisition are identical to `DurableAuthority::open`.
+#[cfg(target_os = "linux")]
+pub struct LockedStorePreflight {
+    _manager_lock: File,
+    canonical_database: PathBuf,
+}
+
+/// Test-harness reader/writer exclusion for one disposable database.
+/// There is deliberately no production constructor: a manager lock is not
+/// evidence that legacy Pod readers, direct writers or relaunches are excluded.
+#[cfg(target_os = "linux")]
+pub struct DisposableReaderExclusion<'a> {
+    database: &'a Path,
+    _barrier: std::sync::RwLockWriteGuard<'a, ()>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum DisposableExchangeError {
+    /// Verification failed; no exchange was issued by this call. If this is a
+    /// retry, the on-disk orientation may nevertheless already be published.
+    OrientationUnknown(podbay_store::V25StagingError),
+    BeforeExchange(std::io::Error),
+    /// Exchange succeeded, or published orientation was observed, but a later
+    /// durability/verification gate failed. Never automatically exchange back.
+    PossiblyPublished(std::io::Error),
+    PossiblyPublishedVerification(podbay_store::V25StagingError),
+    ExchangeOutcomeUnknown {
+        syscall: std::io::Error,
+        verification: podbay_store::V25StagingError,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl LockedStorePreflight {
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Self, DurableAuthorityError> {
+        let path = path.as_ref();
+        let (manager_lock, canonical_database) = acquire_manager_lock(path)?;
+        if path != canonical_database {
+            return Err(DurableAuthorityError::Corrupt(
+                "offline preflight requires canonical database path",
+            ));
+        }
+        Ok(Self {
+            _manager_lock: manager_lock,
+            canonical_database,
+        })
+    }
+
+    pub fn canonical_database(&self) -> &Path {
+        &self.canonical_database
+    }
+
+    /// Disposable exchange only; successful verification is not a durable
+    /// receipt or permission for production activation. The caller retains the
+    /// lock and exclusion through the return, including any post-exchange error.
+    pub fn exchange_staged_v25(
+        &mut self,
+        staged: &podbay_store::V25StagingResult,
+        exclusion: &DisposableReaderExclusion<'_>,
+    ) -> Result<podbay_store::V25ExchangeOrientation, DisposableExchangeError> {
+        self.exchange_staged_v25_inner(staged, exclusion, || Ok(()))
+    }
+
+    fn exchange_staged_v25_inner(
+        &mut self,
+        staged: &podbay_store::V25StagingResult,
+        exclusion: &DisposableReaderExclusion<'_>,
+        after_exchange: impl FnOnce() -> std::io::Result<()>,
+    ) -> Result<podbay_store::V25ExchangeOrientation, DisposableExchangeError> {
+        self.exchange_staged_v25_using(
+            staged,
+            exclusion,
+            after_exchange,
+            |directory, source, target| {
+                rustix::fs::renameat_with(
+                    directory,
+                    source,
+                    directory,
+                    target,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+                .map_err(Into::into)
+            },
+        )
+    }
+
+    fn exchange_staged_v25_using(
+        &mut self,
+        staged: &podbay_store::V25StagingResult,
+        exclusion: &DisposableReaderExclusion<'_>,
+        after_exchange: impl FnOnce() -> std::io::Result<()>,
+        exchange: impl FnOnce(&File, &std::ffi::OsStr, &std::ffi::OsStr) -> std::io::Result<()>,
+    ) -> Result<podbay_store::V25ExchangeOrientation, DisposableExchangeError> {
+        use podbay_store::V25ExchangeOrientation;
+        if staged.source_path != self.canonical_database
+            || exclusion.database != self.canonical_database
+        {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "exchange is not bound to this lock and exclusion database",
+                ),
+            ));
+        }
+        self.verify_exchange_excludes_manager_lock(staged)?;
+        let orientation = staged
+            .verify_exchange_orientation()
+            .map_err(DisposableExchangeError::OrientationUnknown)?;
+        let parent = self.canonical_database.parent().ok_or_else(|| {
+            DisposableExchangeError::OrientationUnknown(podbay_store::V25StagingError::Safety(
+                "database parent missing",
+            ))
+        })?;
+        let directory = File::open(parent).map_err(|error| match orientation {
+            V25ExchangeOrientation::Unpublished => DisposableExchangeError::BeforeExchange(error),
+            V25ExchangeOrientation::Published => DisposableExchangeError::PossiblyPublished(error),
+        })?;
+        if orientation == V25ExchangeOrientation::Unpublished {
+            // Repeat persistence immediately before publication. No two-rename fallback.
+            File::open(&staged.source_path)
+                .and_then(|file| file.sync_all())
+                .map_err(DisposableExchangeError::BeforeExchange)?;
+            File::open(&staged.staging_path)
+                .and_then(|file| file.sync_all())
+                .map_err(DisposableExchangeError::BeforeExchange)?;
+            directory
+                .sync_all()
+                .map_err(DisposableExchangeError::BeforeExchange)?;
+            let source_name = self
+                .canonical_database
+                .file_name()
+                .expect("canonical filename");
+            let staging_name = staged
+                .staging_path
+                .file_name()
+                .expect("verified staging filename");
+            if let Err(syscall) = exchange(&directory, source_name, staging_name) {
+                return Err(match staged.verify_exchange_orientation() {
+                    Ok(V25ExchangeOrientation::Unpublished) => {
+                        DisposableExchangeError::BeforeExchange(syscall)
+                    }
+                    Ok(V25ExchangeOrientation::Published) => {
+                        DisposableExchangeError::PossiblyPublished(syscall)
+                    }
+                    Err(verification) => DisposableExchangeError::ExchangeOutcomeUnknown {
+                        syscall,
+                        verification,
+                    },
+                });
+            }
+            after_exchange().map_err(DisposableExchangeError::PossiblyPublished)?;
+        }
+        directory
+            .sync_all()
+            .map_err(DisposableExchangeError::PossiblyPublished)?;
+        let verified = staged
+            .verify_exchange_orientation()
+            .map_err(DisposableExchangeError::PossiblyPublishedVerification)?;
+        if verified != V25ExchangeOrientation::Published {
+            return Err(DisposableExchangeError::PossiblyPublishedVerification(
+                podbay_store::V25StagingError::Safety(
+                    "exchange did not retain the published orientation",
+                ),
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_exchange_excludes_manager_lock(
+        &self,
+        staged: &podbay_store::V25StagingResult,
+    ) -> Result<(), DisposableExchangeError> {
+        let refuse = |message| {
+            DisposableExchangeError::OrientationUnknown(podbay_store::V25StagingError::Safety(
+                message,
+            ))
+        };
+        // Orientation has not been observed yet; retries may already be published.
+        let unknown_io = |error| {
+            DisposableExchangeError::OrientationUnknown(podbay_store::V25StagingError::Io(error))
+        };
+        let lock_path = manager_lock_path(&self.canonical_database).map_err(unknown_io)?;
+        let staging_parent = staged
+            .staging_path
+            .parent()
+            .ok_or_else(|| refuse("staging parent missing"))?;
+        let staging_name = staged
+            .staging_path
+            .file_name()
+            .ok_or_else(|| refuse("staging filename missing"))?;
+        if staging_name.to_string_lossy().ends_with(".manager.lock") {
+            return Err(refuse(
+                "exchange staging basename uses the reserved manager lock suffix",
+            ));
+        }
+        let normalized_staging = std::fs::canonicalize(staging_parent)
+            .map_err(unknown_io)?
+            .join(staging_name);
+        if normalized_staging == lock_path {
+            return Err(refuse(
+                "exchange staging path is the reserved manager lock pathname",
+            ));
+        }
+        let held = self._manager_lock.metadata().map_err(unknown_io)?;
+        let named = std::fs::symlink_metadata(&lock_path).map_err(unknown_io)?;
+        if !named.is_file()
+            || (named.dev(), named.ino()) != (held.dev(), held.ino())
+            || held.nlink() != 1
+            || named.nlink() != 1
+            || std::fs::canonicalize(&lock_path).map_err(unknown_io)? != lock_path
+        {
+            return Err(refuse(
+                "manager lock pathname no longer names the held single-link inode",
+            ));
+        }
+        for path in [&staged.source_path, &staged.staging_path] {
+            let metadata = std::fs::metadata(path).map_err(unknown_io)?;
+            if (metadata.dev(), metadata.ino()) == (held.dev(), held.ino()) {
+                return Err(refuse(
+                    "exchange database path aliases the held manager lock inode",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 /// SQLite-backed authority. Recorded actors and grants are inert after reopen
 /// until trusted replay. Dispatch here is an authority gate, not durable command
 /// admission; PB09 must issue the durable receipt before production effects.
@@ -9449,14 +9676,7 @@ fn acquire_manager_lock(database: &Path) -> Result<(File, PathBuf), DurableAutho
         ))?;
         std::fs::canonicalize(parent)?.join(file_name)
     };
-    let mut lock_name = canonical_database
-        .file_name()
-        .ok_or(DurableAuthorityError::Corrupt(
-            "database filename is missing",
-        ))?
-        .to_os_string();
-    lock_name.push(".manager.lock");
-    let lock_path: PathBuf = canonical_database.with_file_name(lock_name);
+    let lock_path = manager_lock_path(&canonical_database)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -9495,6 +9715,14 @@ fn acquire_manager_lock(database: &Path) -> Result<(File, PathBuf), DurableAutho
     }
 }
 
+fn manager_lock_path(canonical_database: &Path) -> std::io::Result<PathBuf> {
+    let mut lock_name = canonical_database
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("database filename is missing"))?
+        .to_os_string();
+    lock_name.push(".manager.lock");
+    Ok(canonical_database.with_file_name(lock_name))
+}
 fn apply_recorded_mutation(snapshot: &mut AuthoritySnapshot, mutation: AuthorityMutation) {
     match mutation {
         AuthorityMutation::PutPod(record) => {
@@ -10051,6 +10279,559 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod disposable_exchange_tests {
+    use super::*;
+    use podbay_store::{V25ExchangeOrientation, V25StagingResult, stage_schema_v25};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::RwLock;
+
+    struct Fixture {
+        directory: PathBuf,
+        database: PathBuf,
+        staged: V25StagingResult,
+        barrier: RwLock<()>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "podbay-disposable-exchange-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let database = directory.join("podbay.sqlite");
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&database)
+                .unwrap();
+            drop(PodBayStore::open(&database).unwrap());
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode=DELETE;")
+                .unwrap();
+            drop(connection);
+            let staged =
+                stage_schema_v25(&database, directory.join("podbay.sqlite.staged")).unwrap();
+            Self {
+                directory,
+                database,
+                staged,
+                barrier: RwLock::new(()),
+            }
+        }
+
+        fn exclusion(&self) -> DisposableReaderExclusion<'_> {
+            DisposableReaderExclusion {
+                database: &self.database,
+                _barrier: self.barrier.write().unwrap(),
+            }
+        }
+
+        fn epochs(&self) -> (i64, i64) {
+            let connection = rusqlite::Connection::open_with_flags(
+                &self.database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            (
+                connection
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key='owner_epoch'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key='authority_revision'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_keeps_same_manager_lock_and_test_reader_barrier() {
+        let fixture = Fixture::new();
+        let epochs = fixture.epochs();
+        let before = std::fs::metadata(&fixture.database).unwrap().ino();
+        let target = std::fs::metadata(&fixture.staged.staging_path)
+            .unwrap()
+            .ino();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        let blocked_reader = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| assert!(fixture.barrier.try_read().is_err()))
+                    .join()
+                    .unwrap();
+            });
+        };
+        blocked_reader();
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        assert_eq!(
+            lock.exchange_staged_v25_inner(&fixture.staged, &exclusion, || {
+                blocked_reader();
+                assert!(matches!(
+                    LockedStorePreflight::acquire(&fixture.database),
+                    Err(DurableAuthorityError::Busy)
+                ));
+                Ok(())
+            })
+            .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        blocked_reader();
+        assert_eq!(std::fs::metadata(&fixture.database).unwrap().ino(), target);
+        assert_eq!(
+            std::fs::metadata(&fixture.staged.staging_path)
+                .unwrap()
+                .ino(),
+            before
+        );
+        assert_eq!(fixture.epochs(), epochs);
+        assert!(matches!(
+            PodBayStore::open_existing_read_only(&fixture.database),
+            Err(podbay_store::StoreError::UnsupportedSchema(25))
+        ));
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        drop(exclusion);
+        assert!(fixture.barrier.try_read().is_ok());
+        drop(lock);
+        let _reacquired = LockedStorePreflight::acquire(&fixture.database).unwrap();
+    }
+
+    #[test]
+    fn disposable_exchange_retry_after_publication_never_exchanges_back() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        let failure = lock.exchange_staged_v25_inner(&fixture.staged, &exclusion, || {
+            Err(std::io::Error::other(
+                "injected failure after exchange before directory fsync",
+            ))
+        });
+        assert!(matches!(
+            failure,
+            Err(DisposableExchangeError::PossiblyPublished(_))
+        ));
+        assert_eq!(
+            fixture.staged.verify_exchange_orientation().unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        let canonical_inode = std::fs::metadata(&fixture.database).unwrap().ino();
+        let staging_inode = std::fs::metadata(&fixture.staged.staging_path)
+            .unwrap()
+            .ino();
+        assert_eq!(
+            lock.exchange_staged_v25_inner(&fixture.staged, &exclusion, || {
+                panic!("published retry must not issue another exchange")
+            })
+            .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.database).unwrap().ino(),
+            canonical_inode
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.staged.staging_path)
+                .unwrap()
+                .ino(),
+            staging_inode
+        );
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_every_source_or_staging_sidecar() {
+        for staging in [false, true] {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let fixture = Fixture::new();
+                let path = if staging {
+                    &fixture.staged.staging_path
+                } else {
+                    &fixture.database
+                };
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let sidecar = PathBuf::from(sidecar);
+                std::fs::write(&sidecar, b"foreign sidecar").unwrap();
+                let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+                let exclusion = fixture.exclusion();
+                assert!(matches!(
+                    lock.exchange_staged_v25(&fixture.staged, &exclusion),
+                    Err(DisposableExchangeError::OrientationUnknown(_))
+                ));
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"foreign sidecar");
+                std::fs::remove_file(sidecar).unwrap();
+                assert_eq!(
+                    fixture.staged.verify_exchange_orientation().unwrap(),
+                    V25ExchangeOrientation::Unpublished
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_classifies_syscall_failure_from_verified_orientation() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        let refused = lock.exchange_staged_v25_using(
+            &fixture.staged,
+            &exclusion,
+            || panic!("unsupported exchange must not reach post-publication hook"),
+            |_, _, _| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+        );
+        assert!(matches!(
+            refused,
+            Err(DisposableExchangeError::BeforeExchange(_))
+        ));
+        assert_eq!(
+            fixture.staged.verify_exchange_orientation().unwrap(),
+            V25ExchangeOrientation::Unpublished
+        );
+
+        let interrupted = lock.exchange_staged_v25_using(
+            &fixture.staged,
+            &exclusion,
+            || panic!("reported syscall error must classify orientation first"),
+            |directory, source, target| {
+                rustix::fs::renameat_with(
+                    directory,
+                    source,
+                    directory,
+                    target,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+                .unwrap();
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            },
+        );
+        assert!(matches!(
+            interrupted,
+            Err(DisposableExchangeError::PossiblyPublished(_))
+        ));
+        assert_eq!(
+            lock.exchange_staged_v25(&fixture.staged, &exclusion)
+                .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+    }
+
+    #[test]
+    fn disposable_exchange_unknown_syscall_outcome_does_not_guess_orientation() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        let unknown = lock.exchange_staged_v25_using(
+            &fixture.staged,
+            &exclusion,
+            || panic!("unknown outcome must not activate or guess"),
+            |_, _, _| {
+                // Deliberately violate the fixture's immutable-pair premise.
+                let connection = rusqlite::Connection::open(&fixture.staged.staging_path).unwrap();
+                connection
+                    .execute(
+                        "UPDATE metadata SET value=value+1 WHERE key='owner_epoch'",
+                        [],
+                    )
+                    .unwrap();
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            },
+        );
+        assert!(matches!(
+            unknown,
+            Err(DisposableExchangeError::ExchangeOutcomeUnknown { .. })
+        ));
+        assert_eq!(fixture.epochs(), (0, 0));
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_changed_snapshot_inode_and_foreign_lock() {
+        let fixture = Fixture::new();
+        let connection = rusqlite::Connection::open(&fixture.staged.staging_path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value=value+1 WHERE key='authority_revision'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        assert!(matches!(
+            lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion()),
+            Err(DisposableExchangeError::OrientationUnknown(_))
+        ));
+
+        let replaced = Fixture::new();
+        let replacement = replaced.directory.join("replacement");
+        std::fs::copy(&replaced.staged.staging_path, &replacement).unwrap();
+        std::fs::rename(&replacement, &replaced.staged.staging_path).unwrap();
+        let mut lock = LockedStorePreflight::acquire(&replaced.database).unwrap();
+        assert!(matches!(
+            lock.exchange_staged_v25(&replaced.staged, &replaced.exclusion()),
+            Err(DisposableExchangeError::OrientationUnknown(_))
+        ));
+
+        let foreign = Fixture::new();
+        let mut foreign_lock = LockedStorePreflight::acquire(&foreign.database).unwrap();
+        assert!(matches!(
+            foreign_lock.exchange_staged_v25(&replaced.staged, &replaced.exclusion()),
+            Err(DisposableExchangeError::OrientationUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_version_lineage_schema_and_file_alias_changes() {
+        for sql in [
+            "PRAGMA user_version=26;",
+            "UPDATE store_identity SET lineage='foreign-lineage';",
+            "CREATE TABLE foreign_table(value INTEGER) STRICT;",
+        ] {
+            let fixture = Fixture::new();
+            rusqlite::Connection::open(&fixture.staged.staging_path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+            assert!(matches!(
+                lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion()),
+                Err(DisposableExchangeError::OrientationUnknown(_))
+            ));
+            assert_eq!(fixture.epochs(), (0, 0));
+        }
+        for mutation in ["mode", "hardlink", "symlink"] {
+            let fixture = Fixture::new();
+            match mutation {
+                "mode" => std::fs::set_permissions(
+                    &fixture.staged.staging_path,
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap(),
+                "hardlink" => std::fs::hard_link(
+                    &fixture.staged.staging_path,
+                    fixture.directory.join("alias"),
+                )
+                .unwrap(),
+                _ => {
+                    let old = fixture.directory.join("old-staging");
+                    std::fs::rename(&fixture.staged.staging_path, &old).unwrap();
+                    std::os::unix::fs::symlink(old, &fixture.staged.staging_path).unwrap();
+                }
+            }
+            let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+            assert!(matches!(
+                lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion()),
+                Err(DisposableExchangeError::OrientationUnknown(_))
+            ));
+            assert_eq!(fixture.epochs(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_wal_header_without_creating_reader_sidecars() {
+        let fixture = Fixture::new();
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+        drop(connection);
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        assert!(matches!(
+            lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion()),
+            Err(DisposableExchangeError::OrientationUnknown(_))
+        ));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = fixture.database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(!PathBuf::from(sidecar).exists());
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_staged_manager_lock_and_preserves_busy() {
+        for name in ["podbay.sqlite.manager.lock", "other.sqlite.manager.lock"] {
+            let mut fixture = Fixture::new();
+            let malicious_path = fixture.directory.join(name);
+            std::fs::rename(&fixture.staged.staging_path, &malicious_path).unwrap();
+            fixture.staged.staging_path = malicious_path;
+            // Reproduce a pre-existing malformed v25 lock before acquisition.
+            // The current staging API refuses creating this reserved filename.
+            let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+            let held_inode = lock._manager_lock.metadata().unwrap().ino();
+            let source_inode = std::fs::metadata(&fixture.database).unwrap().ino();
+            let target_inode = std::fs::metadata(&fixture.staged.staging_path)
+                .unwrap()
+                .ino();
+            let refused = lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion());
+            assert!(matches!(
+                refused,
+                Err(DisposableExchangeError::OrientationUnknown(
+                    podbay_store::V25StagingError::Safety(
+                        "exchange staging basename uses the reserved manager lock suffix"
+                    )
+                ))
+            ));
+            assert_eq!(
+                std::fs::metadata(&fixture.database).unwrap().ino(),
+                source_inode
+            );
+            assert_eq!(
+                std::fs::metadata(&fixture.staged.staging_path)
+                    .unwrap()
+                    .ino(),
+                target_inode
+            );
+            assert_eq!(
+                std::fs::metadata(manager_lock_path(&fixture.database).unwrap())
+                    .unwrap()
+                    .ino(),
+                held_inode
+            );
+            assert_eq!(fixture.epochs(), (0, 0));
+            assert!(matches!(
+                LockedStorePreflight::acquire(&fixture.database),
+                Err(DurableAuthorityError::Busy)
+            ));
+            let database_alias = fixture.directory.join("database-alias.sqlite");
+            std::os::unix::fs::symlink(&fixture.database, &database_alias).unwrap();
+            assert!(matches!(
+                LockedStorePreflight::acquire(&database_alias),
+                Err(DurableAuthorityError::Busy)
+            ));
+            assert!(
+                !fixture
+                    .directory
+                    .join("database-alias.sqlite.manager.lock")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_refuses_lock_inode_aliases_and_replaced_lock_path() {
+        for alias in ["hardlink", "symlink", "replace"] {
+            let fixture = Fixture::new();
+            let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+            let lock_path = manager_lock_path(&fixture.database).unwrap();
+            let source_inode = std::fs::metadata(&fixture.database).unwrap().ino();
+            if alias == "replace" {
+                std::fs::rename(&lock_path, fixture.directory.join("held-lock")).unwrap();
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&lock_path)
+                    .unwrap();
+            } else {
+                std::fs::remove_file(&fixture.staged.staging_path).unwrap();
+                if alias == "hardlink" {
+                    std::fs::hard_link(&lock_path, &fixture.staged.staging_path).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&lock_path, &fixture.staged.staging_path).unwrap();
+                }
+            }
+            assert!(matches!(
+                lock.exchange_staged_v25(&fixture.staged, &fixture.exclusion()),
+                Err(DisposableExchangeError::OrientationUnknown(
+                    podbay_store::V25StagingError::Safety(_)
+                ))
+            ));
+            assert_eq!(
+                std::fs::metadata(&fixture.database).unwrap().ino(),
+                source_inode
+            );
+            assert_eq!(fixture.epochs(), (0, 0));
+            if alias == "replace" {
+                std::fs::remove_file(&lock_path).unwrap();
+                std::fs::rename(fixture.directory.join("held-lock"), &lock_path).unwrap();
+            } else if alias == "hardlink" {
+                std::fs::remove_file(&fixture.staged.staging_path).unwrap();
+            }
+            assert!(matches!(
+                LockedStorePreflight::acquire(&fixture.database),
+                Err(DurableAuthorityError::Busy)
+            ));
+        }
+    }
+
+    #[test]
+    fn disposable_exchange_published_retry_missing_named_lock_is_orientation_unknown() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        assert_eq!(
+            lock.exchange_staged_v25(&fixture.staged, &exclusion)
+                .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        let source_inode = std::fs::metadata(&fixture.database).unwrap().ino();
+        let staging_inode = std::fs::metadata(&fixture.staged.staging_path)
+            .unwrap()
+            .ino();
+        let lock_path = manager_lock_path(&fixture.database).unwrap();
+        let missing_name = fixture.directory.join("held-lock-without-canonical-name");
+        std::fs::rename(&lock_path, &missing_name).unwrap();
+        let refused = lock.exchange_staged_v25(&fixture.staged, &exclusion);
+        assert!(
+            matches!(refused, Err(DisposableExchangeError::OrientationUnknown(
+            podbay_store::V25StagingError::Io(ref error)
+        )) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            fixture.staged.verify_exchange_orientation().unwrap(),
+            V25ExchangeOrientation::Published
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.database).unwrap().ino(),
+            source_inode
+        );
+        assert_eq!(
+            std::fs::metadata(&fixture.staged.staging_path)
+                .unwrap()
+                .ino(),
+            staging_inode
+        );
+        std::fs::rename(missing_name, lock_path).unwrap();
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        assert_eq!(
+            lock.exchange_staged_v25(&fixture.staged, &exclusion)
+                .unwrap(),
+            V25ExchangeOrientation::Published
+        );
+    }
+}
 #[cfg(all(test, target_os = "linux"))]
 mod postclaim_refusal_tests {
     use super::*;
