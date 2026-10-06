@@ -1,14 +1,20 @@
 # Disposable v25 pending claim guard
 
-Status: candidate design, 2026-10-06, following `5ac013b`. No implementation or
-test receipt is established here. Anchors are relative to `crates/` and name
+Status: candidate integration design, 2026-10-06, following `bda9c88`. A
+private transaction-local disposition decoder is implemented for rebound V2
+recovery candidates; claim and current-inspection integration is not. The
+decoder's focused 5/5 and full store-library 29/29 tests passed, with
+independent review closing a pre-allocation TEXT byte-budget defect. No
+production v25 opener, authority or maintained effect-use gate exists. Anchors
+are relative to `crates/` and name
 the inspected source. This bounds the next atom from
 [the claim/use fence map](EXTERNAL-DEATH-CLAIM-FENCE-MAP.md).
 
 ## Transaction-local disposition
 
-Add one internal decoder taking the caller's `&Transaction` and an exact
-subject resolved from the stored native-send binding. Its results are store
+The internal decoder takes the caller's `&Transaction` and an exact rebound
+V2 recovery subject. Ordinary fresh native-send subject resolution remains to
+be implemented before claim integration. Its results are store
 facts, with no native permission:
 
 | Result | Meaning at the selected snapshot |
