@@ -1,9 +1,9 @@
 # Two-boot fixture preparation
 
 This directory has a read-only inventory, an offline CLOSED-stub assembler and a
-[QEMU runner preparation](CLOSED-VM.md). Its runner has passed dry-run and fake
-child tests only. There is **no observed VM boot, production admission or
-deployment capability**; QEMU was absent when these checks ran.
+[QEMU runner](CLOSED-VM.md). The runner has passed dry-run, fake-child and one
+real CLOSED-stub VM boot. There is **no two-boot barrier proof, production
+admission or deployment capability**.
 `inventory.py` prints JSON and always exits 3 (`BLOCKED_NOT_BOOTED`). It opens
 only the explicit ISO and device metadata, never the KVM device itself. It does
 not execute discovered tools, extract files, download inputs or change services.
@@ -28,10 +28,12 @@ host mounts, device passthrough or existing personal VM disk. The raw disk is th
 only state carried from boot A to boot B. A reviewed PID1 exclusively starts all
 guest processes. Fix guest owner UID/GID to 1000. Root/kernel/hypervisor are trusted.
 
-No QEMU executable is currently on PATH. Existing VMware tools and a personal VM
-are not a qualified fallback. Do not start or inspect that personal VM. QEMU-img
-and libvirt are unnecessary for a new raw image; actual KVM acceleration remains
-unverified. Kernel config and matching ext4/virtio module closure must be pinned;
+QEMU 10.2.1 is installed. A separate 512-byte guest boot sector executed under
+KVM and emitted `KVM_GUEST_OK` (expected debug-exit status 33); the CLOSED-stub
+runner itself uses TCG. Existing VMware tools and a personal VM are not a
+qualified fallback. Do not start or inspect that personal VM. QEMU-img and
+libvirt are unnecessary for a new raw image. Kernel config and matching
+ext4/virtio module closure must be pinned;
 the readable ISO alone does not establish that closure.
 
 The current `../linux-broker-probe/broker.c` cannot be used unchanged: it creates
@@ -90,9 +92,8 @@ Outside cleanup verifies the exact hypervisor process exited and all its handles
 closed, then removes only its named image/initramfs/log artifacts. Never touch
 host units, mounts, sudo/PAM/polkit policy or existing VM assets.
 
-Next: supply an approved local QEMU executable, pin kernel/config/module inputs,
-implement reviewed fixture PID1 and persistent broker/rebind with a clean exec
-worker, then build the raw disk/initramfs offline. Parent reviews these before
-any separately authorized VM run. Installing tools, booting/rebooting the owner
-machine, production store cutover and production policy installation are outside
-this preparation atom.
+Next: implement reviewed fixture PID1 and persistent broker/rebind with a clean
+exec worker, then build a writable raw disk/initramfs for separate boot A and
+boot B processes. The existing CLOSED-stub boot is only an execution-domain
+smoke test. Booting/rebooting the owner machine, production store cutover and
+production policy installation remain outside this fixture.

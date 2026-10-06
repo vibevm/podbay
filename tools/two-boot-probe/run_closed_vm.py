@@ -94,7 +94,7 @@ def strict_object(pairs):
 
 
 def parse_serial(raw):
-    """Require the exact event as the final nonempty line; reject corrupt/fatal text."""
+    """Require the exact event followed only by bounded observed shutdown chatter."""
     if len(raw) > MAX_SERIAL or not raw.endswith(b'\n') or b'\0' in raw:
         raise ValueError('oversized, incomplete or NUL-containing serial capture')
     try:
@@ -103,17 +103,32 @@ def parse_serial(raw):
         raise ValueError('invalid serial UTF-8') from error
     events = []
     shutdown_seen = False
+    shutdown_chatter = (
+        r'tsc: Refined TSC clocksource calibration: [0-9]+(?:\.[0-9]+)? MHz',
+        r'clocksource: tsc: mask: 0x[0-9a-f]+ max_cycles: 0x[0-9a-f]+, max_idle_ns: [0-9]+ ns',
+        r'clocksource: Switched to clocksource tsc',
+        r'ACPI: PM: Preparing to enter system sleep state S5',
+    )
+    chatter_index = 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
+        if re.search(r'kernel panic|not syncing|oops:|BUG:|segmentation fault', line, re.I):
+            raise ValueError('fatal serial diagnostic')
         if events:
             if not shutdown_seen and re.fullmatch(r'(?:\[\s*\d+\.\d+\]\s*)?reboot: Power down', line):
                 shutdown_seen = True
                 continue
+            if not shutdown_seen:
+                for index in range(chatter_index, len(shutdown_chatter)):
+                    if re.fullmatch(r'\[\s*\d+\.\d+\]\s*' + shutdown_chatter[index], line):
+                        chatter_index = index + 1
+                        break
+                else:
+                    raise ValueError('unexpected serial suffix after CLOSED-stub event')
+                continue
             raise ValueError('unexpected serial suffix after CLOSED-stub event')
-        if re.search(r'kernel panic|not syncing|oops:|BUG:|segmentation fault', line, re.I):
-            raise ValueError('fatal serial diagnostic')
         if line.startswith('{'):
             if len(line) > 4096:
                 raise ValueError('oversized serial JSON line')

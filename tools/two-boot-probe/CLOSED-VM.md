@@ -25,10 +25,17 @@ folders, no guest agent, no host device passthrough, no snapshots/resume and no
 arbitrary QEMU options. The serial backend writes stdout; stdin is `/dev/null`,
 with no monitor mux or signal input. No KVM device is opened.
 
-Installation approval is pending and QEMU is absent. **Do not invoke `--run` in
-this preparation atom.** A later authorized run additionally requires a reviewed
-installed QEMU SHA-256, root-owned non-writable installed tool ancestry and Linux
-pidfd support. Tool path trust is not execution-inode attestation; installed
+QEMU is installed and the owner authorized its local setup and virtualization
+check. The actual CLOSED-stub run on 2026-10-06 used installed QEMU SHA-256
+`0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc`.
+The accepted run retained its separate disk and receipt at
+`/home/olegchir/podbay-two-boot-offline-build/vm-closed-20261006-accepted/`:
+`CLOSED_STUB_OBSERVED_UNIMPLEMENTED`, QEMU exit 0, exact child reaped and pidfd
+exit verified. Two earlier runs returned `VM_FAILED_OR_LIFECYCLE_UNVERIFIED`
+because the serial parser rejected ordinary kernel clocksource/ACPI lines after
+the exact stub event. Their disks and logs remain under sibling run directories.
+The parser now permits only that bounded observed shutdown sequence, and its
+14 fake-child/unit tests pass. Tool path trust is not execution-inode attestation; installed
 firmware/shared-library dependencies remain within trusted host tool state.
 
 The live branch passes only pinned kernel/initramfs/fresh-disk descriptors and
@@ -52,7 +59,8 @@ Only one exact `fixture_stub` CLOSED/unimplemented JSON event, normal QEMU exit
 and verified pidfd exit/reap can produce `CLOSED_STUB_OBSERVED_UNIMPLEMENTED`.
 Malformed, repeated, missing or failed events are failure. Invalid UTF-8, NUL,
 JSON arrays and fatal kernel diagnostics fail closed. After the exact event, only
-blank lines and at most one exact kernel `reboot: Power down` line are allowed;
+blank lines, an ordered optional subset of the observed clocksource/ACPI
+shutdown messages, and at most one exact `reboot: Power down` line are allowed;
 arbitrary trailing output is rejected. Kernel/BusyBox text
 is retained in `serial.raw`; JSON records are separately validated. The launch/report transaction never automatically deletes the disk. A separate
 internal cleanup helper refuses unless exact reap/pidfd exit and a durable
@@ -62,13 +70,14 @@ cleanup command in this preparation. The baseline image is never deleted or used
 writable.
 
 The guest event currently lacks runtime nonce, boot ID, sequence and artifact
-attestation. Its exact message is only a stub oracle. Even a later successful VM
+attestation. Its exact message is only a stub oracle. The successful VM
 run does not prove boot-A handle controls, fresh boot-B sealing, persistent
 broker/rebind, late engagement refusal, recovery, production admission or the
 campaign's full serial contract. Those remain separate implementation/test work.
 
-The unit suite uses fake Popen children and mocked pidfd signaling only; it does
-not launch a substitute process. It covers launch/capture signals, timeout,
+The unit suite uses fake Popen children and mocked pidfd signaling; the separate
+real run booted the exact CLOSED-stub and recorded QEMU exit, pidfd exit and
+reap. The unit suite covers launch/capture signals, timeout,
 capture overflow, immediate exit, pidfd-open/API failure, durable receipt failure,
 broken stdout, safe cleanup prerequisites and retained images. Supported Python
 `os.pidfd_open` and `signal.pidfd_send_signal` must be callable before launch; a

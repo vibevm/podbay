@@ -93,6 +93,18 @@ class ClosedVMPreparation(unittest.TestCase):
                b'{"status":"PASS"}\n', b'Kernel panic\n', b'{"event":\xff}\n']
         bad += [valid + suffix for suffix in (b'[]\n', b'[broken]\n', b'\0\n', b'Kernel panic - not syncing\n', b'{broken}\n', b'garbage\n')]
         self.assertEqual(runner.parse_serial(valid + b'[ 1.234] reboot: Power down\n'), [runner.EXPECTED_EVENT])
+        observed_shutdown = (b'[    3.026277] tsc: Refined TSC clocksource calibration: 3493.418 MHz\n'
+                             b'[    3.026791] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x325b070d116, max_idle_ns: 440795280169 ns\n'
+                             b'[    3.027111] clocksource: Switched to clocksource tsc\n'
+                             b'[    3.032936] ACPI: PM: Preparing to enter system sleep state S5\n'
+                             b'[    3.033832] reboot: Power down\n')
+        self.assertEqual(runner.parse_serial(valid + observed_shutdown), [runner.EXPECTED_EVENT])
+        self.assertEqual(runner.parse_serial(valid +
+                         b'[    3.006808] ACPI: PM: Preparing to enter system sleep state S5\n'
+                         b'[    3.007849] reboot: Power down\n'), [runner.EXPECTED_EVENT])
+        bad += [valid + observed_shutdown + b'late output\n',
+                valid + observed_shutdown.replace(b'ACPI: PM:', b'BUG: PM:'),
+                valid + observed_shutdown.replace(b'3493.418', b'not-a-number')]
         for raw in bad:
             with self.subTest(raw=raw):
                 with self.assertRaises(ValueError):
