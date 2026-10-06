@@ -10,6 +10,10 @@ const MAX_BYTES: usize = 8192;
 #[cfg(all(test, target_os = "linux"))]
 mod disposable_files;
 
+// Scratch-only acquisition prototype. Never compiled into production.
+#[cfg(all(test, target_os = "linux"))]
+mod closed_origin;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     InitialClosed,

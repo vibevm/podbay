@@ -20,7 +20,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "net"] }
 
 [lib]
 path = "src/lib.rs"
