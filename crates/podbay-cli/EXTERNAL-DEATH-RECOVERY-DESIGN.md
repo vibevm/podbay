@@ -6,6 +6,10 @@ command, a signed `pod.stop` receipt or permission to touch the live store.
 The two operations below have separate durable authorities: (A) recovering an
 inner current V2 Pod after external death, and (B) allocating a fresh outer
 Zap Service generation after a terminal stop.
+The current live store is schema 24; the reviewed candidate path to add
+pending/final records is the separate
+[v24→v25 staged migration](STORE-V25-MIGRATION-DRAFT.md). No live migration is
+authorized by either design document.
 
 ## Observed boundary
 
