@@ -6,6 +6,8 @@
 mod restart_model;
 // Pure signed-data verification only; no stop or restart acquisition path.
 mod terminal_attestation;
+// Trusted snapshot assertions only; no database/key acquisition path.
+mod historical_signer;
 
 use std::collections::BTreeSet;
 use std::env;

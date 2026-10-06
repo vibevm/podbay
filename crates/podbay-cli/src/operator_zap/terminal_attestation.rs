@@ -8,17 +8,17 @@ const VERSION: u8 = 1;
 const MAX_BYTES: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SignerBindingV1 {
-    lineage: String,
-    actor: String,
-    scope: String,
-    generation: u64,
-    binding_digest: [u8; 32],
+pub(super) struct SignerBindingV1 {
+    pub(super) lineage: String,
+    pub(super) actor: String,
+    pub(super) scope: String,
+    pub(super) generation: u64,
+    pub(super) binding_digest: [u8; 32],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TrustedSignerV1 {
-    binding: SignerBindingV1,
-    public_key: [u8; 32],
+pub(super) struct TrustedSignerV1 {
+    pub(super) binding: SignerBindingV1,
+    pub(super) public_key: [u8; 32],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SubjectV1 {
