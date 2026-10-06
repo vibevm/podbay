@@ -3574,6 +3574,26 @@ pub struct DisposableReaderExclusion<'a> {
     _barrier: std::sync::RwLockWriteGuard<'a, ()>,
 }
 
+/// Readback-only activated handle borrowing the identical manager lock and
+/// maintained disposable barrier. It cannot outlive either borrowed guard.
+#[cfg(target_os = "linux")]
+pub struct DisposableActivatedV25<'lock, 'barrier> {
+    store: podbay_store::DisposableV25ActivatedStore,
+    preflight: &'lock LockedStorePreflight,
+    _exclusion: &'lock DisposableReaderExclusion<'barrier>,
+}
+
+#[cfg(target_os = "linux")]
+impl DisposableActivatedV25<'_, '_> {
+    pub fn metadata(&self) -> Result<podbay_store::V25ActivationMetadata, DisposableExchangeError> {
+        self.preflight
+            .verify_exchange_excludes_manager_lock(self.store.attested_pair())?;
+        self.store
+            .metadata()
+            .map_err(DisposableExchangeError::PossiblyPublishedVerification)
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub enum DisposableExchangeError {
@@ -3695,6 +3715,38 @@ impl LockedStorePreflight {
         Ok(receipt)
     }
 
+    /// Durable disposable forward boundary. Existing-marker restart uses the
+    /// restricted v25 current-state decoder rather than the historical snapshot.
+    pub fn activate_disposable_v25<'lock, 'barrier>(
+        &'lock self,
+        staging_path: &Path,
+        migration_key: &str,
+        activation_key: &str,
+        exclusion: &'lock DisposableReaderExclusion<'barrier>,
+    ) -> Result<DisposableActivatedV25<'lock, 'barrier>, DisposableExchangeError> {
+        if exclusion.database != self.canonical_database {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "activation is not bound to this lock and exclusion database",
+                ),
+            ));
+        }
+        self.verify_activation_lock_namespace(staging_path)?;
+        let store = podbay_store::activate_disposable_schema_v25(
+            &self.canonical_database,
+            staging_path,
+            migration_key,
+            activation_key,
+        )
+        .map_err(DisposableExchangeError::PossiblyPublishedVerification)?;
+        self.verify_exchange_excludes_manager_lock(store.attested_pair())?;
+        Ok(DisposableActivatedV25 {
+            store,
+            preflight: self,
+            _exclusion: exclusion,
+        })
+    }
+
     /// Disposable exchange only; successful verification is not a durable
     /// receipt or permission for production activation. The caller retains the
     /// lock and exclusion through the return, including any post-exchange error.
@@ -3808,6 +3860,39 @@ impl LockedStorePreflight {
             ));
         }
         Ok(verified)
+    }
+
+    fn verify_activation_lock_namespace(
+        &self,
+        staging_path: &Path,
+    ) -> Result<(), DisposableExchangeError> {
+        let failure = |error| {
+            DisposableExchangeError::OrientationUnknown(podbay_store::V25StagingError::Io(error))
+        };
+        let lock_path = manager_lock_path(&self.canonical_database).map_err(failure)?;
+        let held = self._manager_lock.metadata().map_err(failure)?;
+        let named = std::fs::symlink_metadata(&lock_path).map_err(failure)?;
+        if !named.is_file()
+            || (named.dev(), named.ino()) != (held.dev(), held.ino())
+            || held.nlink() != 1
+            || named.nlink() != 1
+            || std::fs::canonicalize(&lock_path).map_err(failure)? != lock_path
+        {
+            return Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety("activation manager lock namespace changed"),
+            ));
+        }
+        for path in [&self.canonical_database, staging_path] {
+            let metadata = std::fs::symlink_metadata(path).map_err(failure)?;
+            if (metadata.dev(), metadata.ino()) == (held.dev(), held.ino()) {
+                return Err(DisposableExchangeError::OrientationUnknown(
+                    podbay_store::V25StagingError::Safety(
+                        "activation pair aliases manager lock inode",
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn verify_exchange_excludes_manager_lock(
@@ -10575,6 +10660,62 @@ mod disposable_exchange_tests {
             assert_eq!(std::fs::metadata(&fixture.database).unwrap().ino(), inode);
             assert_eq!(std::fs::read(&reserved).unwrap(), foreign_before);
         }
+    }
+
+    #[test]
+    fn disposable_activation_borrows_lock_barrier_and_forbids_later_exchange() {
+        let fixture = Fixture::new();
+        let mut lock = LockedStorePreflight::acquire(&fixture.database).unwrap();
+        let exclusion = fixture.exclusion();
+        lock.exchange_keyed_staged_v25(&fixture.staged, "migration.activation", &exclusion)
+            .unwrap();
+        lock.finalize_keyed_v25_publication(
+            &fixture.staged.staging_path,
+            "migration.activation",
+            &exclusion,
+        )
+        .unwrap();
+        let active = lock
+            .activate_disposable_v25(
+                &fixture.staged.staging_path,
+                "migration.activation",
+                "activation.one",
+                &exclusion,
+            )
+            .unwrap();
+        assert!(!active.metadata().unwrap().store_lineage.is_empty());
+        assert!(fixture.barrier.try_read().is_err());
+        assert!(matches!(
+            LockedStorePreflight::acquire(&fixture.database),
+            Err(DurableAuthorityError::Busy)
+        ));
+        drop(active);
+        let refused = lock.exchange_staged_v25_using(
+            &fixture.staged,
+            &exclusion,
+            || panic!("activated pair must not reach post-exchange hook"),
+            |_, _, _| panic!("activated pair must never issue exchange"),
+        );
+        assert!(matches!(
+            refused,
+            Err(DisposableExchangeError::OrientationUnknown(
+                podbay_store::V25StagingError::Safety(
+                    "forward activation exists or is partial; frozen migration exchange is forbidden"
+                )
+            ))
+        ));
+        let active = lock
+            .activate_disposable_v25(
+                &fixture.staged.staging_path,
+                "migration.activation",
+                "activation.one",
+                &exclusion,
+            )
+            .unwrap();
+        active.metadata().unwrap();
+        drop(active);
+        drop(exclusion);
+        drop(lock);
     }
 
     #[test]

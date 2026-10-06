@@ -84,6 +84,7 @@ impl V25StagingResult {
         #[cfg(unix)]
         {
             self.verify_exchange_namespace()?;
+            refuse_activation_direction(&self.source_path)?;
             let proof = &self.exchange;
             verify_parent_identity(&proof.source_path, proof.parent_identity)?;
             if self.source_path != proof.source_path || self.staging_path != proof.staging_path {
@@ -760,6 +761,472 @@ fn persist_schema_v25_receipt_with_sync(
     recover_schema_v25_receipt(source_path, staging_path, key)
 }
 
+const ACTIVATION_FORMAT: &str = "podbay.disposable-v25-forward-activation/1";
+const ACTIVATION_DIRECTION: &str = "forward_only_metadata_readback";
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V25ActivationMetadata {
+    pub store_lineage: String,
+    pub owner_epoch: u64,
+    pub authority_revision: u64,
+}
+
+/// Restricted metadata/readback handle, not PodBayStore or a runtime grant.
+/// Decoder version 1 allows only monotone authority_revision drift; it forbids
+/// new pending/final rows and every other authority mutation. A later versioned
+/// current-state decoder is required before exposing any pending or runtime API.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DisposableV25ActivatedStore {
+    source_path: PathBuf,
+    staging_path: PathBuf,
+    migration_key: String,
+    activation_key: String,
+    proof: V25StagingResult,
+}
+
+#[cfg(unix)]
+impl DisposableV25ActivatedStore {
+    pub fn metadata(&self) -> Result<V25ActivationMetadata, V25StagingError> {
+        let (_, metadata, _) = read_activation(
+            &self.source_path,
+            &self.staging_path,
+            &self.migration_key,
+            &self.activation_key,
+        )?;
+        Ok(metadata)
+    }
+    /// Historical pair identities for the host's exact manager-lock namespace
+    /// check only. Calling its frozen migration verifier after activation refuses.
+    pub fn attested_pair(&self) -> &V25StagingResult {
+        &self.proof
+    }
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ActivationMetadataRow {
+    rowid: i64,
+    key: String,
+    value: i64,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationPayload {
+    migration_key: String,
+    activation_key: String,
+    direction: String,
+    receipt_path: PathBuf,
+    receipt_identity: FileIdentity,
+    receipt_bytes_digest: String,
+    intent_path: PathBuf,
+    intent_identity: FileIdentity,
+    intent_bytes_digest: String,
+    attestation: ExchangeAttestation,
+    initial_metadata: Vec<ActivationMetadataRow>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableActivation {
+    format: String,
+    payload: ActivationPayload,
+    payload_digest: String,
+}
+
+#[cfg(unix)]
+fn activation_paths(source: &Path) -> Result<(PathBuf, PathBuf), V25StagingError> {
+    let mut name = source
+        .file_name()
+        .ok_or(V25StagingError::InvalidInput("source filename missing"))?
+        .to_os_string();
+    name.push(".v25-activation.json");
+    let marker = source.with_file_name(name);
+    let mut writing = marker.as_os_str().to_os_string();
+    writing.push(".writing");
+    Ok((marker, PathBuf::from(writing)))
+}
+
+#[cfg(unix)]
+fn refuse_activation_direction(source: &Path) -> Result<(), V25StagingError> {
+    let (marker, writing) = activation_paths(source)?;
+    for path in [marker, writing] {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(V25StagingError::Safety(
+                    "forward activation exists or is partial; frozen migration exchange is forbidden",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn activation_digest(payload: &ActivationPayload) -> Result<String, V25StagingError> {
+    Ok(hex_digest(&serde_json::to_vec(&(
+        ACTIVATION_FORMAT,
+        payload,
+    ))?))
+}
+
+#[cfg(unix)]
+fn activation_metadata_rows(
+    connection: &Connection,
+) -> Result<Vec<ActivationMetadataRow>, V25StagingError> {
+    let mut statement = connection.prepare("SELECT rowid,key,value FROM metadata ORDER BY key")?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok(ActivationMetadataRow {
+                rowid: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+#[cfg(unix)]
+fn activation_proof_result(proof: ExchangeAttestation) -> V25StagingResult {
+    V25StagingResult {
+        source_path: proof.source_path.clone(),
+        staging_path: proof.staging_path.clone(),
+        store_lineage: proof.source.lineage.clone(),
+        source_schema_version: proof.source.version,
+        staging_schema_version: proof.staging.version,
+        preserved_tables: proof.source.tables.clone(),
+        sequence_high_water: proof.source.sequences.clone(),
+        exchange: proof,
+    }
+}
+
+#[cfg(unix)]
+fn decode_activated_current_state(
+    payload: &ActivationPayload,
+) -> Result<V25ActivationMetadata, V25StagingError> {
+    let proof = &payload.attestation;
+    verify_parent_identity(&proof.source_path, proof.parent_identity)?;
+    reject_reserved_staging_path(&proof.source_path, &proof.staging_path)?;
+    for path in [&proof.source_path, &proof.staging_path] {
+        reject_exchange_sidecars(path)?;
+    }
+    open_exact_private_file(&proof.source_path, proof.staging_identity)?;
+    open_exact_private_file(&proof.staging_path, proof.source_identity)?;
+    let old = open_exchange_read_only(&proof.staging_path)?;
+    verify_integrity(&old)?;
+    verify_foreign_keys(&old)?;
+    verify_current_v2_bindings(&old)?;
+    if snapshot(&old)? != proof.source {
+        return Err(V25StagingError::Safety(
+            "activated old v24 snapshot changed",
+        ));
+    }
+    if activation_metadata_rows(&old)? != payload.initial_metadata {
+        return Err(V25StagingError::Safety(
+            "activation initial metadata differs from preserved v24",
+        ));
+    }
+    drop(old);
+    let current = open_exchange_read_only(&proof.source_path)?;
+    verify_integrity(&current)?;
+    verify_foreign_keys(&current)?;
+    verify_current_v2_bindings(&current)?;
+    verify_recovery_tables_empty(&current)?;
+    let state = snapshot(&current)?;
+    if state.version != STAGING_SCHEMA_VERSION
+        || state.lineage != proof.staging.lineage
+        || state.schema != canonical_schema(true)?
+        || state.schema != proof.staging.schema
+        || state.sequences != proof.staging.sequences
+        || state
+            .tables
+            .iter()
+            .filter(|table| table.name != "metadata")
+            .collect::<Vec<_>>()
+            != proof
+                .staging
+                .tables
+                .iter()
+                .filter(|table| table.name != "metadata")
+                .collect::<Vec<_>>()
+    {
+        return Err(V25StagingError::Safety(
+            "restricted activated v25 schema, lineage or authority state changed",
+        ));
+    }
+    let rows = activation_metadata_rows(&current)?;
+    if rows.len() != payload.initial_metadata.len() {
+        return Err(V25StagingError::Safety("activated metadata set changed"));
+    }
+    let mut authority_revision = None;
+    let mut owner_epoch = None;
+    for (row, initial) in rows.iter().zip(&payload.initial_metadata) {
+        if row.rowid != initial.rowid
+            || row.key != initial.key
+            || (if row.key == "authority_revision" {
+                initial.value < 0 || row.value < initial.value
+            } else {
+                row.value != initial.value
+            })
+        {
+            return Err(V25StagingError::Safety(
+                "activated metadata rollback or unsupported mutation",
+            ));
+        }
+        if row.key == "authority_revision" {
+            authority_revision = Some(row.value as u64);
+        }
+        if row.key == "owner_epoch" {
+            owner_epoch =
+                Some(u64::try_from(row.value).map_err(|_| {
+                    V25StagingError::Safety("activated owner metadata is negative")
+                })?);
+        }
+    }
+    drop(current);
+    verify_parent_identity(&proof.source_path, proof.parent_identity)?;
+    for path in [&proof.source_path, &proof.staging_path] {
+        reject_exchange_sidecars(path)?;
+    }
+    open_exact_private_file(&proof.source_path, proof.staging_identity)?;
+    open_exact_private_file(&proof.staging_path, proof.source_identity)?;
+    Ok(V25ActivationMetadata {
+        store_lineage: state.lineage,
+        owner_epoch: owner_epoch
+            .ok_or(V25StagingError::Safety("activated owner metadata missing"))?,
+        authority_revision: authority_revision.ok_or(V25StagingError::Safety(
+            "activated revision metadata missing",
+        ))?,
+    })
+}
+
+#[cfg(unix)]
+fn read_activation(
+    source: &Path,
+    staging: &Path,
+    migration_key: &str,
+    activation_key: &str,
+) -> Result<(ActivationPayload, V25ActivationMetadata, FileIdentity), V25StagingError> {
+    intent_paths(source, migration_key)?;
+    intent_paths(source, activation_key)?;
+    let (marker, writing) = activation_paths(source)?;
+    refuse_occupied(&writing)?;
+    let marker_identity = private_file_identity(&marker, false)?;
+    let record: DurableActivation = serde_json::from_slice(&bounded_private_bytes(&marker)?)?;
+    let p = record.payload;
+    let (receipt_path, receipt_writing) = receipt_paths(source, migration_key)?;
+    let (intent_path, intent_writing) = intent_paths(source, migration_key)?;
+    if record.format != ACTIVATION_FORMAT
+        || p.direction != ACTIVATION_DIRECTION
+        || p.migration_key != migration_key
+        || p.activation_key != activation_key
+        || p.attestation.source_path != source
+        || p.attestation.staging_path != staging
+        || p.receipt_path != receipt_path
+        || p.intent_path != intent_path
+        || record.payload_digest != activation_digest(&p)?
+    {
+        return Err(V25StagingError::Safety(
+            "activation format, keys, paths or payload mismatch",
+        ));
+    }
+    refuse_occupied(&receipt_writing)?;
+    refuse_occupied(&intent_writing)?;
+    open_exact_private_file(&receipt_path, p.receipt_identity)?;
+    open_exact_private_file(&intent_path, p.intent_identity)?;
+    let receipt_bytes = bounded_private_bytes(&receipt_path)?;
+    let intent_bytes = bounded_private_bytes(&intent_path)?;
+    if hex_digest(&receipt_bytes) != p.receipt_bytes_digest
+        || hex_digest(&intent_bytes) != p.intent_bytes_digest
+    {
+        return Err(V25StagingError::Safety(
+            "activation historical receipt or intent bytes changed",
+        ));
+    }
+    let receipt: DurablePublicationReceipt = serde_json::from_slice(&receipt_bytes)?;
+    let intent: DurableIntent = serde_json::from_slice(&intent_bytes)?;
+    if receipt.format != RECEIPT_FORMAT
+        || receipt.payload.key != migration_key
+        || receipt.payload.disposition != RECEIPT_DISPOSITION
+        || receipt.payload.attestation != p.attestation
+        || receipt.payload.intent_digest != p.intent_bytes_digest
+        || receipt.receipt_digest != receipt_digest(&receipt.payload)?
+        || intent.format != INTENT_FORMAT
+        || intent.key != migration_key
+        || intent.attestation != p.attestation
+        || intent.attestation_digest != attestation_digest(migration_key, &p.attestation)?
+        || p.attestation.source.version != SOURCE_SCHEMA_VERSION
+        || p.attestation.staging.version != STAGING_SCHEMA_VERSION
+        || p.attestation.source.schema != canonical_schema(false)?
+        || p.attestation.staging.schema != canonical_schema(true)?
+    {
+        return Err(V25StagingError::Safety(
+            "activation historical publication binding differs",
+        ));
+    }
+    verify_preserved_snapshot(&p.attestation.source, &p.attestation.staging)?;
+    let metadata = decode_activated_current_state(&p)?;
+    if private_file_identity(&marker, false)? != marker_identity
+        || hex_digest(&bounded_private_bytes(&receipt_path)?) != p.receipt_bytes_digest
+        || hex_digest(&bounded_private_bytes(&intent_path)?) != p.intent_bytes_digest
+        || private_file_identity(&receipt_path, false)? != p.receipt_identity
+        || private_file_identity(&intent_path, false)? != p.intent_identity
+    {
+        return Err(V25StagingError::Safety(
+            "activation identities changed during recovery",
+        ));
+    }
+    Ok((p, metadata, marker_identity))
+}
+
+/// Read-only exact-key restart decoder. It uses the marker's historical receipt
+/// and its restricted current-state protocol, never the frozen v25 snapshot.
+#[cfg(unix)]
+pub fn recover_disposable_v25_activation(
+    source: impl AsRef<Path>,
+    staging: impl AsRef<Path>,
+    migration_key: &str,
+    activation_key: &str,
+) -> Result<V25ActivationMetadata, V25StagingError> {
+    Ok(read_activation(
+        source.as_ref(),
+        staging.as_ref(),
+        migration_key,
+        activation_key,
+    )?
+    .1)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationSyncPoint {
+    WritingMarker,
+    ExistingMarker,
+    ParentDirectory,
+}
+
+/// Durable forward-only disposable boundary; callers must hold the exact manager
+/// lock and exclusion through the handle's lifetime. No runtime/writer methods exist.
+#[cfg(target_os = "linux")]
+pub fn activate_disposable_schema_v25(
+    source: impl AsRef<Path>,
+    staging: impl AsRef<Path>,
+    migration_key: &str,
+    activation_key: &str,
+) -> Result<DisposableV25ActivatedStore, V25StagingError> {
+    activate_disposable_schema_v25_with_sync(
+        source.as_ref(),
+        staging.as_ref(),
+        migration_key,
+        activation_key,
+        |file, _| file.sync_all(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn activate_disposable_schema_v25_with_sync(
+    source: &Path,
+    staging: &Path,
+    migration_key: &str,
+    activation_key: &str,
+    mut sync: impl FnMut(&File, ActivationSyncPoint) -> std::io::Result<()>,
+) -> Result<DisposableV25ActivatedStore, V25StagingError> {
+    use std::io::Write;
+    intent_paths(source, activation_key)?;
+    let (marker, writing) = activation_paths(source)?;
+    refuse_occupied(&writing)?;
+    let payload = match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            let (payload, _, identity) =
+                read_activation(source, staging, migration_key, activation_key)?;
+            let file = open_exact_private_file(&marker, identity)?;
+            let directory = pinned_parent_directory(source, payload.attestation.parent_identity)?;
+            sync(&file, ActivationSyncPoint::ExistingMarker)?;
+            sync(&directory, ActivationSyncPoint::ParentDirectory)?;
+            let (rechecked, _, after_identity) =
+                read_activation(source, staging, migration_key, activation_key)?;
+            if activation_digest(&payload)? != activation_digest(&rechecked)?
+                || identity != after_identity
+            {
+                return Err(V25StagingError::Safety(
+                    "activation marker changed during durability repair",
+                ));
+            }
+            rechecked
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let receipt = persist_schema_v25_receipt(source, staging, migration_key)?;
+            let proof = receipt.recovered.staged.exchange.clone();
+            let current = open_exchange_read_only(source)?;
+            let initial_metadata = activation_metadata_rows(&current)?;
+            drop(current);
+            let payload = ActivationPayload {
+                migration_key: migration_key.to_owned(),
+                activation_key: activation_key.to_owned(),
+                direction: ACTIVATION_DIRECTION.to_owned(),
+                receipt_path: receipt.receipt_path.clone(),
+                receipt_identity: private_file_identity(&receipt.receipt_path, false)?,
+                receipt_bytes_digest: hex_digest(&bounded_private_bytes(&receipt.receipt_path)?),
+                intent_path: receipt.recovered.intent_path.clone(),
+                intent_identity: private_file_identity(&receipt.recovered.intent_path, false)?,
+                intent_bytes_digest: receipt.intent_digest,
+                attestation: proof,
+                initial_metadata,
+            };
+            // The restricted decoder checks the full admitted state before marker publication.
+            decode_activated_current_state(&payload)?;
+            let record = DurableActivation {
+                format: ACTIVATION_FORMAT.to_owned(),
+                payload_digest: activation_digest(&payload)?,
+                payload,
+            };
+            let bytes = serde_json::to_vec(&record)?;
+            if bytes.len() as u64 > INTENT_MAX_BYTES {
+                return Err(V25StagingError::Safety(
+                    "activation marker exceeds bounded encoding",
+                ));
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc_no_follow())
+                .open(&writing)?;
+            file.write_all(&bytes)?;
+            sync(&file, ActivationSyncPoint::WritingMarker)?;
+            drop(file);
+            private_file_identity(&writing, false)?;
+            let directory =
+                pinned_parent_directory(source, record.payload.attestation.parent_identity)?;
+            rustix::fs::renameat_with(
+                &directory,
+                writing.file_name().expect("writing filename"),
+                &directory,
+                marker.file_name().expect("marker filename"),
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(std::io::Error::from)?;
+            sync(&directory, ActivationSyncPoint::ParentDirectory)?;
+            read_activation(source, staging, migration_key, activation_key)?.0
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(DisposableV25ActivatedStore {
+        source_path: source.to_path_buf(),
+        staging_path: staging.to_path_buf(),
+        migration_key: migration_key.to_owned(),
+        activation_key: activation_key.to_owned(),
+        proof: activation_proof_result(payload.attestation),
+    })
+}
+
 fn reject_exchange_sidecars(path: &Path) -> Result<(), V25StagingError> {
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut name = OsString::from(path.as_os_str());
@@ -913,6 +1380,8 @@ pub fn stage_schema_v25(
     let source_path = source_path.as_ref();
     let staging_path = staging_path.as_ref();
     validate_path_pair(source_path, staging_path)?;
+    #[cfg(unix)]
+    refuse_activation_direction(source_path)?;
     #[cfg(not(unix))]
     validate_private_file(source_path, false)?;
 
@@ -1064,6 +1533,8 @@ fn reject_reserved_staging_path(
         ".v25-intent.json.writing",
         ".v25-publication-receipt.json",
         ".v25-publication-receipt.json.writing",
+        ".v25-activation.json",
+        ".v25-activation.json.writing",
         "-wal",
         "-shm",
         "-journal",
@@ -1699,5 +2170,580 @@ mod durable_receipt_sync_tests {
             V25ExchangeOrientation::Published
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod disposable_activation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    struct Fixture {
+        directory: PathBuf,
+        source: PathBuf,
+        staging: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_revision(0)
+        }
+        fn with_revision(revision: i64) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "podbay-activate-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let source = directory.join("podbay.sqlite");
+            let staging = directory.join("old.sqlite");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&source)
+                .unwrap();
+            drop(PodBayStore::open(&source).unwrap());
+            let c = Connection::open(&source).unwrap();
+            c.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+            c.execute(
+                "UPDATE metadata SET value=?1 WHERE key='authority_revision'",
+                [revision],
+            )
+            .unwrap();
+            drop(c);
+            let staged = stage_schema_v25(&source, &staging).unwrap();
+            staged.persist_exchange_intent("migration.one").unwrap();
+            let dir = File::open(&directory).unwrap();
+            rustix::fs::renameat_with(
+                &dir,
+                source.file_name().unwrap(),
+                &dir,
+                staging.file_name().unwrap(),
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .unwrap();
+            persist_schema_v25_receipt(&source, &staging, "migration.one").unwrap();
+            drop(staged);
+            Self {
+                directory,
+                source,
+                staging,
+            }
+        }
+        fn activate(&self) -> DisposableV25ActivatedStore {
+            activate_disposable_schema_v25(
+                &self.source,
+                &self.staging,
+                "migration.one",
+                "activation.one",
+            )
+            .unwrap()
+        }
+        fn recover(&self) -> Result<V25ActivationMetadata, V25StagingError> {
+            recover_disposable_v25_activation(
+                &self.source,
+                &self.staging,
+                "migration.one",
+                "activation.one",
+            )
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    // No production write method exists. This private oracle proves that the
+    // persisted boundary precedes a disposable monotone revision transaction.
+    fn advance_revision_for_test(store: &DisposableV25ActivatedStore) -> u64 {
+        let before = store.metadata().unwrap();
+        let mut connection =
+            Connection::open_with_flags(&store.source_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .unwrap();
+        connection
+            .execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let next = before.authority_revision.checked_add(1).unwrap();
+        assert_eq!(
+            transaction
+                .execute(
+                    "UPDATE metadata SET value=?1 WHERE key='authority_revision' AND value=?2",
+                    rusqlite::params![
+                        i64::try_from(next).unwrap(),
+                        i64::try_from(before.authority_revision).unwrap()
+                    ]
+                )
+                .unwrap(),
+            1
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+        File::open(&store.source_path).unwrap().sync_all().unwrap();
+        File::open(store.source_path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        next
+    }
+
+    #[test]
+    fn activation_marker_precedes_write_and_decoder_reopens_changed_v25_state() {
+        let f = Fixture::new();
+        let old_bytes = fs::read(&f.staging).unwrap();
+        let handle = f.activate();
+        let initial = handle.metadata().unwrap();
+        let (marker, _) = activation_paths(&f.source).unwrap();
+        assert_eq!(fs::metadata(&marker).unwrap().mode() & 0o7777, 0o600);
+        let next = advance_revision_for_test(&handle);
+        assert_eq!(next, initial.authority_revision + 1);
+        assert_eq!(handle.metadata().unwrap().authority_revision, next);
+        let current = open_exchange_read_only(&f.source).unwrap();
+        assert_ne!(snapshot(&current).unwrap(), handle.proof.exchange.staging);
+        drop(current);
+        assert!(recover_schema_v25_receipt(&f.source, &f.staging, "migration.one").is_err());
+        assert_eq!(fs::read(&f.staging).unwrap(), old_bytes);
+        assert!(PodBayStore::open(&f.source).is_err());
+        assert!(PodBayStore::open_existing_read_only(&f.source).is_err());
+        drop(handle);
+        assert_eq!(f.activate().metadata().unwrap().authority_revision, next);
+    }
+
+    #[test]
+    fn checksum_valid_marker_cannot_rebase_metadata_away_from_preserved_v24() {
+        for field in ["authority_revision", "owner_epoch"] {
+            let f = Fixture::with_revision(5);
+            let handle = f.activate();
+            assert_eq!(advance_revision_for_test(&handle), 6);
+            drop(handle);
+            let old_bytes = fs::read(&f.staging).unwrap();
+            let (marker, _) = activation_paths(&f.source).unwrap();
+            let mut record: DurableActivation =
+                serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+            let baseline = record
+                .payload
+                .initial_metadata
+                .iter_mut()
+                .find(|row| row.key == field)
+                .unwrap();
+            let current_value = if field == "authority_revision" {
+                assert_eq!(baseline.value, 5);
+                baseline.value = 0;
+                4
+            } else {
+                baseline.value += 1;
+                baseline.value
+            };
+            record.payload_digest = activation_digest(&record.payload).unwrap();
+            fs::write(&marker, serde_json::to_vec(&record).unwrap()).unwrap();
+            // SQL-valid current values match the forged marker but not the preserved v24 origin.
+            let current = Connection::open(&f.source).unwrap();
+            assert_eq!(
+                current
+                    .execute(
+                        "UPDATE metadata SET value=?1 WHERE key=?2",
+                        rusqlite::params![current_value, field]
+                    )
+                    .unwrap(),
+                1
+            );
+            let observed: i64 = current
+                .query_row("SELECT value FROM metadata WHERE key=?1", [field], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(observed, current_value);
+            drop(current);
+            assert!(
+                matches!(
+                    f.recover(),
+                    Err(V25StagingError::Safety(
+                        "activation initial metadata differs from preserved v24"
+                    ))
+                ),
+                "{field}"
+            );
+            assert!(
+                matches!(
+                    activate_disposable_schema_v25(
+                        &f.source,
+                        &f.staging,
+                        "migration.one",
+                        "activation.one"
+                    ),
+                    Err(V25StagingError::Safety(
+                        "activation initial metadata differs from preserved v24"
+                    ))
+                ),
+                "{field}"
+            );
+            assert_eq!(fs::read(&f.staging).unwrap(), old_bytes);
+        }
+    }
+
+    #[test]
+    fn activation_restart_child() {
+        let Some(source) = std::env::var_os("PODBAY_ACTIVATE_PROBE_SOURCE") else {
+            return;
+        };
+        let staging = std::env::var_os("PODBAY_ACTIVATE_PROBE_STAGING").unwrap();
+        let expected = std::env::var("PODBAY_ACTIVATE_PROBE_REVISION")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let handle = activate_disposable_schema_v25(
+            PathBuf::from(source),
+            PathBuf::from(staging),
+            "migration.one",
+            "activation.one",
+        )
+        .unwrap();
+        assert_eq!(handle.metadata().unwrap().authority_revision, expected);
+        println!("fresh-process activated metadata revision={expected}");
+    }
+
+    #[test]
+    fn activation_fresh_process_recovers_after_private_revision_write() {
+        let f = Fixture::new();
+        let handle = f.activate();
+        let next = advance_revision_for_test(&handle);
+        drop(handle);
+        let source_inode = fs::metadata(&f.source).unwrap().ino();
+        let old_bytes = fs::read(&f.staging).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "migration_v25::disposable_activation_tests::activation_restart_child",
+                "--nocapture",
+            ])
+            .env("PODBAY_ACTIVATE_PROBE_SOURCE", &f.source)
+            .env("PODBAY_ACTIVATE_PROBE_STAGING", &f.staging)
+            .env("PODBAY_ACTIVATE_PROBE_REVISION", next.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&child.stdout));
+        assert_eq!(fs::metadata(&f.source).unwrap().ino(), source_inode);
+        assert_eq!(fs::read(&f.staging).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn activation_retry_repairs_post_rename_sync_and_never_demands_frozen_state() {
+        let f = Fixture::with_revision(5);
+        let (marker, writing) = activation_paths(&f.source).unwrap();
+        let first = activate_disposable_schema_v25_with_sync(
+            &f.source,
+            &f.staging,
+            "migration.one",
+            "activation.one",
+            |file, point| {
+                if point == ActivationSyncPoint::ParentDirectory {
+                    assert!(marker.exists());
+                    assert!(!writing.exists());
+                    return Err(std::io::Error::other(
+                        "injected after marker rename before dir sync",
+                    ));
+                }
+                file.sync_all()
+            },
+        );
+        assert!(matches!(first, Err(V25StagingError::Io(_))));
+        for fail in [
+            ActivationSyncPoint::ExistingMarker,
+            ActivationSyncPoint::ParentDirectory,
+        ] {
+            let mut calls = Vec::new();
+            let attempt = activate_disposable_schema_v25_with_sync(
+                &f.source,
+                &f.staging,
+                "migration.one",
+                "activation.one",
+                |file, point| {
+                    calls.push(point);
+                    if point == fail {
+                        return Err(std::io::Error::other(
+                            "injected activation retry repair error",
+                        ));
+                    }
+                    file.sync_all()
+                },
+            );
+            assert!(matches!(attempt, Err(V25StagingError::Io(_))));
+            assert_eq!(calls.first(), Some(&ActivationSyncPoint::ExistingMarker));
+            assert_eq!(calls.last(), Some(&fail));
+        }
+        let mut calls = Vec::new();
+        let handle = activate_disposable_schema_v25_with_sync(
+            &f.source,
+            &f.staging,
+            "migration.one",
+            "activation.one",
+            |file, point| {
+                calls.push(point);
+                file.sync_all()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            [
+                ActivationSyncPoint::ExistingMarker,
+                ActivationSyncPoint::ParentDirectory
+            ]
+        );
+        let next = advance_revision_for_test(&handle);
+        drop(handle);
+        assert_eq!(f.activate().metadata().unwrap().authority_revision, next);
+        let c = Connection::open(&f.source).unwrap();
+        c.execute(
+            "UPDATE metadata SET value=4 WHERE key='authority_revision'",
+            [],
+        )
+        .unwrap();
+        drop(c);
+        assert!(
+            activate_disposable_schema_v25(
+                &f.source,
+                &f.staging,
+                "migration.one",
+                "activation.one"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_activation_refuses_and_preserves_forward_only_direction() {
+        let f = Fixture::new();
+        let source_before = fs::read(&f.source).unwrap();
+        let result = activate_disposable_schema_v25_with_sync(
+            &f.source,
+            &f.staging,
+            "migration.one",
+            "activation.one",
+            |_, point| {
+                if point == ActivationSyncPoint::WritingMarker {
+                    return Err(std::io::Error::other("injected writing marker failure"));
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(V25StagingError::Io(_))));
+        assert!(f.recover().is_err());
+        assert!(
+            activate_disposable_schema_v25(
+                &f.source,
+                &f.staging,
+                "migration.one",
+                "activation.one"
+            )
+            .is_err()
+        );
+        assert!(recover_schema_v25_receipt(&f.source, &f.staging, "migration.one").is_err());
+        assert_eq!(fs::read(&f.source).unwrap(), source_before);
+    }
+
+    #[test]
+    fn activation_refuses_wrong_keys_corrupt_foreign_marker_and_historical_artifacts() {
+        for change in [
+            "format",
+            "direction",
+            "checksum",
+            "unknown",
+            "partial",
+            "receipt_bytes",
+            "intent_inode",
+            "marker_link",
+            "marker_symlink",
+            "marker_mode",
+            "receipt_inode",
+        ] {
+            let f = Fixture::new();
+            drop(f.activate());
+            let (marker, writing) = activation_paths(&f.source).unwrap();
+            assert!(
+                activate_disposable_schema_v25(
+                    &f.source,
+                    &f.staging,
+                    "migration.other",
+                    "activation.one"
+                )
+                .is_err()
+            );
+            assert!(
+                activate_disposable_schema_v25(
+                    &f.source,
+                    &f.staging,
+                    "migration.one",
+                    "activation.other"
+                )
+                .is_err()
+            );
+            assert!(
+                recover_disposable_v25_activation(
+                    &f.source,
+                    f.directory.join("foreign-stage.sqlite"),
+                    "migration.one",
+                    "activation.one"
+                )
+                .is_err()
+            );
+            match change {
+                "format" | "direction" | "checksum" | "unknown" => {
+                    let mut v: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+                    match change {
+                        "format" => v["format"] = "future/2".into(),
+                        "direction" => v["payload"]["direction"] = "rollback".into(),
+                        "checksum" => v["payload_digest"] = "0".repeat(64).into(),
+                        "unknown" => v["caller_activated"] = true.into(),
+                        _ => unreachable!(),
+                    }
+                    fs::write(&marker, serde_json::to_vec(&v).unwrap()).unwrap();
+                }
+                "partial" => fs::write(writing, b"partial foreign").unwrap(),
+                "receipt_bytes" => {
+                    let (path, _) = receipt_paths(&f.source, "migration.one").unwrap();
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.push(b' ');
+                    fs::write(path, bytes).unwrap();
+                }
+                "intent_inode" => {
+                    let (path, _) = intent_paths(&f.source, "migration.one").unwrap();
+                    let replacement = f.directory.join("replacement");
+                    fs::copy(&path, &replacement).unwrap();
+                    fs::rename(replacement, path).unwrap();
+                }
+                "marker_link" => fs::hard_link(&marker, f.directory.join("marker.link")).unwrap(),
+                "marker_symlink" => {
+                    let old = f.directory.join("marker.old");
+                    fs::rename(&marker, &old).unwrap();
+                    std::os::unix::fs::symlink(old, &marker).unwrap();
+                }
+                "marker_mode" => {
+                    fs::set_permissions(&marker, fs::Permissions::from_mode(0o640)).unwrap()
+                }
+                "receipt_inode" => {
+                    let (path, _) = receipt_paths(&f.source, "migration.one").unwrap();
+                    let replacement = f.directory.join("receipt.replacement");
+                    fs::copy(&path, &replacement).unwrap();
+                    fs::rename(replacement, path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(f.recover().is_err(), "{change}");
+            assert!(
+                activate_disposable_schema_v25(
+                    &f.source,
+                    &f.staging,
+                    "migration.one",
+                    "activation.one"
+                )
+                .is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_decoder_refuses_schema_lineage_authority_changes_old_companions_and_orientation()
+    {
+        for change in [
+            "schema",
+            "version",
+            "lineage",
+            "owner",
+            "old_sidecar",
+            "source_inode",
+            "orientation",
+            "new_pending",
+        ] {
+            let f = Fixture::new();
+            drop(f.activate());
+            match change {
+                "schema" | "version" | "lineage" | "owner" | "new_pending" => {
+                    let c = Connection::open(&f.source).unwrap();
+                    c.execute_batch(match change {
+                        "schema"=>"CREATE TABLE unsupported_activation(value INTEGER) STRICT",
+                        "version"=>"PRAGMA user_version=24",
+                        "lineage"=>"UPDATE store_identity SET lineage='foreign' WHERE singleton=1",
+                        "owner"=>"UPDATE metadata SET value=value+1 WHERE key='owner_epoch'",
+                        "new_pending"=>"PRAGMA foreign_keys=OFF; INSERT INTO external_death_pending(recovery_key,store_lineage,scope_id,pod_id,pod_incarnation,launch_command_rowid,activated_rebind_rowid,preparing_owner_epoch,preparing_authority_revision,request_digest) SELECT 'new',lineage,'scope','pod',1,1,1,1,1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' FROM store_identity",
+                        _=>unreachable!()
+                    }).unwrap();
+                }
+                "old_sidecar" => fs::write(
+                    format!("{}-wal", f.staging.display()),
+                    b"foreign old v24 sidecar",
+                )
+                .unwrap(),
+                "source_inode" => {
+                    let replacement = f.directory.join("replacement.sqlite");
+                    fs::copy(&f.source, &replacement).unwrap();
+                    fs::rename(replacement, &f.source).unwrap();
+                }
+                "orientation" => {
+                    let dir = File::open(&f.directory).unwrap();
+                    rustix::fs::renameat_with(
+                        &dir,
+                        f.source.file_name().unwrap(),
+                        &dir,
+                        f.staging.file_name().unwrap(),
+                        rustix::fs::RenameFlags::EXCHANGE,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(f.recover().is_err(), "{change}");
+            assert!(
+                activate_disposable_schema_v25(
+                    &f.source,
+                    &f.staging,
+                    "migration.one",
+                    "activation.one"
+                )
+                .is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_metadata_filenames_are_reserved_before_staging_creation() {
+        for suffix in [".v25-activation.json", ".v25-activation.json.writing"] {
+            let f = Fixture::new();
+            let alternate = f.directory.join("another-source.sqlite");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&alternate)
+                .unwrap();
+            drop(PodBayStore::open(&alternate).unwrap());
+            let mut name = alternate.as_os_str().to_os_string();
+            name.push(suffix);
+            let reserved = PathBuf::from(name);
+            assert!(matches!(
+                stage_schema_v25(&alternate, &reserved),
+                Err(V25StagingError::Safety(
+                    "staging path is reserved for canonical migration metadata or SQLite companions"
+                ))
+            ));
+            assert!(!reserved.exists());
+        }
     }
 }
