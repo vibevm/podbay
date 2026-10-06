@@ -42,6 +42,15 @@ fn boot() -> String {
         .trim()
         .into()
 }
+fn parent_pid(pid: u32) -> std::io::Result<u32> {
+    let data = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    data[data.rfind(')').ok_or(std::io::ErrorKind::InvalidData)? + 2..]
+        .split_whitespace()
+        .nth(1)
+        .ok_or(std::io::ErrorKind::InvalidData)?
+        .parse()
+        .map_err(|_| std::io::ErrorKind::InvalidData.into())
+}
 fn birth(pid: u32) -> std::io::Result<u64> {
     let data = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     data[data.rfind(')').ok_or(std::io::ErrorKind::InvalidData)? + 2..]
@@ -229,12 +238,24 @@ fn spawn(mode: &str) -> ExactChild {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // SAFETY: before exec this closure invokes only async-signal-safe syscalls.
+    // CLOEXEC closes all extra descriptors at exec, preserving Rust's spawn-error
+    // pipe until then. FD3 is the only deliberate extra child descriptor.
     unsafe {
         command.pre_exec(move || {
             if fd != 3 && libc::dup2(fd, 3) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::syscall(
+                libc::SYS_close_range,
+                4u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) < 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -267,7 +288,39 @@ fn child_endpoint() {
     if mode == "exit" {
         return;
     }
+    // SAFETY: the isolated supervisor deliberately transfers ownership of its
+    // socket endpoint as FD3. This test process constructs exactly one owner.
     let mut stream = unsafe { UnixStream::from_raw_fd(3) };
+    if mode == "custody" {
+        // Enumerate the complete inherited FD set. The directory FD used for
+        // enumeration is temporary and excluded by exact identity.
+        let directory = std::fs::read_dir("/proc/self/fd").unwrap();
+        let mut descriptors: Vec<i32> = directory
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        descriptors.sort_unstable();
+        // read_dir's one descriptor is closed when the iterator is consumed.
+        descriptors.retain(|fd| std::fs::symlink_metadata(format!("/proc/self/fd/{fd}")).is_ok());
+        assert_eq!(
+            descriptors,
+            vec![0, 1, 2, 3],
+            "no leaked inherited endpoints or sentinel"
+        );
+        let mut observation = b"CUSTODY1".to_vec();
+        observation.extend_from_slice(&std::process::id().to_be_bytes());
+        observation.extend_from_slice(&birth(std::process::id()).unwrap().to_be_bytes());
+        observation.extend_from_slice(&parent_pid(std::process::id()).unwrap().to_be_bytes());
+        observation.extend_from_slice(&descriptors.iter().map(|fd| *fd as u8).collect::<Vec<_>>());
+        send(&mut stream, &observation).unwrap();
+    }
     let seed = receive(&mut stream).unwrap();
     let k = KeyPair::from_seed(Seed::from_slice(&seed).unwrap());
     let challenge = receive(&mut stream).unwrap();
@@ -366,4 +419,80 @@ fn actual_exec_child_immediate_exit_eof_and_timeout_are_nonobservations() {
         );
     }
     assert!(began.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn supervisor_socketpair_custody_retries_same_child_without_descriptor_leak() {
+    let sentinel = std::fs::File::open("/dev/null").unwrap();
+    // Deliberately non-CLOEXEC descriptor proves the child handoff closes even
+    // unrelated inherited descriptors. The parent retains its own descriptor.
+    let raw = unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_DUPFD, 64) };
+    assert!(raw >= 64);
+    // SAFETY: F_DUPFD returned a newly owned descriptor, reconstructed once.
+    let sentinel_copy = unsafe { std::fs::File::from_raw_fd(raw) };
+    let mut child = spawn("custody");
+    let custody = receive(&mut child.stream).unwrap();
+    assert_eq!(&custody[..8], b"CUSTODY1");
+    assert_eq!(custody.len(), 28);
+    assert_eq!(
+        u32::from_be_bytes(custody[8..12].try_into().unwrap()),
+        child.pid
+    );
+    assert_eq!(
+        u64::from_be_bytes(custody[12..20].try_into().unwrap()),
+        child.birth.unwrap()
+    );
+    assert_eq!(
+        u32::from_be_bytes(custody[20..24].try_into().unwrap()),
+        std::process::id()
+    );
+    assert_eq!(&custody[24..], &[0, 1, 2, 3]);
+    assert!(
+        std::fs::symlink_metadata(format!("/proc/self/fd/{}", sentinel_copy.as_raw_fd())).is_ok()
+    );
+    let mut entropy = [0u8; 64];
+    std::fs::File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut entropy)
+        .unwrap();
+    let mut expected = fixture();
+    expected.nonce.copy_from_slice(&entropy[..32]);
+    expected.child_pid = child.pid;
+    expected.child_birth = child.birth.unwrap();
+    let seed: [u8; 32] = entropy[32..].try_into().unwrap();
+    let trusted_key = KeyPair::from_seed(Seed::new(seed));
+    let challenge = body(&expected, Observation::IdentityUnavailable).unwrap();
+    send(&mut child.stream, &seed).unwrap();
+    send(&mut child.stream, &challenge).unwrap();
+    for _ in 0..2 {
+        let reply = receive(&mut child.stream).unwrap();
+        assert!(verify(&reply, &expected, &trusted_key.pk).is_ok());
+        assert!(child.process.try_wait().unwrap().is_none());
+        assert_eq!(birth(child.pid).unwrap(), expected.child_birth);
+        assert_eq!(parent_pid(child.pid).unwrap(), std::process::id());
+        send(&mut child.stream, &challenge).unwrap();
+    }
+    let final_reply = receive(&mut child.stream).unwrap();
+    assert!(verify(&final_reply, &expected, &trusted_key.pk).is_ok());
+    send(&mut child.stream, &[]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while child.process.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "exact child clean shutdown deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        child.process.wait().unwrap().success(),
+        "exact child exited cleanly"
+    );
+    let mut eof = [0u8; 1];
+    assert_eq!(
+        child.stream.read(&mut eof).unwrap(),
+        0,
+        "no leaked peer retains socket"
+    );
+    assert!(birth(child.pid).is_err());
+    entropy.fill(0);
 }
