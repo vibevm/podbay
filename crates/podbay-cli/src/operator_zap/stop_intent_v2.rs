@@ -1,6 +1,6 @@
 //! Unwired canonical data. Neither caller metadata nor decoded bytes prove
 //! origin, a grant, admission, one-send custody, signing time or terminality.
-//! No Store mutation or Pod send is reachable from this module.
+//! No production Store mutation or Pod send is reachable from this module.
 #![allow(dead_code)]
 
 use podbay_pod::{
@@ -530,7 +530,7 @@ mod tests {
     use serde_json::{Value, json};
 
     // Explicit codec DTO fixture, not an authenticated origin/preparation.
-    fn fixture() -> IntentRecord {
+    pub(super) fn fixture() -> IntentRecord {
         let boot = "12345678-1234-1234-1234-123456789abc".to_owned();
         IntentRecord {
             schema: INTENT_SCHEMA.into(),
@@ -606,7 +606,7 @@ mod tests {
             },
         }
     }
-    fn reply_record(intent: &IntentRecord, running: bool) -> OutcomeRecord {
+    pub(super) fn reply_record(intent: &IntentRecord, running: bool) -> OutcomeRecord {
         let mut status = intent.prepared.status.clone();
         status.child_running = running;
         status.exit_code = if running { None } else { Some(0) };
@@ -1101,3 +1101,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "stop_one_send_fixture.rs"]
+mod one_send_fixture;

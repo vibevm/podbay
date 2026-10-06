@@ -129,6 +129,12 @@ refusal, postwrite uncertainty and exact reply bytes; none denotes `pod.stopped`
 or creates a send permit. Owner signer generation and Pod manager credential
 epoch remain independently bound values. Caller-supplied intent context still
 requires an authenticated writer before durable admission.
+A cfg(test) driver now exercises real schema24 `pod.stop` admission and claim:
+only fresh Committed plus NewClaim produces a consumed fake-send permit.
+Duplicates and reopened uncertain claims never resend; a separate noncanonical
+outcome journal stores reply/uncertainty without marking `pod.stopped`.
+Authority is injected and sends are emulated, so this is not production
+one-send custody or terminal settlement.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 
