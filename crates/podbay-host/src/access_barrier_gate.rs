@@ -4,6 +4,8 @@
 
 const VERSION: u8 = 1;
 
+mod codec;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
@@ -262,7 +264,7 @@ fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (SubjectV1, DurableV1, ObservationV1, RequestV1) {
+    pub(super) fn fixture() -> (SubjectV1, DurableV1, ObservationV1, RequestV1) {
         let s = SubjectV1 {
             version: VERSION,
             canonical_name: "db.sqlite".into(),
