@@ -104,9 +104,15 @@ One disposable privileged mount-namespace fixture preserved the original
 database inode and owner UID while denying outside path, raw SQLite, symlink
 and `/proc` opens. Its inherited-descriptor oracle failed before the full
 descriptor/SCM/mmap boundary was established, so that probe is **not** a
-production isolation receipt. Any future broker must prevent preexisting or
-exported file descriptors as well as path opens, and prove its cleanup and
-cold-boot admission separately.
+production isolation receipt. A separate repaired disposable FD oracle then
+showed the actual counterexample: after a root-owned ancestor denied fresh
+path opens, preissued DB and directory FDs still allowed `pread`, `pwrite` and
+`openat`; a writable shared mapping persisted with `msync`, and rights queued
+before denial were received and used afterward. That oracle exited 0 and its
+fixture/process cleanup was independently checked. A clean worker fixture
+closed extra FDs before its first store open, but it did not prove a production
+sandbox. Any future broker must prevent preexisting or exported handles and
+mappings as well as path opens, and prove cold-boot admission separately.
 
 The migration is bound to a stable Owner request key, old database lineage,
 source file identity, schema 24 content digest and expected v25 schema digest.
