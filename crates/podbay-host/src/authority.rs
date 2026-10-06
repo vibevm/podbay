@@ -7605,6 +7605,7 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchFormat::CodexV2 => self.host.port.accepts_claimed_codex_bootstrap(),
             BoundLaunchFormat::CodexV3 => self.host.port.accepts_claimed_codex_v3_bootstrap(),
             BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped => false,
+            BoundLaunchFormat::OperatorFd3ObserveV1 => false,
         };
         if !port_accepts {
             return Ok(prepared());
@@ -8545,7 +8546,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                 &request.key,
                 &canonical_intent,
             )?,
-            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped
+                | BoundLaunchFormat::OperatorFd3ObserveV1 =>
                 return Err(HostError::Unsupported.into()),
         };
         if let Some(record) = existing {
@@ -8724,7 +8726,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchFormat::CodexV3 => {
                 self.admit_bound_root_codex_v3(transport, planned_request.clone())?
             }
-            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped
+                | BoundLaunchFormat::OperatorFd3ObserveV1 =>
                 return Err(HostError::Unsupported.into()),
         };
         if admitted.duplicate {
@@ -8741,7 +8744,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             BoundLaunchFormat::CodexV3 => {
                 self.dispatch_prepared_bound_root_codex_v3(transport, planned_request)
             }
-            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+            BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped
+                | BoundLaunchFormat::OperatorFd3ObserveV1 =>
                 return Err(HostError::Unsupported.into()),
         };
         match dispatch {
@@ -8760,7 +8764,8 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
                     BoundLaunchFormat::CodexV3 => {
                         self.lookup_bound_root_codex_v3_by_key(transport, &scope, &key, &intent)
                     }
-                    BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped =>
+                    BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped
+                | BoundLaunchFormat::OperatorFd3ObserveV1 =>
                         return Err(HostError::Unsupported.into()),
                 };
                 if let Ok(Some(record)) = original {
@@ -9154,6 +9159,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
             .store
             .lookup_bound_launch(&lookup)?
             .ok_or(StoreError::NotFound)?;
+        if record.format == BoundLaunchFormat::OperatorFd3ObserveV1 {
+            return Err(HostError::Unsupported.into());
+        }
         if record.format != BoundLaunchFormat::V1 || operator_root_record(&record) {
             return Err(HostError::Unauthorised.into());
         }
@@ -9203,6 +9211,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
         let principal = VerifiedPrincipal::from_authenticated_boundary(actor.actor_id.as_str())?;
         let lookup = self.bound_lookup(&request, principal);
         let record = self.store.lookup_bound_launch(&lookup)?.ok_or(StoreError::NotFound)?;
+        if record.format == BoundLaunchFormat::OperatorFd3ObserveV1 {
+            return Err(HostError::Unsupported.into());
+        }
         if !operator_root_record(&record) {
             return Err(HostError::Unauthorised.into());
         }
@@ -9534,6 +9545,9 @@ impl<P: HostDispatchPort> DurableAuthority<P> {
     where
         P::Receipt: StablePortReceipt,
     {
+        if record.format == BoundLaunchFormat::OperatorFd3ObserveV1 {
+            return Err(HostError::Unsupported.into());
+        }
         // Validate exactly the committed bytes before moving the outbox into
         // an uncertain claim state. No current proposal reaches this port.
         let committed = AuthorisedBoundLaunch::from_committed(&authorised, record.clone())?;

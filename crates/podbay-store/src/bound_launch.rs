@@ -13,6 +13,8 @@ use podbay_wire::{
     LAUNCH_DESCRIPTOR_SCHEMA, LAUNCH_DESCRIPTOR_V2_SCHEMA,
     LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA, LifetimeLimit, NativeResourceKind, NativeRole,
     NativeWorkKind, OPERATOR_PROCESS_PROFILE_REF, ResourceDriver,
+    EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION, LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA,
+    EffectiveOperatorFd3ObserveContractV1, ImmutableOperatorFd3ObserveDescriptorV1,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeMap;
@@ -168,6 +170,27 @@ pub struct BoundOperatorRootLaunchRequest<'a> {
     pub proposal: Option<BoundOperatorRootLaunchProposal<'a>>,
 }
 
+/// Reviewed data for admission only. The caller must authenticate its actor,
+/// current grant and trusted registry; these public fields confer no authority.
+pub struct BoundOperatorFd3ObserveRootProposal<'a> {
+    pub session: &'a Session,
+    pub run: &'a Run,
+    pub binding: &'a PlannedRootBinding,
+    pub effective_spec: &'a EffectiveOperatorFd3ObserveContractV1,
+    pub descriptor: &'a ImmutableOperatorFd3ObserveDescriptorV1,
+    pub expected_owner_epoch: u64,
+    pub expected_authority_revision: u64,
+}
+
+pub struct BoundOperatorFd3ObserveRootRequest<'a> {
+    pub principal: VerifiedPrincipal,
+    pub command_key: &'a str,
+    pub canonical_intent: &'a [u8],
+    pub scope_id: &'a str,
+    pub pod_id: &'a str,
+    pub proposal: Option<BoundOperatorFd3ObserveRootProposal<'a>>,
+}
+
 /// Reviewed internal Codex V2 proof for a new first root launch. Both values are
 /// typed and canonical before the store checks them again under one writer
 /// transaction. This cannot admit a child Worker of an existing parent Run
@@ -208,6 +231,8 @@ pub struct CurrentLaunchPolicyFence {
 pub enum BoundLaunchFormat {
     V1,
     OperatorUntilStopped,
+    /// Both FD3 lifetimes are admitted/readable, but dispatch is unsupported.
+    OperatorFd3ObserveV1,
     CodexV2,
     /// V2 typed descriptor bytes with a distinct committed V3 policy row.
     CodexV3,
@@ -218,6 +243,7 @@ impl BoundLaunchFormat {
         match self {
             Self::V1 => EFFECTIVE_LAUNCH_VERSION,
             Self::OperatorUntilStopped => EFFECTIVE_OPERATOR_UNTIL_STOPPED_VERSION,
+            Self::OperatorFd3ObserveV1 => EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION,
             Self::CodexV2 | Self::CodexV3 => EFFECTIVE_LAUNCH_V2_VERSION,
         }
     }
@@ -226,6 +252,7 @@ impl BoundLaunchFormat {
         match self {
             Self::V1 => LAUNCH_DESCRIPTOR_SCHEMA,
             Self::OperatorUntilStopped => LAUNCH_DESCRIPTOR_OPERATOR_UNTIL_STOPPED_SCHEMA,
+            Self::OperatorFd3ObserveV1 => LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA,
             Self::CodexV2 | Self::CodexV3 => LAUNCH_DESCRIPTOR_V2_SCHEMA,
         }
     }
@@ -234,6 +261,7 @@ impl BoundLaunchFormat {
 enum ProposalKind<'a> {
     V1(BoundLaunchProposal<'a>),
     OperatorRoot(BoundOperatorRootLaunchProposal<'a>),
+    OperatorFd3ObserveRoot(BoundOperatorFd3ObserveRootProposal<'a>),
     CodexV2(BoundRootLaunchProposalV2<'a>),
 }
 
@@ -1379,6 +1407,11 @@ impl PodBayStore {
                     .map_err(|_| StoreError::Conflict("stored V2 descriptor is malformed"))?;
                 (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
             }
+            BoundLaunchFormat::OperatorFd3ObserveV1 => {
+                let descriptor = ImmutableOperatorFd3ObserveDescriptorV1::decode_json(&launch.descriptor)
+                    .map_err(|_| StoreError::Conflict("stored FD3 descriptor is malformed"))?;
+                (descriptor.attempt_ordinal(), descriptor.attempt_epoch())
+            }
         };
         if attempt_ordinal != bound_ordinal || attempt_epoch != bound_attempt_epoch {
             return Err(StoreError::Conflict(
@@ -1641,6 +1674,27 @@ impl PodBayStore {
             proposal: request.proposal.map(ProposalKind::OperatorRoot),
             format: BoundLaunchFormat::OperatorUntilStopped,
             operator_root: true,
+            policy_fence_epoch: None,
+        })
+    }
+
+    /// Commits a first-root FD3 observation declaration and a Prepared outbox.
+    /// Neither finite nor UntilStopped records may be claimed or dispatched.
+    pub fn admit_bound_operator_fd3_observe_root(
+        &mut self,
+        request: BoundOperatorFd3ObserveRootRequest<'_>,
+    ) -> Result<BoundLaunchAdmission, StoreError> {
+        self.admit_bound_launch_internal(AdmissionRequest {
+            principal: request.principal,
+            command_key: request.command_key,
+            canonical_intent: request.canonical_intent,
+            scope_id: request.scope_id,
+            pod_id: request.pod_id,
+            proposal: request.proposal.map(ProposalKind::OperatorFd3ObserveRoot),
+            format: BoundLaunchFormat::OperatorFd3ObserveV1,
+            // This flag distinguishes the legacy V1 operator path. FD3 has its
+            // own exact format and must never enter that legacy classification.
+            operator_root: false,
             policy_fence_epoch: None,
         })
     }
@@ -2203,6 +2257,42 @@ fn check_proposal<'a>(
                 expected_authority_revision: proposal.expected_authority_revision,
             })
         }
+        ProposalKind::OperatorFd3ObserveRoot(proposal) => {
+            let binding = proposal.binding.identity();
+            validate_planned_initial(request, proposal.session, proposal.run, binding)?;
+            proposal.descriptor.validate_against_planned_root(proposal.binding)
+                .map_err(|_| StoreError::Conflict("FD3 descriptor differs from queued root"))?;
+            let descriptor = proposal.descriptor.encode_json()
+                .map_err(|_| StoreError::InvalidInput("FD3 descriptor cannot encode"))?;
+            let decoded = ImmutableOperatorFd3ObserveDescriptorV1::decode_json(&descriptor)
+                .map_err(|_| StoreError::InvalidInput("FD3 descriptor is malformed"))?;
+            if decoded != *proposal.descriptor {
+                return Err(StoreError::Conflict("FD3 descriptor is not canonical"));
+            }
+            let effective_spec = proposal.effective_spec.canonical_bytes();
+            let effective = EffectiveOperatorFd3ObserveContractV1::decode(effective_spec)
+                .map_err(|_| StoreError::InvalidInput("FD3 effective launch is malformed"))?;
+            if effective != *proposal.effective_spec {
+                return Err(StoreError::Conflict("FD3 effective launch is not canonical"));
+            }
+            effective.compare_with_descriptor(proposal.descriptor)
+                .map_err(|_| StoreError::Conflict("FD3 effective launch differs from descriptor"))?;
+            Ok(CheckedProposal {
+                session: proposal.session,
+                run: proposal.run,
+                binding,
+                planned_binding: Some(proposal.binding),
+                effective_spec,
+                descriptor,
+                spec_digest: effective.digest().to_owned(),
+                descriptor_digest: proposal.descriptor.digest().to_owned(),
+                format: BoundLaunchFormat::OperatorFd3ObserveV1,
+                // Fixed by the strictly decoded FD3 contract.
+                max_children: 0,
+                expected_owner_epoch: proposal.expected_owner_epoch,
+                expected_authority_revision: proposal.expected_authority_revision,
+            })
+        }
         ProposalKind::CodexV2(proposal) => {
             let binding = proposal.binding.identity();
             validate_planned_initial(request, proposal.session, proposal.run, binding)?;
@@ -2398,7 +2488,7 @@ struct StoredNativeResource {
     epoch: u64,
 }
 
-/// Projection from strictly decoded V1 or V2 wire types only. It is never
+/// Projection from strictly decoded versioned wire types only. It is never
 /// formed by parsing raw JSON fields or by trusting a stored digest alone.
 struct StoredLaunchFacts {
     effective_digest: String,
@@ -2425,6 +2515,38 @@ fn stored_launch_facts(
     descriptor_bytes: &[u8],
 ) -> Result<StoredLaunchFacts, StoreError> {
     match format {
+        BoundLaunchFormat::OperatorFd3ObserveV1 => {
+            let effective = EffectiveOperatorFd3ObserveContractV1::decode(effective_bytes)
+                .map_err(|_| StoreError::Conflict("stored FD3 effective launch is malformed"))?;
+            let descriptor = ImmutableOperatorFd3ObserveDescriptorV1::decode_json(descriptor_bytes)
+                .map_err(|_| StoreError::Conflict("stored FD3 descriptor is malformed"))?;
+            effective.compare_with_descriptor(&descriptor)
+                .map_err(|_| StoreError::Conflict("stored FD3 effective launch differs from descriptor"))?;
+            let native = descriptor.resource();
+            Ok(StoredLaunchFacts {
+                effective_digest: effective.digest().to_owned(),
+                descriptor_digest: descriptor.digest().to_owned(),
+                effective_spec_digest: descriptor.effective_spec_digest().to_owned(),
+                scope_id: descriptor.scope_id().to_owned(),
+                actor_id: descriptor.actor_id().to_owned(),
+                session_id: descriptor.session_id().to_owned(),
+                run_id: descriptor.run_id().to_owned(),
+                attempt_id: descriptor.attempt_id().to_owned(),
+                pod_id: descriptor.pod_id().to_owned(),
+                pod_incarnation: descriptor.pod_incarnation(),
+                // These are invariants of the typed FD3 decoder, not raw JSON.
+                role: NativeRole::Coordinator,
+                work_kind: NativeWorkKind::Service,
+                parent_run_id: None,
+                attempt_ordinal: descriptor.attempt_ordinal(),
+                attempt_epoch: descriptor.attempt_epoch(),
+                resources: vec![StoredNativeResource {
+                    id: native.resource_id.to_owned(),
+                    kind: native.kind,
+                    epoch: native.epoch,
+                }],
+            })
+        }
         BoundLaunchFormat::V1 | BoundLaunchFormat::OperatorUntilStopped => {
             let effective = EffectiveLaunchContract::decode(effective_bytes)
                 .map_err(|_| StoreError::Conflict("stored effective launch is malformed"))?;
@@ -2630,6 +2752,9 @@ pub(crate) fn read_bound_record(
         }
         (EFFECTIVE_LAUNCH_V2_VERSION, LAUNCH_DESCRIPTOR_V2_SCHEMA, true) => {
             BoundLaunchFormat::CodexV3
+        }
+        (EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION, LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA, false) => {
+            BoundLaunchFormat::OperatorFd3ObserveV1
         }
         _ => return Err(StoreError::Conflict("bound launch version pair differs")),
     };
@@ -2890,12 +3015,170 @@ fn work_native_text(value: NativeWorkKind) -> &'static str {
     }
 }
 
+pub(crate) const FD3_ADMISSION_ONLY: &str = "FD3-observe launch is admission-only";
+
+pub(crate) fn ensure_dispatch_format_supported(
+    format: BoundLaunchFormat,
+) -> Result<(), StoreError> {
+    if format == BoundLaunchFormat::OperatorFd3ObserveV1 {
+        return Err(StoreError::Conflict(FD3_ADMISSION_ONLY));
+    }
+    Ok(())
+}
+
+/// Outcome writers also handle historical unbound launches. Preserve that
+/// behavior while refusing either FD3 version marker before any retry/write.
+pub(crate) fn ensure_launch_outcome_supported(
+    transaction: &Transaction<'_>,
+    command_rowid: i64,
+) -> Result<(), StoreError> {
+    let versions: Option<(String, String)> = transaction.query_row(
+        "SELECT effective_spec_version,descriptor_version FROM launch_bindings WHERE command_rowid=?1",
+        [command_rowid], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    if let Some((effective, descriptor)) = versions {
+        if effective == EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION
+            || descriptor == LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA
+        {
+            return Err(StoreError::Conflict(FD3_ADMISSION_ONLY));
+        }
+        // A relabelled FD3 body must not borrow an old format's outcome path.
+        // Existing unbound history has no row and retains its prior behavior.
+        let record = read_bound_record(transaction, command_rowid)?;
+        ensure_dispatch_format_supported(record.format)?;
+    } else {
+        ensure_legacy_unbound_outcome(transaction, command_rowid)?;
+    }
+    Ok(())
+}
+
+/// Absence of a binding is not evidence of a legacy admission. Require the
+/// intact generic-admission graph and digests, with no surviving bound metadata.
+/// This classifies stored history; it does not authenticate its provenance.
+fn ensure_legacy_unbound_outcome(
+    transaction: &Transaction<'_>,
+    command_rowid: i64,
+) -> Result<(), StoreError> {
+    const LOST: &str = "launch binding is missing while bound evidence remains";
+    const UNVERIFIED: &str = "legacy unbound launch admission is not verified";
+    let bound_evidence: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM launch_resources WHERE command_rowid=?1)
+             OR EXISTS(SELECT 1 FROM launch_policy_fences WHERE command_rowid=?1)
+             OR EXISTS(SELECT 1 FROM events WHERE command_rowid=?1 AND kind='launch.bound')",
+        [command_rowid],
+        |row| row.get(0),
+    )?;
+    if bound_evidence {
+        return Err(StoreError::Conflict(LOST));
+    }
+    // The bounds precede allocation of the stored BLOB values. All joins are
+    // exact original receipt/backlinks, never a nearest event or current row.
+    let legacy: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+    )> = transaction
+        .query_row(
+            "SELECT c.principal,c.namespace,c.command_key,c.scope_id,c.target_id,
+                c.owner_epoch,c.target_epoch,c.canonical_request,e.kind,e.payload,
+                o.payload,c.request_digest,o.effect_digest
+         FROM commands c
+         JOIN events e ON e.sequence=c.event_sequence AND e.command_rowid=c.command_rowid
+         JOIN outbox o ON o.outbox_id=c.outbox_id AND o.command_rowid=c.command_rowid
+         JOIN launch_slots s ON s.command_rowid=c.command_rowid
+             AND s.scope_id=c.scope_id AND s.pod_id=c.target_id AND s.pod_incarnation=c.target_epoch
+         WHERE c.command_rowid=?1 AND c.digest_version=?2
+           AND c.owner_epoch>=0 AND c.target_epoch>0
+           AND e.schema_version=1 AND e.kind!='launch.bound' AND o.kind='pod.offer'
+           AND e.scope_id=c.scope_id AND e.target_id=c.target_id
+           AND e.owner_epoch=c.owner_epoch AND e.target_epoch=c.target_epoch
+           AND o.scope_id=c.scope_id AND o.target_id=c.target_id
+           AND o.owner_epoch=c.owner_epoch AND o.target_epoch=c.target_epoch
+           AND e.source_kind='manager.admission' AND e.source_id=c.command_id
+           AND e.source_epoch=c.owner_epoch AND e.source_sequence=1
+           AND e.source_digest=c.request_digest AND e.source_order='contiguous'
+           AND e.provenance='authenticated.manager.admission' AND e.causation_id=c.command_id
+           AND length(c.canonical_request) BETWEEN 1 AND 1048576
+           AND length(e.payload) BETWEEN 1 AND 1048576
+           AND length(o.payload) BETWEEN 1 AND 1048576",
+            params![command_rowid, DIGEST_VERSION],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (
+        principal,
+        namespace,
+        command_key,
+        scope_id,
+        target_id,
+        owner,
+        target,
+        canonical_request,
+        event_kind,
+        event_payload,
+        effect_payload,
+        request_digest,
+        effect_digest,
+    ) = legacy.ok_or(StoreError::Conflict(UNVERIFIED))?;
+    // Generic admission payloads are opaque. Neither a domain substring nor a
+    // canonical descriptor embedded as data proves the producer was bound.
+    // A coherent rewrite of all structural evidence is outside this boundary.
+    let request = CommandRequest {
+        principal: VerifiedPrincipal::from_authenticated_boundary(&principal)?,
+        namespace,
+        command_key,
+        scope_id,
+        target_id,
+        expected_owner_epoch: owner as u64,
+        expected_target_epoch: target as u64,
+        canonical_request,
+        event_kind,
+        event_payload,
+        effect_kind: "pod.offer".into(),
+        effect_payload,
+    };
+    validate_request(&request).map_err(|_| StoreError::Conflict(UNVERIFIED))?;
+    if digest_request(&request) != request_digest
+        || sha256_hex(&request.effect_payload) != effect_digest
+    {
+        return Err(StoreError::Conflict(UNVERIFIED));
+    }
+    Ok(())
+}
+
 /// Current-state gate for a *new* outbox claim. Immutable receipt lookup never
 /// calls this: an ended run or newer pod incarnation cannot erase its history.
 pub(crate) fn ensure_current_dispatch_eligible(
     transaction: &Transaction<'_>,
     record: &BoundLaunchRecord,
 ) -> Result<(), StoreError> {
+    ensure_dispatch_format_supported(record.format)?;
     let session: Option<(String, Option<String>)> = transaction
         .query_row(
             "SELECT state,current_run_id FROM runtime_sessions WHERE session_id=?1",

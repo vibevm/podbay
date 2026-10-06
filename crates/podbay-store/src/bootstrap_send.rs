@@ -322,6 +322,8 @@ pub(crate) fn check_host_accepted_launch(
     owner_epoch: u64,
     manager_credential_epoch: u64,
 ) -> Result<(), StoreError> {
+    // HostAccepted is necessary only for the existing Codex wire pair (V2/V3).
+    // Another one-resource format must not inherit this predicate from labels.
     let evidence: Option<(
         String,
         String,
@@ -341,13 +343,16 @@ pub(crate) fn check_host_accepted_launch(
              JOIN outbox AS o ON o.command_rowid=b.command_rowid
              JOIN launch_dispatch_outcomes AS result ON result.outbox_id=o.outbox_id
              WHERE b.scope_id=?1 AND b.run_id=?2 AND b.attempt_id=?3
-               AND b.pod_id=?4 AND b.pod_incarnation=?5",
+               AND b.pod_id=?4 AND b.pod_incarnation=?5
+               AND b.effective_spec_version=?6 AND b.descriptor_version=?7",
             params![
                 target.scope_id.as_str(),
                 target.run_id.as_str(),
                 target.attempt_id.as_str(),
                 target.pod_id.as_str(),
-                integer(target.pod_incarnation)?
+                integer(target.pod_incarnation)?,
+                podbay_wire::EFFECTIVE_LAUNCH_V2_VERSION,
+                podbay_wire::LAUNCH_DESCRIPTOR_V2_SCHEMA,
             ],
             |row| {
                 Ok((
@@ -1374,4 +1379,77 @@ pub(crate) fn schema24_native_send_fence(
         return Err(StoreError::UnsupportedSchema(version));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fd3_host_accepted_tests {
+    use super::*;
+
+    #[test]
+    fn fd3_and_mixed_wire_pairs_never_become_codex_host_accepted() {
+        // Minimal noncanonical relations isolate this private predicate. These
+        // are attacker-shaped rows, not a real dispatch or authority fixture.
+        for state in ["claimed_uncertain", "observed"] {
+            for (effective, descriptor, accepted) in [
+                (
+                    podbay_wire::EFFECTIVE_LAUNCH_V2_VERSION,
+                    podbay_wire::LAUNCH_DESCRIPTOR_V2_SCHEMA,
+                    true,
+                ),
+                (
+                    podbay_wire::EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION,
+                    podbay_wire::LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA,
+                    false,
+                ),
+                (
+                    podbay_wire::EFFECTIVE_OPERATOR_FD3_OBSERVE_VERSION,
+                    podbay_wire::LAUNCH_DESCRIPTOR_V2_SCHEMA,
+                    false,
+                ),
+                (
+                    podbay_wire::EFFECTIVE_LAUNCH_V2_VERSION,
+                    podbay_wire::LAUNCH_DESCRIPTOR_OPERATOR_FD3_OBSERVE_SCHEMA,
+                    false,
+                ),
+            ] {
+                let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+                connection.execute_batch("CREATE TABLE launch_bindings(command_rowid INTEGER,scope_id TEXT,run_id TEXT,attempt_id TEXT,pod_id TEXT,pod_incarnation INTEGER,session_id TEXT,resource_count INTEGER,effective_spec_version TEXT,descriptor_version TEXT);
+                    CREATE TABLE commands(command_rowid INTEGER,command_id TEXT);
+                    CREATE TABLE outbox(outbox_id INTEGER,command_rowid INTEGER,kind TEXT,state TEXT,claim_owner_epoch INTEGER,claim_key TEXT);
+                    CREATE TABLE launch_dispatch_outcomes(outbox_id INTEGER,stage TEXT,claim_key TEXT);
+                    INSERT INTO commands VALUES(1,'command.fixture');
+                    INSERT INTO launch_dispatch_outcomes VALUES(1,'host_accepted','claim.command.fixture');").unwrap();
+                connection.execute("INSERT INTO launch_bindings VALUES(1,'scope.fixture','run.fixture','attempt.fixture','pod.fixture',1,'session.fixture',1,?1,?2)", params![effective,descriptor]).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO outbox VALUES(1,1,'pod.offer',?1,1,'claim.command.fixture')",
+                        [state],
+                    )
+                    .unwrap();
+                let target = NativeWriterTarget {
+                    store_lineage: podbay_core::StoreLineageId::try_from("lineage.fixture")
+                        .unwrap(),
+                    scope_id: ScopeId::try_from("scope.fixture").unwrap(),
+                    session_id: SessionId::try_from("session.fixture").unwrap(),
+                    run_id: podbay_core::RunId::try_from("run.fixture").unwrap(),
+                    attempt_id: podbay_core::AttemptId::try_from("attempt.fixture").unwrap(),
+                    pod_id: podbay_core::PodId::try_from("pod.fixture").unwrap(),
+                    pod_incarnation: 1,
+                    resource_id: podbay_core::ResourceId::try_from("resource.fixture").unwrap(),
+                    resource_epoch: 1,
+                    resource_input_epoch: 1,
+                };
+                let transaction = connection.transaction().unwrap();
+                let result = check_host_accepted_launch(&transaction, &target, 1, 3);
+                if accepted {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(StoreError::Conflict("Codex V2 launch is not HostAccepted"))
+                    ));
+                }
+            }
+        }
+    }
 }

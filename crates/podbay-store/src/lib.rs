@@ -25,6 +25,7 @@ pub use bound_launch::{
     BoundLaunchAdmission, BoundLaunchFormat, BoundLaunchProposal, BoundLaunchRecord,
     BoundLaunchRequest, BoundLaunchResource, BoundOperatorRootLaunchProposal,
     BoundOperatorRootLaunchRequest, BoundRootLaunchProposalV2, BoundRootLaunchRequestV2,
+    BoundOperatorFd3ObserveRootProposal, BoundOperatorFd3ObserveRootRequest,
     CurrentBoundPodSnapshot, CurrentBoundResource, CurrentDelegatingParentSnapshot,
     CurrentLaunchPolicyFence, CurrentV2RebindCandidate, CurrentV2RebindCursor,
     CurrentV2RebindDisposition, CurrentV2RebindPage, RunChildBudget,

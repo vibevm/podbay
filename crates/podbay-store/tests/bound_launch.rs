@@ -23,6 +23,9 @@ use podbay_wire::{
 };
 use sha2::{Digest, Sha256};
 
+#[path = "bound_launch/fd3_observe.rs"]
+mod fd3_observe;
+
 struct Fixture {
     directory: PathBuf,
     database: PathBuf,

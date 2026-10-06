@@ -2,6 +2,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::model::{LaunchDispatchStage, LaunchDispatchStatus, LaunchPortResult, StoreError};
 use crate::store::PodBayStore;
+use crate::bound_launch::ensure_launch_outcome_supported;
 
 impl PodBayStore {
     pub fn launch_dispatch_status(
@@ -101,9 +102,9 @@ impl PodBayStore {
         if current_owner != owner {
             return Err(StoreError::StaleEpoch);
         }
-        let row: Option<(String, String, String, String, Option<String>)> = transaction
+        let row: Option<(String, String, String, String, Option<String>, i64)> = transaction
             .query_row(
-                "SELECT scope_id,target_id,kind,state,claim_key FROM outbox WHERE outbox_id=?1",
+                "SELECT scope_id,target_id,kind,state,claim_key,command_rowid FROM outbox WHERE outbox_id=?1",
                 [outbox_id],
                 |row| {
                     Ok((
@@ -112,17 +113,19 @@ impl PodBayStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        let (scope, target, kind, state, prior_claim) = row.ok_or(StoreError::NotFound)?;
+        let (scope, target, kind, state, prior_claim, command_rowid) = row.ok_or(StoreError::NotFound)?;
         if scope != scope_id || target != target_id {
             return Err(StoreError::WrongScope);
         }
         if kind != "pod.offer" {
             return Err(StoreError::UnsupportedEffectKind);
         }
+        ensure_launch_outcome_supported(&transaction, command_rowid)?;
         if !matches!(state.as_str(), "claimed_uncertain" | "observed")
             || prior_claim.as_deref() != Some(claim_key)
         {

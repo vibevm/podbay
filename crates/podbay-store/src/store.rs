@@ -8,7 +8,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 
 use crate::authority::advance_policy_fence_epoch;
-use crate::bound_launch::{ensure_current_dispatch_eligible, read_bound_record};
+use crate::bound_launch::{
+    ensure_current_dispatch_eligible, ensure_dispatch_format_supported,
+    ensure_launch_outcome_supported, read_bound_record,
+};
 
 use crate::model::{
     Admission, AdmittedLaunchInspection, CommandInspection, CommandLookupSelector, CommandRequest,
@@ -1519,6 +1522,9 @@ impl PodBayStore {
             // Generic legacy admissions remain inspectable, but no unbound
             // offer may cross the effect-claim boundary in schema eight.
             let bound = read_bound_record(&transaction, row.8)?;
+            // Admission-only formats cannot become live claims through either
+            // a fresh claim or an ExistingUncertain/AlreadyObserved retry.
+            ensure_dispatch_format_supported(bound.format)?;
             if row.3 == "prepared" {
                 ensure_current_dispatch_eligible(&transaction, &bound)?;
             }
@@ -1800,6 +1806,9 @@ impl PodBayStore {
         }
         if !supported_effect_kind(&row.3) {
             return Err(StoreError::UnsupportedEffectKind);
+        }
+        if row.3 == "pod.offer" {
+            ensure_launch_outcome_supported(&transaction, row.0)?;
         }
         if row.5.as_deref() != Some(claim_key) {
             return Err(StoreError::Conflict("effect claim identity changed"));
