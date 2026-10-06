@@ -117,6 +117,12 @@ revision transaction used to serialize Owner rotation. Exact committed replay
 survives rotation; an old key first presented after rotation refuses. Process
 SIGKILL controls cover before/after commit, not power loss. This noncanonical
 fixture does not sign or authorize the production terminal envelope.
+An unwired `PodClient::load_for_attested_stop` path now pins the manifest
+without opening a socket, then prepares a one-send stop exchange by checking
+the connected peer before either status or stop bearer reaches it. It retains
+the full reply as an inert observation; a lost/contradictory reply or peer
+disappearance after writing remains uncertain, never an automatic retry or
+terminal proof. The existing operator `stop` call site is unchanged.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 

@@ -252,6 +252,8 @@ pub struct PodClient {
     pinned_manifest: Option<PinnedManifest>,
 }
 
+pub use attested_stop::{AttestedStopError, AttestedStopReply, PreparedAttestedStop};
+
 /// Cheap per-status file proof after one full manifest/descriptor validation.
 /// Every read still checks the exact path, inode, owner, mode and bytes; the
 /// executable hash is checked once before polling and once on acceptance.
@@ -987,6 +989,14 @@ impl PodClient {
     /// proves a process in the expected unit, not systemd MainPID or hostile
     /// same-UID isolation; those require separate platform evidence.
     pub fn attested_status(&self) -> Result<PodStatus, PodError> {
+        self.attested_status_with_peer(inspect_exchange)
+            .map(|(status, _)| status)
+    }
+
+    fn attested_status_with_peer(
+        &self,
+        exchange: impl FnOnce(&Path, &[u8]) -> Result<(Vec<u8>, LinuxPeerEvidence), PodError>,
+    ) -> Result<(PodStatus, LinuxPeerEvidence), PodError> {
         if let Some(pinned) = &self.pinned_manifest {
             pinned.recheck(&self.manifest_path)?;
         }
@@ -1000,7 +1010,7 @@ impl PodClient {
             terminal: None,
         };
         let (bytes, observed) =
-            inspect_exchange(&self.manifest.socket_path, &serde_json::to_vec(&request)?)?;
+            exchange(&self.manifest.socket_path, &serde_json::to_vec(&request)?)?;
         let response: Response = serde_json::from_slice(&bytes)?;
         if !response.ok {
             return Err(PodError::Refused("pod rejected authenticated status"));
@@ -1041,7 +1051,7 @@ impl PodClient {
         {
             return Err(PodError::Refused("pod status server OS identity differs"));
         }
-        Ok(status)
+        Ok((status, observed))
     }
 
     /// Submit only an already-claimed bootstrap selector. The pod obtains
@@ -4997,5 +5007,1165 @@ mod tests {
         let raw = reopened.read_all_bounded().unwrap();
         assert_eq!(raw, b"intentrece");
         fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+/// Unwired reply observation. This module grants no StopPod authority and
+/// does not persist intent, settle an outbox, sign terminal evidence or retry.
+mod attested_stop {
+    use super::*;
+    use std::fmt;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
+    const PREPARATION_LIFETIME: Duration = Duration::from_secs(30);
+
+    /// The boundary is the first attempted write of the stop request. Reasons
+    /// are static: neither bearer tokens nor untrusted replies enter diagnostics.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum AttestedStopError {
+        RefusedBeforeWrite(&'static str),
+        UncertainAfterWrite(&'static str),
+    }
+
+    impl fmt::Display for AttestedStopError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::RefusedBeforeWrite(reason) => {
+                    write!(f, "stop refused before write: {reason}")
+                }
+                Self::UncertainAfterWrite(reason) => {
+                    write!(f, "stop outcome uncertain after write: {reason}")
+                }
+            }
+        }
+    }
+    impl std::error::Error for AttestedStopError {}
+    use AttestedStopError::{RefusedBeforeWrite as Refused, UncertainAfterWrite as Uncertain};
+
+    /// An in-process anchor obtained by authenticated status acquisition. It
+    /// has no DTO/deserialize constructor and is consumed by one send attempt.
+    /// It is not a durable claim: creating another preparation is not deduplication.
+    #[must_use]
+    pub struct PreparedAttestedStop<'a> {
+        client: &'a PodClient,
+        manifest: PinnedManifest,
+        socket: SocketIdentity,
+        status: PodStatus,
+        peer: LinuxPeerEvidence,
+        expires: Instant,
+    }
+
+    impl fmt::Debug for PreparedAttestedStop<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("PreparedAttestedStop { private anchor }")
+        }
+    }
+
+    /// Exact authenticated reply observation, including the full bound status.
+    /// A running child is valid observation data. Even a stopped child does not
+    /// prove unit/process/socket terminality, signing time or durable admission.
+    /// The wire protocol has no command ID, stop key or nonce to acknowledge.
+    pub struct AttestedStopReply {
+        status: PodStatus,
+        bytes: Vec<u8>,
+        peer: LinuxPeerEvidence,
+    }
+    impl AttestedStopReply {
+        pub fn status(&self) -> &PodStatus {
+            &self.status
+        }
+        pub fn reply_bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+        pub fn peer(&self) -> &LinuxPeerEvidence {
+            &self.peer
+        }
+    }
+    impl fmt::Debug for AttestedStopReply {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("AttestedStopReply")
+                .field("child_running", &self.status.child_running)
+                .field("reply_length", &self.bytes.len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct SocketIdentity {
+        dev: u64,
+        ino: u64,
+        uid: u32,
+        mode: u32,
+    }
+    impl SocketIdentity {
+        fn read(path: &Path, uid: u32) -> Result<Self, AttestedStopError> {
+            let metadata = fs::symlink_metadata(path).map_err(|_| Refused("socket unavailable"))?;
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != uid
+                || metadata.mode() & 0o077 != 0
+                || fs::canonicalize(path).ok().as_deref() != Some(path)
+            {
+                return Err(Refused("socket identity is not private and exact"));
+            }
+            Ok(Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                uid,
+                mode: metadata.mode() & 0o7777,
+            })
+        }
+        fn recheck(&self, path: &Path) -> Result<(), AttestedStopError> {
+            if Self::read(path, self.uid)? == *self {
+                Ok(())
+            } else {
+                Err(Refused("socket identity changed"))
+            }
+        }
+    }
+
+    impl PodClient {
+        /// Load and validate the exact private manifest without opening any
+        /// control socket or sending a bearer. Use this entry, followed by
+        /// `prepare_attested_stop`, for authentication before the first status
+        /// or stop write. Historical `connect` sends its own ordinary status
+        /// request and does not provide that guarantee.
+        pub fn load_for_attested_stop(path: impl AsRef<Path>) -> Result<Self, AttestedStopError> {
+            let path = path.as_ref();
+            let manifest = read_manifest(path)
+                .map_err(|_| Refused("attested-stop manifest is invalid or unavailable"))?;
+            if manifest.peer_binding.is_none() {
+                return Err(Refused("unbound stop is unavailable"));
+            }
+            let pinned_manifest = PinnedManifest::capture(path, &manifest)
+                .map_err(|_| Refused("attested-stop manifest cannot be pinned"))?;
+            Ok(Self {
+                manifest_path: path.to_path_buf(),
+                manifest,
+                pinned_manifest: Some(pinned_manifest),
+            })
+        }
+
+        /// Prepare without sending a stop. Begin with `load_for_attested_stop`
+        /// to avoid any earlier unguarded status exchange. Status is acquired internally; a
+        /// caller's status DTO cannot supply the anchor. This authenticates a
+        /// process in the exact unit, not systemd MainPID or hostile same-UID
+        /// isolation. The caller still needs its current control grant and a
+        /// durable one-send intent before consuming the result.
+        pub fn prepare_attested_stop(&self) -> Result<PreparedAttestedStop<'_>, AttestedStopError> {
+            if self.manifest.peer_binding.is_none() {
+                return Err(Refused("unbound stop is unavailable"));
+            }
+            let manifest = PinnedManifest::capture(&self.manifest_path, &self.manifest)
+                .map_err(|_| Refused("manifest cannot be pinned"))?;
+            let uid = LinuxPeerEvidence::for_current_process()
+                .map_err(|_| Refused("client identity unavailable"))?
+                .uid();
+            let socket = SocketIdentity::read(&self.manifest.socket_path, uid)?;
+            let (status, peer) = self
+                .attested_status_with_peer(|path, request| {
+                    bounded_status_exchange(path, request, uid, &self.manifest.unit_name)
+                })
+                .map_err(|_| Refused("authenticated status unavailable"))?;
+            if status.bound.is_none() || (status.child_running && status.exit_code.is_some()) {
+                return Err(Refused(
+                    "status has no exact bound identity or is contradictory",
+                ));
+            }
+            manifest
+                .recheck(&self.manifest_path)
+                .map_err(|_| Refused("manifest changed during preparation"))?;
+            socket.recheck(&self.manifest.socket_path)?;
+            Ok(PreparedAttestedStop {
+                client: self,
+                manifest,
+                socket,
+                status,
+                peer,
+                expires: Instant::now() + PREPARATION_LIFETIME,
+            })
+        }
+    }
+
+    fn bounded_status_exchange(
+        path: &Path,
+        request: &[u8],
+        uid: u32,
+        unit: &str,
+    ) -> Result<(Vec<u8>, LinuxPeerEvidence), PodError> {
+        let mut connection = TimedUnix::connect(path)
+            .map_err(|_| PodError::Refused("bounded status connection unavailable"))?;
+        let peer = connection
+            .peer()
+            .map_err(|_| PodError::Refused("status server identity unavailable before write"))?;
+        if peer.uid() != uid || !unit_cgroup_exact(peer.cgroup(), unit) {
+            return Err(PodError::Refused(
+                "status server identity differs before write",
+            ));
+        }
+        exchange_bytes(&mut connection, request, &peer)
+            .map_err(|_| PodError::Refused("bounded attested status unavailable"))
+    }
+
+    impl PreparedAttestedStop<'_> {
+        fn recheck_files(&self) -> Result<(), AttestedStopError> {
+            if Instant::now() >= self.expires {
+                return Err(Refused("preparation expired"));
+            }
+            self.manifest
+                .recheck(&self.client.manifest_path)
+                .map_err(|_| Refused("manifest changed since preparation"))?;
+            self.socket.recheck(&self.client.manifest.socket_path)
+        }
+
+        /// Attempt one stop exchange. This consumes the preparation even when
+        /// refusing. Any failure after the first write attempt stays uncertain;
+        /// in particular, normal supervisor exit can defeat the final peer check.
+        pub fn send(self) -> Result<AttestedStopReply, AttestedStopError> {
+            self.recheck_files()?;
+            attest(&self.client.manifest, &self.status)
+                .map_err(|_| Refused("current bound identity differs"))?;
+            let request = serde_json::to_vec(&Request {
+                protocol: PROTOCOL.into(),
+                pod_id: self.client.manifest.descriptor.pod_id.clone(),
+                attempt_id: self.client.manifest.descriptor.attempt_id.clone(),
+                incarnation: self.client.manifest.descriptor.incarnation,
+                token: self.client.manifest.token.clone(),
+                operation: "stop".into(),
+                terminal: None,
+            })
+            .map_err(|_| Refused("request encoding failed"))?;
+            let mut connection = TimedUnix::connect(&self.client.manifest.socket_path)
+                .map_err(|_| Refused("stop connection unavailable"))?;
+            self.recheck_files()?;
+            let (bytes, peer) = exchange_bytes(&mut connection, &request, &self.peer)?;
+            let reply = decode_reply(bytes, peer, &self.status)?;
+            attest(&self.client.manifest, reply.status())
+                .map_err(|_| Uncertain("current bound identity changed after possible effect"))?;
+            self.manifest
+                .recheck(&self.client.manifest_path)
+                .map_err(|_| Uncertain("manifest changed after possible effect"))?;
+            Ok(reply)
+        }
+    }
+
+    fn decode_reply(
+        bytes: Vec<u8>,
+        peer: LinuxPeerEvidence,
+        anchor: &PodStatus,
+    ) -> Result<AttestedStopReply, AttestedStopError> {
+        let response: Response =
+            serde_json::from_slice(&bytes).map_err(|_| Uncertain("reply is malformed"))?;
+        if !response.ok
+            || response.error.is_some()
+            || response.error_code.is_some()
+            || response.terminal.is_some()
+        {
+            return Err(Uncertain("reply is negative or contradictory"));
+        }
+        let status = response
+            .status
+            .ok_or(Uncertain("reply status is missing"))?;
+        if status.bound.is_none() || (status.child_running && status.exit_code.is_some()) {
+            return Err(Uncertain("reply status is unbound or contradictory"));
+        }
+        let mut identity = status.clone();
+        identity.child_running = anchor.child_running;
+        identity.exit_code = anchor.exit_code;
+        if identity != *anchor {
+            return Err(Uncertain("reply identity differs from prepared status"));
+        }
+        Ok(AttestedStopReply {
+            status,
+            bytes,
+            peer,
+        })
+    }
+
+    // Private transport seam permits deterministic phase tests without making
+    // caller-asserted kernel evidence a production constructor.
+    trait StopConnection: Read + Write {
+        fn peer(&mut self) -> Result<LinuxPeerEvidence, ()>;
+        fn recheck(&mut self, peer: &LinuxPeerEvidence) -> Result<(), ()>;
+        fn finish_request(&mut self) -> io::Result<()>;
+    }
+
+    fn exchange_bytes<C: StopConnection>(
+        connection: &mut C,
+        request: &[u8],
+        expected: &LinuxPeerEvidence,
+    ) -> Result<(Vec<u8>, LinuxPeerEvidence), AttestedStopError> {
+        if request.is_empty() || request.len() as u64 > FRAME_LIMIT {
+            return Err(Refused("request exceeds bound"));
+        }
+        let peer = connection
+            .peer()
+            .map_err(|_| Refused("connected peer unavailable"))?;
+        if expected != &peer {
+            return Err(Refused("connected peer differs from prepared peer"));
+        }
+        connection
+            .recheck(&peer)
+            .map_err(|_| Refused("connected peer changed before write"))?;
+        // From this point even a zero-byte write error may not invite replay.
+        connection
+            .write_all(request)
+            .map_err(|_| Uncertain("request write failed"))?;
+        connection
+            .finish_request()
+            .map_err(|_| Uncertain("request completion failed"))?;
+        let mut bytes = Vec::new();
+        (&mut *connection)
+            .take(FRAME_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Uncertain("reply unavailable"))?;
+        if bytes.len() as u64 > FRAME_LIMIT {
+            return Err(Uncertain("reply exceeds bound"));
+        }
+        connection
+            .recheck(&peer)
+            .map_err(|_| Uncertain("connected peer unavailable after reply"))?;
+        Ok((bytes, peer))
+    }
+
+    struct TimedUnix {
+        socket: UnixStream,
+        deadline: Instant,
+    }
+    impl TimedUnix {
+        fn connect(path: &Path) -> io::Result<Self> {
+            use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+            let address = UnixAddr::new(path).map_err(io::Error::from)?;
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .map_err(io::Error::from)?;
+            // Unix connect either completes immediately or refuses before any
+            // request. A full backlog never leaves a blocking connect hanging.
+            connect(fd.as_raw_fd(), &address).map_err(io::Error::from)?;
+            let socket = UnixStream::from(fd);
+            socket.set_nonblocking(false)?;
+            Ok(Self {
+                socket,
+                deadline: Instant::now() + EXCHANGE_TIMEOUT,
+            })
+        }
+        fn remaining(&self) -> io::Result<Duration> {
+            self.deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "stop exchange deadline"))
+        }
+    }
+    impl Read for TimedUnix {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.socket.set_read_timeout(Some(self.remaining()?))?;
+            self.socket.read(bytes)
+        }
+    }
+    impl Write for TimedUnix {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.socket.set_write_timeout(Some(self.remaining()?))?;
+            self.socket.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl StopConnection for TimedUnix {
+        fn peer(&mut self) -> Result<LinuxPeerEvidence, ()> {
+            LinuxPeerEvidence::from_connected(&self.socket).map_err(|_| ())
+        }
+        fn recheck(&mut self, peer: &LinuxPeerEvidence) -> Result<(), ()> {
+            peer.recheck_connected(&self.socket).map_err(|_| ())
+        }
+        fn finish_request(&mut self) -> io::Result<()> {
+            self.socket.shutdown(std::net::Shutdown::Write)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+
+        fn status(peer: &LinuxPeerEvidence) -> PodStatus {
+            PodStatus {
+                protocol: PROTOCOL.into(),
+                pod_id: "pod.stop.fixture".into(),
+                attempt_id: "attempt.stop.fixture".into(),
+                incarnation: 1,
+                manifest_digest: "a".repeat(64),
+                supervisor_pid: peer.pid() as u32,
+                supervisor_start_ticks: peer.start_ticks(),
+                child_pid: 123,
+                child_start_ticks: 456,
+                boot_id: peer.boot_id().into(),
+                unit_name: "podbay-pod-fixture.service".into(),
+                cgroup_path: peer.cgroup().into(),
+                child_running: true,
+                exit_code: None,
+                bound: Some(BoundPodStatus {
+                    capability: OPERATOR_PROCESS_CAPABILITY.into(),
+                    descriptor_digest: "b".repeat(64),
+                    effective_digest: "c".repeat(64),
+                    resource_id: "resource.fixture".into(),
+                    resource_epoch: 1,
+                    scope_id: "scope.fixture".into(),
+                    store_lineage: "lineage.fixture".into(),
+                    owner_epoch: 1,
+                    credential_epoch: 1,
+                    policy_fence: None,
+                    manager_os_identity: "linux.uid.fixture".into(),
+                    manager_process_id: "linux.pid.fixture".into(),
+                    manager_boot_identity: "linux.boot.fixture".into(),
+                    manager_birth_identity: "linux.start.fixture".into(),
+                    manager_containment: "linux.cgroup.fixture".into(),
+                }),
+            }
+        }
+        fn reply(status: PodStatus) -> Vec<u8> {
+            serde_json::to_vec(&Response {
+                ok: true,
+                status: Some(status),
+                error: None,
+                error_code: None,
+                terminal: None,
+            })
+            .unwrap()
+        }
+
+        // This transport explicitly injects evidence for phase tests. It is
+        // private and cfg(test); no production preparation is constructed here.
+        struct Fake {
+            peer: LinuxPeerEvidence,
+            input: Cursor<Vec<u8>>,
+            written: Vec<u8>,
+            events: Vec<&'static str>,
+            checks: usize,
+            fail_check: Option<usize>,
+            fail_after: Option<usize>,
+            fail_read: bool,
+            fail_finish: bool,
+        }
+        impl Fake {
+            fn new(bytes: Vec<u8>) -> Self {
+                Self {
+                    peer: LinuxPeerEvidence::for_current_process().unwrap(),
+                    input: Cursor::new(bytes),
+                    written: Vec::new(),
+                    events: Vec::new(),
+                    checks: 0,
+                    fail_check: None,
+                    fail_after: None,
+                    fail_read: false,
+                    fail_finish: false,
+                }
+            }
+        }
+        impl Read for Fake {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.events.push("read");
+                if self.fail_read {
+                    Err(io::ErrorKind::TimedOut.into())
+                } else {
+                    self.input.read(out)
+                }
+            }
+        }
+        impl Write for Fake {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.events.push("write");
+                let count = match self.fail_after {
+                    Some(max) if self.written.len() >= max => {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
+                    Some(max) => bytes.len().min(max - self.written.len()),
+                    None => bytes.len(),
+                };
+                self.written.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl StopConnection for Fake {
+            fn peer(&mut self) -> Result<LinuxPeerEvidence, ()> {
+                self.events.push("peer");
+                Ok(self.peer.clone())
+            }
+            fn recheck(&mut self, _: &LinuxPeerEvidence) -> Result<(), ()> {
+                self.events.push("recheck");
+                let point = self.checks;
+                self.checks += 1;
+                if self.fail_check == Some(point) {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            }
+            fn finish_request(&mut self) -> io::Result<()> {
+                self.events.push("finish");
+                if self.fail_finish {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        fn run(
+            fake: &mut Fake,
+            anchor: &PodStatus,
+        ) -> Result<AttestedStopReply, AttestedStopError> {
+            let expected = fake.peer.clone();
+            let (bytes, peer) = exchange_bytes(fake, b"one-stop-request", &expected)?;
+            decode_reply(bytes, peer, anchor)
+        }
+
+        #[test]
+        fn attested_stop_checks_peer_before_first_write_and_retains_running_reply() {
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let anchor = status(&peer);
+            let bytes = reply(anchor.clone());
+            let mut fake = Fake::new(bytes.clone());
+            let observed = run(&mut fake, &anchor).unwrap();
+            assert_eq!(&fake.events[..3], &["peer", "recheck", "write"]);
+            assert_eq!(fake.events.iter().filter(|&&e| e == "write").count(), 1);
+            assert_eq!(fake.events.iter().filter(|&&e| e == "finish").count(), 1);
+            assert_eq!(observed.status(), &anchor);
+            assert!(observed.status().child_running);
+            assert_eq!(observed.reply_bytes(), bytes);
+            assert_eq!(observed.peer(), &peer);
+        }
+
+        #[test]
+        fn attested_stop_prewrite_peer_refusal_never_writes() {
+            let mut fake = Fake::new(Vec::new());
+            fake.fail_check = Some(0);
+            let expected = fake.peer.clone();
+            assert!(matches!(
+                exchange_bytes(&mut fake, b"stop", &expected),
+                Err(Refused(_))
+            ));
+            assert!(fake.written.is_empty());
+            assert!(!fake.events.contains(&"write"));
+        }
+
+        #[test]
+        fn attested_stop_failures_after_any_write_attempt_are_uncertain() {
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let anchor = status(&peer);
+            for case in 0..5 {
+                let mut fake = Fake::new(reply(anchor.clone()));
+                match case {
+                    0 => fake.fail_after = Some(0),
+                    1 => fake.fail_after = Some(2),
+                    2 => fake.fail_finish = true,
+                    3 => fake.fail_read = true,
+                    _ => fake.fail_check = Some(1),
+                }
+                assert!(
+                    matches!(run(&mut fake, &anchor), Err(Uncertain(_))),
+                    "case {case}"
+                );
+                assert!(fake.events.contains(&"write"));
+                assert!(fake.events.iter().filter(|&&e| e == "finish").count() <= 1);
+                if case == 1 {
+                    assert_eq!(fake.written, b"on");
+                }
+            }
+        }
+
+        #[test]
+        fn attested_stop_compares_every_status_and_bound_identity_field() {
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let anchor = status(&peer);
+            let original = serde_json::to_value(&anchor).unwrap();
+            for field in [
+                "protocol",
+                "pod_id",
+                "attempt_id",
+                "incarnation",
+                "manifest_digest",
+                "supervisor_pid",
+                "supervisor_start_ticks",
+                "child_pid",
+                "child_start_ticks",
+                "boot_id",
+                "unit_name",
+                "cgroup_path",
+            ] {
+                let mut changed = original.clone();
+                changed[field] = if changed[field].is_number() {
+                    serde_json::json!(999_999)
+                } else {
+                    serde_json::json!("wrong")
+                };
+                let mut fake = Fake::new(reply(serde_json::from_value(changed).unwrap()));
+                assert!(
+                    matches!(run(&mut fake, &anchor), Err(Uncertain(_))),
+                    "{field}"
+                );
+            }
+            for field in [
+                "capability",
+                "descriptor_digest",
+                "effective_digest",
+                "resource_id",
+                "resource_epoch",
+                "scope_id",
+                "store_lineage",
+                "owner_epoch",
+                "credential_epoch",
+                "manager_os_identity",
+                "manager_process_id",
+                "manager_boot_identity",
+                "manager_birth_identity",
+                "manager_containment",
+            ] {
+                let mut changed = original.clone();
+                changed["bound"][field] = if changed["bound"][field].is_number() {
+                    serde_json::json!(999_999)
+                } else {
+                    serde_json::json!("wrong")
+                };
+                let mut fake = Fake::new(reply(serde_json::from_value(changed).unwrap()));
+                assert!(
+                    matches!(run(&mut fake, &anchor), Err(Uncertain(_))),
+                    "bound.{field}"
+                );
+            }
+            let mut changed = original;
+            changed["bound"]["policy_fence"] =
+                serde_json::json!({"policy_fence_epoch":1,"admission_authority_revision":1});
+            // An invalid or differing policy fence both refuse; its shape is
+            // intentionally fed through the actual strict response decoder.
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"ok":true,"status":changed,"error":null}))
+                    .unwrap();
+            assert!(matches!(
+                run(&mut Fake::new(bytes), &anchor),
+                Err(Uncertain(_))
+            ));
+        }
+
+        #[test]
+        fn attested_stop_strict_shape_bounds_and_stopped_child_are_separate() {
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let anchor = status(&peer);
+            let good: serde_json::Value = serde_json::from_slice(&reply(anchor.clone())).unwrap();
+            let mut cases = vec![
+                Vec::new(),
+                b"{".to_vec(),
+                vec![b' '; FRAME_LIMIT as usize + 1],
+            ];
+            for (field, value) in [
+                ("ok", serde_json::json!(false)),
+                ("status", serde_json::Value::Null),
+                ("error", serde_json::json!("bearer-secret")),
+                ("error_code", serde_json::json!("refused")),
+                ("terminal", serde_json::json!({})),
+                ("extra", serde_json::json!(true)),
+            ] {
+                let mut changed = good.clone();
+                changed[field] = value;
+                cases.push(serde_json::to_vec(&changed).unwrap());
+            }
+            let mut no_binding = anchor.clone();
+            no_binding.bound = None;
+            cases.push(reply(no_binding));
+            let mut contradictory = anchor.clone();
+            contradictory.exit_code = Some(0);
+            cases.push(reply(contradictory));
+            let duplicate =
+                String::from_utf8(reply(anchor.clone()))
+                    .unwrap()
+                    .replacen("{", "{\"ok\":true,", 1);
+            cases.push(duplicate.into_bytes());
+            for bytes in cases {
+                let error = run(&mut Fake::new(bytes), &anchor).unwrap_err();
+                assert!(matches!(error, Uncertain(_)));
+                assert!(!format!("{error:?} {error}").contains("bearer-secret"));
+            }
+            let mut stopped = anchor.clone();
+            stopped.child_running = false;
+            stopped.exit_code = Some(9);
+            let observed = run(&mut Fake::new(reply(stopped.clone())), &anchor).unwrap();
+            assert_eq!(observed.status(), &stopped);
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        struct Directory(PathBuf);
+        impl Directory {
+            fn new() -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "as-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                Self(path)
+            }
+            fn listener(&self) -> UnixListener {
+                let path = self.0.join("s");
+                let listener = UnixListener::bind(&path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                listener
+            }
+        }
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn attested_stop_real_unix_peer_and_bytes_are_retained() {
+            let directory = Directory::new();
+            let listener = directory.listener();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let anchor = status(&peer);
+            let bytes = reply(anchor.clone());
+            let sent = bytes.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).unwrap();
+                assert_eq!(request, b"one-stop-request");
+                socket.write_all(&sent).unwrap();
+            });
+            let mut connection = TimedUnix::connect(&directory.0.join("s")).unwrap();
+            let (read, observed) =
+                exchange_bytes(&mut connection, b"one-stop-request", &peer).unwrap();
+            let result = decode_reply(read, observed, &anchor).unwrap();
+            assert_eq!(result.reply_bytes(), bytes);
+            assert_eq!(result.status().bound, anchor.bound);
+            assert_eq!(result.peer(), &peer);
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn attested_stop_wrong_real_peer_receives_zero_request_bytes() {
+            let directory = Directory::new();
+            let listener = directory.listener();
+            let expected = LinuxPeerEvidence::for_launcher_parent().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(EXCHANGE_TIMEOUT)).unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            let mut connection = TimedUnix::connect(&directory.0.join("s")).unwrap();
+            assert!(matches!(
+                exchange_bytes(&mut connection, b"never-send-this-token", &expected),
+                Err(Refused(_))
+            ));
+            drop(connection);
+            assert!(server.join().unwrap().is_empty());
+        }
+
+        // A complete private synthetic manifest accepted by the real loader.
+        // Its byte-pinned executable is fixture data and is never executed.
+        fn valid_manifest_fixture(directory: &Directory) -> PathBuf {
+            use sha2::{Digest, Sha256};
+            fn text(bytes: &mut Vec<u8>, value: &str) {
+                bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            let executable = directory.0.join("fixture-program");
+            fs::write(&executable, b"fixture executable bytes; never run\n").unwrap();
+            let executable_sha = hex(&Sha256::digest(fs::read(&executable).unwrap()));
+            let generation = format!("sha256:{executable_sha}");
+            let mut effective_bytes = b"podbay.effective-launch/1\0".to_vec();
+            text(&mut effective_bytes, "pod.fixture");
+            text(&mut effective_bytes, "worker");
+            effective_bytes.push(0);
+            text(&mut effective_bytes, "podbay.fixture.process.exec");
+            effective_bytes.extend_from_slice(&1u64.to_be_bytes());
+            text(&mut effective_bytes, executable.to_str().unwrap());
+            text(&mut effective_bytes, &generation);
+            effective_bytes.extend_from_slice(&1u32.to_be_bytes());
+            text(&mut effective_bytes, "60");
+            text(&mut effective_bytes, "none");
+            text(&mut effective_bytes, "none");
+            effective_bytes.push(0);
+            text(&mut effective_bytes, "scope.fixture");
+            text(&mut effective_bytes, "basis.fixture");
+            text(&mut effective_bytes, ".");
+            effective_bytes.push(0);
+            effective_bytes.extend_from_slice(&0u32.to_be_bytes());
+            effective_bytes.extend_from_slice(&1u64.to_be_bytes());
+            effective_bytes.extend_from_slice(&60u64.to_be_bytes());
+            effective_bytes.extend_from_slice(&[0; 12]);
+            let effective = EffectiveLaunchContract::decode(&effective_bytes).unwrap();
+            let body = format!(
+                concat!(
+                    "{{\"scopeId\":\"scope.fixture\",\"actorId\":\"actor.fixture\",",
+                    "\"sessionId\":\"session.fixture\",\"runId\":\"run.fixture\",\"parentRunId\":null,",
+                    "\"role\":\"worker\",\"workKind\":\"task\",\"attemptId\":\"attempt.fixture\",",
+                    "\"attemptOrdinal\":\"1\",\"attemptEpoch\":\"1\",\"podId\":\"pod.fixture\",\"podIncarnation\":\"1\",",
+                    "\"resources\":[{{\"resourceId\":\"resource.fixture\",\"kind\":\"auxiliary\",\"epoch\":\"1\",",
+                    "\"driver\":{{\"kind\":\"auxiliary\",\"driverRef\":\"process.exec\"}}}}],",
+                    "\"targetOs\":\"linux\",\"hostId\":\"host.fixture\",\"profileRef\":\"podbay.fixture.process.exec\",",
+                    "\"profileGeneration\":\"1\",\"modelId\":\"none\",\"reasoningEffort\":\"none\",",
+                    "\"executableGeneration\":{generation},\"effectiveSpecDigest\":{effective},",
+                    "\"workspaceBasisRef\":\"basis.fixture\",\"executable\":{executable},\"cwd\":{cwd},",
+                    "\"arguments\":[\"60\"],\"environmentRefs\":[],\"credentialRefs\":[],\"wallSeconds\":\"60\",\"maxChildren\":\"0\"}}"
+                ),
+                generation = serde_json::to_string(&generation).unwrap(),
+                effective = serde_json::to_string(effective.digest()).unwrap(),
+                executable = serde_json::to_string(&executable).unwrap(),
+                cwd = serde_json::to_string(&directory.0).unwrap()
+            );
+            let mut digest = Sha256::new();
+            digest.update(b"podbay.launch-descriptor/1\0");
+            digest.update(body.as_bytes());
+            let digest = hex(&digest.finalize());
+            let wire_bytes = format!("{{\"protocol\":{},\"schema\":\"podbay.launch-descriptor/1\",\"digest\":\"{}\",\"descriptor\":{}}}",
+                serde_json::to_string(&podbay_wire::ProtocolVersion::V1).unwrap(), digest, body).into_bytes();
+            let wire = ImmutableLaunchDescriptor::decode_json(&wire_bytes).unwrap();
+            effective.compare_with_descriptor(&wire).unwrap();
+            let descriptor = LaunchDescriptor {
+                protocol: PROTOCOL.into(),
+                pod_id: "pod.fixture".into(),
+                attempt_id: "attempt.fixture".into(),
+                session_id: "session.fixture".into(),
+                run_id: "run.fixture".into(),
+                scope_id: "scope.fixture".into(),
+                role: PodRole::Worker,
+                incarnation: 1,
+                resource_id: "resource.fixture".into(),
+                executable: executable.clone(),
+                args: vec!["60".into()],
+                cwd: directory.0.clone(),
+                pty: None,
+            };
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let manager = peer.attested_peer();
+            let mut bound = BoundPeerManifest {
+                protocol: PEER_BINDING_PROTOCOL.into(),
+                capability: SYNTHETIC_CAPABILITY.into(),
+                wire_descriptor: wire_bytes,
+                effective_spec: effective_bytes,
+                descriptor_digest: wire.digest().into(),
+                effective_digest: effective.digest().into(),
+                resource_epoch: 1,
+                store_path: directory.0.join("not-opened.sqlite"),
+                store_lineage: "store.fixture".into(),
+                owner_epoch: 1,
+                credential_epoch: 1,
+                authority_revision: None,
+                policy_fence: None,
+                resource_input_epochs: BTreeMap::from([("resource.fixture".into(), 1)]),
+                manager_os_identity: manager.os_identity().into(),
+                manager_process_id: manager.native_process_id().into(),
+                manager_boot_identity: manager.boot_identity().into(),
+                manager_birth_identity: manager.birth_identity().into(),
+                manager_containment: manager.containment_identity().into(),
+                canonical_executable: executable,
+                executable_sha256: executable_sha,
+                binding_digest: String::new(),
+            };
+            bound.binding_digest = bound.digest().unwrap();
+            bound.validate(&descriptor, &directory.0).unwrap();
+            let path = manifest_path(&directory.0, &descriptor).unwrap();
+            let manifest = PodManifest {
+                digest: descriptor.digest().unwrap(),
+                token: "f".repeat(64),
+                viewer_token: None,
+                socket_path: path.with_extension("sock"),
+                unit_name: unit_name(&path).unwrap(),
+                descriptor,
+                peer_binding: Some(bound),
+            };
+            write_manifest(&path, &manifest).unwrap();
+            path
+        }
+
+        #[test]
+        fn attested_stop_public_manifest_entry_is_socket_free_and_wrong_unit_receives_zero_bytes() {
+            let directory = Directory::new();
+            let path = valid_manifest_fixture(&directory);
+            let listener = UnixListener::bind(path.with_extension("sock")).unwrap();
+            fs::set_permissions(
+                path.with_extension("sock"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let client = PodClient::load_for_attested_stop(&path).unwrap();
+            assert!(client.manifest.peer_binding.is_some());
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            listener.set_nonblocking(false).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(EXCHANGE_TIMEOUT)).unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            assert!(matches!(
+                client.prepare_attested_stop(),
+                Err(Refused("authenticated status unavailable"))
+            ));
+            assert!(server.join().unwrap().is_empty());
+            assert!(!directory.0.join("not-opened.sqlite").exists());
+        }
+
+        #[test]
+        fn attested_stop_public_entry_control_confirms_legacy_connect_still_sends_status() {
+            let directory = Directory::new();
+            let path = valid_manifest_fixture(&directory);
+            let manifest = read_manifest(&path).unwrap();
+            let listener = UnixListener::bind(&manifest.socket_path).unwrap();
+            fs::set_permissions(&manifest.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let mut claimed = status(&peer);
+            claimed.pod_id = manifest.descriptor.pod_id.clone();
+            claimed.attempt_id = manifest.descriptor.attempt_id.clone();
+            claimed.manifest_digest = manifest.digest.clone();
+            claimed.unit_name = manifest.unit_name.clone();
+            claimed.cgroup_path = format!("/fixture/{}", manifest.unit_name);
+            claimed.bound = Some(manifest.peer_binding.as_ref().unwrap().status(
+                &manifest.descriptor.resource_id,
+                &manifest.descriptor.scope_id,
+            ));
+            let encoded = reply(claimed);
+            let token = manifest.token;
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).unwrap();
+                let request: Request = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request.operation, "status");
+                assert_eq!(request.token, token);
+                socket.write_all(&encoded).unwrap();
+            });
+            // An explicit negative control using a fake fixture bearer: this
+            // historical entry is deliberately NOT the attested-stop entry.
+            assert!(PodClient::connect(&path).is_ok());
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn attested_stop_preparation_with_wrong_unit_does_not_send_bearer() {
+            let directory = Directory::new();
+            let listener = directory.listener();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(EXCHANGE_TIMEOUT)).unwrap();
+                let mut bytes = Vec::new();
+                socket.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            assert!(
+                bounded_status_exchange(
+                    &directory.0.join("s"),
+                    b"never-send-this-token",
+                    peer.uid(),
+                    "podbay-nonexistent-unit.fixture.service"
+                )
+                .is_err()
+            );
+            assert!(server.join().unwrap().is_empty());
+        }
+
+        #[test]
+        fn attested_stop_real_reply_timeout_is_uncertain_without_resend() {
+            let directory = Directory::new();
+            let listener = directory.listener();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let (release, wait) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).unwrap();
+                assert_eq!(request, b"one-stop-request");
+                wait.recv_timeout(EXCHANGE_TIMEOUT).unwrap();
+            });
+            let mut connection = TimedUnix::connect(&directory.0.join("s")).unwrap();
+            connection.deadline = Instant::now() + Duration::from_millis(30);
+            assert!(matches!(
+                exchange_bytes(&mut connection, b"one-stop-request", &peer),
+                Err(Uncertain(_))
+            ));
+            release.send(()).unwrap();
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn attested_stop_file_changes_and_expiry_refuse_before_connection() {
+            let directory = Directory::new();
+            let _listener = directory.listener();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            let manifest = PodManifest {
+                descriptor: LaunchDescriptor {
+                    protocol: PROTOCOL.into(),
+                    pod_id: "pod.fixture".into(),
+                    attempt_id: "attempt.fixture".into(),
+                    session_id: "session.fixture".into(),
+                    run_id: "run.fixture".into(),
+                    scope_id: "scope.fixture".into(),
+                    role: PodRole::Worker,
+                    incarnation: 1,
+                    resource_id: "resource.fixture".into(),
+                    executable: "/bin/true".into(),
+                    args: vec![],
+                    cwd: directory.0.clone(),
+                    pty: None,
+                },
+                digest: "a".repeat(64),
+                token: "f".repeat(64),
+                viewer_token: None,
+                socket_path: directory.0.join("s"),
+                unit_name: "podbay-pod-fixture.service".into(),
+                peer_binding: None,
+            };
+            let client = PodClient {
+                manifest_path: directory.0.join("m.json"),
+                manifest,
+                pinned_manifest: None,
+            };
+            write_manifest(&client.manifest_path, &client.manifest).unwrap();
+            // Test-only construction exercises file guards; production must
+            // obtain this inaccessible value through authenticated preparation.
+            let prepare = || PreparedAttestedStop {
+                client: &client,
+                manifest: PinnedManifest::capture(&client.manifest_path, &client.manifest).unwrap(),
+                socket: SocketIdentity::read(&client.manifest.socket_path, peer.uid()).unwrap(),
+                status: status(&peer),
+                peer: peer.clone(),
+                expires: Instant::now() + PREPARATION_LIFETIME,
+            };
+            assert!(matches!(client.prepare_attested_stop(), Err(Refused(_))));
+            let mut expired = prepare();
+            expired.expires = Instant::now();
+            assert!(matches!(
+                expired.send(),
+                Err(Refused("preparation expired"))
+            ));
+            let pinned = prepare();
+            assert!(!format!("{pinned:?}").contains(&client.manifest.token));
+            fs::set_permissions(&client.manifest_path, fs::Permissions::from_mode(0o640)).unwrap();
+            assert!(matches!(pinned.send(), Err(Refused(_))));
+            fs::set_permissions(&client.manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let pinned = prepare();
+            fs::remove_file(&client.manifest.socket_path).unwrap();
+            let _replacement = directory.listener();
+            assert!(matches!(pinned.send(), Err(Refused(_))));
+        }
+
+        #[test]
+        #[ignore = "disposable child helper invoked only by immediate-exit control"]
+        fn attested_stop_exit_child() {
+            let directory = PathBuf::from(
+                std::env::var_os("PODBAY_ATTESTED_STOP_CHILD")
+                    .expect("helper requires fixture directory"),
+            );
+            let listener = UnixListener::bind(directory.join("s")).unwrap();
+            fs::set_permissions(directory.join("s"), fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(directory.join("ready"), b"ready").unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(EXCHANGE_TIMEOUT)).unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"one-stop-request");
+            socket
+                .write_all(&fs::read(directory.join("reply")).unwrap())
+                .unwrap();
+            std::process::exit(0);
+        }
+
+        #[test]
+        fn attested_stop_immediate_real_server_exit_remains_uncertain() {
+            struct ExitConnection {
+                inner: TimedUnix,
+                child: Child,
+                checks: usize,
+            }
+            impl Read for ExitConnection {
+                fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                    self.inner.read(b)
+                }
+            }
+            impl Write for ExitConnection {
+                fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                    self.inner.write(b)
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    self.inner.flush()
+                }
+            }
+            impl StopConnection for ExitConnection {
+                fn peer(&mut self) -> Result<LinuxPeerEvidence, ()> {
+                    self.inner.peer()
+                }
+                fn recheck(&mut self, peer: &LinuxPeerEvidence) -> Result<(), ()> {
+                    self.checks += 1;
+                    if self.checks == 2 {
+                        assert!(self.child.wait().unwrap().success());
+                    }
+                    self.inner.recheck(peer)
+                }
+                fn finish_request(&mut self) -> io::Result<()> {
+                    self.inner.finish_request()
+                }
+            }
+            impl Drop for ExitConnection {
+                fn drop(&mut self) {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+            let directory = Directory::new();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::attested_stop::tests::attested_stop_exit_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PODBAY_ATTESTED_STOP_CHILD", &directory.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+            while !directory.0.join("ready").exists() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not bind disposable socket");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut connection = ExitConnection {
+                inner: TimedUnix::connect(&directory.0.join("s")).unwrap(),
+                child,
+                checks: 0,
+            };
+            let peer = connection.peer().unwrap();
+            let mut stopped = status(&peer);
+            stopped.child_running = false;
+            fs::write(directory.0.join("reply"), reply(stopped)).unwrap();
+            assert!(matches!(
+                exchange_bytes(&mut connection, b"one-stop-request", &peer),
+                Err(Uncertain("connected peer unavailable after reply"))
+            ));
+            assert_eq!(connection.checks, 2);
+        }
     }
 }

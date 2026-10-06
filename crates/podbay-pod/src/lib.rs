@@ -95,6 +95,7 @@ pub use ports::{
 };
 #[cfg(target_os = "linux")]
 pub use runtime::{
+    AttestedStopError, AttestedStopReply, PreparedAttestedStop,
     LinuxBackend, PodClient, RebindInspection, TerminalViewer, current_bound_peer_binding, launch,
     launch_bound, serve,
 };
