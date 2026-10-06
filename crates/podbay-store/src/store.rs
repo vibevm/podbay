@@ -493,25 +493,7 @@ impl PodBayStore {
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema(version));
-        }
-        verify_authority_schema(&transaction)?;
-        verify_runtime_schema(&transaction)?;
-        verify_writer_lease_schema(&transaction)?;
-        verify_codex_bootstrap_schema(&transaction)?;
-        verify_rebind_schema(&transaction)?;
-        verify_manager_credential_schema(&transaction)?;
-        verify_manager_peer_schema(&transaction)?;
-        verify_prior_observation_schema(&transaction)?;
-        verify_actor_verifier_schema(&transaction)?;
-        verify_owner_rotation_schema(&transaction)?;
-        verify_current_scope_schema(&transaction)?;
-        verify_policy_fence_schema(&transaction)?;
-        verify_supersession_schema(&transaction)?;
-        verify_codex_later_turn_schema(&transaction)?;
-        verify_codex_native_schema(&transaction)?;
+        verify_current_read_only_schema(&transaction)?;
         let store_lineage: String = transaction.query_row(
             "SELECT lineage FROM store_identity WHERE singleton=1",
             [],
@@ -2403,6 +2385,39 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Apply the production read-only schema contract inside the caller's snapshot.
+/// Raw witnesses must refuse unsupported or malformed stores before authority
+/// lookup; this admits only the current production schema, never schema 25.
+pub(crate) fn verify_current_read_only_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema(version));
+    }
+    verify_authority_schema(transaction)?;
+    verify_runtime_schema(transaction)?;
+    verify_writer_lease_schema(transaction)?;
+    verify_exact_table(
+        transaction,
+        "native_writer_renewals",
+        NATIVE_WRITER_RENEWALS_V24,
+    )?;
+    verify_codex_bootstrap_schema(transaction)?;
+    verify_rebind_schema(transaction)?;
+    verify_manager_credential_schema(transaction)?;
+    verify_manager_peer_schema(transaction)?;
+    verify_prior_observation_schema(transaction)?;
+    verify_actor_verifier_schema(transaction)?;
+    verify_owner_rotation_schema(transaction)?;
+    verify_current_scope_schema(transaction)?;
+    verify_policy_fence_schema(transaction)?;
+    verify_supersession_schema(transaction)?;
+    verify_codex_later_turn_schema(transaction)?;
+    verify_codex_native_schema(transaction)?;
+    Ok(())
 }
 
 fn verify_authority_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {

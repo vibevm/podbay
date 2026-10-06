@@ -184,6 +184,7 @@ impl SqliteManagerPeerWitness {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .ok()?;
+        crate::store::verify_current_read_only_schema(&transaction).ok()?;
         let lineage = self.identity.store_lineage.as_str();
         if !current_claim_matches(&transaction, lineage, owner, credential).ok()? {
             return None;

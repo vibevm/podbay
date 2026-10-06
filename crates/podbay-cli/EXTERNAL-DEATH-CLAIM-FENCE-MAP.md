@@ -21,11 +21,12 @@ Its author fields are private (`:14-17`). Host disposable exclusion is a test
 (`podbay-host/src/authority.rs:3569-3576`); activated/pending handles borrow
 that barrier and manager lock (`:3580`, `:3602`).
 
-Thus schema refusal is an observed limitation, not a complete runtime fence.
-Raw authority witnesses reopen SQLite without the ordinary store's schema
-validation. A retained process/manifest and a compatible subset of schema 25
-rows can still reach some authority checks. No inspected production module
-outside migration/pending reads `external_death_pending` or
+Schema refusal is an observed limitation, not a complete runtime fence. The
+raw Owner and Manager witnesses now reuse the production schema-24 read-only
+validator in their own snapshots, so they refuse unsupported schema 25 before
+issuing authority evidence. Other runtime paths and direct adapters still lack
+a v25 pending/final decoder and maintained effect-use gate. No inspected
+production module outside migration/pending reads `external_death_pending` or
 `external_death_final`.
 
 ## Production entry points and effect boundaries
@@ -51,18 +52,19 @@ check; caller-supplied Pod fields are insufficient.
 | Later-turn admission, claim and submission | `podbay-host/src/authority.rs:7770`; `podbay-store/src/later_turn.rs:514,1238,1276`; `podbay-launch-linux/src/linux.rs:1724`; `podbay-pod/src/runtime.rs:3492,3529,3559` | Resolve exact native target and fence admission, claim and actual native send. |
 | Deferred/nonblocking native writes and observation pumps | `podbay-pod/src/codex_later_turn.rs:134,138,142,260,276`; `podbay-pod/src/runtime.rs:2666` | Every future write tick needs maintained use authorization; an earlier submission check cannot authorize delayed writes. Distinguish passive history from RPCs that write to native input. |
 | Generic and inner stop | `podbay-store/src/store.rs:731,1481`; `podbay-host/src/authority.rs:7984,8036,8058,8183,8215`; `podbay-server/src/host_launch_handler.rs:65`; `podbay-server/src/inner_stop.rs:662,687`; `podbay-pod/src/runtime.rs:3867,3897,3934` | Fence ordinary stop admission, claim and actual kill. External-death maintenance uses separate exact authorization and does not manufacture `pod.stop`. |
-| Raw owner/manager/rebind witnesses | `podbay-store/src/peer_witness.rs:26,33`; `podbay-store/src/manager_peer.rs:183`; `podbay-store/src/rebind.rs:1423,1471` | Upgrade direct readonly SQLite adapters to the canonical decoder or replace them with typed broker witnesses. Missing/unsupported state refuses. |
+| Raw owner/manager/rebind witnesses | `podbay-store/src/peer_witness.rs:26,33`; `podbay-store/src/manager_peer.rs:183`; `podbay-store/src/rebind.rs:1423,1471` | Owner/Manager now refuse non-v24 schemas; a future v25 runtime must replace that refusal with the canonical pending/final decoder before any authority proof. Other direct adapters still require audit. |
 | Authority mutation, incarnation/resource changes and input leases | `podbay-host/src/authority.rs:10360,10392,10409,10421,10463,10487`; `podbay-store/src/authority.rs:910` | Prevent a mutation from erasing/rebinding around the old subject's fence. A successor incarnation requires a separately reviewed allocation policy; final never restores the old one. |
 
 ## Concrete bypasses and uncertainty
 
-* `SqliteOwnerEpochWitness` checks lineage, owner, registered incarnation and
-  target epoch (`peer_witness.rs:33-91`). `SqliteManagerPeerWitness` checks
-  current manager claim and identity (`manager_peer.rs:175` onward). Neither
-  checks schema 25 or death records. Runtime ordinary stop calls these
-  witnesses, then `child.kill()` (`runtime.rs:3934`). Its additional
-  `active_codex_binding` predicate applies only to V3 (`:3909`), leaving a
-  concrete V2 raw-witness gap.
+* `SqliteOwnerEpochWitness` and `SqliteManagerPeerWitness` now check the same
+  supported schema-24 read-only contract before lineage, Owner or manager
+  claim. A disposable v25 store refuses both before and after pending. They do
+  not interpret v25 death records or establish an effect-use gate. Runtime
+  ordinary stop still calls these witnesses before `child.kill()`
+  (`runtime.rs:3934`); its additional `active_codex_binding` predicate applies
+  only to V3 (`:3909`). A future v25 V2 stop cannot rely on these old witnesses
+  for pending/final authorization.
 * Bootstrap claim's non-Prepared branch (`bootstrap_send.rs:1259`) and later
   claim's equivalent (`later_turn.rs:1248`) return `ExistingUncertain` before
   `check_current_record`. Adding a guard only to that helper misses retries.

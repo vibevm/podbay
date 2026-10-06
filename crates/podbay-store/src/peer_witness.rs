@@ -37,6 +37,7 @@ impl SqliteOwnerEpochWitness {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .ok()?;
+        crate::store::verify_current_read_only_schema(&transaction).ok()?;
         let lineage: String = transaction
             .query_row(
                 "SELECT lineage FROM store_identity WHERE singleton=1",

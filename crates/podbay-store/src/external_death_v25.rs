@@ -999,6 +999,14 @@ mod tests {
                     &proof,
                 )
                 .unwrap();
+            if variant == "raw_witness" {
+                let claim = store
+                    .current_manager_credential_claim(observing_owner)
+                    .unwrap();
+                store
+                    .register_current_manager_peer(&claim, &raw_witness_peer())
+                    .unwrap();
+            }
             drop(store);
             let c = Connection::open(&source).unwrap();
             c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; UPDATE metadata SET value=5 WHERE key='authority_revision'; INSERT INTO authority_actors(actor_id,scope_id,role,origin,credential_generation,platform,os_identity,process_identity,start_identity,containment_identity) VALUES('owner.fixture','scope.launch','coordinator','owner_cli',1,'linux','linux.uid.1000','linux.pid.100',100,'/fixture');").unwrap();
@@ -1208,6 +1216,78 @@ mod tests {
             let _ = fs::remove_dir_all(&self.directory);
         }
     }
+    fn raw_witness_peer() -> podbay_core::AttestedPeer {
+        podbay_core::AttestedPeer::from_port(
+            "uid:1000",
+            "pid:100",
+            "boot.old",
+            "birth.100",
+            "unit.fixture",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn raw_witnesses_refuse_disposable_v25_before_and_after_pending() {
+        use crate::{SqliteManagerPeerWitness, SqliteOwnerEpochWitness};
+        use podbay_core::{OwnerEpoch, OwnerEpochWitness, PodFenceIdentity, StoreLineageId};
+
+        let f = Fixture::new("raw_witness");
+        let identity = PodFenceIdentity {
+            store_lineage: StoreLineageId::try_from(f.request.store_lineage.as_str()).unwrap(),
+            scope_id: ScopeId::try_from(f.request.scope_id.as_str()).unwrap(),
+            pod_id: PodId::try_from(f.request.pod_id.as_str()).unwrap(),
+            attempt_id: AttemptId::try_from(f.request.attempt_id.as_str()).unwrap(),
+            incarnation: Epoch::new(f.request.pod_incarnation).unwrap(),
+        };
+        // Exchange preserved the genuine v24 store with the same authority
+        // rows. Those rows remain sufficient proof only in the supported store.
+        let old_owner = SqliteOwnerEpochWitness::for_pod(&f.staging, identity.clone());
+        let old_manager = SqliteManagerPeerWitness::for_pod(&f.staging, identity.clone());
+        assert_eq!(
+            old_owner.current_owner_epoch(&identity.store_lineage, &identity.scope_id),
+            Some(OwnerEpoch::new(f.request.expected_owner_epoch).unwrap())
+        );
+        assert!(old_manager.matches_current(
+            f.request.expected_owner_epoch,
+            f.request.expected_manager_credential_epoch,
+            &raw_witness_peer()
+        ));
+
+        let owner = SqliteOwnerEpochWitness::for_pod(&f.source, identity.clone());
+        let manager = SqliteManagerPeerWitness::for_pod(&f.source, identity.clone());
+        for pending in [false, true] {
+            if pending {
+                f.open().prepare(&f.author(), &f.request).unwrap();
+            }
+            assert_eq!(
+                owner.current_owner_epoch(&identity.store_lineage, &identity.scope_id),
+                None
+            );
+            assert!(!manager.matches_current(
+                f.request.expected_owner_epoch,
+                f.request.expected_manager_credential_epoch,
+                &raw_witness_peer()
+            ));
+            assert_eq!(f.counts(), if pending { (1, 6) } else { (0, 5) });
+            let c = open_exchange_read_only(&f.source).unwrap();
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM external_death_final", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                c.query_row("SELECT state FROM outbox WHERE outbox_id=2", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+                "claimed_uncertain"
+            );
+        }
+    }
+
     #[test]
     fn pending_commits_atomically_and_exact_readback_survives_epoch_drift() {
         let f = Fixture::new("");

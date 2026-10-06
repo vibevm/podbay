@@ -3,9 +3,10 @@ use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use podbay_core::{
-    AttemptId, AttestedPeer, Epoch, PodFenceIdentity, PodId, ScopeId, StoreLineageId,
+    AttemptId, AttestedPeer, Epoch, OwnerEpoch, OwnerEpochWitness, PodFenceIdentity, PodId,
+    ScopeId, StoreLineageId,
 };
-use podbay_store::{PodBayStore, SqliteManagerPeerWitness, StoreError};
+use podbay_store::{PodBayStore, SqliteManagerPeerWitness, SqliteOwnerEpochWitness, StoreError};
 
 struct Fixture {
     directory: PathBuf,
@@ -237,4 +238,56 @@ fn competing_peer_registrations_have_one_winner() {
             .count(),
         1
     );
+}
+
+#[test]
+fn raw_witnesses_refuse_unsupported_or_malformed_schema_with_matching_authority_rows() {
+    for mutation in [
+        "PRAGMA user_version=0",
+        "PRAGMA user_version=23",
+        "PRAGMA user_version=25",
+        "PRAGMA user_version=99",
+        "ALTER TABLE authority_pods ADD COLUMN unsupported INTEGER",
+        "ALTER TABLE manager_peer_bindings ADD COLUMN unsupported INTEGER",
+        "DROP INDEX runtime_sessions_open_scope_v19",
+        "DROP TABLE native_writer_renewals",
+        "ALTER TABLE native_writer_renewals ADD COLUMN unsupported INTEGER",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = PodBayStore::open(&fixture.database).unwrap();
+        store.begin_authority_replay(0, 1).unwrap();
+        let identity = seed_bound_identity(&mut store, &fixture);
+        let claim = store.current_manager_credential_claim(1).unwrap();
+        store
+            .register_current_manager_peer(&claim, &peer("birth.one"))
+            .unwrap();
+        let owner = SqliteOwnerEpochWitness::for_pod(&fixture.database, identity.clone());
+        let manager = SqliteManagerPeerWitness::for_pod(&fixture.database, identity.clone());
+        assert_eq!(
+            owner.current_owner_epoch(&identity.store_lineage, &identity.scope_id),
+            Some(OwnerEpoch::new(1).unwrap()),
+            "v24 positive before {mutation}"
+        );
+        assert!(
+            manager.matches_current(1, 1, &peer("birth.one")),
+            "v24 positive before {mutation}"
+        );
+        drop(store);
+        let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+        connection.execute_batch(mutation).unwrap();
+        drop(connection);
+        assert_eq!(
+            owner.current_owner_epoch(&identity.store_lineage, &identity.scope_id),
+            None,
+            "{mutation}"
+        );
+        assert!(
+            !manager.matches_current(1, 1, &peer("birth.one")),
+            "{mutation}"
+        );
+        assert!(
+            PodBayStore::open_existing_read_only(&fixture.database).is_err(),
+            "{mutation}"
+        );
+    }
 }
