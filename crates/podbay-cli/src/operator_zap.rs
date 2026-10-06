@@ -12,6 +12,8 @@ mod historical_signer;
 mod restart;
 // Fixture-only origin injection; production evidence acquisition stays closed.
 mod restart_evidence;
+// Inert canonical data only; no stop/store/terminal wiring.
+mod stop_intent_v2;
 
 use std::collections::BTreeSet;
 use std::env;

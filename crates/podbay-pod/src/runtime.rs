@@ -252,7 +252,7 @@ pub struct PodClient {
     pinned_manifest: Option<PinnedManifest>,
 }
 
-pub use attested_stop::{AttestedStopError, AttestedStopReply, PreparedAttestedStop};
+pub use attested_stop::{AttestedStopError, AttestedStopReply, PreparedAttestedStop, PreparedStopIdentity};
 
 /// Cheap per-status file proof after one full manifest/descriptor validation.
 /// Every read still checks the exact path, inode, owner, mode and bytes; the
@@ -5058,6 +5058,59 @@ mod attested_stop {
         expires: Instant,
     }
 
+    /// Token-free view of the exact observation already held by a preparation.
+    /// This performs no fresh I/O, proves no current authority and cannot be
+    /// deserialized or constructed from a caller's status DTO.
+    pub struct PreparedStopIdentity<'a> {
+        status: &'a PodStatus,
+        peer: &'a LinuxPeerEvidence,
+        manifest_file_digest: [u8; 32],
+        socket: &'a SocketIdentity,
+    }
+    impl PreparedStopIdentity<'_> {
+        pub fn status(&self) -> &PodStatus {
+            self.status
+        }
+        pub fn peer(&self) -> &LinuxPeerEvidence {
+            self.peer
+        }
+        pub fn manifest_file_digest(&self) -> &[u8; 32] {
+            &self.manifest_file_digest
+        }
+        pub fn socket_device(&self) -> u64 {
+            self.socket.dev
+        }
+        pub fn socket_inode(&self) -> u64 {
+            self.socket.ino
+        }
+        pub fn socket_uid(&self) -> u32 {
+            self.socket.uid
+        }
+        pub fn socket_mode(&self) -> u32 {
+            self.socket.mode
+        }
+    }
+    impl fmt::Debug for PreparedStopIdentity<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("PreparedStopIdentity { token-free captured observation }")
+        }
+    }
+    impl PreparedAttestedStop<'_> {
+        pub fn identity(&self) -> PreparedStopIdentity<'_> {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(b"podbay.prepared-stop-manifest/1\0");
+            digest.update((self.manifest.bytes.len() as u64).to_be_bytes());
+            digest.update(&self.manifest.bytes);
+            PreparedStopIdentity {
+                status: &self.status,
+                peer: &self.peer,
+                manifest_file_digest: digest.finalize().into(),
+                socket: &self.socket,
+            }
+        }
+    }
+
     impl fmt::Debug for PreparedAttestedStop<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("PreparedAttestedStop { private anchor }")
@@ -5890,6 +5943,61 @@ mod attested_stop {
             };
             write_manifest(&path, &manifest).unwrap();
             path
+        }
+
+        #[test]
+        fn prepared_stop_identity_projects_exact_capture_without_io_or_bearer() {
+            use sha2::{Digest, Sha256};
+            let directory = Directory::new();
+            let path = valid_manifest_fixture(&directory);
+            let _listener = UnixListener::bind(path.with_extension("sock")).unwrap();
+            fs::set_permissions(
+                path.with_extension("sock"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let client = PodClient::load_for_attested_stop(&path).unwrap();
+            let peer = LinuxPeerEvidence::for_current_process().unwrap();
+            // Injected test capture; this does not claim an actual systemd Pod.
+            let prepared = PreparedAttestedStop {
+                client: &client,
+                manifest: PinnedManifest::capture(&path, &client.manifest).unwrap(),
+                socket: SocketIdentity::read(&client.manifest.socket_path, peer.uid()).unwrap(),
+                status: status(&peer),
+                peer,
+                expires: Instant::now() + PREPARATION_LIFETIME,
+            };
+            let bytes = fs::read(&path).unwrap();
+            let mut hash = Sha256::new();
+            hash.update(b"podbay.prepared-stop-manifest/1\0");
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(&bytes);
+            let expected: [u8; 32] = hash.finalize().into();
+            let identity = prepared.identity();
+            assert!(std::ptr::eq(identity.status(), &prepared.status));
+            assert!(std::ptr::eq(identity.peer(), &prepared.peer));
+            assert_eq!(identity.status().bound, prepared.status.bound);
+            assert_eq!(identity.manifest_file_digest(), &expected);
+            assert_eq!(
+                (
+                    identity.socket_device(),
+                    identity.socket_inode(),
+                    identity.socket_uid(),
+                    identity.socket_mode()
+                ),
+                (
+                    prepared.socket.dev,
+                    prepared.socket.ino,
+                    prepared.socket.uid,
+                    prepared.socket.mode
+                )
+            );
+            assert!(!format!("{identity:?}").contains(&client.manifest.token));
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(&client.manifest.socket_path).unwrap();
+            let after_removal = prepared.identity();
+            assert_eq!(after_removal.manifest_file_digest(), &expected);
+            assert_eq!(after_removal.status(), identity.status());
         }
 
         #[test]

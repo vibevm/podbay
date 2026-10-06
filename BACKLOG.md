@@ -123,6 +123,12 @@ the connected peer before either status or stop bearer reaches it. It retains
 the full reply as an inert observation; a lost/contradictory reply or peer
 disappearance after writing remains uncertain, never an automatic retry or
 terminal proof. The existing operator `stop` call site is unchanged.
+An unwired v2 intent codec now records a token-free projection from that same
+prepared observation. A separate exchange-outcome codec distinguishes prewrite
+refusal, postwrite uncertainty and exact reply bytes; none denotes `pod.stopped`
+or creates a send permit. Owner signer generation and Pod manager credential
+epoch remain independently bound values. Caller-supplied intent context still
+requires an authenticated writer before durable admission.
 P1-006 remains open until trusted signed-terminal acquisition, durable fresh
 generation publication, and authenticated child readiness are implemented.
 
