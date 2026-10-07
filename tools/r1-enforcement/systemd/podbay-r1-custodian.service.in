@@ -1,0 +1,18 @@
+[Unit]
+Description=PodBay R1 unavailable custodian (staged plan only)
+Requires=podbay-r1-closed-bootstrap.service
+After=podbay-r1-closed-bootstrap.service
+
+[Service]
+Type=notify
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/podbay-r1-linux custodian --manifest /etc/podbay/r1-install-manifest.json
+Restart=no
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

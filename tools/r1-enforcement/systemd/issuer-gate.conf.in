@@ -1,0 +1,3 @@
+[Unit]
+Requires=podbay-r1-closed-bootstrap.service
+After=podbay-r1-closed-bootstrap.service

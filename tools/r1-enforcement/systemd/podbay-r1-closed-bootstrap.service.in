@@ -1,0 +1,21 @@
+[Unit]
+Description=PodBay R1 unavailable early bootstrap (staged plan only)
+DefaultDependencies=no
+RequiresMountsFor={vault_path}
+After=local-fs.target
+Before=sysinit.target basic.target {issuer_units}
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/podbay-r1-linux bootstrap --manifest /etc/podbay/r1-install-manifest.json
+RemainAfterExit=yes
+Restart=no
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=sysinit.target
