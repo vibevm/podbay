@@ -4,6 +4,8 @@
 
 const VERSION: u8 = 1;
 
+// Ordinary-build pre-source refusal seam; no successful origin acquisition.
+mod bootstrap;
 mod codec;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

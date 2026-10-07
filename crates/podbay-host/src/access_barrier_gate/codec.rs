@@ -533,4 +533,29 @@ mod tests {
         let clean = next(&late, Kind::ForwardProgress);
         assert_eq!(check_next(&late, &clean), Err(CodecError::State));
     }
+
+    #[test]
+    fn bootstrap_refuses_valid_historical_closed_bytes_without_io() {
+        use super::super::bootstrap::{BootstrapRefusal, BootstrapRequest, PreSourceAttempt};
+
+        let record = initial();
+        let bytes = encode(&record).unwrap();
+        assert_eq!(decode(&bytes), Ok(record));
+        let mut attempt = PreSourceAttempt::new(BootstrapRequest {
+            boundary_path: "/fixture/vault",
+            historical_checkpoint: Some(&bytes),
+        });
+        let expected = if cfg!(target_os = "linux") {
+            BootstrapRefusal::HistoricalInputCannotAcquire
+        } else {
+            BootstrapRefusal::UnsupportedTarget
+        };
+        for _ in 0..8 {
+            assert_eq!(
+                attempt.acquire(&mut |_| panic!("valid historical record attempted I/O")),
+                Err(expected),
+            );
+        }
+        assert_eq!(decode(&bytes).unwrap().kind, Kind::InitialClosed);
+    }
 }

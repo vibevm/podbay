@@ -207,3 +207,48 @@ constructor, owner-machine deployment or warm recovery. Root/kernel/hypervisor,
 the invoking host UID and toolchain remain trusted. Preexisting FD, directory
 FD, mmap and queued SCM_RIGHTS still require an independently proved old-issuer
 exclusion boundary before any production release.
+
+## Production-compiled pre-source refusal seam
+
+`crates/podbay-host/src/access_barrier_gate/bootstrap.rs` is a separate private
+ordinary-build entry/lifetime boundary. Its borrowed request contains only an
+unobserved intended boundary path and optional historical bytes. It requires
+no source, stage, lock, lineage, PID/UID, boot, policy digest or artifact identity
+to exist before exclusion. No request field can assert CLOSED or NeverStarted.
+Constructing `PreSourceAttempt` creates inert bookkeeping only.
+
+Acquisition returns `Result<Infallible, BootstrapRefusal>`: there is no safe Rust
+success value or origin witness to return. On Linux, well-formed fresh requests
+refuse with `LauncherEnforcementUnavailable`, malformed paths refuse with
+`MalformedRequest`, and supplied historical bytes refuse with
+`HistoricalInputCannotAcquire` without being decoded, hashed or copied. Other
+targets refuse with `UnsupportedTarget`. The first refusal is sticky for that
+attempt; creating another attempt still confers no authority. Drop has no
+callback or release effect.
+
+The entry uses only core operations. Its borrowed deferred-I/O observer is
+never invoked: there is no filesystem, lock, socket, process or checkpoint
+implementation. The observer is a testing boundary, not an enforcement oracle
+or a source of evidence. There are no runtime callers, public exports, store
+open grants, migration conversions, admit/release operations or Ready results.
+The existing inert calculus remains unchanged, and `codec/closed_origin.rs`
+remains restricted to Linux tests. A valid inert InitialClosed record passed
+through the actual codec still cannot acquire a live origin through this seam.
+
+Focused tests cover malformed and well-formed inputs, opaque historical bytes,
+a real valid codec record, sticky refusal, new attempted lifetimes, drop, a
+counting observer with a real disposable marker positive control, and unchanged
+disposable source/checkpoint/lock specimens. The observer and snapshots prove
+the stated tested boundary; they are not OS exclusion observations. An external
+no-std compile control checks the ordinary module body, and the ordinary Host
+check ensures the module is present outside cfg(test). The exact offline gates,
+source pins and retained candidate report are at
+`/fast/git/v/research/2026-10-07-podbay-r1-bootstrap-seam/`.
+
+This seam establishes no production CLOSED boundary, old-issuer exclusion or
+admission. The recorded disposable two-boot success does not supply a missing
+production launcher. Actual enforcement still needs a separately reviewed
+launcher and a custodian-loss experiment with the kernel and an open-FD broker
+still alive; whole-guest termination does not establish that property. Live
+schema24 stores, deployment, services, VM execution, migration/pending state and
+CLI routing are unaffected by this preparatory atom.
