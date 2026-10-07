@@ -71,6 +71,21 @@ class PureTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'executor bytes'):
                 b.verify_elf_closure(changed)
     def test_graph(self):b.verify_units(b.fixed_units(synthetic_units()))
+    def test_umount_callout_and_exec_failure_veto(self):
+        pins=b.strict_json((b.HERE/'r1_systemd_runtime.json').read_bytes())
+        for value in (None,'0'*64):
+            changed=dict(pins)
+            if value is None:del changed[b.UMOUNT]
+            else:changed[b.UMOUNT]=value
+            with self.assertRaisesRegex(ValueError,'umount pin'):b.runtime_bytes(changed)
+        files=b.runtime_bytes(pins)
+        for value in (None,files[b.UMOUNT][:-1]+bytes([files[b.UMOUNT][-1]^1])):
+            changed=dict(files)
+            if value is None:del changed[b.UMOUNT]
+            else:changed[b.UMOUNT]=value
+            with self.assertRaisesRegex(ValueError,'umount bytes'):b.verify_elf_closure(changed)
+        failure=b'[    5.986807] (umount)[95]: fixture.mount: fixture.mount: Failed at step EXEC spawning /usr/bin/umount: No such file or directory\r\n'
+        with self.assertRaisesRegex(ValueError,'fatal raw'):b.verify_console(failure+console())
     def test_graph_failures(self):
         changes=[(b.ISSUER,b'Requires=',b'Wants='),(b.ISSUER,b'After=',b'Before='),(b.BOOTSTRAP,b'[Unit]',b'[Unit]\nConditionPathExists=/absent'),(b.CUSTODIAN,b'Restart=no',b'Restart=always'),(b.CUSTODIAN,b'ExecStart=',b'ExecStartPre='),(b.BOOTSTRAP,b'After=local-fs.target',b'After=unreviewed.target')]
         for name,old,new in changes:
@@ -195,6 +210,9 @@ def verify_builds(first,second):
         executor_mode,executor_data,_=decoded['usr/lib/systemd/systemd-executor']
         assert executor_mode==stat.S_IFREG|0o755,'executor is not root archive regular0755'
         assert b.offline.sha(executor_data)==b.EXECUTOR_SHA,'executor archive bytes differ'
+        umount_mode,umount_data,_=decoded['usr/bin/umount']
+        assert umount_mode==stat.S_IFREG|0o755,'umount is not root archive regular0755'
+        assert b.offline.sha(umount_data)==b.UMOUNT_SHA,'umount archive bytes differ'
         b.verify_elf_closure({'/'+n:d for n,(m,d,v) in decoded.items() if stat.S_ISREG(m)})
         image=p/'fixture.raw'
         for path,uid,mode in (('/',0,'0700'),('/vault',0,'0700'),('/vault/state',1000,'0700'),('/vault/state/db.sqlite',1000,'0600'),('/vault/manager.lock',0,'0600')):

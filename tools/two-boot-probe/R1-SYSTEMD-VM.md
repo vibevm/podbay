@@ -93,3 +93,5 @@ existing bounded TCG, no-network, no-monitor lifecycle harness. The read-only
 disk means this first negative smoke cannot test a writable custodian or latch.
 
 The mandatory systemd-executor callout is explicitly pinned and packaged root:root0755. Missing/mutated executor pins/bytes fail offline assembly; readback explicitly checks this path, mode and hash. It was absent in the first failed native candidate. Parent retained that failure and no retry follows automatically.
+
+The required systemd unmount callout is pinned util-linux `/usr/bin/umount`, root:root0755, SHA8d160edce6166bcc29f5b7cb8b9cc7b66feb176d6149f597340885fff8db85e3. BusyBox umount does not advertise the -c option used by systemd; no shim substitutes for it. Missing/mutated helper and any Failed-at-step-EXEC diagnostic refuse. The second native run observed refusal/denials but failed clean shutdown due to the previously missing helper; original evidence remains retained.

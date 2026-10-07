@@ -1,6 +1,7 @@
 {
   "/lib64/ld-linux-x86-64.so.2": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
   "/usr/bin/systemctl": "6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2",
+  "/usr/bin/umount": "8d160edce6166bcc29f5b7cb8b9cc7b66feb176d6149f597340885fff8db85e3",
   "/usr/lib/systemd/systemd": "3c4b78ddb68e29e23da0465dd273f1ee82f5b9439ebfcec9798b395c05a2c1e3",
   "/usr/lib/systemd/systemd-executor": "94738f53492ff7f2921c9d1795b54013c577f776a6da94b0801bbd3b2619fd57",
   "/usr/lib/systemd/systemd-shutdown": "1cb40a7615982e066c4a1caee0ce01a245b65603826a85d67d3fa9bc2df5f36e",

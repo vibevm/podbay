@@ -31,6 +31,8 @@ ANALYZE = '/usr/bin/systemd-analyze'
 ANALYZE_SHA = '7056ccf8da593ccd9795085d45ef3af92fd27ca8765a3acd8efdc0fbf92fe6dc'
 EXECUTOR = '/usr/lib/systemd/systemd-executor'
 EXECUTOR_SHA = '94738f53492ff7f2921c9d1795b54013c577f776a6da94b0801bbd3b2619fd57'
+UMOUNT = '/usr/bin/umount'
+UMOUNT_SHA = '8d160edce6166bcc29f5b7cb8b9cc7b66feb176d6149f597340885fff8db85e3'
 
 
 def strict_json(data):
@@ -54,6 +56,8 @@ def pinned(path, digest, limit=128*1024*1024):
 def runtime_bytes(pins):
     if pins.get(EXECUTOR) != EXECUTOR_SHA:
         raise ValueError('required systemd executor pin missing or changed')
+    if pins.get(UMOUNT) != UMOUNT_SHA:
+        raise ValueError('required systemd umount pin missing or changed')
     result={}
     for guest,digest in pins.items():
         # Installed merged-/usr and versioned-library symlinks are resolved only
@@ -109,6 +113,9 @@ def verify_elf_closure(files):
     if '/usr/lib/systemd/systemd' in files and (
             EXECUTOR not in files or offline.sha(files[EXECUTOR]) != EXECUTOR_SHA):
         raise ValueError('required systemd executor bytes missing or changed')
+    if '/usr/lib/systemd/systemd' in files and (
+            UMOUNT not in files or offline.sha(files[UMOUNT]) != UMOUNT_SHA):
+        raise ValueError('required systemd umount bytes missing or changed')
     libs={Path(p).name:p for p in files if '/lib' in p}
     result={}
     for path,data in files.items():
@@ -244,7 +251,7 @@ def verify_console(raw):
         raise ValueError('invalid diagnostic console capture')
     text=raw.decode('utf-8','strict')
     if 'R1_SYSTEMD' in text:raise ValueError('observer event leaked into console')
-    fatal=r'kernel panic|not syncing|oops:|BUG:|segmentation fault|R1_.*FAILED|ordering cycle|Failed to execute|Failed to mount|Failed to allocate manager|Freezing execution'
+    fatal=r'kernel panic|not syncing|oops:|BUG:|segmentation fault|R1_.*FAILED|ordering cycle|Failed to execute|Failed at step EXEC|Failed to mount|Failed to allocate manager|Freezing execution'
     if re.search(fatal,text,re.I):raise ValueError('fatal raw diagnostic console')
     text=text.replace('\r','')
     if re.search(fatal,text,re.I):raise ValueError('fatal CR-normalized diagnostic console')

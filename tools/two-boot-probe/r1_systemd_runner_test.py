@@ -17,8 +17,8 @@ import r1_systemd_test as fixture
 
 REAL_POPEN = subprocess.Popen
 REAL_REAP = runner.closed.reap_exact
-BASELINE = builder.BASE/'systemd-console-a'
-PLAN_SHA = 'aa1fd2d0b467ccbf6ad4df00b654250e04238892c3affbb7ebe918b69c40cb5d'
+BASELINE = builder.BASE/'systemd-umount-a'
+PLAN_SHA = '663536a6e677b8f39b55913d692f151e77c12374f0699703d8ab36b6cb71e287'
 
 
 class InputValidation(unittest.TestCase):

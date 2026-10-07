@@ -11,8 +11,8 @@ Prepare-only example for the corrected candidate:
 ```
 python3 -B tools/two-boot-probe/run_r1_systemd_vm.py \
   --name systemd-run-review-new \
-  --input /home/olegchir/podbay-r1-systemd-vm-build/systemd-console-a \
-  --input-plan-sha256 aa1fd2d0b467ccbf6ad4df00b654250e04238892c3affbb7ebe918b69c40cb5d
+  --input /home/olegchir/podbay-r1-systemd-vm-build/systemd-umount-a \
+  --input-plan-sha256 663536a6e677b8f39b55913d692f151e77c12374f0699703d8ab36b6cb71e287
 ```
 
 Do not reuse a prepare-only directory for execution. Every invocation copies to
@@ -59,3 +59,5 @@ a native systemd boot. Invoking UID/root, kernel and installed QEMU/toolchain
 remain trusted; no hostile same-UID or arbitrary-root containment is claimed.
 
 A stopped machine-none local QEMU probe confirmed its file chardev can open the preopened pipe descriptor and quit with exact pidfd reap. No guest kernel/disk/CPU or ISA-UART write was exercised by that probe. Actual ttyS1 discovery/output remains a separately reviewed native gate.
+
+Console `Failed at step EXEC` diagnostics are fatal even when the observer event and powerdown marker are present. The retained second native run is qualified negative-mechanism evidence, not a clean-shutdown pass.
