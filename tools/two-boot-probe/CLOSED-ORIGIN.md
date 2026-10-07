@@ -91,3 +91,119 @@ trusted. User-namespace bind attacks, arbitrary hostile interleavings, custodian
 warm recovery, persistent CLOSED recovery across boots, PID1 loss and power-loss
 durability are not established by this run. No host reboot, deployment or live
 cutover follows from the result.
+
+## Separate two-boot diagnostic candidate
+
+`run_r1_two_boot_origin.py`, `init.r1_two_boot.c`, `r1_two_boot_probe.c` and
+`r1_two_boot_checkpoint.h` add a separate fixed crash/recovery fixture. The
+default runner only builds a fresh canonical schema24 specimen, two static
+executables, an initramfs and a retained 32 MiB ext4 image. It neither adopts an
+existing image nor restores a handle from a checkpoint.
+
+```sh
+python3 -B tools/two-boot-probe/run_r1_two_boot_origin_test.py
+python3 -B tools/two-boot-probe/run_r1_two_boot_origin.py --name r1-new-offline
+# Only after independent source review and explicit disposable-VM authorization:
+python3 -B tools/two-boot-probe/run_r1_two_boot_origin.py --name r1-new-reviewed \
+  --run --qemu-sha256 <reviewed-installed-qemu-sha256>
+```
+
+Both boots begin with the fixed PID1 as the only launcher, no inherited data
+descriptors and a root0700 unmounted `/fixture`. The CLOSED event precedes any
+seed or source data read. After mounting the sole fixture device, PID1 keeps
+the mount root and vault root0700 and the store owner1000/0600 under its
+owner1000/0700 directory. The clean broker's private mount namespace, chroot,
+descriptor closure, privilege drop and seccomp policy follow the one-boot
+mechanism above. No other executable or owner process can run before CLOSED.
+
+Boot A creates the source and exact manager lock, runs the clean broker with
+an open source FD, and checks outside source/sidecar, proc and namespace denial.
+It fsyncs the source, lock and directories, then writes a bounded canonical
+checkpoint using file fsync, no-replace rename, directory fsync and exact
+readback. The checkpoint binds the nonce, fixture declaration, Boot A, source,
+parents, lock, executable/policy hashes and historical broker identity. After
+a fresh held-FD response and pidfd liveness check, PID1 emits crash readiness
+and waits indefinitely. The host validates that complete event prefix before
+SIGKILL of the exact QEMU pidfd, verifies exit -9 and reaps it. It preserves raw
+logs and the same image before starting Boot B in a new QEMU process.
+
+Boot B reinstalls CLOSED before opening the checkpoint or source. It refuses
+partial, noncanonical, foreign, same-boot or changed-identity records and
+acquires the exact manager lock anew. The decoded record is historical data;
+it creates no authority and supplies no inherited FD. Boot B validates the
+unchanged source bytes, runs a fresh read-only broker, kills/reaps that exact
+broker and repeats outside denial while PID1 retains the vault and lock. The
+host requires a distinct guest boot ID and an unchanged source/checkpoint
+tuple. Every accepted event says `admission=UNIMPLEMENTED` and
+`origin_restored=false`.
+
+On 2026-10-07, the static compiler and nine offline codec/parser/fake-child
+tests passed. The first compiler failure and initial pinned candidate are
+retained in the external report. After parent source review, the first VM
+attempt `r1-guest-reviewed` failed in Boot A before seed/source reads: the phase
+parser did not consume `/proc/cmdline`'s trailing newline. Its first failure
+event also incorrectly labelled the gate CLOSED before establishment. Exact
+QEMU PID 1433686/birth 9244865 was killed through its pidfd and reaped with exit
+-9; Boot B was not launched. The raw first failure and image are retained.
+
+The correction uses one tested whitespace-aware phase parser and an explicit
+closure-established flag. A bootstrap failure now says `PRE_CLOSURE`; only the
+validated `closed_before_source` transition sets CLOSED. New offline controls
+exercise trailing-newline/malformed/duplicate phase tokens, the gate label and
+strict parser refusal of a PRE_CLOSURE success stream. Both static builds and
+all nine tests passed again. A second parent-authorized attempt,
+`r1-guest-corrected`, passed phase parsing, CLOSED, vault creation and lock
+acquisition, then failed because informational kernel TSC calibration output
+interleaved inside the `seed_read_started` JSON record. The strict host parser
+refused that malformed stream; exact QEMU PID 1436934/birth 9268971 was reaped
+with -9 and verified pidfd exit. Boot B was not launched, and this second image
+and raw failure are retained separately.
+
+The current runner explicitly uses `loglevel=4` to suppress informational
+kernel console chatter while retaining kernel error output. It still refuses
+any corrupted/interleaved event rather than repairing the stream. PID1 formats
+each complete JSON line into a fixed 2048-byte buffer and rejects truncation.
+It issues one `write` request, retries only EINTR with no reported written
+bytes, and refuses any short positive write. This is best-effort diagnostic
+framing, not kernel/serial atomicity. An actual-pipe capture control verifies
+malformed input cannot trigger the crash-ready signal. A separate ordinary-UID
+C control calls the actual PID1 event function without bootstrap, checks the
+pre/post-closure labels and validates exact complete JSON bytes/length below
+the cap. All eleven offline tests and both static builds passed. The current
+offline build is
+`/home/olegchir/podbay-r1-two-boot-origin-build/r1-offline-single-write/`;
+the source patch, pins, both raw failures and evidence are at
+`/fast/git/v/research/2026-10-07-podbay-r1-two-boot-origin/`.
+The third parent-reviewed attempt, `r1-guest-serial-corrected`, exited 0 with
+`DISPOSABLE_TWO_BOOT_CLOSED_RECOVERY_NO_PRODUCTION_ADMISSION`. Boot A emitted
+19 exact events and held its broker FD at the durable checkpoint. Exact QEMU
+PID 1440085/birth 9312144 was killed through its pidfd, exited -9 and was reaped.
+Boot B used a new kernel on the same retained image, emitted 39 exact events,
+reacquired the lock without restoring authority and completed maintained
+outside denial through fresh broker death. Its QEMU PID 1440098/birth 9312630
+exited 0 with verified pidfd exit/reap. Both host PIDs are absent.
+
+The distinct guest boot IDs were `f9d1b6d1-6c4d-4af9-8321-7213b67b4703` and
+`f284b4d9-987d-491e-a093-12a045bb93c8`. Source device/inode/owner/size/hash and
+checkpoint hash/inode/old-broker tuple matched across them. The parent
+independently checked those tuples, event counts, process absence, result hash
+and retained final image hash
+`7993624565cdcc700b5fb23044761116670bc4535dbe1fc2aff016ce886413b7`.
+Full raw logs, results and image are at
+`/home/olegchir/podbay-r1-two-boot-origin-build/r1-guest-serial-corrected/`.
+Both earlier failed images/logs remain separate. Synthetic offline test
+receipts remain explicitly marked `OFFLINE_FAKE_CHILD_TEST`.
+
+The successful run covers one selected crash after a durable checkpoint, followed
+by a fresh kernel. The host fsyncs the retained image only after exact QEMU reap;
+this does not model host power loss. Offline corruption tests exercise the
+actual checkpoint decoder; they do not establish guest filesystem behavior at
+every interrupted write/rename window. The guest uses raw exact-byte probes;
+full canonical SQLite validation occurs offline before packaging, and whole
+source hashing binds those bytes in the guest. The filesystem UUID is a
+host-created declaration in the pinned config, not a guest superblock probe.
+This fixture adds no migration, pending/final mutation, admission API, production
+constructor, owner-machine deployment or warm recovery. Root/kernel/hypervisor,
+the invoking host UID and toolchain remain trusted. Preexisting FD, directory
+FD, mmap and queued SCM_RIGHTS still require an independently proved old-issuer
+exclusion boundary before any production release.
