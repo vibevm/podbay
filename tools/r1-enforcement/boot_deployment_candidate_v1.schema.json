@@ -1,0 +1,888 @@
+{
+  "$comment": "Structural schema only. validate_boot_candidate.py additionally enforces cross-field identity/layout/bundle-path rules, actual captured-buffer/artifact hashes, complete declared routes and Requires+After graph/cycle checks. Schema success never establishes production origin. Semantic validation rejects component-boundary equality/ancestor/descendant overlap among all regular artifact destinations and the vault in both directions.",
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "filename": {
+              "const": "kernel.bin"
+            },
+            "id": {
+              "const": "kernel"
+            },
+            "install_path": {
+              "const": "/boot/podbay/vmlinuz"
+            },
+            "mode": {
+              "const": 420
+            },
+            "role": {
+              "const": "kernel"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "setup.bin"
+            },
+            "id": {
+              "const": "setup"
+            },
+            "install_path": {
+              "const": "/usr/local/libexec/podbay-r1-setup"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "setup"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "manager.bin"
+            },
+            "id": {
+              "const": "manager"
+            },
+            "install_path": {
+              "const": "/usr/lib/systemd/systemd"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "manager"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "executor.bin"
+            },
+            "id": {
+              "const": "executor"
+            },
+            "install_path": {
+              "const": "/usr/lib/systemd/systemd-executor"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "executor"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "shutdown.bin"
+            },
+            "id": {
+              "const": "shutdown"
+            },
+            "install_path": {
+              "const": "/usr/lib/systemd/systemd-shutdown"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "shutdown"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "umount.bin"
+            },
+            "id": {
+              "const": "umount"
+            },
+            "install_path": {
+              "const": "/usr/bin/umount"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "umount"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "enforcer.bin"
+            },
+            "id": {
+              "const": "enforcer"
+            },
+            "install_path": {
+              "const": "/usr/local/libexec/podbay-r1-linux"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "enforcer"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "producer.bin"
+            },
+            "id": {
+              "const": "producer"
+            },
+            "install_path": {
+              "const": "/usr/local/libexec/podbay-r1-boot-producer"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "producer"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "const": "policy.json"
+            },
+            "id": {
+              "const": "policy"
+            },
+            "install_path": {
+              "const": "/etc/podbay/r1-boot-policy.json"
+            },
+            "mode": {
+              "const": 384
+            },
+            "role": {
+              "const": "policy"
+            }
+          }
+        },
+        {
+          "properties": {
+            "bytes": {
+              "maximum": 32768
+            },
+            "filename": {
+              "pattern": "^unit-[0-9]{3}\\.service$"
+            },
+            "id": {
+              "pattern": "^unit-[0-9]{3}$"
+            },
+            "install_path": {
+              "pattern": "^/etc/systemd/system/[A-Za-z0-9][A-Za-z0-9_.@-]*\\.service$"
+            },
+            "mode": {
+              "const": 420
+            },
+            "role": {
+              "const": "unit"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "pattern": "^lib-[0-9]{3}\\.bin$"
+            },
+            "id": {
+              "pattern": "^lib-[0-9]{3}$"
+            },
+            "install_path": {
+              "pattern": "^(?:/usr/lib/x86_64-linux-gnu/(?:systemd/)?[A-Za-z0-9_.+-]+|/lib64/ld-linux-x86-64.so.2)$"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "library"
+            }
+          }
+        },
+        {
+          "properties": {
+            "filename": {
+              "pattern": "^issuer-[0-9]{3}\\.bin$"
+            },
+            "id": {
+              "pattern": "^issuer-[0-9]{3}$"
+            },
+            "install_path": {
+              "pattern": "^/usr/local/libexec/podbay-r1/issuer-[0-9]{3}$"
+            },
+            "mode": {
+              "const": 493
+            },
+            "role": {
+              "const": "issuer-program"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "bytes": {
+          "maximum": 67108864,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "filename": {
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "generation": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "gid": {
+          "const": 0
+        },
+        "id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "install_path": {
+          "maxLength": 4096,
+          "minLength": 2,
+          "pattern": "^/[^\\\\\\u0000-\\u0020\\u007f]+$",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            384,
+            420,
+            493
+          ]
+        },
+        "role": {
+          "enum": [
+            "kernel",
+            "setup",
+            "manager",
+            "executor",
+            "shutdown",
+            "umount",
+            "enforcer",
+            "producer",
+            "policy",
+            "unit",
+            "library",
+            "issuer-program"
+          ]
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "uid": {
+          "const": 0
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "filename",
+        "sha256",
+        "bytes",
+        "install_path",
+        "uid",
+        "gid",
+        "mode",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "directory": {
+      "additionalProperties": false,
+      "properties": {
+        "gid": {
+          "maximum": 4294967294,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inode": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "const": 448
+        },
+        "uid": {
+          "maximum": 4294967294,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inode",
+        "uid",
+        "gid",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "inventory": {
+      "additionalProperties": false,
+      "properties": {
+        "complete_declared": {
+          "const": true
+        },
+        "expected_units": {
+          "contains": {
+            "const": "podbay-r1-boot-producer.service"
+          },
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@-]*\\.service$",
+            "type": "string"
+          },
+          "maxItems": 33,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "issuers": {
+          "items": {
+            "$ref": "#/$defs/issuer"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "routes": {
+          "items": {
+            "$ref": "#/$defs/route"
+          },
+          "maxItems": 10,
+          "minItems": 10,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "scope": {
+          "const": "DECLARED_BOOT_IMAGE"
+        },
+        "unresolved": {
+          "maxItems": 0,
+          "type": "array"
+        }
+      },
+      "required": [
+        "scope",
+        "complete_declared",
+        "unresolved",
+        "expected_units",
+        "issuers",
+        "routes"
+      ],
+      "type": "object"
+    },
+    "issuer": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 4294967294,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unit": {
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@-]*\\.service$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "artifact",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "lock": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 1048576,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "gid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "inode": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mode": {
+          "const": 384
+        },
+        "nlink": {
+          "const": 1
+        },
+        "path": {
+          "const": "state/db.sqlite.manager.lock"
+        },
+        "uid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "producer": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "const": "producer"
+        },
+        "attempt_policy": {
+          "const": "ONE_ATTEMPT_PER_BOOT"
+        },
+        "before_source_lock_child": {
+          "const": true
+        },
+        "custody_loss": {
+          "const": "REFUSE_NO_RETRY"
+        },
+        "deferred_native_predicates": {
+          "items": {
+            "enum": [
+              "trusted-pre-issuer-producer",
+              "complete-native-issuer-exclusion",
+              "protected-source-provisioning",
+              "source-alias-exclusion",
+              "private-live-capability-transfer",
+              "one-attempt-and-custody-loss",
+              "two-boot-new-custody",
+              "production-migration-release"
+            ]
+          },
+          "maxItems": 8,
+          "minItems": 8,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "late_entry": {
+          "const": "REFUSE"
+        },
+        "live_evidence": {
+          "const": "UNAVAILABLE"
+        },
+        "unit": {
+          "const": "podbay-r1-boot-producer.service"
+        }
+      },
+      "required": [
+        "unit",
+        "artifact",
+        "live_evidence",
+        "attempt_policy",
+        "late_entry",
+        "custody_loss",
+        "before_source_lock_child",
+        "deferred_native_predicates"
+      ],
+      "type": "object"
+    },
+    "route": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "disposition": {
+              "const": "ABSENT_DECLARED"
+            },
+            "units": {
+              "maxItems": 0
+            }
+          }
+        },
+        {
+          "properties": {
+            "disposition": {
+              "const": "GATED_DECLARED"
+            },
+            "units": {
+              "minItems": 1
+            }
+          }
+        }
+      ],
+      "properties": {
+        "disposition": {
+          "enum": [
+            "ABSENT_DECLARED",
+            "GATED_DECLARED"
+          ]
+        },
+        "route": {
+          "enum": [
+            "user-manager",
+            "login",
+            "cron-at",
+            "ssh",
+            "containers",
+            "initramfs-owner-code",
+            "root-helper-fd-pass",
+            "manual-owner-code",
+            "alternate-source-aliases",
+            "inherited-fd-mmap-scm-rights"
+          ]
+        },
+        "units": {
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@-]*\\.service$",
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "route",
+        "disposition",
+        "units"
+      ],
+      "type": "object"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 268435456,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "device": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "gid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "inode": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "lineage": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "mode": {
+          "const": 384
+        },
+        "nlink": {
+          "const": 1
+        },
+        "path": {
+          "const": "state/db.sqlite"
+        },
+        "schema_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "bytes",
+        "sha256",
+        "schema_sha256",
+        "lineage"
+      ],
+      "type": "object"
+    },
+    "subject": {
+      "additionalProperties": false,
+      "properties": {
+        "aliases_absent_declared": {
+          "const": true
+        },
+        "companions_absent_declared": {
+          "items": {
+            "enum": [
+              "state/stage.sqlite",
+              "state/db.sqlite-wal",
+              "state/db.sqlite-shm",
+              "state/db.sqlite-journal"
+            ]
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "device": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "lock": {
+          "$ref": "#/$defs/lock"
+        },
+        "owner_gid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "owner_uid": {
+          "maximum": 4294967294,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "state": {
+          "$ref": "#/$defs/directory"
+        },
+        "vault": {
+          "$ref": "#/$defs/directory"
+        },
+        "vault_path": {
+          "maxLength": 4096,
+          "minLength": 2,
+          "pattern": "^/[^\\\\\\u0000-\\u0020\\u007f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "vault_path",
+        "device",
+        "owner_uid",
+        "owner_gid",
+        "vault",
+        "state",
+        "source",
+        "lock",
+        "companions_absent_declared",
+        "aliases_absent_declared"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:podbay:r1:boot-deployment-candidate:1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "kernel"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "setup"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "manager"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "executor"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "shutdown"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "umount"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "enforcer"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "producer"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        {
+          "contains": {
+            "properties": {
+              "id": {
+                "const": "policy"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        }
+      ],
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "maxItems": 96,
+      "minItems": 11,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "domain": {
+      "const": "DECLARED_BOOT_IMAGE"
+    },
+    "generation": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "type": "string"
+    },
+    "issuer_inventory": {
+      "$ref": "#/$defs/inventory"
+    },
+    "producer": {
+      "$ref": "#/$defs/producer"
+    },
+    "schema": {
+      "const": "podbay.r1.boot-deployment-candidate/1"
+    },
+    "subject": {
+      "$ref": "#/$defs/subject"
+    }
+  },
+  "required": [
+    "schema",
+    "generation",
+    "domain",
+    "subject",
+    "artifacts",
+    "producer",
+    "issuer_inventory"
+  ],
+  "title": "Data-only un-attested boot deployment candidate",
+  "type": "object"
+}
