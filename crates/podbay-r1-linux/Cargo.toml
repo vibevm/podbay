@@ -11,6 +11,7 @@ native-test-probe = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+sha2 = "0.11"
 
 [[bin]]
 name = "podbay-r1-linux"
@@ -19,6 +20,14 @@ path = "src/main.rs"
 [[bin]]
 name = "podbay-r1-boot-producer"
 path = "src/producer_main.rs"
+
+[[bin]]
+name = "podbay-r1-appliance-keeper"
+path = "src/appliance_keeper_main.rs"
+
+[[bin]]
+name = "podbay-r1-appliance-custodian"
+path = "src/appliance_custodian_main.rs"
 
 [[bin]]
 name = "podbay-r1-native-test-probe"
