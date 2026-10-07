@@ -54,6 +54,21 @@ class PureTests(unittest.TestCase):
     def test_malformed_elf(self):
         for data in (b'',b'\x7fELF',b'\x7fELF\x02\x01\x01'+b'\0'*90):
             with self.assertRaises(ValueError):b.elf_info(data)
+    def test_required_executor_missing_or_mutated_refuses_build_gate(self):
+        pins=b.strict_json((b.HERE/'r1_systemd_runtime.json').read_bytes())
+        for value in (None,'0'*64):
+            changed=dict(pins)
+            if value is None:del changed[b.EXECUTOR]
+            else:changed[b.EXECUTOR]=value
+            with self.assertRaisesRegex(ValueError,'executor pin'):
+                b.runtime_bytes(changed)
+        files=b.runtime_bytes(pins)
+        for value in (None,files[b.EXECUTOR][:-1]+bytes([files[b.EXECUTOR][-1]^1])):
+            changed=dict(files)
+            if value is None:del changed[b.EXECUTOR]
+            else:changed[b.EXECUTOR]=value
+            with self.assertRaisesRegex(ValueError,'executor bytes'):
+                b.verify_elf_closure(changed)
     def test_graph(self):b.verify_units(b.fixed_units(synthetic_units()))
     def test_graph_failures(self):
         changes=[(b.ISSUER,b'Requires=',b'Wants='),(b.ISSUER,b'After=',b'Before='),(b.BOOTSTRAP,b'[Unit]',b'[Unit]\nConditionPathExists=/absent'),(b.CUSTODIAN,b'Restart=no',b'Restart=always'),(b.CUSTODIAN,b'ExecStart=',b'ExecStartPre='),(b.BOOTSTRAP,b'After=local-fs.target',b'After=unreviewed.target')]
@@ -154,6 +169,9 @@ def verify_builds(first,second):
             mode,data,dev=decoded[x['path']];assert mode==x['mode'] and len(data)==x['bytes'] and b.offline.sha(data)==x['sha256']
         assert not any('generator' in x or 'initrd-release' in x or 'host' in x for x in decoded)
         b.offline.static_elf(decoded['init'][1]);b.offline.static_elf(decoded['usr/local/libexec/r1-observer'][1])
+        executor_mode,executor_data,_=decoded['usr/lib/systemd/systemd-executor']
+        assert executor_mode==stat.S_IFREG|0o755,'executor is not root archive regular0755'
+        assert b.offline.sha(executor_data)==b.EXECUTOR_SHA,'executor archive bytes differ'
         b.verify_elf_closure({'/'+n:d for n,(m,d,v) in decoded.items() if stat.S_ISREG(m)})
         image=p/'fixture.raw'
         for path,uid,mode in (('/',0,'0700'),('/vault',0,'0700'),('/vault/state',1000,'0700'),('/vault/state/db.sqlite',1000,'0600'),('/vault/manager.lock',0,'0600')):

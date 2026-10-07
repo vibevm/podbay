@@ -29,6 +29,8 @@ PIN_NAMES = ('r1_systemd_runtime.json', 'init.r1_systemd.c', 'r1_systemd_observe
 DIGEST = re.compile('[0-9a-f]{64}')
 ANALYZE = '/usr/bin/systemd-analyze'
 ANALYZE_SHA = '7056ccf8da593ccd9795085d45ef3af92fd27ca8765a3acd8efdc0fbf92fe6dc'
+EXECUTOR = '/usr/lib/systemd/systemd-executor'
+EXECUTOR_SHA = '94738f53492ff7f2921c9d1795b54013c577f776a6da94b0801bbd3b2619fd57'
 
 
 def strict_json(data):
@@ -50,6 +52,8 @@ def pinned(path, digest, limit=128*1024*1024):
 
 
 def runtime_bytes(pins):
+    if pins.get(EXECUTOR) != EXECUTOR_SHA:
+        raise ValueError('required systemd executor pin missing or changed')
     result={}
     for guest,digest in pins.items():
         # Installed merged-/usr and versioned-library symlinks are resolved only
@@ -102,6 +106,9 @@ def elf_info(data):
 
 
 def verify_elf_closure(files):
+    if '/usr/lib/systemd/systemd' in files and (
+            EXECUTOR not in files or offline.sha(files[EXECUTOR]) != EXECUTOR_SHA):
+        raise ValueError('required systemd executor bytes missing or changed')
     libs={Path(p).name:p for p in files if '/lib' in p}
     result={}
     for path,data in files.items():
