@@ -17,6 +17,10 @@ name = "podbay-r1-linux"
 path = "src/main.rs"
 
 [[bin]]
+name = "podbay-r1-boot-producer"
+path = "src/producer_main.rs"
+
+[[bin]]
 name = "podbay-r1-native-test-probe"
 path = "src/bin/native_test_probe.rs"
 required-features = ["native-test-probe"]

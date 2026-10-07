@@ -1,0 +1,23 @@
+# Negative-only v2 scaffold. Staging this template does not authorize boot.
+[Unit]
+Description=PodBay R1 unavailable notify producer scaffold
+DefaultDependencies=no
+RefuseManualStart=yes
+RequiresMountsFor={vault_path}
+After=local-fs.target
+Before=sysinit.target basic.target {issuer_units}
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/podbay-r1-boot-producer
+Restart=no
+TimeoutStartSec=30s
+TimeoutStopSec=5s
+KillMode=control-group
+
+[Install]
+WantedBy=sysinit.target

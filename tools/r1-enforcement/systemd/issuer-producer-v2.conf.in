@@ -1,0 +1,5 @@
+# Startup/loss dependencies are declarations until separately proved natively.
+[Unit]
+Requires=podbay-r1-boot-producer-v2.service
+After=podbay-r1-boot-producer-v2.service
+BindsTo=podbay-r1-boot-producer-v2.service
