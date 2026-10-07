@@ -252,3 +252,89 @@ launcher and a custodian-loss experiment with the kernel and an open-FD broker
 still alive; whole-guest termination does not establish that property. Live
 schema24 stores, deployment, services, VM execution, migration/pending state and
 CLI routing are unaffected by this preparatory atom.
+
+## Separate warm custodian-loss fixture
+
+`init.r1_warm.c`, `r1_warm_probe.c`, `r1_warm_shared.h`,
+`run_r1_warm_custodian.py` and `run_r1_warm_custodian_test.py` add a separate
+fixed diagnostic on a new image. The accepted two-boot code is unchanged.
+
+```sh
+python3 -B tools/two-boot-probe/run_r1_warm_custodian_test.py
+python3 -B tools/two-boot-probe/run_r1_warm_custodian.py --name warm-new-offline
+# Only after complete parent source review and explicit disposable-VM go:
+python3 -B tools/two-boot-probe/run_r1_warm_custodian.py --name warm-new-reviewed \
+  --run --qemu-sha256 <reviewed-installed-qemu-sha256>
+```
+
+The trusted fixed PID1 establishes CLOSED before seed/source reads and remains
+a diagnostic observer for the whole boot. The mount root and vault remain
+root0700; state/source remain owner1000/0700 and owner1000/0600. A distinct root
+custodian opens its own manager-lock description and holds the flock, then
+forks the clean owner broker. The custodian closes inherited data descriptors;
+the broker closes all unrelated descriptors, including the custodian's lock
+and a deliberate high data FD, before its sealed exec. PID1 holds no copy of
+the custodian's lock and never reacquires it after loss.
+
+The broker has a private mount namespace/chroot, cleared groups/capabilities,
+NNP/dumpable0 and a seccomp allowlist. After opening the exact source FD, it
+adds a second filter refusing every subsequent open/openat. It demonstrates
+denial of socket/SCM, namespace, ptrace, pidfd_getfd, fork/exec and dumpability
+operations both before and after custodian loss. Its authorized original FD
+is intentionally still readable. The fixture does not claim to revoke it.
+
+PID1 establishes observation pipes and pins both process pidfds before loss.
+It verifies outside owner source/sidecar/proc/namespace denial, then kills and
+reaps only the exact custodian. The same broker must remain alive in the same
+kernel with unchanged PID, birth and FD, and must report PPID changing from
+the custodian to PID1. Kernel orphan reparenting permits exact reaping; it does
+not restore an origin or manager authority. The actual private launcher is
+called again and must refuse before pipe/open/fork; no replacement custodian
+is created. Outside denials and sealed-broker checks repeat. PID1 then kills
+and reaps the exact broker and checks CLOSED, unchanged source, absent
+stage/sidecars, unchanged boot and no remaining children.
+
+The host expects exactly 52 events with the same boot/source/lock identities,
+the exact custodian/broker PID and birth, sticky LOST/DEAD states, the original
+FD and monotonic protocol sequences. Every accepted event says
+`admission=UNIMPLEMENTED`, `warm_adoption=UNAVAILABLE` and
+`origin_restored=false`. Serial uses the reviewed bounded single-write
+diagnostic framing and loglevel=4; interleaved or partial records refuse.
+The host retains the new image and raw first failure, uses one bounded QEMU
+child with exact pidfd/reap tracking, and has no retry or existing-image mode.
+
+On 2026-10-07 the static C builds and **9/9 offline tests passed**. Tests cover
+the actual C protocol, actual pre-I/O warm-launch refusal, actual bounded
+event output, strict parser controls and fake-child lifecycle failures. The
+unbooted build is
+`/home/olegchir/podbay-r1-warm-custodian-build/warm-offline-reviewed/`.
+The patch, pins, report and raw gates are under
+`/fast/git/v/research/2026-10-07-podbay-r1-warm-custodian/`.
+After parent and independent source review, the single authorized
+`warm-guest-reviewed` run exited 0 with
+`DISPOSABLE_WARM_CUSTODIAN_LOSS_CLOSED_NO_PRODUCTION_ADMISSION`: 52 exact events
+in guest boot `89c5a67c-b87e-4b29-a760-f74bf039ea80`. Custodian PID 76/birth 309
+was killed and reaped with -9 at event 27. Broker PID 77/birth 310 remained
+live with the same readable FD3 and its PPID changed 76 to 1 at event 28.
+The private warm-launch retry refused EOWNERDEAD, broker restrictions and
+outside denials persisted, and exact broker death/reap followed at event 41.
+The unchanged source, absence of children and CLOSED final event completed at
+52. This is one observed process-loss point with the kernel and PID1 alive.
+
+Host QEMU PID 1537082/birth 11990018 exited 0 with verified pidfd exit/reap and
+was absent afterward. Raw serial, result, image and source/binary pins remain
+at `/home/olegchir/podbay-r1-warm-custodian-build/warm-guest-reviewed/`.
+Final image SHA256 is
+`0c22e5eecfe286cd5908c13e3f15a7470cbb6af5d37fa8a3b2a1da3f1d27da73`.
+Synthetic lifecycle receipts still explicitly say `OFFLINE_FAKE_CHILD_TEST`
+and remain separate from this real guest result. No further VM run follows.
+
+This fixture keeps PID1 and the kernel alive. It adds no production origin
+constructor, release/admission, warm authority adoption, arbitrary issuer,
+live store access, migration, activation, pending/final, readiness or runtime
+resumption. The private launch refusal is diagnostic code, not a production
+bootstrap implementation. Root/kernel/hypervisor, the invoking host UID and
+toolchain remain trusted. It does not prove PID1 loss, power loss, arbitrary
+hostile broker containment or owner-machine old-issuer exclusion. Preexisting
+FD, directory FD, mmap and queued SCM_RIGHTS remain the established
+counterexample to treating pathname denial as revocation.
