@@ -1,0 +1,23 @@
+[package]
+name = "podbay-r1-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Explicit ordinary-UID native syscall test executable; never installed.
+native-test-probe = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "podbay-r1-linux"
+path = "src/main.rs"
+
+[[bin]]
+name = "podbay-r1-native-test-probe"
+path = "src/bin/native_test_probe.rs"
+required-features = ["native-test-probe"]
+test = false

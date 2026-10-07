@@ -14,6 +14,7 @@ members = [
   "crates/podbay-server",
   "crates/podbay-adapter-codex",
   "crates/podbay-cli",
+  "crates/podbay-r1-linux",
 ]
 
 [workspace.package]
