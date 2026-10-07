@@ -17,8 +17,8 @@ import r1_systemd_test as fixture
 
 REAL_POPEN = subprocess.Popen
 REAL_REAP = runner.closed.reap_exact
-BASELINE = builder.BASE/'systemd-executor-a'
-PLAN_SHA = '1281fd35b2ee9d57c560b629170557520d8c68235cfc8d0ec097ee0066ebfbe3'
+BASELINE = builder.BASE/'systemd-console-a'
+PLAN_SHA = 'aa1fd2d0b467ccbf6ad4df00b654250e04238892c3affbb7ebe918b69c40cb5d'
 
 
 class InputValidation(unittest.TestCase):
@@ -70,7 +70,7 @@ class InputValidation(unittest.TestCase):
 
 
 class SyntheticLifecycle(unittest.TestCase):
-    def exercise(self,case,code,timeout=2,pidfd_error=False,birth_error=False,receipt_error=False,reap_error=False):
+    def exercise(self,case,code,timeout=2,pidfd_error=False,birth_error=False,receipt_error=False,reap_error=False,event_raw=None):
         name='runner-test-'+case+'-'+str(time.monotonic_ns())[-9:]
         with runner.offline.TrustedOutput(builder.BASE) as output:
             output.create_dir(name)
@@ -85,10 +85,14 @@ class SyntheticLifecycle(unittest.TestCase):
                 self.assertEqual(argv[argv.index('-monitor')+1],'none')
                 self.assertIn('pc,accel=tcg',argv)
                 self.assertIn('readonly=on',argv[argv.index('-drive')+1])
-                self.assertEqual(kwargs['pass_fds'],tuple(output.pins[output.out/n] for n in runner.ARTIFACTS))
+                self.assertEqual(kwargs['pass_fds'][:3],tuple(output.pins[output.out/n] for n in runner.ARTIFACTS))
+                self.assertEqual(len(kwargs['pass_fds']),4)
+                eventfd=kwargs['pass_fds'][-1]
+                self.assertIn('file,id=r1events,path=/proc/self/fd/'+str(eventfd),argv)
                 starts.append(argv)
-                child=REAL_POPEN([sys.executable,'-B','-c',code],stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+                prefix='import os;os.write('+str(eventfd)+','+repr(fixture.serial() if event_raw is None else event_raw)+');'
+                child=REAL_POPEN([sys.executable,'-B','-c',prefix+code],stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,pass_fds=(eventfd,))
                 children.append(child);return child
             with ExitStack() as stack:
                 stack.enter_context(patch.object(runner,'validate_qemu',return_value=None))
@@ -120,42 +124,48 @@ class SyntheticLifecycle(unittest.TestCase):
                 saved=builder.strict_json(output.read('result.json'))
                 self.assertEqual(saved['status'],report['status'])
                 self.assertFalse(saved['boot_executed'])
-            return report,output.read('serial.raw')
+            return report,output.read('serial.raw'),output.read('events.raw')
     @staticmethod
     def valid_code(suffix=''):
-        return 'import sys;sys.stdout.buffer.write('+repr(fixture.serial())+');sys.stdout.flush();'+suffix
+        return 'import sys;sys.stdout.buffer.write('+repr(fixture.console())+');sys.stdout.flush();'+suffix
     def test_fake_pass_is_not_native_proof(self):
-        report,raw=self.exercise('valid',self.valid_code())
+        report,raw,events=self.exercise('valid',self.valid_code())
         self.assertEqual(report['status'],runner.SYNTHETIC)
         self.assertTrue(report['pidfd_exit_verified']);self.assertTrue(report['exact_child_reaped'])
-        self.assertEqual(raw,fixture.serial())
+        self.assertEqual(raw,fixture.console());self.assertEqual(events,fixture.serial())
     def test_timeout_retains_prefix_and_reaps(self):
-        report,raw=self.exercise('timeout','import time;print("first-timeout-byte",flush=True);time.sleep(10)',timeout=.2)
+        report,raw,events=self.exercise('timeout','import time;print("first-timeout-byte",flush=True);time.sleep(10)',timeout=.2)
         self.assertEqual(report['status'],runner.FAILED);self.assertEqual(report['error_type'],'TimeoutError')
         self.assertIn(b'first-timeout-byte',raw);self.assertTrue(report['exact_child_reaped'])
     def test_pidfd_failure_kills_owned_child_without_claiming_pidfd(self):
-        report,raw=self.exercise('pidfd','import time;time.sleep(10)',pidfd_error=True)
+        report,raw,events=self.exercise('pidfd','import time;time.sleep(10)',pidfd_error=True)
         self.assertEqual(report['status'],runner.FAILED);self.assertTrue(report['exact_child_reaped'])
         self.assertFalse(report['pidfd_exit_verified'])
     def test_birth_failure_refuses(self):
-        report,raw=self.exercise('birth','import time;time.sleep(10)',birth_error=True)
+        report,raw,events=self.exercise('birth','import time;time.sleep(10)',birth_error=True)
         self.assertEqual(report['status'],runner.FAILED);self.assertTrue(report['exact_child_reaped'])
     def test_parser_failure_retains_first_raw(self):
-        report,raw=self.exercise('parser','print("first-invalid-record")')
-        self.assertEqual(report['status'],runner.FAILED);self.assertEqual(raw,b'first-invalid-record\n')
+        report,raw,events=self.exercise('parser',self.valid_code(),event_raw=b'first-invalid-record\n')
+        self.assertEqual(report['status'],runner.FAILED);self.assertEqual(events,b'first-invalid-record\n')
     def test_nonzero_refuses_valid_fake_record(self):
-        report,raw=self.exercise('nonzero',self.valid_code('sys.exit(7)'))
+        report,raw,events=self.exercise('nonzero',self.valid_code('sys.exit(7)'))
         self.assertEqual(report['status'],runner.FAILED);self.assertEqual(report['exit_code'],7)
-        self.assertEqual(raw,fixture.serial())
+        self.assertEqual(raw,fixture.console());self.assertEqual(events,fixture.serial())
     def test_stderr_refuses_valid_fake_record(self):
-        report,raw=self.exercise('stderr',self.valid_code('sys.stderr.write("unexpected warning\\n")'))
+        report,raw,events=self.exercise('stderr',self.valid_code('sys.stderr.write("unexpected warning\\n")'))
         self.assertEqual(report['status'],runner.FAILED)
     def test_receipt_failure_retains_first_error_and_raw(self):
-        report,raw=self.exercise('receipt','print("first-invalid-record")',receipt_error=True)
-        self.assertEqual(report['status'],runner.FAILED);self.assertIn('unexpected guest output',report['error'])
-        self.assertTrue(report['exact_child_reaped']);self.assertEqual(raw,b'first-invalid-record\n')
+        report,raw,events=self.exercise('receipt',self.valid_code(),receipt_error=True,event_raw=b'first-invalid-record\n')
+        self.assertEqual(report['status'],runner.FAILED);self.assertIn('invalid dedicated observer channel',report['error'])
+        self.assertTrue(report['exact_child_reaped']);self.assertEqual(events,b'first-invalid-record\n')
+    def test_event_overflow_retains_bounded_prefix_and_reaps(self):
+        report,raw,events=self.exercise('overflow',self.valid_code(),event_raw=b'x'*(builder.MAX_EVENT+10))
+        self.assertEqual(report['status'],runner.FAILED)
+        self.assertIn('events.raw capture limit exceeded',report['error'])
+        self.assertEqual(events,b'x'*builder.MAX_EVENT)
+        self.assertTrue(report['exact_child_reaped'])
     def test_unknown_reap_cannot_claim_stable_image(self):
-        report,raw=self.exercise('reap',self.valid_code(),reap_error=True)
+        report,raw,events=self.exercise('reap',self.valid_code(),reap_error=True)
         self.assertEqual(report['status'],runner.FAILED);self.assertFalse(report['exact_child_reaped'])
         self.assertIn('teardown_error',report);self.assertNotIn('post_reap_disk_sha256',report)
 

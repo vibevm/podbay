@@ -39,7 +39,8 @@ def decode(data):
 def fake_pins():return {k:'a'*64 for k in ('enforcer_sha256','manifest_sha256','systemd_sha256','archive_generation')}
 def fake_event():
     return dict(schema=1,event=b.SUCCESS,boot_id='00000000-0000-0000-0000-000000000001',pid1=1,observer_pid=12,bootstrap_exit=2,custodian_exit=2,issuer_starts=0,outside_denials=4,enforcer_gate='UNESTABLISHED',admission='UNAVAILABLE',**fake_pins())
-def serial(e=None):return ('R1_SYSTEMD '+json.dumps(e or fake_event())+'\n[ 1.000] reboot: Power down\n').encode()
+def serial(e=None):return ('R1_SYSTEMD '+json.dumps(e or fake_event())+'\n').encode()
+def console():return b'[ 1.000] reboot: Power down\n'
 def synthetic_units():
     # Explicit fake fixture for graph negatives, never assembly input.
     return {b.BOOTSTRAP:('[Unit]\nDefaultDependencies=no\nAfter=local-fs.target\nBefore=sysinit.target\n[Service]\nType=oneshot\nRemainAfterExit=yes\nRestart=no\nExecStart=/usr/local/libexec/podbay-r1-linux bootstrap --manifest /etc/podbay/r1-install-manifest.json\n').encode(),b.CUSTODIAN:('[Unit]\nDefaultDependencies=no\nRequires='+b.BOOTSTRAP+'\nAfter='+b.BOOTSTRAP+'\n[Service]\nType=notify\nRestart=no\nExecStart=/usr/local/libexec/podbay-r1-linux custodian --manifest /etc/podbay/r1-install-manifest.json\n').encode()}
@@ -88,6 +89,28 @@ class PureTests(unittest.TestCase):
             with self.subTest(key=key),self.assertRaises((ValueError,TypeError)):b.parse_events(serial(e),fake_pins())
     def test_forgeries(self):
         for raw in (serial()+b'x\n',serial()[:-1],serial().replace(b'"schema": 1',b'"schema":true'),serial().replace(b'"schema": 1',b'"schema":1,"schema":1'),serial().replace(b'R1_SYSTEMD ',b'x R1_SYSTEMD '),serial().replace(b'\n',b'\0\n',1),serial().replace(b'UNAVAILABLE',b'READY'),serial()+serial(),b'R1_SYSTEMD {}\n',serial().replace(b'R1_SYSTEMD ',b'kernel panic\nR1_SYSTEMD ')):
+            with self.assertRaises(ValueError):b.parse_events(raw,fake_pins())
+    def test_separate_console_and_event_channels(self):
+        self.assertEqual(b.native_receipt(serial(),fake_pins(),0,True,True,console=console()),fake_event())
+        diagnostics=b'\x1bP+q6E616D65\x1b\\\x1b[0mOptional feature warning\r\r\n'+console()
+        self.assertTrue(b.verify_console(diagnostics))
+        bad=(b'',console()+console(),console()+b'late\n',serial()+console(),
+             b'\x1b]0;kernel panic\x07\n'+console(),
+             b'\x1b]0;kernel \x1b[0mpanic\x07\n'+console(),
+             b'\x1bPkernel \x1b[0mpanic\x1b\\\n'+console(),
+             b'\x1b]0;Failed to allocate \x1b[0mmanager\x1b\\\n'+console(),
+             b'\x1bPFreezing \x1b[0mexecution\x1b\\\n'+console(),
+             b'\x1bPkernel \x1b]0;x\x07panic\x1b\\\n'+console(),
+             b'\x1b]0;kernel \rpanic\x07\n'+console(),
+             b'\x1bPFailed to allocate \rmanager\x1b\\\n'+console(),
+             b'\x1bPbenign \x1b]0;x\x07payload\x1b\\\n'+console(),
+             b'kernel \x1b]0;x\x07panic\n'+console(),
+             b'kernel \x1bPbenign\x1b\\panic\n'+console(),
+             b'Failed to allocate \x1b[0mmanager\n'+console(),
+             b'\x1b[?\n'+console())
+        for raw in bad:
+            with self.assertRaises(ValueError):b.verify_console(raw)
+        for raw in (b'\x1b[0m'+serial(),b'noise\n'+serial(),serial()+console(),serial().replace(b'\n',b'\r\n')):
             with self.assertRaises(ValueError):b.parse_events(raw,fake_pins())
     def test_lifecycle_gate(self):
         for rc,reap,pidfd,stderr in ((1,True,True,b''),(0,False,True,b''),(0,True,False,b''),(0,True,True,b'warning'),(False,True,True,b'')):

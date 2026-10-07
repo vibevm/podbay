@@ -221,42 +221,86 @@ def verify_systemd(output, entries):
     return {'argv':args,'exit':r.returncode,'sha256':ANALYZE_SHA,'native_ordering_proved':False}
 
 
+MAX_EVENT = 2048
+
+
 def parse_events(raw,pins):
-    if len(raw)>closed.MAX_SERIAL or not raw.endswith(b'\n') or b'\0' in raw:raise ValueError('invalid bounded serial')
-    text=raw.decode('utf-8','strict')
-    if re.search(r'kernel panic|not syncing|oops:|BUG:|segmentation fault|R1_.*FAILED|ordering cycle|Failed to execute|Failed to mount',text,re.I):raise ValueError('fatal guest diagnostic')
-    events=[];shutdown=False
-    for line in text.splitlines():
-        if not line:continue
-        if line.startswith('R1_SYSTEMD '):
-            if events or len(line)>=2048:raise ValueError('duplicate/oversized event')
-            events.append(strict_json(line[11:]));continue
-        if 'R1_SYSTEMD' in line or line.startswith(('{','[')) and not re.match(r'^\[\s*\d+\.\d+\]',line):raise ValueError('corrupted/unexpected event')
-        if re.fullmatch(r'(?:\[\s*\d+\.\d+\]\s*)?reboot: Power down',line):
-            if not events or shutdown:raise ValueError('shutdown out of order')
-            shutdown=True;continue
-        if shutdown:raise ValueError('output after shutdown')
-        # Bounded kernel/systemd diagnostics can occur around the structured
-        # observer record. Arbitrary user output and interleaved JSON cannot.
-        if not re.match(r'^(?:\[\s*\d+\.\d+\]\s*)?(?:systemd(?:\[1\])?:|systemd-shutdown\[1\]:)',line) and not re.match(r'^\[\s*\d+\.\d+\]',line):raise ValueError('unexpected guest output')
-    if len(events)!=1 or not shutdown:raise ValueError('missing observation/shutdown')
-    e=events[0]
+    """Only the dedicated ttyS1 channel can carry the single observer event."""
+    if (not isinstance(raw,bytes) or not 0<len(raw)<MAX_EVENT or raw.count(b'\n')!=1
+            or not raw.endswith(b'\n') or b'\r' in raw or b'\0' in raw or b'\x1b' in raw
+            or not raw.startswith(b'R1_SYSTEMD ')):
+        raise ValueError('invalid dedicated observer channel')
+    e=strict_json(raw[11:-1].decode('utf-8','strict'))
     expected=dict(schema=1,event=SUCCESS,pid1=1,bootstrap_exit=2,custodian_exit=2,issuer_starts=0,outside_denials=4,enforcer_gate='UNESTABLISHED',admission='UNAVAILABLE',**{k:pins[k] for k in ('enforcer_sha256','manifest_sha256','systemd_sha256','archive_generation')})
     if not isinstance(e,dict) or set(e)!=set(expected)|{'boot_id','observer_pid'} or any(e[k]!=v or type(e[k]) is not type(v) for k,v in expected.items()):raise ValueError('foreign or authority-claim event')
     if type(e['observer_pid']) is not int or e['observer_pid']<=1 or not isinstance(e['boot_id'],str) or not origin.BOOT_ID.fullmatch(e['boot_id']):raise ValueError('bad actual boot/observer identity')
     return e
 
 
-def native_receipt(serial,pins,exit_code,exact_reaped,pidfd_verified,stderr=b''):
-    # This pure verifier is deliberately not a launch API.
+
+def verify_console(raw):
+    """Keep raw ttyS0 diagnostics; strip terminal controls only for fatal checks."""
+    if not isinstance(raw,bytes) or len(raw)>closed.MAX_SERIAL or not raw.endswith(b'\n') or b'\0' in raw:
+        raise ValueError('invalid diagnostic console capture')
+    text=raw.decode('utf-8','strict')
+    if 'R1_SYSTEMD' in text:raise ValueError('observer event leaked into console')
+    fatal=r'kernel panic|not syncing|oops:|BUG:|segmentation fault|R1_.*FAILED|ordering cycle|Failed to execute|Failed to mount|Failed to allocate manager|Freezing execution'
+    if re.search(fatal,text,re.I):raise ValueError('fatal raw diagnostic console')
+    text=text.replace('\r','')
+    if re.search(fatal,text,re.I):raise ValueError('fatal CR-normalized diagnostic console')
+    # The observed console uses non-nested CSI/OSC/DCS only. Reject nested
+    # escapes before any destructive removal; payloads cannot conceal tokens
+    # that a subsequent normalization stage would reconstruct and discard.
+    cursor=0
+    while True:
+        start=text.find('\x1b',cursor)
+        if start<0:break
+        kind=text[start+1:start+2]
+        if kind=='[':
+            control=re.match(r'\x1b\[[0-?]*[ -/]*[@-~]',text[start:])
+            if control is None:raise ValueError('malformed CSI diagnostic control')
+            cursor=start+len(control.group())
+        elif kind in (']','P'):
+            cursor=start+2
+            while cursor<len(text):
+                if kind==']' and text[cursor]=='\x07':cursor+=1;break
+                if text[cursor]=='\x1b':
+                    if text[cursor:cursor+2]!='\x1b\\':
+                        raise ValueError('nested diagnostic escape control')
+                    cursor+=2;break
+                cursor+=1
+            else:raise ValueError('unterminated diagnostic string control')
+        else:raise ValueError('unrecognized diagnostic terminal control')
+    # Bounded CSI, OSC and DCS sequences observed from systemd's console setup.
+    # This normalization is never applied to structured observer bytes.
+    text=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',text)
+    # CSI may split a fatal token inside an OSC/DCS payload. Inspect that
+    # joined text before discarding payloads, not only before/after all strips.
+    if re.search(fatal,text,re.I):raise ValueError('fatal CSI-normalized diagnostic console')
+    text=re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)','',text)
+    if re.search(fatal,text,re.I):raise ValueError('fatal OSC-normalized diagnostic console')
+    text=re.sub(r'\x1bP[^\x1b]*(?:\x1b\\)','',text)
+    if re.search(fatal,text,re.I):raise ValueError('fatal DCS-normalized diagnostic console')
+    if '\x1b' in text:raise ValueError('unrecognized diagnostic terminal control')
+    if re.search(fatal,text,re.I):
+        raise ValueError('fatal diagnostic console')
+    lines=[x for x in text.splitlines() if x.strip()]
+    shutdown=[i for i,x in enumerate(lines) if re.fullmatch(r'(?:\[\s*\d+\.\d+\]\s*)?reboot: Power down',x)]
+    if shutdown!=[len(lines)-1]:raise ValueError('missing/duplicate/nonfinal console shutdown')
+    return True
+
+
+def native_receipt(events,pins,exit_code,exact_reaped,pidfd_verified,stderr=b'',console=None):
     if type(exit_code) is not int or exit_code!=0 or exact_reaped is not True or pidfd_verified is not True or stderr:
         raise ValueError('native lifecycle/stderr failure')
-    return parse_events(serial,pins)
+    verify_console(console)
+    return parse_events(events,pins)
 
 
-def planned_qemu(kernel,archive,disk):
+def planned_qemu(kernel,archive,disk,event_path='EVENT_PIPE_FD_REQUIRED'):
     args=closed.qemu_argv(kernel,archive,disk)
     args[args.index('-append')+1]+=' quiet loglevel=4 systemd.show_status=false systemd.log_level=warning'
+    args+=['-chardev','file,id=r1events,path='+str(event_path),'-serial','chardev:r1events']
     return args
 
 
@@ -375,7 +419,7 @@ def prepare(name,enforcer,enforcer_sha,stage,manifest_sha,unit_pins,plan_sha):
             for n,h in (('vmlinuz',offline.KERNEL[2]),('kernel.config',offline.CONFIG_HASH),('modules.builtin',offline.BUILTIN_HASH)):
                 fd=closed.attach(inputs,n,h);out.write(n,os.pread(fd,os.fstat(fd).st_size,0))
         cfg=out.read('kernel.config').decode().splitlines()
-        if any('CONFIG_'+x+'=y' not in cfg for x in (*offline.REQUIRED_CONFIG,'UNIX','CGROUPS','CGROUP_PIDS','EPOLL','INOTIFY_USER','FHANDLE','BINFMT_ELF')):raise ValueError('missing kernel/systemd builtin')
+        if any('CONFIG_'+x+'=y' not in cfg for x in (*offline.REQUIRED_CONFIG,'UNIX','CGROUPS','CGROUP_PIDS','EPOLL','INOTIFY_USER','FHANDLE','BINFMT_ELF','SERIAL_8250','SERIAL_CORE')):raise ValueError('missing kernel/systemd builtin')
         if any(x not in out.read('modules.builtin').decode().splitlines() for x in offline.REQUIRED_BUILTIN):raise ValueError('missing storage builtin')
         disk_build(out,seed);origin.verify_seed(out.out/'source24.sqlite',schema,LINEAGE)
         report=dict(expected,schema=1,status=OFFLINE,boot_executed=False,native_execution_supported=False,install_plan_sha256=plan_sha,tool_pins={**offline.PINS,'compiler':(str(origin.GCC),origin.GCC_SHA256)},systemd_syntax=syntax,output=str(out.out),runtime_pins=runtime_pins,elf_closure=closure,unit_pins=unit_pins,source_pins={n:offline.sha(d) for n,d in source.items()},builder_sha256=offline.sha(Path(__file__).read_bytes()),schema_sha256=offline.sha(schema.encode()),source_sha256=offline.sha(seed),fixture_uuid=UUID,lineage=LINEAGE,artifacts={n:offline.sha(out.read(n)) for n in ('vmlinuz','initramfs.cpio.gz','fixture.raw')},qemu_plan=planned_qemu('vmlinuz','initramfs.cpio.gz','fixture.raw'),limits=['Unbooted; no actual systemd ordering or native refusal observed','Offline closure/graph are not native acceptance','Ordinary invoking UID/root/compiler toolchain trusted; compiler driver pinned only','Fixture issuer graph only, no host production inventory or admission'])

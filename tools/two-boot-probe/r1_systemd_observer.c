@@ -10,6 +10,7 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #include "r1_systemd_pins.h"
 static const char refusal[]="{\"schema\":\"podbay.r1.refusal/1\",\"manifest_schema\":\"podbay.r1.install-manifest/1\",\"code\":\"COLD_BOOT_PROVENANCE_UNAVAILABLE\",\"gate\":\"UNESTABLISHED\",\"admission\":\"UNAVAILABLE\"}\n";
@@ -93,7 +94,15 @@ int main(void) {
     int status;if(waitpid(p,&status,0)!=p||!WIFEXITED(status)||WEXITSTATUS(status))die();
     hashcheck();
     int n=snprintf(b,sizeof b,"R1_SYSTEMD {\"schema\":1,\"event\":\"BOOTSTRAP_REFUSED_ISSUERS_BLOCKED_NO_PRODUCTION_ADMISSION\",\"boot_id\":\"%s\",\"pid1\":1,\"observer_pid\":%ld,\"enforcer_sha256\":\"%s\",\"manifest_sha256\":\"%s\",\"systemd_sha256\":\"%s\",\"archive_generation\":\"%s\",\"bootstrap_exit\":2,\"custodian_exit\":2,\"issuer_starts\":0,\"outside_denials\":4,\"enforcer_gate\":\"UNESTABLISHED\",\"admission\":\"UNAVAILABLE\"}\n",boot,(long)getpid(),ENFORCER_SHA,MANIFEST_SHA,SYSTEMD_SHA,GENERATION);
-    if(n<1 || n>=2048 || write(1,b,(size_t)n)!=n)die();
+    if(n<1 || n>=2048)die();
+    int events=open("/dev/ttyS1",O_WRONLY|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+    if(events<0)die();
+    struct termios serial;
+    if(tcgetattr(events,&serial))die();
+    cfmakeraw(&serial);serial.c_cflag|=CLOCAL|CREAD;
+    if(cfsetispeed(&serial,B115200)||cfsetospeed(&serial,B115200)||
+       tcsetattr(events,TCSANOW,&serial)||fcntl(events,F_SETFL,0))die();
+    if(write(events,b,(size_t)n)!=n||tcdrain(events)||close(events))die();
     char *power[]={"/usr/bin/systemctl","--no-block","poweroff",NULL};
     if(command(power,b,sizeof b))die();
     alarm(0);return 0;

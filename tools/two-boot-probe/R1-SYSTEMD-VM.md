@@ -87,11 +87,9 @@ not VM evidence. The second independently decodes both archives, checks their
 manifest/path/mode/pins, ELF closure, exact disk tree/metadata/source, and equality
 of all deployable bytes. Every run remains unbooted.
 
-`parse_events` is a new systemd-specific parser, not the warm fixture's 52-event
-parser. `native_receipt` additionally requires zero exit, exact reap, pidfd exit
-and empty QEMU stderr. It is a pure verifier and cannot launch a VM. Structured
-serial records must be bounded single writes; corrupted/missing/extra events,
-authority claims, fatal diagnostics and unknown output refuse. Future host
+`parse_events` accepts exactly one bounded observer record from dedicated ttyS1, with no ANSI or console normalization. The observer opens ttyS1 directly, configures raw115200 output, writes once and drains before shutdown. General diagnostics stay on ttyS0. `native_receipt` requires the separate ttyS0 console to end in exactly one shutdown marker, rejects fatal tokens in both raw and terminal-normalized diagnostics, and also requires zero exit, exact reap, pidfd exit and empty QEMU stderr. It is a pure verifier and cannot launch a VM. Corrupted/missing/extra events, authority claims, malformed controls and fatal diagnostics refuse. Future host
 execution must also retain exact image/kernel/archive descriptors and use the
 existing bounded TCG, no-network, no-monitor lifecycle harness. The read-only
 disk means this first negative smoke cannot test a writable custodian or latch.
+
+The mandatory systemd-executor callout is explicitly pinned and packaged root:root0755. Missing/mutated executor pins/bytes fail offline assembly; readback explicitly checks this path, mode and hash. It was absent in the first failed native candidate. Parent retained that failure and no retry follows automatically.

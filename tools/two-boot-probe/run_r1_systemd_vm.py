@@ -5,10 +5,13 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import selectors
 import signal
 import stat
 import subprocess
 import sys
+import time
 sys.dont_write_bytecode = True
 import offline
 import run_closed_vm as closed
@@ -72,12 +75,42 @@ def attach_bounded(inputs, name, digest, limit):
     return fd
 
 
+def capture_channels(child, pidfd, event_reader, output, latch):
+    """Drain console/stderr/event pipe separately; retain bounded first bytes."""
+    deadline=time.monotonic()+closed.TIMEOUT
+    sizes={}
+    channels=((child.stdout,'serial.raw',closed.MAX_SERIAL),
+              (child.stderr,'qemu.stderr',closed.MAX_STDERR),
+              (event_reader,'events.raw',builder.MAX_EVENT))
+    with selectors.DefaultSelector() as selector:
+        for stream,name,limit in channels:
+            fd=stream if isinstance(stream,int) else stream.fileno()
+            os.set_blocking(fd,False);sizes[name]=0
+            selector.register(fd,selectors.EVENT_READ,(name,limit))
+        while selector.get_map():
+            latch.check();remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('QEMU channel capture deadline exceeded')
+            for key,_ in selector.select(min(remaining,1)):
+                name,limit=key.data
+                data=os.read(key.fd,min(65536,limit-sizes[name]+1))
+                if not data:selector.unregister(key.fd);continue
+                retained=data[:limit-sizes[name]]
+                output.check();closed.write_all(output.pins[output.out/name],retained);output.check()
+                sizes[name]+=len(data)
+                if sizes[name]>limit:raise ValueError('QEMU '+name+' capture limit exceeded')
+        poller=select.poll();poller.register(pidfd,select.POLLIN)
+        while child.poll() is None:
+            latch.check();remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError('QEMU exit deadline exceeded')
+            poller.poll(max(1,min(1000,int(remaining*1000))))
+
+
 def _execute(inputs, output, report, qemu_hash, latch):
     """One attempt, always retain first capture/image; tests mark synthetic explicitly."""
-    child = pidfd = None
+    child = pidfd = event_reader = event_writer = None
     report.update(status=FAILED, boot_executed=False, process_launched=False,
                   exact_child_reaped=False, pidfd_exit_verified=False, disk_retained=True)
-    for name in ('serial.raw', 'qemu.stderr', 'guest-events.jsonl'):
+    for name in ('serial.raw', 'qemu.stderr', 'events.raw', 'guest-events.jsonl'):
         output.write(name, b'')
     try:
         if report.get('evidence_kind') not in (NATIVE_KIND, TEST_KIND):
@@ -87,26 +120,29 @@ def _execute(inputs, output, report, qemu_hash, latch):
             if offline.fd_hash(output.pins[output.out/name]) != expected:
                 raise ValueError('run artifact changed before launch: ' + name)
         fds = tuple(output.pins[output.out/n] for n in ARTIFACTS)
-        argv = builder.planned_qemu(*(f'/proc/self/fd/{fd}' for fd in fds))
+        event_reader,event_writer=os.pipe2(os.O_CLOEXEC)
+        argv = builder.planned_qemu(*(f'/proc/self/fd/{fd}' for fd in fds),
+                                    event_path=f'/proc/self/fd/{event_writer}')
         # argv is constructed locally; no argv from a JSON plan is executed.
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, close_fds=True, pass_fds=fds,
+                                 stderr=subprocess.PIPE, close_fds=True, pass_fds=fds+(event_writer,),
                                  cwd=output.out, env={'LC_ALL': 'C', 'TZ': 'UTC'}, start_new_session=True)
         report.update(process_launched=True, boot_executed=report['evidence_kind'] == NATIVE_KIND,
                       pid=child.pid, executed_argv=argv)
+        os.close(event_writer);event_writer=None
         pidfd = os.pidfd_open(child.pid, 0)
         report['process_birth_ticks'] = closed.process_birth(child.pid)
         if type(report['process_birth_ticks']) is not int or report['process_birth_ticks'] < 1:
             raise ValueError('missing exact child birth')
         latch.check()
-        closed.capture(child, pidfd, output.pins[output.out/'serial.raw'],
-                       output.pins[output.out/'qemu.stderr'], output, latch)
+        capture_channels(child,pidfd,event_reader,output,latch)
         report['exit_code'] = closed.reap_exact(child, pidfd)
         report.update(exact_child_reaped=True, pidfd_exit_verified=True)
         latch.check(); inputs.check(); output.check()
-        observation = builder.native_receipt(output.read('serial.raw'), report,
+        observation = builder.native_receipt(output.read('events.raw'), report,
                                              report['exit_code'], report['exact_child_reaped'],
-                                             report['pidfd_exit_verified'], output.read('qemu.stderr'))
+                                             report['pidfd_exit_verified'], output.read('qemu.stderr'),
+                                             console=output.read('serial.raw'))
         # Readonly=on is fixed in argv. Check exact retained image bytes too.
         for name, expected in report['artifact_pins'].items():
             if offline.fd_hash(output.pins[output.out/name]) != expected:
@@ -135,12 +171,19 @@ def _execute(inputs, output, report, qemu_hash, latch):
         if latch.signum is not None and report['status'] in (builder.SUCCESS, SYNTHETIC):
             report.update(status=FAILED, error_type='InterruptedError',
                           error='runner received signal '+str(latch.signum))
+        closers=[]
         if child is not None:
-            for stream in (child.stdout, child.stderr):
-                if stream is not None: stream.close()
-        if pidfd is not None: os.close(pidfd)
+            closers.extend(stream.close for stream in (child.stdout,child.stderr) if stream is not None)
+        closers.extend(lambda fd=fd:os.close(fd) for fd in (pidfd,event_reader,event_writer) if fd is not None)
+        for close in closers:
+            try:close()
+            except BaseException as cleanup:
+                report.setdefault('cleanup_errors',[]).append(str(cleanup))
+                report.setdefault('error_type',type(cleanup).__name__)
+                report.setdefault('error',str(cleanup))
+                report['status']=FAILED
         try:
-            for name in ('serial.raw', 'qemu.stderr', 'guest-events.jsonl'):
+            for name in ('serial.raw', 'qemu.stderr', 'events.raw', 'guest-events.jsonl'):
                 os.fsync(output.pins[output.out/name])
             # Unknown reap means the image might still be in use; preserve it
             # without claiming a stable post-exit digest.
@@ -199,6 +242,7 @@ def prepare(name, input_dir, input_plan_sha256, execute=False, qemu_sha256=None)
                       exact_child_reaped=False, pidfd_exit_verified=False,
                       enforcer_gate='UNESTABLISHED', admission='UNAVAILABLE',
                       timeout_seconds=closed.TIMEOUT, max_serial=closed.MAX_SERIAL, max_stderr=closed.MAX_STDERR,
+                      max_event=builder.MAX_EVENT, event_channel='ttyS1_preopened_pipe',
                       qemu_sha256=qemu_sha256, runner_sha256=offline.sha(Path(__file__).read_bytes()),
                       argv=builder.planned_qemu(*(str(output.out/n) for n in ARTIFACTS)),
                       limits=['Fixed single-issuer negative smoke only; no production origin/custody/admission',
